@@ -16,7 +16,7 @@ import (
 )
 
 // -------------------------------------------------------------------------
-// Interface (unchanged – but all methods now expect/use company_id)
+// Interface (unchanged)
 // -------------------------------------------------------------------------
 
 type DiscountUsageRepository interface {
@@ -54,14 +54,15 @@ type DiscountUsageRepository interface {
 }
 
 // -------------------------------------------------------------------------
-// Filters & Aggregates (unchanged)
+// Filters & Aggregates
 // -------------------------------------------------------------------------
 
 type DiscountUsageFilter struct {
 	CompanyID uuid.UUID
 
-	OrderID   *uuid.UUID
-	InvoiceID *uuid.UUID
+	OrderID    *uuid.UUID
+	InvoiceID  *uuid.UUID
+	CustomerID *uuid.UUID // NEW: filter by customer
 
 	ApplicationIDs []uuid.UUID
 
@@ -166,6 +167,11 @@ func (r *discountUsageRepository) buildFilter(filter DiscountUsageFilter) (strin
 		args = append(args, *filter.InvoiceID)
 		idx++
 	}
+	if filter.CustomerID != nil { // NEW
+		conds = append(conds, fmt.Sprintf("customer_id = $%d", idx))
+		args = append(args, *filter.CustomerID)
+		idx++
+	}
 	if len(filter.ApplicationIDs) > 0 {
 		placeholders := make([]string, len(filter.ApplicationIDs))
 		for i, id := range filter.ApplicationIDs {
@@ -222,16 +228,17 @@ func (r *discountUsageRepository) buildFilter(filter DiscountUsageFilter) (strin
 	return "WHERE " + strings.Join(conds, " AND "), args
 }
 
-// scanDiscountApplication now includes company_id
+// scanDiscountApplication now includes customer_id
 func (r *discountUsageRepository) scanDiscountApplication(s scanner) (*discount.DiscountApplication, error) {
 	var d discount.DiscountApplication
-	var orderID, invoiceID, discountID, autoDiscountID uuid.NullUUID
+	var orderID, invoiceID, customerID, discountID, autoDiscountID uuid.NullUUID
 
 	err := s.Scan(
 		&d.ApplicationID,
 		&d.CompanyID,
 		&orderID,
 		&invoiceID,
+		&customerID, // NEW
 		&d.DiscountType,
 		&discountID,
 		&autoDiscountID,
@@ -252,6 +259,9 @@ func (r *discountUsageRepository) scanDiscountApplication(s scanner) (*discount.
 	if invoiceID.Valid {
 		d.InvoiceID = &invoiceID.UUID
 	}
+	if customerID.Valid { // NEW
+		d.CustomerID = &customerID.UUID
+	}
 	if discountID.Valid {
 		d.DiscountID = &discountID.UUID
 	}
@@ -268,9 +278,9 @@ func (r *discountUsageRepository) scanDiscountApplication(s scanner) (*discount.
 func (r *discountUsageRepository) Create(ctx context.Context, db DBTX, application *discount.DiscountApplication) error {
 	query := `
 		INSERT INTO sales.discount_applications (
-			application_id, company_id, order_id, invoice_id, discount_type,
-			discount_id, auto_discount_id, discount_name, amount, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+			application_id, company_id, order_id, invoice_id, customer_id,
+			discount_type, discount_id, auto_discount_id, discount_name, amount, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
 		RETURNING created_at
 	`
 	err := db.QueryRowContext(ctx, query,
@@ -278,6 +288,7 @@ func (r *discountUsageRepository) Create(ctx context.Context, db DBTX, applicati
 		application.CompanyID,
 		r.nullUUIDParam(application.OrderID),
 		r.nullUUIDParam(application.InvoiceID),
+		r.nullUUIDParam(application.CustomerID), // NEW
 		application.DiscountType,
 		r.nullUUIDParam(application.DiscountID),
 		r.nullUUIDParam(application.AutoDiscountID),
@@ -296,28 +307,29 @@ func (r *discountUsageRepository) BulkCreate(ctx context.Context, db DBTX, appli
 		return nil
 	}
 	valueStrings := make([]string, 0, len(applications))
-	args := make([]interface{}, 0, len(applications)*9)
+	args := make([]interface{}, 0, len(applications)*10) // now 10 fields
 	idx := 1
 	for _, app := range applications {
-		valueStrings = append(valueStrings, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, NOW())",
-			idx, idx+1, idx+2, idx+3, idx+4, idx+5, idx+6, idx+7, idx+8))
+		valueStrings = append(valueStrings, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, NOW())",
+			idx, idx+1, idx+2, idx+3, idx+4, idx+5, idx+6, idx+7, idx+8, idx+9))
 		args = append(args,
 			app.ApplicationID,
 			app.CompanyID,
 			r.nullUUIDParam(app.OrderID),
 			r.nullUUIDParam(app.InvoiceID),
+			r.nullUUIDParam(app.CustomerID), // NEW
 			app.DiscountType,
 			r.nullUUIDParam(app.DiscountID),
 			r.nullUUIDParam(app.AutoDiscountID),
 			app.DiscountName,
 			app.Amount,
 		)
-		idx += 9
+		idx += 10
 	}
 	query := fmt.Sprintf(`
 		INSERT INTO sales.discount_applications (
-			application_id, company_id, order_id, invoice_id, discount_type,
-			discount_id, auto_discount_id, discount_name, amount, created_at
+			application_id, company_id, order_id, invoice_id, customer_id,
+			discount_type, discount_id, auto_discount_id, discount_name, amount, created_at
 		) VALUES %s
 	`, strings.Join(valueStrings, ","))
 	_, err := db.ExecContext(ctx, query, args...)
@@ -330,8 +342,8 @@ func (r *discountUsageRepository) BulkCreate(ctx context.Context, db DBTX, appli
 
 func (r *discountUsageRepository) GetByID(ctx context.Context, db DBTX, applicationID uuid.UUID) (*discount.DiscountApplication, error) {
 	query := `
-		SELECT application_id, company_id, order_id, invoice_id, discount_type,
-			discount_id, auto_discount_id, discount_name, amount, created_at
+		SELECT application_id, company_id, order_id, invoice_id, customer_id,
+			discount_type, discount_id, auto_discount_id, discount_name, amount, created_at
 		FROM sales.discount_applications
 		WHERE application_id = $1
 	`
@@ -410,8 +422,8 @@ func (r *discountUsageRepository) ExistsForInvoice(ctx context.Context, db DBTX,
 
 func (r *discountUsageRepository) GetByOrder(ctx context.Context, db DBTX, companyID, orderID uuid.UUID) ([]*discount.DiscountApplication, error) {
 	query := `
-		SELECT application_id, company_id, order_id, invoice_id, discount_type,
-			discount_id, auto_discount_id, discount_name, amount, created_at
+		SELECT application_id, company_id, order_id, invoice_id, customer_id,
+			discount_type, discount_id, auto_discount_id, discount_name, amount, created_at
 		FROM sales.discount_applications
 		WHERE company_id = $1 AND order_id = $2
 		ORDER BY created_at
@@ -434,8 +446,8 @@ func (r *discountUsageRepository) GetByOrder(ctx context.Context, db DBTX, compa
 
 func (r *discountUsageRepository) GetByInvoice(ctx context.Context, db DBTX, companyID, invoiceID uuid.UUID) ([]*discount.DiscountApplication, error) {
 	query := `
-		SELECT application_id, company_id, order_id, invoice_id, discount_type,
-			discount_id, auto_discount_id, discount_name, amount, created_at
+		SELECT application_id, company_id, order_id, invoice_id, customer_id,
+			discount_type, discount_id, auto_discount_id, discount_name, amount, created_at
 		FROM sales.discount_applications
 		WHERE company_id = $1 AND invoice_id = $2
 		ORDER BY created_at
@@ -462,8 +474,8 @@ func (r *discountUsageRepository) GetByInvoice(ctx context.Context, db DBTX, com
 
 func (r *discountUsageRepository) GetByDiscountID(ctx context.Context, db DBTX, discountID uuid.UUID) ([]*discount.DiscountApplication, error) {
 	query := `
-		SELECT application_id, company_id, order_id, invoice_id, discount_type,
-			discount_id, auto_discount_id, discount_name, amount, created_at
+		SELECT application_id, company_id, order_id, invoice_id, customer_id,
+			discount_type, discount_id, auto_discount_id, discount_name, amount, created_at
 		FROM sales.discount_applications
 		WHERE discount_id = $1
 		ORDER BY created_at
@@ -486,8 +498,8 @@ func (r *discountUsageRepository) GetByDiscountID(ctx context.Context, db DBTX, 
 
 func (r *discountUsageRepository) GetByAutoDiscountID(ctx context.Context, db DBTX, autoDiscountID uuid.UUID) ([]*discount.DiscountApplication, error) {
 	query := `
-		SELECT application_id, company_id, order_id, invoice_id, discount_type,
-			discount_id, auto_discount_id, discount_name, amount, created_at
+		SELECT application_id, company_id, order_id, invoice_id, customer_id,
+			discount_type, discount_id, auto_discount_id, discount_name, amount, created_at
 		FROM sales.discount_applications
 		WHERE auto_discount_id = $1
 		ORDER BY created_at
@@ -510,8 +522,8 @@ func (r *discountUsageRepository) GetByAutoDiscountID(ctx context.Context, db DB
 
 func (r *discountUsageRepository) GetByDiscountName(ctx context.Context, db DBTX, companyID uuid.UUID, discountName string) ([]*discount.DiscountApplication, error) {
 	query := `
-		SELECT application_id, company_id, order_id, invoice_id, discount_type,
-			discount_id, auto_discount_id, discount_name, amount, created_at
+		SELECT application_id, company_id, order_id, invoice_id, customer_id,
+			discount_type, discount_id, auto_discount_id, discount_name, amount, created_at
 		FROM sales.discount_applications
 		WHERE company_id = $1 AND discount_name ILIKE $2
 		ORDER BY created_at
@@ -812,8 +824,8 @@ func (r *discountUsageRepository) List(ctx context.Context, db DBTX, filter Disc
 	}
 
 	query := fmt.Sprintf(`
-		SELECT application_id, company_id, order_id, invoice_id, discount_type,
-			discount_id, auto_discount_id, discount_name, amount, created_at
+		SELECT application_id, company_id, order_id, invoice_id, customer_id,
+			discount_type, discount_id, auto_discount_id, discount_name, amount, created_at
 		FROM sales.discount_applications
 		%s
 		%s
@@ -844,8 +856,8 @@ func (r *discountUsageRepository) List(ctx context.Context, db DBTX, filter Disc
 
 func (r *discountUsageRepository) GetByIDForUpdate(ctx context.Context, db DBTX, applicationID uuid.UUID) (*discount.DiscountApplication, error) {
 	query := `
-		SELECT application_id, company_id, order_id, invoice_id, discount_type,
-			discount_id, auto_discount_id, discount_name, amount, created_at
+		SELECT application_id, company_id, order_id, invoice_id, customer_id,
+			discount_type, discount_id, auto_discount_id, discount_name, amount, created_at
 		FROM sales.discount_applications
 		WHERE application_id = $1
 		FOR UPDATE

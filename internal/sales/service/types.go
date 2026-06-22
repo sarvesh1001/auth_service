@@ -434,44 +434,11 @@ var ErrNotSupported = fmt.Errorf("operation not supported by current data model"
 // Promotion DTOs
 // ================================
 
-type CreatePromotionRequest struct {
-	CompanyID    uuid.UUID  `json:"companyId"`
-	Name         string     `json:"name"`
-	Description  *string    `json:"description,omitempty"`
-	StartDate    time.Time  `json:"startDate"`
-	EndDate      time.Time  `json:"endDate"`
-	IsActive     bool       `json:"isActive"`
-	Priority     *int       `json:"priority,omitempty"`
-	StackingType string     `json:"stacking_type,omitempty"` // NEW: "stackable", "exclusive", "none"
-	CreatedBy    *uuid.UUID `json:"createdBy,omitempty"`
-}
-
-type UpdatePromotionRequest struct {
-	Name         *string    `json:"name,omitempty"`
-	Description  *string    `json:"description,omitempty"`
-	StartDate    *time.Time `json:"startDate,omitempty"`
-	EndDate      *time.Time `json:"endDate,omitempty"`
-	IsActive     *bool      `json:"isActive,omitempty"`
-	Priority     *int       `json:"priority,omitempty"`
-	StackingType *string    `json:"stacking_type,omitempty"` // NEW: allows update
-	UpdatedBy    *uuid.UUID `json:"updatedBy,omitempty"`
-}
-
 type PromotionListFilter struct {
 	CompanyID    uuid.UUID   `json:"companyId"`
 	IsActive     *bool       `json:"isActive,omitempty"`
 	Name         *string     `json:"name,omitempty"`
 	PromotionIDs []uuid.UUID `json:"promotionIds,omitempty"`
-}
-
-type CreatePromotionRuleRequest struct {
-	CompanyID     uuid.UUID              `json:"companyId"`
-	PromotionID   uuid.UUID              `json:"promotionId"`
-	RuleType      string                 `json:"ruleType"`
-	RuleConfig    map[string]interface{} `json:"ruleConfig"`
-	DiscountType  discount.DiscountType  `json:"discountType"`
-	DiscountValue decimal.Decimal        `json:"discountValue"`
-	MaxDiscount   *decimal.Decimal       `json:"maxDiscount,omitempty"`
 }
 
 type UpdatePromotionRuleRequest struct {
@@ -1850,4 +1817,51 @@ type CreateOrderItemRequest struct {
 	UnitPrice      *decimal.Decimal `json:"unit_price,omitempty"`
 	DiscountAmount *decimal.Decimal `json:"discount_amount,omitempty"`
 	Metadata       models.JSONB     `json:"metadata,omitempty"`
+}
+
+// ================================
+// Promotion DTOs
+// ================================
+type UpdatePromotionRequest struct {
+	Name         *string    `json:"name,omitempty"`
+	Description  *string    `json:"description,omitempty"`
+	StartDate    *time.Time `json:"startDate,omitempty"`
+	EndDate      *time.Time `json:"endDate,omitempty"`
+	IsActive     *bool      `json:"isActive,omitempty"`
+	Priority     *int       `json:"priority,omitempty"`
+	StackingType *string    `json:"stacking_type,omitempty"` // allows update
+	UsageLimit   *int       `json:"usageLimit,omitempty"`    // NEW
+	PerUserLimit *int       `json:"perUserLimit,omitempty"`  // NEW
+	UpdatedBy    *uuid.UUID `json:"updatedBy,omitempty"`
+}
+type CreatePromotionRequest struct {
+	CompanyID    uuid.UUID                    `json:"company_id"`
+	Name         string                       `json:"name"`
+	Description  *string                      `json:"description,omitempty"`
+	StartDate    time.Time                    `json:"start_date"`
+	EndDate      time.Time                    `json:"end_date"`
+	IsActive     bool                         `json:"is_active"`
+	Priority     *int                         `json:"priority,omitempty"`
+	StackingType string                       `json:"stacking_type,omitempty"`
+	UsageLimit   *int                         `json:"usage_limit,omitempty"`
+	PerUserLimit *int                         `json:"per_user_limit,omitempty"`
+	CreatedBy    *uuid.UUID                   `json:"created_by,omitempty"`
+	Rules        []CreatePromotionRuleRequest `json:"rules,omitempty"`
+}
+
+type CreatePromotionRuleRequest struct {
+	CompanyID     uuid.UUID              `json:"company_id"`
+	PromotionID   uuid.UUID              `json:"promotion_id"`
+	RuleType      string                 `json:"rule_type"`
+	RuleConfig    map[string]interface{} `json:"rule_config"`
+	DiscountType  discount.DiscountType  `json:"discount_type"`
+	DiscountValue decimal.Decimal        `json:"discount_value"`
+	MaxDiscount   *decimal.Decimal       `json:"max_discount,omitempty"`
+}
+
+// PromotionWithMetrics is used for analytics responses.
+type PromotionWithMetrics struct {
+	*discount.Promotion
+	UsageCount    int64           `json:"usage_count,omitempty"`
+	TotalDiscount decimal.Decimal `json:"total_discount,omitempty"`
 }

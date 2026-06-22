@@ -1,8 +1,11 @@
 package handler
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -32,15 +35,17 @@ func NewPromotionHandler(promotionService service.PromotionService, logger *zap.
 // ---------- Request/Response Types ----------
 
 type createPromotionRequest struct {
-	Name         string  `json:"name"`
-	Description  *string `json:"description,omitempty"`
-	StartDate    string  `json:"start_date"`
-	EndDate      string  `json:"end_date"`
-	IsActive     bool    `json:"is_active"`
-	Priority     *int    `json:"priority,omitempty"`
-	StackingType string  `json:"stacking_type,omitempty"` // NEW
+	Name         string                       `json:"name"`
+	Description  *string                      `json:"description,omitempty"`
+	StartDate    string                       `json:"start_date"`
+	EndDate      string                       `json:"end_date"`
+	IsActive     bool                         `json:"is_active"`
+	Priority     *int                         `json:"priority,omitempty"`
+	StackingType string                       `json:"stacking_type,omitempty"`
+	UsageLimit   *int                         `json:"usage_limit,omitempty"`
+	PerUserLimit *int                         `json:"per_user_limit,omitempty"`
+	Rules        []createPromotionRuleRequest `json:"rules,omitempty"` // <-- ADD THIS
 }
-
 type createPromotionResponse struct {
 	PromotionID  string  `json:"promotion_id"`
 	CompanyID    string  `json:"company_id"`
@@ -50,7 +55,9 @@ type createPromotionResponse struct {
 	EndDate      string  `json:"end_date"`
 	IsActive     bool    `json:"is_active"`
 	Priority     *int    `json:"priority,omitempty"`
-	StackingType string  `json:"stacking_type,omitempty"` // NEW
+	StackingType string  `json:"stacking_type,omitempty"`
+	UsageLimit   *int    `json:"usage_limit,omitempty"`    // NEW
+	PerUserLimit *int    `json:"per_user_limit,omitempty"` // NEW
 	CreatedAt    string  `json:"created_at"`
 	UpdatedAt    string  `json:"updated_at"`
 }
@@ -62,7 +69,9 @@ type updatePromotionRequest struct {
 	EndDate      *string `json:"end_date,omitempty"`
 	IsActive     *bool   `json:"is_active,omitempty"`
 	Priority     *int    `json:"priority,omitempty"`
-	StackingType *string `json:"stacking_type,omitempty"` // NEW
+	StackingType *string `json:"stacking_type,omitempty"`
+	UsageLimit   *int    `json:"usage_limit,omitempty"`    // NEW
+	PerUserLimit *int    `json:"per_user_limit,omitempty"` // NEW
 }
 
 type createPromotionRuleRequest struct {
@@ -90,15 +99,18 @@ type listPromotionsResponse struct {
 }
 
 type promotionSummary struct {
-	PromotionID  string `json:"promotion_id"`
-	Name         string `json:"name"`
-	StartDate    string `json:"start_date"`
-	EndDate      string `json:"end_date"`
-	IsActive     bool   `json:"is_active"`
-	Priority     *int   `json:"priority,omitempty"`
-	StackingType string `json:"stacking_type,omitempty"` // NEW
+	PromotionID   string           `json:"promotion_id"`
+	Name          string           `json:"name"`
+	StartDate     string           `json:"start_date"`
+	EndDate       string           `json:"end_date"`
+	IsActive      bool             `json:"is_active"`
+	Priority      *int             `json:"priority,omitempty"`
+	StackingType  string           `json:"stacking_type,omitempty"`
+	UsageLimit    *int             `json:"usage_limit,omitempty"`
+	PerUserLimit  *int             `json:"per_user_limit,omitempty"`
+	UsageCount    *int64           `json:"usage_count,omitempty"`    // NEW
+	TotalDiscount *decimal.Decimal `json:"total_discount,omitempty"` // NEW
 }
-
 type evaluatePromotionRequest struct {
 	PromotionID string  `json:"promotion_id"`
 	CustomerID  *string `json:"customer_id,omitempty"`
@@ -128,6 +140,7 @@ type recordUsageRequest struct {
 
 // ---------- Promotion CRUD ----------
 
+// CreatePromotion handles POST /promotions
 // CreatePromotion handles POST /promotions
 func (h *PromotionHandler) CreatePromotion(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -173,7 +186,6 @@ func (h *PromotionHandler) CreatePromotion(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Validate stacking_type
 	allowedStacking := map[string]bool{"stackable": true, "exclusive": true, "none": true}
 	if req.StackingType != "" && !allowedStacking[req.StackingType] {
 		h.respondWithError(w, http.StatusBadRequest, "stacking_type must be 'stackable', 'exclusive', or 'none'")
@@ -190,7 +202,9 @@ func (h *PromotionHandler) CreatePromotion(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
+	// Build the service request
 	svcReq := service.CreatePromotionRequest{
 		CompanyID:    companyID,
 		Name:         req.Name,
@@ -199,9 +213,51 @@ func (h *PromotionHandler) CreatePromotion(w http.ResponseWriter, r *http.Reques
 		EndDate:      endDate,
 		IsActive:     req.IsActive,
 		Priority:     req.Priority,
-		StackingType: req.StackingType, // NEW
+		StackingType: req.StackingType,
+		UsageLimit:   req.UsageLimit,
+		PerUserLimit: req.PerUserLimit,
 		CreatedBy:    &userID,
 	}
+
+	// ----- Convert rules from request to service rule requests -----
+	if len(req.Rules) > 0 {
+		ruleReqs := make([]service.CreatePromotionRuleRequest, len(req.Rules))
+		for i, rule := range req.Rules {
+			// Parse discount_value
+			discountValue, err := decimal.NewFromString(rule.DiscountValue)
+			if err != nil {
+				h.respondWithError(w, http.StatusBadRequest, "invalid discount_value in rule")
+				return
+			}
+			// Parse max_discount if present
+			var maxDiscount *decimal.Decimal
+			if rule.MaxDiscount != nil && *rule.MaxDiscount != "" {
+				md, err := decimal.NewFromString(*rule.MaxDiscount)
+				if err != nil {
+					h.respondWithError(w, http.StatusBadRequest, "invalid max_discount in rule")
+					return
+				}
+				maxDiscount = &md
+			}
+			// Validate discount_type
+			dt := discount.DiscountType(rule.DiscountType)
+			if dt != "percentage" && dt != "fixed_amount" && dt != "buy_x_get_y" {
+				h.respondWithError(w, http.StatusBadRequest, "discount_type must be 'percentage', 'fixed_amount', or 'buy_x_get_y'")
+				return
+			}
+			ruleReqs[i] = service.CreatePromotionRuleRequest{
+				CompanyID:     companyID,
+				PromotionID:   uuid.Nil, // will be set by service after promotion creation
+				RuleType:      rule.RuleType,
+				RuleConfig:    rule.RuleConfig,
+				DiscountType:  dt,
+				DiscountValue: discountValue,
+				MaxDiscount:   maxDiscount,
+			}
+		}
+		svcReq.Rules = ruleReqs
+	}
+	// ----------------------------------------------------------------
 
 	promotion, err := h.promotionService.CreatePromotion(ctx, &svcReq)
 	if err != nil {
@@ -258,13 +314,16 @@ func (h *PromotionHandler) UpdatePromotion(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	svcReq := service.UpdatePromotionRequest{
-		Name:        req.Name,
-		Description: req.Description,
-		IsActive:    req.IsActive,
-		Priority:    req.Priority,
-		UpdatedBy:   &userID,
+		Name:         req.Name,
+		Description:  req.Description,
+		IsActive:     req.IsActive,
+		Priority:     req.Priority,
+		UsageLimit:   req.UsageLimit,   // NEW
+		PerUserLimit: req.PerUserLimit, // NEW
+		UpdatedBy:    &userID,
 	}
 	if req.StartDate != nil {
 		start, err := time.Parse(time.RFC3339, *req.StartDate)
@@ -282,7 +341,6 @@ func (h *PromotionHandler) UpdatePromotion(w http.ResponseWriter, r *http.Reques
 		}
 		svcReq.EndDate = &end
 	}
-	// NEW: handle stacking_type update
 	if req.StackingType != nil {
 		allowed := map[string]bool{"stackable": true, "exclusive": true, "none": true}
 		if !allowed[*req.StackingType] {
@@ -339,6 +397,7 @@ func (h *PromotionHandler) DeletePromotion(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	err = h.promotionService.DeletePromotion(ctx, companyID, promotionID, userID)
 	if err != nil {
@@ -551,7 +610,9 @@ func (h *PromotionHandler) ListPromotions(w http.ResponseWriter, r *http.Request
 			EndDate:      p.EndDate.Format(time.RFC3339),
 			IsActive:     p.IsActive,
 			Priority:     p.Priority,
-			StackingType: p.StackingType, // NEW
+			StackingType: p.StackingType,
+			UsageLimit:   p.UsageLimit,   // NEW
+			PerUserLimit: p.PerUserLimit, // NEW
 		}
 	}
 
@@ -623,7 +684,9 @@ func (h *PromotionHandler) SearchPromotions(w http.ResponseWriter, r *http.Reque
 			EndDate:      p.EndDate.Format(time.RFC3339),
 			IsActive:     p.IsActive,
 			Priority:     p.Priority,
-			StackingType: p.StackingType, // NEW
+			StackingType: p.StackingType,
+			UsageLimit:   p.UsageLimit,   // NEW
+			PerUserLimit: p.PerUserLimit, // NEW
 		}
 	}
 
@@ -687,7 +750,9 @@ func (h *PromotionHandler) GetActivePromotions(w http.ResponseWriter, r *http.Re
 			EndDate:      p.EndDate.Format(time.RFC3339),
 			IsActive:     p.IsActive,
 			Priority:     p.Priority,
-			StackingType: p.StackingType, // NEW
+			StackingType: p.StackingType,
+			UsageLimit:   p.UsageLimit,   // NEW
+			PerUserLimit: p.PerUserLimit, // NEW
 		}
 	}
 
@@ -729,6 +794,7 @@ func (h *PromotionHandler) ActivatePromotion(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	err = h.promotionService.ActivatePromotion(ctx, companyID, promotionID, userID)
 	if err != nil {
@@ -776,6 +842,7 @@ func (h *PromotionHandler) DeactivatePromotion(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	err = h.promotionService.DeactivatePromotion(ctx, companyID, promotionID, userID)
 	if err != nil {
@@ -823,6 +890,7 @@ func (h *PromotionHandler) ExpirePromotion(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	err = h.promotionService.ExpirePromotion(ctx, companyID, promotionID, userID)
 	if err != nil {
@@ -856,11 +924,40 @@ func (h *PromotionHandler) CreatePromotionRule(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	var req createPromotionRuleRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	// --- Read raw body for logging ---
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		h.logger.Error("failed to read request body", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	// Restore body for decoder
+	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+	h.logger.Info("CreatePromotionRule request",
+		zap.String("raw_body", string(bodyBytes)),
+		zap.String("company_id", companyID.String()),
+		zap.String("user_id", userID.String()),
+	)
+
+	var req createPromotionRuleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.logger.Error("failed to decode request body",
+			zap.Error(err),
+			zap.String("raw_body", string(bodyBytes)),
+		)
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// Log decoded struct
+	h.logger.Info("CreatePromotionRule decoded request",
+		zap.Any("request", req),
+		zap.String("promotion_id", req.PromotionID),
+		zap.String("rule_type", req.RuleType),
+		zap.String("discount_type", req.DiscountType),
+		zap.String("discount_value", req.DiscountValue),
+	)
 
 	if req.PromotionID == "" {
 		h.respondWithError(w, http.StatusBadRequest, "promotion_id is required")
@@ -882,9 +979,11 @@ func (h *PromotionHandler) CreatePromotionRule(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	discountValue, err := decimal.NewFromString(req.DiscountValue)
 	if err != nil {
+		h.logger.Error("invalid discount_value", zap.String("value", req.DiscountValue), zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, "invalid discount_value")
 		return
 	}
@@ -892,17 +991,32 @@ func (h *PromotionHandler) CreatePromotionRule(w http.ResponseWriter, r *http.Re
 	if req.MaxDiscount != nil && *req.MaxDiscount != "" {
 		md, err := decimal.NewFromString(*req.MaxDiscount)
 		if err != nil {
+			h.logger.Error("invalid max_discount", zap.String("value", *req.MaxDiscount), zap.Error(err))
 			h.respondWithError(w, http.StatusBadRequest, "invalid max_discount")
 			return
 		}
 		maxDiscount = &md
 	}
 
+	// Validate discount_type
+	if req.DiscountType == "" {
+		h.respondWithError(w, http.StatusBadRequest, "discount_type is required")
+		return
+	}
+	// Check if it's a valid enum value
+	dt := discount.DiscountType(req.DiscountType)
+	if dt != "percentage" && dt != "fixed_amount" && dt != "buy_x_get_y" {
+		h.logger.Error("invalid discount_type", zap.String("discount_type", string(dt)))
+		h.respondWithError(w, http.StatusBadRequest, "discount_type must be 'percentage', 'fixed_amount', or 'buy_x_get_y'")
+		return
+	}
+
 	svcReq := service.CreatePromotionRuleRequest{
+		CompanyID:     companyID, // <-- add this
 		PromotionID:   promotionID,
 		RuleType:      req.RuleType,
 		RuleConfig:    req.RuleConfig,
-		DiscountType:  discount.DiscountType(req.DiscountType),
+		DiscountType:  dt,
 		DiscountValue: discountValue,
 		MaxDiscount:   maxDiscount,
 	}
@@ -971,6 +1085,7 @@ func (h *PromotionHandler) UpdatePromotionRule(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	svcReq := service.UpdatePromotionRuleRequest{
 		RuleType:   req.RuleType,
@@ -1055,6 +1170,7 @@ func (h *PromotionHandler) DeletePromotionRule(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	err = h.promotionService.DeletePromotionRule(ctx, companyID, ruleID, userID)
 	if err != nil {
@@ -1467,6 +1583,7 @@ func (h *PromotionHandler) ApplyPromotionToOrder(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	promotion, discountAmount, err := h.promotionService.ApplyPromotionToOrder(ctx, companyID, orderID, promotionID, userID)
 	if err != nil {
@@ -1538,6 +1655,7 @@ func (h *PromotionHandler) applyPromotionToEntity(w http.ResponseWriter, r *http
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	var promotion *discount.Promotion
 	var discountAmount decimal.Decimal
@@ -1627,6 +1745,7 @@ func (h *PromotionHandler) removePromotionFromEntity(w http.ResponseWriter, r *h
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	switch entityType {
 	case "order":
@@ -1693,6 +1812,7 @@ func (h *PromotionHandler) ClearPromotions(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	err = h.promotionService.ClearPromotions(ctx, companyID, req.EntityType, entityID, userID)
 	if err != nil {
@@ -1770,6 +1890,7 @@ func (h *PromotionHandler) RecordPromotionUsage(w http.ResponseWriter, r *http.R
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	usageReq := &service.RecordPromotionUsageRequest{
 		CompanyID:      companyID,
@@ -2071,6 +2192,7 @@ func (h *PromotionHandler) ValidatePromotionStacking(w http.ResponseWriter, r *h
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	err = h.promotionService.ValidatePromotionStacking(ctx, companyID, promotionIDs)
 	if err != nil {
@@ -2130,6 +2252,7 @@ func (h *PromotionHandler) GetStackablePromotions(w http.ResponseWriter, r *http
 }
 
 // GetTopPromotions handles GET /promotions/top
+// GetTopPromotions handles GET /promotions/top
 func (h *PromotionHandler) GetTopPromotions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -2178,6 +2301,7 @@ func (h *PromotionHandler) GetTopPromotions(w http.ResponseWriter, r *http.Reque
 
 	summaries := make([]promotionSummary, len(promotions))
 	for i, p := range promotions {
+		// p is *PromotionWithMetrics (embedding *discount.Promotion)
 		summaries[i] = promotionSummary{
 			PromotionID:  p.PromotionID.String(),
 			Name:         p.Name,
@@ -2186,6 +2310,13 @@ func (h *PromotionHandler) GetTopPromotions(w http.ResponseWriter, r *http.Reque
 			IsActive:     p.IsActive,
 			Priority:     p.Priority,
 			StackingType: p.StackingType,
+			UsageLimit:   p.UsageLimit,
+			PerUserLimit: p.PerUserLimit,
+			UsageCount:   &p.UsageCount,
+		}
+		// If TotalDiscount is set (non-zero), include it
+		if !p.TotalDiscount.IsZero() {
+			summaries[i].TotalDiscount = &p.TotalDiscount
 		}
 	}
 
@@ -2195,6 +2326,7 @@ func (h *PromotionHandler) GetTopPromotions(w http.ResponseWriter, r *http.Reque
 	})
 }
 
+// GetMostUsedPromotions handles GET /promotions/most-used
 // GetMostUsedPromotions handles GET /promotions/most-used
 func (h *PromotionHandler) GetMostUsedPromotions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -2252,6 +2384,12 @@ func (h *PromotionHandler) GetMostUsedPromotions(w http.ResponseWriter, r *http.
 			IsActive:     p.IsActive,
 			Priority:     p.Priority,
 			StackingType: p.StackingType,
+			UsageLimit:   p.UsageLimit,
+			PerUserLimit: p.PerUserLimit,
+			UsageCount:   &p.UsageCount,
+		}
+		if !p.TotalDiscount.IsZero() {
+			summaries[i].TotalDiscount = &p.TotalDiscount
 		}
 	}
 
@@ -2261,6 +2399,7 @@ func (h *PromotionHandler) GetMostUsedPromotions(w http.ResponseWriter, r *http.
 	})
 }
 
+// GetHighestRevenuePromotions handles GET /promotions/highest-revenue
 // GetHighestRevenuePromotions handles GET /promotions/highest-revenue
 func (h *PromotionHandler) GetHighestRevenuePromotions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -2311,13 +2450,20 @@ func (h *PromotionHandler) GetHighestRevenuePromotions(w http.ResponseWriter, r 
 	summaries := make([]promotionSummary, len(promotions))
 	for i, p := range promotions {
 		summaries[i] = promotionSummary{
-			PromotionID:  p.PromotionID.String(),
-			Name:         p.Name,
-			StartDate:    p.StartDate.Format(time.RFC3339),
-			EndDate:      p.EndDate.Format(time.RFC3339),
-			IsActive:     p.IsActive,
-			Priority:     p.Priority,
-			StackingType: p.StackingType,
+			PromotionID:   p.PromotionID.String(),
+			Name:          p.Name,
+			StartDate:     p.StartDate.Format(time.RFC3339),
+			EndDate:       p.EndDate.Format(time.RFC3339),
+			IsActive:      p.IsActive,
+			Priority:      p.Priority,
+			StackingType:  p.StackingType,
+			UsageLimit:    p.UsageLimit,
+			PerUserLimit:  p.PerUserLimit,
+			TotalDiscount: &p.TotalDiscount, // this is the primary metric
+		}
+		// Optionally include usage count if needed
+		if p.UsageCount > 0 {
+			summaries[i].UsageCount = &p.UsageCount
 		}
 	}
 
@@ -2756,9 +2902,83 @@ func (h *PromotionHandler) promotionToResponse(p *discount.Promotion) createProm
 		EndDate:      p.EndDate.Format(time.RFC3339),
 		IsActive:     p.IsActive,
 		Priority:     p.Priority,
-		StackingType: p.StackingType, // NEW
+		StackingType: p.StackingType,
+		UsageLimit:   p.UsageLimit,   // NEW
+		PerUserLimit: p.PerUserLimit, // NEW
 		CreatedAt:    p.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:    p.UpdatedAt.Format(time.RFC3339),
 	}
 	return resp
+}
+
+// ApplyBestPromotions handles POST /promotions/apply-best
+func (h *PromotionHandler) ApplyBestPromotions(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	var req struct {
+		EntityType string `json:"entity_type"`
+		EntityID   string `json:"entity_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	entityID, err := uuid.Parse(req.EntityID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid entity_id")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "promotion:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
+
+	result, err := h.promotionService.ApplyBestPromotions(ctx, companyID, req.EntityType, entityID, userID)
+	if err != nil {
+		h.logger.Error("failed to apply best promotions", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+
+	// Build response
+	applied := make([]map[string]interface{}, len(result.AppliedPromotions))
+	for i, p := range result.AppliedPromotions {
+		applied[i] = map[string]interface{}{
+			"promotion_id": p.PromotionID.String(),
+			"name":         p.Name,
+		}
+		if p.Description != nil {
+			applied[i]["description"] = *p.Description
+		}
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"applied_promotions": applied,
+			"total_discount":     result.TotalDiscount.String(),
+		},
+	})
 }

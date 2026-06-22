@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -46,6 +47,8 @@ type PromotionRepository interface {
 	Update(ctx context.Context, db DBTX, promotion *discount.Promotion) error
 	Delete(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID) error
 	Exists(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID) (bool, error)
+	GetTopPromotionsByUsage(ctx context.Context, db DBTX, companyID uuid.UUID, limit int, from, to *time.Time) ([]*PromotionAnalyticsAggregate, error)
+	GetTopPromotionsByDiscountAmount(ctx context.Context, db DBTX, companyID uuid.UUID, limit int, from, to *time.Time) ([]*PromotionAnalyticsAggregate, error)
 
 	// Status / lifecycle
 	SetActiveStatus(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID, isActive bool, updatedBy *uuid.UUID) error
@@ -54,8 +57,8 @@ type PromotionRepository interface {
 
 	// Stacking type
 	GetStackingType(ctx context.Context, db DBTX, promotionID uuid.UUID) (string, error)
-	// in coupon_repository.go interface
-	FindByIDs(ctx context.Context, db DBTX, companyID uuid.UUID, ids []uuid.UUID) ([]*discount.Promotion, error) // Promotion rules
+
+	// Promotion rules
 	AddRules(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID, rules []*discount.PromotionRule) error
 	ReplaceRules(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID, rules []*discount.PromotionRule) error
 	DeleteRule(ctx context.Context, db DBTX, companyID, promotionID, ruleID uuid.UUID) error
@@ -85,13 +88,14 @@ type PromotionRepository interface {
 
 	// Analytics / reporting
 	GetTotalDiscountGiven(ctx context.Context, db DBTX, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
-	GetTopPromotionsByUsage(ctx context.Context, db DBTX, companyID uuid.UUID, limit int, from, to *time.Time) ([]*discount.Promotion, error)
-	GetTopPromotionsByDiscountAmount(ctx context.Context, db DBTX, companyID uuid.UUID, limit int, from, to *time.Time) ([]*discount.Promotion, error)
 	GetUnusedPromotions(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*discount.Promotion, error)
 
 	// Concurrency / locking
 	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID) (*discount.Promotion, error)
 	GetRuleByIDForUpdate(ctx context.Context, db DBTX, companyID, promotionID, ruleID uuid.UUID) (*discount.PromotionRule, error)
+
+	// Bulk find
+	FindByIDs(ctx context.Context, db DBTX, companyID uuid.UUID, ids []uuid.UUID) ([]*discount.Promotion, error)
 }
 
 // -------------------------------------------------------------------------
@@ -148,10 +152,14 @@ func (r *promotionRepository) validatePagination(p Pagination) (int, int) {
 	return limit, offset
 }
 
+// buildPromotionFilter now always includes deleted_at IS NULL to exclude soft-deleted promotions.
 func (r *promotionRepository) buildPromotionFilter(filter PromotionFilter) (string, []interface{}) {
 	var conds []string
 	var args []interface{}
 	idx := 1
+
+	// Always exclude soft-deleted promotions
+	conds = append(conds, "deleted_at IS NULL")
 
 	if filter.CompanyID != uuid.Nil {
 		conds = append(conds, fmt.Sprintf("company_id = $%d", idx))
@@ -243,11 +251,13 @@ func (r *promotionRepository) buildPromotionFilter(filter PromotionFilter) (stri
 	return "WHERE " + strings.Join(conds, " AND "), args
 }
 
-// scanPromotion includes stacking_type
+// scanPromotion now includes usage_limit, per_user_limit, and deleted_at.
 func (r *promotionRepository) scanPromotion(s scanner) (*discount.Promotion, error) {
 	var p discount.Promotion
 	var createdBy, updatedBy uuid.NullUUID
 	var priority sql.NullInt32
+	var usageLimit, perUserLimit sql.NullInt32
+	var deletedAt sql.NullTime
 
 	err := s.Scan(
 		&p.PromotionID,
@@ -259,6 +269,9 @@ func (r *promotionRepository) scanPromotion(s scanner) (*discount.Promotion, err
 		&p.IsActive,
 		&priority,
 		&p.StackingType,
+		&usageLimit,
+		&perUserLimit,
+		&deletedAt,
 		&p.CreatedAt,
 		&p.UpdatedAt,
 		&createdBy,
@@ -274,6 +287,17 @@ func (r *promotionRepository) scanPromotion(s scanner) (*discount.Promotion, err
 		p.Priority = new(int)
 		*p.Priority = int(priority.Int32)
 	}
+	if usageLimit.Valid {
+		val := int(usageLimit.Int32)
+		p.UsageLimit = &val
+	}
+	if perUserLimit.Valid {
+		val := int(perUserLimit.Int32)
+		p.PerUserLimit = &val
+	}
+	if deletedAt.Valid {
+		p.DeletedAt = &deletedAt.Time
+	}
 	if createdBy.Valid {
 		p.CreatedBy = &createdBy.UUID
 	}
@@ -283,7 +307,7 @@ func (r *promotionRepository) scanPromotion(s scanner) (*discount.Promotion, err
 	return &p, nil
 }
 
-// scanPromotionRule unchanged
+// scanPromotionRule unchanged.
 func (r *promotionRepository) scanPromotionRule(s scanner) (*discount.PromotionRule, error) {
 	var rule discount.PromotionRule
 	var maxDiscount sql.NullString
@@ -322,12 +346,19 @@ func (r *promotionRepository) scanPromotionRule(s scanner) (*discount.PromotionR
 // -------------------------------------------------------------------------
 
 func (r *promotionRepository) Create(ctx context.Context, db DBTX, promotion *discount.Promotion, rules []*discount.PromotionRule) error {
+	logger := r.logger.With(
+		zap.String("method", "Create"),
+		zap.String("promotion_id", promotion.PromotionID.String()),
+	)
+	logger.Info("inserting promotion")
+
 	queryPromo := `
 		INSERT INTO sales.promotions (
 			promotion_id, company_id, name, description,
 			start_date, end_date, is_active, priority, stacking_type,
+			usage_limit, per_user_limit,
 			created_at, updated_at, created_by, updated_by
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW(), $10, $11)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW(), $12, $13)
 		RETURNING created_at, updated_at
 	`
 	var priority interface{}
@@ -346,19 +377,32 @@ func (r *promotionRepository) Create(ctx context.Context, db DBTX, promotion *di
 		promotion.IsActive,
 		priority,
 		promotion.StackingType,
+		promotion.UsageLimit,
+		promotion.PerUserLimit,
 		r.nullUUIDParam(promotion.CreatedBy),
 		r.nullUUIDParam(promotion.UpdatedBy),
 	).Scan(&promotion.CreatedAt, &promotion.UpdatedAt)
 	if err != nil {
-		r.logger.Error("failed to create promotion", zap.Error(err))
+		logger.Error("failed to insert promotion", zap.Error(err))
 		return fmt.Errorf("create promotion: %w", err)
 	}
+	logger.Info("promotion inserted",
+		zap.Time("created_at", promotion.CreatedAt),
+		zap.Time("updated_at", promotion.UpdatedAt))
 
+	// ---- Insert rules if any ----
 	if len(rules) > 0 {
+		logger.Info("adding rules", zap.Int("rule_count", len(rules)))
 		if err := r.AddRules(ctx, db, promotion.CompanyID, promotion.PromotionID, rules); err != nil {
+			logger.Error("failed to add rules", zap.Error(err))
 			return err
 		}
+		logger.Info("rules added successfully")
+	} else {
+		logger.Info("no rules to add")
 	}
+	// -----------------------------
+
 	return nil
 }
 
@@ -366,9 +410,10 @@ func (r *promotionRepository) GetByID(ctx context.Context, db DBTX, companyID, p
 	query := `
 		SELECT promotion_id, company_id, name, description,
 		       start_date, end_date, is_active, priority, stacking_type,
+		       usage_limit, per_user_limit, deleted_at,
 		       created_at, updated_at, created_by, updated_by
 		FROM sales.promotions
-		WHERE company_id = $1 AND promotion_id = $2
+		WHERE company_id = $1 AND promotion_id = $2 AND deleted_at IS NULL
 	`
 	row := db.QueryRowContext(ctx, query, companyID, promotionID)
 	return r.scanPromotion(row)
@@ -384,9 +429,11 @@ func (r *promotionRepository) Update(ctx context.Context, db DBTX, promotion *di
 			is_active = $7,
 			priority = $8,
 			stacking_type = $9,
+			usage_limit = $10,
+			per_user_limit = $11,
 			updated_at = NOW(),
-			updated_by = $10
-		WHERE promotion_id = $1 AND company_id = $2
+			updated_by = $12
+		WHERE promotion_id = $1 AND company_id = $2 AND deleted_at IS NULL
 		RETURNING updated_at
 	`
 	var priority interface{}
@@ -405,6 +452,8 @@ func (r *promotionRepository) Update(ctx context.Context, db DBTX, promotion *di
 		promotion.IsActive,
 		priority,
 		promotion.StackingType,
+		promotion.UsageLimit,
+		promotion.PerUserLimit,
 		r.nullUUIDParam(promotion.UpdatedBy),
 	).Scan(&promotion.UpdatedAt)
 	if err != nil {
@@ -416,14 +465,12 @@ func (r *promotionRepository) Update(ctx context.Context, db DBTX, promotion *di
 	return nil
 }
 
+// Delete performs soft delete by setting deleted_at.
 func (r *promotionRepository) Delete(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID) error {
-	_, err := db.ExecContext(ctx, `DELETE FROM sales.promotion_rules WHERE promotion_id = $1`, promotionID)
+	query := `UPDATE sales.promotions SET deleted_at = NOW() WHERE company_id = $1 AND promotion_id = $2 AND deleted_at IS NULL`
+	result, err := db.ExecContext(ctx, query, companyID, promotionID)
 	if err != nil {
-		return fmt.Errorf("delete promotion rules: %w", err)
-	}
-	result, err := db.ExecContext(ctx, `DELETE FROM sales.promotions WHERE company_id = $1 AND promotion_id = $2`, companyID, promotionID)
-	if err != nil {
-		return fmt.Errorf("delete promotion: %w", err)
+		return fmt.Errorf("soft delete promotion: %w", err)
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
@@ -434,7 +481,7 @@ func (r *promotionRepository) Delete(ctx context.Context, db DBTX, companyID, pr
 
 func (r *promotionRepository) Exists(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID) (bool, error) {
 	var exists bool
-	query := `SELECT EXISTS(SELECT 1 FROM sales.promotions WHERE company_id = $1 AND promotion_id = $2)`
+	query := `SELECT EXISTS(SELECT 1 FROM sales.promotions WHERE company_id = $1 AND promotion_id = $2 AND deleted_at IS NULL)`
 	err := db.QueryRowContext(ctx, query, companyID, promotionID).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("exists promotion: %w", err)
@@ -450,7 +497,7 @@ func (r *promotionRepository) SetActiveStatus(ctx context.Context, db DBTX, comp
 	query := `
 		UPDATE sales.promotions
 		SET is_active = $3, updated_at = NOW(), updated_by = $4
-		WHERE company_id = $1 AND promotion_id = $2
+		WHERE company_id = $1 AND promotion_id = $2 AND deleted_at IS NULL
 	`
 	result, err := db.ExecContext(ctx, query, companyID, promotionID, isActive, r.nullUUIDParam(updatedBy))
 	if err != nil {
@@ -465,7 +512,7 @@ func (r *promotionRepository) SetActiveStatus(ctx context.Context, db DBTX, comp
 
 func (r *promotionRepository) IsActive(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID) (bool, error) {
 	var active bool
-	query := `SELECT is_active FROM sales.promotions WHERE company_id = $1 AND promotion_id = $2`
+	query := `SELECT is_active FROM sales.promotions WHERE company_id = $1 AND promotion_id = $2 AND deleted_at IS NULL`
 	err := db.QueryRowContext(ctx, query, companyID, promotionID).Scan(&active)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -478,7 +525,7 @@ func (r *promotionRepository) IsActive(ctx context.Context, db DBTX, companyID, 
 
 func (r *promotionRepository) IsExpired(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID, at time.Time) (bool, error) {
 	var expired bool
-	query := `SELECT EXISTS(SELECT 1 FROM sales.promotions WHERE company_id = $1 AND promotion_id = $2 AND end_date < $3)`
+	query := `SELECT EXISTS(SELECT 1 FROM sales.promotions WHERE company_id = $1 AND promotion_id = $2 AND deleted_at IS NULL AND end_date < $3)`
 	err := db.QueryRowContext(ctx, query, companyID, promotionID, at).Scan(&expired)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -491,7 +538,7 @@ func (r *promotionRepository) IsExpired(ctx context.Context, db DBTX, companyID,
 
 func (r *promotionRepository) GetStackingType(ctx context.Context, db DBTX, promotionID uuid.UUID) (string, error) {
 	var stackingType string
-	query := `SELECT stacking_type FROM sales.promotions WHERE promotion_id = $1`
+	query := `SELECT stacking_type FROM sales.promotions WHERE promotion_id = $1 AND deleted_at IS NULL`
 	err := db.QueryRowContext(ctx, query, promotionID).Scan(&stackingType)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -556,7 +603,7 @@ func (r *promotionRepository) DeleteRule(ctx context.Context, db DBTX, companyID
 		DELETE FROM sales.promotion_rules
 		WHERE rule_id = $1
 		AND promotion_id = $2
-		AND promotion_id IN (SELECT promotion_id FROM sales.promotions WHERE company_id = $3)
+		AND promotion_id IN (SELECT promotion_id FROM sales.promotions WHERE company_id = $3 AND deleted_at IS NULL)
 	`
 	result, err := db.ExecContext(ctx, query, ruleID, promotionID, companyID)
 	if err != nil {
@@ -575,7 +622,7 @@ func (r *promotionRepository) GetRules(ctx context.Context, db DBTX, companyID, 
 		       pr.discount_type, pr.discount_value, pr.max_discount, pr.created_at
 		FROM sales.promotion_rules pr
 		JOIN sales.promotions p ON pr.promotion_id = p.promotion_id
-		WHERE p.company_id = $1 AND pr.promotion_id = $2
+		WHERE p.company_id = $1 AND pr.promotion_id = $2 AND p.deleted_at IS NULL
 		ORDER BY pr.created_at
 	`
 	rows, err := db.QueryContext(ctx, query, companyID, promotionID)
@@ -600,7 +647,7 @@ func (r *promotionRepository) GetRuleByID(ctx context.Context, db DBTX, companyI
 		       pr.discount_type, pr.discount_value, pr.max_discount, pr.created_at
 		FROM sales.promotion_rules pr
 		JOIN sales.promotions p ON pr.promotion_id = p.promotion_id
-		WHERE p.company_id = $1 AND pr.promotion_id = $2 AND pr.rule_id = $3
+		WHERE p.company_id = $1 AND pr.promotion_id = $2 AND pr.rule_id = $3 AND p.deleted_at IS NULL
 	`
 	row := db.QueryRowContext(ctx, query, companyID, promotionID, ruleID)
 	return r.scanPromotionRule(row)
@@ -612,7 +659,7 @@ func (r *promotionRepository) ExistsRule(ctx context.Context, db DBTX, companyID
 		SELECT EXISTS(
 			SELECT 1 FROM sales.promotion_rules pr
 			JOIN sales.promotions p ON pr.promotion_id = p.promotion_id
-			WHERE p.company_id = $1 AND pr.promotion_id = $2 AND pr.rule_id = $3
+			WHERE p.company_id = $1 AND pr.promotion_id = $2 AND pr.rule_id = $3 AND p.deleted_at IS NULL
 		)
 	`
 	err := db.QueryRowContext(ctx, query, companyID, promotionID, ruleID).Scan(&exists)
@@ -630,12 +677,14 @@ func (r *promotionRepository) GetApplicablePromotions(ctx context.Context, db DB
 	query := `
 		SELECT promotion_id, company_id, name, description,
 		       start_date, end_date, is_active, priority, stacking_type,
+		       usage_limit, per_user_limit, deleted_at,
 		       created_at, updated_at, created_by, updated_by
 		FROM sales.promotions
 		WHERE company_id = $1
 		AND is_active = true
 		AND start_date <= $2
 		AND end_date >= $2
+		AND deleted_at IS NULL
 		ORDER BY priority DESC, start_date ASC
 	`
 	rows, err := db.QueryContext(ctx, query, companyID, at)
@@ -765,6 +814,7 @@ func (r *promotionRepository) List(ctx context.Context, db DBTX, filter Promotio
 	query := fmt.Sprintf(`
 		SELECT promotion_id, company_id, name, description,
 		       start_date, end_date, is_active, priority, stacking_type,
+		       usage_limit, per_user_limit, deleted_at,
 		       created_at, updated_at, created_by, updated_by
 		FROM sales.promotions
 		%s
@@ -797,6 +847,7 @@ func (r *promotionRepository) Search(ctx context.Context, db DBTX, companyID uui
 		SELECT COUNT(*)
 		FROM sales.promotions
 		WHERE company_id = $1
+		AND deleted_at IS NULL
 		AND (name ILIKE $2 OR description ILIKE $3)
 	`
 	var total int64
@@ -811,9 +862,11 @@ func (r *promotionRepository) Search(ctx context.Context, db DBTX, companyID uui
 	dataQuery := `
 		SELECT promotion_id, company_id, name, description,
 		       start_date, end_date, is_active, priority, stacking_type,
+		       usage_limit, per_user_limit, deleted_at,
 		       created_at, updated_at, created_by, updated_by
 		FROM sales.promotions
 		WHERE company_id = $1
+		AND deleted_at IS NULL
 		AND (name ILIKE $2 OR description ILIKE $3)
 		ORDER BY name ASC
 		LIMIT $4 OFFSET $5
@@ -840,9 +893,11 @@ func (r *promotionRepository) GetActivePromotions(ctx context.Context, db DBTX, 
 	query := `
 		SELECT promotion_id, company_id, name, description,
 		       start_date, end_date, is_active, priority, stacking_type,
+		       usage_limit, per_user_limit, deleted_at,
 		       created_at, updated_at, created_by, updated_by
 		FROM sales.promotions
 		WHERE company_id = $1
+		AND deleted_at IS NULL
 		AND is_active = true
 		AND start_date <= $2
 		AND end_date >= $2
@@ -868,9 +923,11 @@ func (r *promotionRepository) GetExpiredPromotions(ctx context.Context, db DBTX,
 	query := `
 		SELECT promotion_id, company_id, name, description,
 		       start_date, end_date, is_active, priority, stacking_type,
+		       usage_limit, per_user_limit, deleted_at,
 		       created_at, updated_at, created_by, updated_by
 		FROM sales.promotions
 		WHERE company_id = $1
+		AND deleted_at IS NULL
 		AND end_date < $2
 		ORDER BY end_date DESC
 	`
@@ -894,9 +951,11 @@ func (r *promotionRepository) GetPromotionsStartingSoon(ctx context.Context, db 
 	query := `
 		SELECT promotion_id, company_id, name, description,
 		       start_date, end_date, is_active, priority, stacking_type,
+		       usage_limit, per_user_limit, deleted_at,
 		       created_at, updated_at, created_by, updated_by
 		FROM sales.promotions
 		WHERE company_id = $1
+		AND deleted_at IS NULL
 		AND is_active = true
 		AND start_date > NOW()
 		AND start_date <= $2
@@ -922,9 +981,11 @@ func (r *promotionRepository) GetPromotionsEndingSoon(ctx context.Context, db DB
 	query := `
 		SELECT promotion_id, company_id, name, description,
 		       start_date, end_date, is_active, priority, stacking_type,
+		       usage_limit, per_user_limit, deleted_at,
 		       created_at, updated_at, created_by, updated_by
 		FROM sales.promotions
 		WHERE company_id = $1
+		AND deleted_at IS NULL
 		AND is_active = true
 		AND end_date >= NOW()
 		AND end_date <= $2
@@ -955,7 +1016,7 @@ func (r *promotionRepository) GetTotalDiscountGiven(ctx context.Context, db DBTX
 		SELECT COALESCE(SUM(amount), 0)
 		FROM sales.discount_applications
 		WHERE discount_type = 'promotion'
-		AND discount_id IN (SELECT promotion_id FROM sales.promotions WHERE company_id = $1)
+		AND discount_id IN (SELECT promotion_id FROM sales.promotions WHERE company_id = $1 AND deleted_at IS NULL)
 	`
 	args := []interface{}{companyID}
 	if from != nil {
@@ -975,24 +1036,15 @@ func (r *promotionRepository) GetTotalDiscountGiven(ctx context.Context, db DBTX
 	return total, nil
 }
 
-func (r *promotionRepository) GetTopPromotionsByUsage(ctx context.Context, db DBTX, companyID uuid.UUID, limit int, from, to *time.Time) ([]*discount.Promotion, error) {
-	// Simplified: not fully implemented – return empty slice
-	return []*discount.Promotion{}, nil
-}
-
-func (r *promotionRepository) GetTopPromotionsByDiscountAmount(ctx context.Context, db DBTX, companyID uuid.UUID, limit int, from, to *time.Time) ([]*discount.Promotion, error) {
-	// Simplified: not fully implemented – return empty slice
-	return []*discount.Promotion{}, nil
-}
-
 func (r *promotionRepository) GetUnusedPromotions(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*discount.Promotion, error) {
 	query := `
 		SELECT p.promotion_id, p.company_id, p.name, p.description,
 		       p.start_date, p.end_date, p.is_active, p.priority, p.stacking_type,
+		       p.usage_limit, p.per_user_limit, p.deleted_at,
 		       p.created_at, p.updated_at, p.created_by, p.updated_by
 		FROM sales.promotions p
 		LEFT JOIN sales.discount_applications da ON p.promotion_id = da.discount_id AND da.discount_type = 'promotion'
-		WHERE p.company_id = $1 AND da.application_id IS NULL
+		WHERE p.company_id = $1 AND p.deleted_at IS NULL AND da.application_id IS NULL
 	`
 	rows, err := db.QueryContext(ctx, query, companyID)
 	if err != nil {
@@ -1018,9 +1070,10 @@ func (r *promotionRepository) GetByIDForUpdate(ctx context.Context, db DBTX, com
 	query := `
 		SELECT promotion_id, company_id, name, description,
 		       start_date, end_date, is_active, priority, stacking_type,
+		       usage_limit, per_user_limit, deleted_at,
 		       created_at, updated_at, created_by, updated_by
 		FROM sales.promotions
-		WHERE company_id = $1 AND promotion_id = $2
+		WHERE company_id = $1 AND promotion_id = $2 AND deleted_at IS NULL
 		FOR UPDATE
 	`
 	row := db.QueryRowContext(ctx, query, companyID, promotionID)
@@ -1033,15 +1086,14 @@ func (r *promotionRepository) GetRuleByIDForUpdate(ctx context.Context, db DBTX,
 		       pr.discount_type, pr.discount_value, pr.max_discount, pr.created_at
 		FROM sales.promotion_rules pr
 		JOIN sales.promotions p ON pr.promotion_id = p.promotion_id
-		WHERE p.company_id = $1 AND pr.promotion_id = $2 AND pr.rule_id = $3
+		WHERE p.company_id = $1 AND pr.promotion_id = $2 AND pr.rule_id = $3 AND p.deleted_at IS NULL
 		FOR UPDATE
 	`
 	row := db.QueryRowContext(ctx, query, companyID, promotionID, ruleID)
 	return r.scanPromotionRule(row)
 }
 
-// FindByIDs retrieves multiple promotions by their IDs (ignoring company_id).
-// Returns a slice of promotions, order is not guaranteed. If no promotions found, returns empty slice.
+// FindByIDs retrieves multiple promotions by their IDs, excluding soft-deleted ones.
 func (r *promotionRepository) FindByIDs(ctx context.Context, db DBTX, companyID uuid.UUID, ids []uuid.UUID) ([]*discount.Promotion, error) {
 	if len(ids) == 0 {
 		return []*discount.Promotion{}, nil
@@ -1056,12 +1108,13 @@ func (r *promotionRepository) FindByIDs(ctx context.Context, db DBTX, companyID 
 	}
 
 	query := fmt.Sprintf(`
-        SELECT promotion_id, company_id, name, description,
-               start_date, end_date, is_active, priority, stacking_type,
-               created_at, updated_at, created_by, updated_by
-        FROM sales.promotions
-        WHERE company_id = $1 AND promotion_id IN (%s)
-    `, strings.Join(placeholders, ","))
+		SELECT promotion_id, company_id, name, description,
+		       start_date, end_date, is_active, priority, stacking_type,
+		       usage_limit, per_user_limit, deleted_at,
+		       created_at, updated_at, created_by, updated_by
+		FROM sales.promotions
+		WHERE company_id = $1 AND promotion_id IN (%s) AND deleted_at IS NULL
+	`, strings.Join(placeholders, ","))
 
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -1071,28 +1124,171 @@ func (r *promotionRepository) FindByIDs(ctx context.Context, db DBTX, companyID 
 
 	var promotions []*discount.Promotion
 	for rows.Next() {
-		p := &discount.Promotion{}
-		var priority sql.NullInt32
-		var createdBy, updatedBy uuid.NullUUID
-		err := rows.Scan(
-			&p.PromotionID, &p.CompanyID, &p.Name, &p.Description,
-			&p.StartDate, &p.EndDate, &p.IsActive, &priority, &p.StackingType,
-			&p.CreatedAt, &p.UpdatedAt, &createdBy, &updatedBy,
-		)
+		p, err := r.scanPromotion(rows)
 		if err != nil {
-			return nil, fmt.Errorf("scan promotion: %w", err)
-		}
-		if priority.Valid {
-			p.Priority = new(int)
-			*p.Priority = int(priority.Int32)
-		}
-		if createdBy.Valid {
-			p.CreatedBy = &createdBy.UUID
-		}
-		if updatedBy.Valid {
-			p.UpdatedBy = &updatedBy.UUID
+			return nil, err
 		}
 		promotions = append(promotions, p)
 	}
 	return promotions, rows.Err()
+}
+
+// GetTopPromotionsByUsage returns the top N promotions by usage count (number of times applied),
+// optionally filtered by date range.
+
+// PromotionAnalyticsAggregate holds promotion data with usage metrics.
+type PromotionAnalyticsAggregate struct {
+	Promotion     *discount.Promotion
+	UsageCount    int64
+	TotalDiscount decimal.Decimal
+}
+
+func (r *promotionRepository) GetTopPromotionsByUsage(ctx context.Context, db DBTX, companyID uuid.UUID, limit int, from, to *time.Time) ([]*PromotionAnalyticsAggregate, error) {
+	query := `
+        SELECT discount_id, COUNT(*) as usage_count
+        FROM sales.discount_applications
+        WHERE company_id = $1
+          AND discount_type = 'promotion'
+          AND discount_id IS NOT NULL
+    `
+	args := []interface{}{companyID}
+	paramIdx := 2
+
+	if from != nil {
+		query += fmt.Sprintf(" AND created_at >= $%d", paramIdx)
+		args = append(args, *from)
+		paramIdx++
+	}
+	if to != nil {
+		query += fmt.Sprintf(" AND created_at <= $%d", paramIdx)
+		args = append(args, *to)
+		paramIdx++
+	}
+
+	query += fmt.Sprintf(`
+        GROUP BY discount_id
+        ORDER BY usage_count DESC
+        LIMIT $%d
+    `, paramIdx)
+	args = append(args, limit)
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get top promotions by usage: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []uuid.UUID
+	usageMap := make(map[uuid.UUID]int64)
+
+	for rows.Next() {
+		var id uuid.UUID
+		var count int64
+		if err := rows.Scan(&id, &count); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+		usageMap[id] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(ids) == 0 {
+		return []*PromotionAnalyticsAggregate{}, nil
+	}
+
+	promotions, err := r.FindByIDs(ctx, db, companyID, ids)
+	if err != nil {
+		return nil, err
+	}
+
+	aggregates := make([]*PromotionAnalyticsAggregate, 0, len(promotions))
+	for _, p := range promotions {
+		aggregates = append(aggregates, &PromotionAnalyticsAggregate{
+			Promotion:  p,
+			UsageCount: usageMap[p.PromotionID],
+		})
+	}
+
+	sort.Slice(aggregates, func(i, j int) bool {
+		return aggregates[i].UsageCount > aggregates[j].UsageCount
+	})
+
+	return aggregates, nil
+}
+
+func (r *promotionRepository) GetTopPromotionsByDiscountAmount(ctx context.Context, db DBTX, companyID uuid.UUID, limit int, from, to *time.Time) ([]*PromotionAnalyticsAggregate, error) {
+	query := `
+        SELECT discount_id, COALESCE(SUM(amount), 0) as total_discount
+        FROM sales.discount_applications
+        WHERE company_id = $1
+          AND discount_type = 'promotion'
+          AND discount_id IS NOT NULL
+    `
+	args := []interface{}{companyID}
+	paramIdx := 2
+
+	if from != nil {
+		query += fmt.Sprintf(" AND created_at >= $%d", paramIdx)
+		args = append(args, *from)
+		paramIdx++
+	}
+	if to != nil {
+		query += fmt.Sprintf(" AND created_at <= $%d", paramIdx)
+		args = append(args, *to)
+		paramIdx++
+	}
+
+	query += fmt.Sprintf(`
+        GROUP BY discount_id
+        ORDER BY total_discount DESC
+        LIMIT $%d
+    `, paramIdx)
+	args = append(args, limit)
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get top promotions by discount amount: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []uuid.UUID
+	discountMap := make(map[uuid.UUID]decimal.Decimal)
+
+	for rows.Next() {
+		var id uuid.UUID
+		var total decimal.Decimal
+		if err := rows.Scan(&id, &total); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+		discountMap[id] = total
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(ids) == 0 {
+		return []*PromotionAnalyticsAggregate{}, nil
+	}
+
+	promotions, err := r.FindByIDs(ctx, db, companyID, ids)
+	if err != nil {
+		return nil, err
+	}
+
+	aggregates := make([]*PromotionAnalyticsAggregate, 0, len(promotions))
+	for _, p := range promotions {
+		aggregates = append(aggregates, &PromotionAnalyticsAggregate{
+			Promotion:     p,
+			TotalDiscount: discountMap[p.PromotionID],
+		})
+	}
+
+	sort.Slice(aggregates, func(i, j int) bool {
+		return aggregates[i].TotalDiscount.GreaterThan(aggregates[j].TotalDiscount)
+	})
+
+	return aggregates, nil
 }

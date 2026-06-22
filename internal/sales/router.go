@@ -1389,6 +1389,10 @@ func RegisterSalesRoutes(
 		r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.update", logger)).
 			Post("/apply/invoice", handlers.PromotionHandler.ApplyPromotionToInvoice)
 
+		// Apply best promotion automatically
+		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
+			Post("/apply-best", handlers.PromotionHandler.ApplyBestPromotions)
+
 		// Removing promotions
 		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 			Delete("/remove/order", handlers.PromotionHandler.RemovePromotionFromOrder)
@@ -1445,7 +1449,6 @@ func RegisterSalesRoutes(
 		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.view", logger)).
 			Get("/customer-limit-reached", handlers.PromotionHandler.IsCustomerPromotionUsageLimitReached)
 	})
-
 	// ==================== NEW QUOTE ROUTES ====================
 	r.Route("/sales/quotes", func(r chi.Router) {
 		// Create & modify

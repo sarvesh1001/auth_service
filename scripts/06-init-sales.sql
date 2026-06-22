@@ -2173,3 +2173,65 @@ CREATE TABLE sales_analytics.daily_allocated_amount (
     total_allocated NUMERIC(14,4) NOT NULL DEFAULT 0,
     PRIMARY KEY (company_id, date)
 );
+
+
+-- ==========================================================================
+-- PROMOTION MODULE – ADDITIONAL ALTERS (missing columns & constraints)
+-- ==========================================================================
+
+-- 1. Add usage limit columns to promotions
+ALTER TABLE sales.promotions ADD COLUMN IF NOT EXISTS usage_limit INT;
+ALTER TABLE sales.promotions ADD COLUMN IF NOT EXISTS per_user_limit INT DEFAULT 1;
+ALTER TABLE sales.promotions ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+
+-- 2. Optional check constraints to ensure limits are positive
+ALTER TABLE sales.promotions ADD CONSTRAINT chk_promotion_usage_limit
+    CHECK (usage_limit IS NULL OR usage_limit > 0);
+ALTER TABLE sales.promotions ADD CONSTRAINT chk_promotion_per_user_limit
+    CHECK (per_user_limit IS NULL OR per_user_limit > 0);
+
+-- 3. Prevent duplicate promotion application on the same order
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_discount_app_order_promotion
+    ON sales.discount_applications (order_id, discount_id)
+    WHERE order_id IS NOT NULL AND discount_type = 'promotion';
+
+-- 4. Prevent duplicate promotion application on the same invoice
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_discount_app_invoice_promotion
+    ON sales.discount_applications (invoice_id, discount_id)
+    WHERE invoice_id IS NOT NULL AND discount_type = 'promotion';
+
+-- 5. (Optional) Add an index on deleted_at for faster soft‑delete checks
+CREATE INDEX IF NOT EXISTS idx_promotions_deleted_at
+    ON sales.promotions(deleted_at) WHERE deleted_at IS NOT NULL;
+
+-- ==========================================================================
+-- PROMOTION MODULE – ADDITIONAL ALTERS (missing columns & constraints)
+-- ==========================================================================
+
+-- 1. Add usage limit columns to promotions
+ALTER TABLE sales.promotions ADD COLUMN IF NOT EXISTS usage_limit INT;
+ALTER TABLE sales.promotions ADD COLUMN IF NOT EXISTS per_user_limit INT DEFAULT 1;
+ALTER TABLE sales.promotions ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+
+-- 2. Optional check constraints to ensure limits are positive
+ALTER TABLE sales.promotions ADD CONSTRAINT chk_promotion_usage_limit
+    CHECK (usage_limit IS NULL OR usage_limit > 0);
+ALTER TABLE sales.promotions ADD CONSTRAINT chk_promotion_per_user_limit
+    CHECK (per_user_limit IS NULL OR per_user_limit > 0);
+
+-- 3. Prevent duplicate promotion application on the same order
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_discount_app_order_promotion
+    ON sales.discount_applications (order_id, discount_id)
+    WHERE order_id IS NOT NULL AND discount_type = 'promotion';
+
+-- 4. Prevent duplicate promotion application on the same invoice
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_discount_app_invoice_promotion
+    ON sales.discount_applications (invoice_id, discount_id)
+    WHERE invoice_id IS NOT NULL AND discount_type = 'promotion';
+
+-- 5. (Optional) Add an index on deleted_at for faster soft‑delete checks
+CREATE INDEX IF NOT EXISTS idx_promotions_deleted_at
+    ON sales.promotions(deleted_at) WHERE deleted_at IS NOT NULL;    
+
+ALTER TABLE sales.discount_applications ADD COLUMN customer_id UUID;
+ALTER TABLE sales.discount_applications ADD CONSTRAINT fk_discount_app_customer FOREIGN KEY (customer_id) REFERENCES sales.customers(customer_id);    

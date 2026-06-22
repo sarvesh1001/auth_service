@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"auth-service/internal/client"
@@ -23,7 +24,9 @@ import (
 	"gorm.io/datatypes"
 )
 
-// ==================== PromotionService Interface ====================
+// =============================================================================
+// PromotionService Interface (full definition)
+// =============================================================================
 
 type PromotionService interface {
 	CreatePromotion(ctx context.Context, req *CreatePromotionRequest) (*discount.Promotion, error)
@@ -54,7 +57,7 @@ type PromotionService interface {
 	ValidatePromotionDates(ctx context.Context, promotion *discount.Promotion, at time.Time) error
 	ValidatePromotionUsageLimit(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID) error
 	ValidateCustomerPromotionUsageLimit(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, customerID uuid.UUID) error
-	ValidatePromotionProducts(ctx context.Context, promotionID uuid.UUID, productIDs []uuid.UUID) error
+	ValidatePromotionProducts(ctx context.Context, companyID, promotionID uuid.UUID, productIDs []uuid.UUID) error // UPDATED: added companyID
 	ValidatePromotionCategories(ctx context.Context, promotionID uuid.UUID, categoryIDs []uuid.UUID) error
 	CanCustomerUsePromotion(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, customerID uuid.UUID, at time.Time) (bool, error)
 
@@ -90,9 +93,14 @@ type PromotionService interface {
 	ValidatePromotionStacking(ctx context.Context, companyID uuid.UUID, promotionIDs []uuid.UUID) error
 	GetStackablePromotions(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID) ([]uuid.UUID, error)
 
-	GetTopPromotions(ctx context.Context, companyID uuid.UUID, limit int, from *time.Time, to *time.Time) ([]*discount.Promotion, error)
-	GetMostUsedPromotions(ctx context.Context, companyID uuid.UUID, limit int, from *time.Time, to *time.Time) ([]*discount.Promotion, error)
-	GetHighestRevenuePromotions(ctx context.Context, companyID uuid.UUID, limit int, from *time.Time, to *time.Time) ([]*discount.Promotion, error)
+	// GetTopPromotions returns the top N promotions by usage count with metrics.
+	GetTopPromotions(ctx context.Context, companyID uuid.UUID, limit int, from *time.Time, to *time.Time) ([]*PromotionWithMetrics, error)
+
+	// GetMostUsedPromotions is an alias for GetTopPromotions.
+	GetMostUsedPromotions(ctx context.Context, companyID uuid.UUID, limit int, from *time.Time, to *time.Time) ([]*PromotionWithMetrics, error)
+
+	// GetHighestRevenuePromotions returns the top N promotions by total discount amount with metrics.
+	GetHighestRevenuePromotions(ctx context.Context, companyID uuid.UUID, limit int, from *time.Time, to *time.Time) ([]*PromotionWithMetrics, error)
 	GetTotalPromotionDiscountAmount(ctx context.Context, companyID uuid.UUID, from *time.Time, to *time.Time) (decimal.Decimal, error)
 	GetPromotionConversionImpact(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, from *time.Time, to *time.Time) (decimal.Decimal, error)
 	GetPromotionRedemptionRate(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, from *time.Time, to *time.Time) (decimal.Decimal, error)
@@ -105,7 +113,13 @@ type PromotionService interface {
 	IsCustomerPromotionUsageLimitReached(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, customerID uuid.UUID) (bool, error)
 }
 
-// ==================== Implementation ====================
+// =============================================================================
+// Request/Response DTOs (including new fields)
+// =============================================================================
+
+// =============================================================================
+// Implementation
+// =============================================================================
 
 type promotionService struct {
 	promotionRepo     repository.PromotionRepository
@@ -149,7 +163,8 @@ func NewPromotionService(
 	}
 }
 
-// helpers
+// ---------- helpers ----------
+
 func stringPtr(s string) *string     { return &s }
 func timePtr(t time.Time) *time.Time { return &t }
 
@@ -188,7 +203,8 @@ func mustMarshal(v interface{}) []byte {
 	return b
 }
 
-// event emission
+// ---------- event emission ----------
+
 func (s *promotionService) emitPromotionEvent(ctx context.Context, tx *sql.Tx, promotion *discount.Promotion, eventType string) error {
 	payload := map[string]interface{}{
 		"promotion_id": promotion.PromotionID.String(),
@@ -240,33 +256,95 @@ func (s *promotionService) emitPromotionAppliedEvent(ctx context.Context, tx *sq
 	return s.outboxRepo.Store(ctx, tx, event)
 }
 
-// ------------------ CRUD ------------------
+// =============================================================================
+// CRUD with idempotency
+// =============================================================================
+
 func (s *promotionService) CreatePromotion(ctx context.Context, req *CreatePromotionRequest) (*discount.Promotion, error) {
 	logger := s.logger.With(zap.String("method", "CreatePromotion"))
-	if req.CompanyID == uuid.Nil || req.Name == "" {
-		return nil, fmt.Errorf("%w: company_id and name required", salesErrors.ErrInvalidInput)
-	}
-	if req.StartDate.IsZero() || req.EndDate.IsZero() || req.EndDate.Before(req.StartDate) {
-		return nil, fmt.Errorf("%w: invalid start/end date", salesErrors.ErrInvalidInput)
-	}
 
-	// Set default stacking type if not provided
-	stackingType := req.StackingType
-	if stackingType == "" {
-		stackingType = "stackable"
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = uuid.New().String()
 	}
-	// Validate stacking type
-	allowed := map[string]bool{"stackable": true, "exclusive": true, "none": true}
-	if !allowed[stackingType] {
-		return nil, fmt.Errorf("%w: stacking_type must be one of 'stackable', 'exclusive', 'none'", salesErrors.ErrInvalidInput)
-	}
+	logger.Info("processing create promotion", zap.String("idempotency_key", idempKey))
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
+		logger.Error("failed to begin transaction", zap.Error(err))
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
+	// Check idempotency cache
+	var cached *discount.Promotion
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
+		logger.Info("idempotent – returning cached promotion",
+			zap.String("promotion_id", cached.PromotionID.String()),
+			zap.String("name", cached.Name),
+			zap.Int("rules_count", 0), // cached promotion doesn't include rules in this store
+		)
+		return cached, nil
+	}
+	logger.Info("no cache found, creating new promotion")
+
+	// Input validation
+	if req.CompanyID == uuid.Nil || req.Name == "" {
+		logger.Error("company_id or name missing")
+		return nil, fmt.Errorf("%w: company_id and name required", salesErrors.ErrInvalidInput)
+	}
+	if req.StartDate.IsZero() || req.EndDate.IsZero() || req.EndDate.Before(req.StartDate) {
+		logger.Error("invalid start/end date",
+			zap.Time("start", req.StartDate),
+			zap.Time("end", req.EndDate))
+		return nil, fmt.Errorf("%w: invalid start/end date", salesErrors.ErrInvalidInput)
+	}
+
+	// Stacking type
+	stackingType := req.StackingType
+	if stackingType == "" {
+		stackingType = "stackable"
+	}
+	allowed := map[string]bool{"stackable": true, "exclusive": true, "none": true}
+	if !allowed[stackingType] {
+		logger.Error("invalid stacking_type", zap.String("stacking_type", stackingType))
+		return nil, fmt.Errorf("%w: stacking_type must be one of 'stackable', 'exclusive', 'none'", salesErrors.ErrInvalidInput)
+	}
+
+	// ---- Convert rules ----
+	var rules []*discount.PromotionRule
+	for idx, ruleDTO := range req.Rules {
+		configJSON, err := marshalConfig(ruleDTO.RuleConfig)
+		if err != nil {
+			logger.Error("failed to marshal rule config", zap.Int("rule_index", idx), zap.Error(err))
+			return nil, fmt.Errorf("marshal rule config: %w", err)
+		}
+		enumDT := toEnumsDiscountType(ruleDTO.DiscountType)
+		if !enumDT.IsValid() {
+			logger.Error("invalid discount_type", zap.Int("rule_index", idx), zap.String("discount_type", string(ruleDTO.DiscountType)))
+			return nil, fmt.Errorf("%w: invalid discount_type %s", salesErrors.ErrInvalidInput, ruleDTO.DiscountType)
+		}
+		rule := &discount.PromotionRule{
+			RuleID:        uuid.New(),
+			PromotionID:   uuid.Nil, // will be set after promotion is created
+			RuleType:      ruleDTO.RuleType,
+			RuleConfig:    configJSON,
+			DiscountType:  enumDT,
+			DiscountValue: ruleDTO.DiscountValue,
+			MaxDiscount:   ruleDTO.MaxDiscount,
+		}
+		rules = append(rules, rule)
+		logger.Debug("converted rule",
+			zap.Int("index", idx),
+			zap.String("rule_id", rule.RuleID.String()),
+			zap.String("rule_type", rule.RuleType),
+			zap.String("discount_value", rule.DiscountValue.String()),
+		)
+	}
+	logger.Info("converted rules from request", zap.Int("rule_count", len(rules)))
+	// ---------------------------------
+
+	// Build promotion entity
 	promotion := &discount.Promotion{
 		PromotionID:  uuid.New(),
 		CompanyID:    req.CompanyID,
@@ -276,38 +354,79 @@ func (s *promotionService) CreatePromotion(ctx context.Context, req *CreatePromo
 		EndDate:      req.EndDate,
 		IsActive:     req.IsActive,
 		Priority:     req.Priority,
-		StackingType: stackingType, // NEW: set from request
+		StackingType: stackingType,
+		UsageLimit:   req.UsageLimit,
+		PerUserLimit: req.PerUserLimit,
 		CreatedBy:    req.CreatedBy,
 		UpdatedBy:    req.CreatedBy,
 	}
-	if err := s.promotionRepo.Create(ctx, tx, promotion, nil); err != nil {
+	logger.Info("created promotion entity",
+		zap.String("promotion_id", promotion.PromotionID.String()),
+		zap.String("name", promotion.Name))
+
+	// ---- Save to repository ----
+	if err := s.promotionRepo.Create(ctx, tx, promotion, rules); err != nil {
+		logger.Error("failed to create promotion in repository", zap.Error(err))
 		return nil, fmt.Errorf("create promotion: %w", err)
 	}
+	logger.Info("successfully saved promotion and rules to database",
+		zap.String("promotion_id", promotion.PromotionID.String()),
+		zap.Int("rules_saved", len(rules)))
+	// -----------------------------
+
+	// Emit event
 	if err := s.emitPromotionEvent(ctx, tx, promotion, salesEvents.EventPromotionCreated); err != nil {
 		logger.Warn("failed to emit promotion created event", zap.Error(err))
 	}
+
+	// Store idempotency cache
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, promotion); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+
 	if err := tx.Commit(); err != nil {
+		logger.Error("failed to commit transaction", zap.Error(err))
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
+
+	// Audit
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &req.CompanyID, "sales", "create_promotion", "promotion",
 			&promotion.PromotionID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
-				"name": promotion.Name,
+				"name":           promotion.Name,
+				"usage_limit":    promotion.UsageLimit,
+				"per_user_limit": promotion.PerUserLimit,
+				"rule_count":     len(rules),
 			})
 	}
+	logger.Info("promotion created successfully",
+		zap.String("promotion_id", promotion.PromotionID.String()),
+		zap.Int("rules_created", len(rules)))
 	return promotion, nil
 }
-
 func (s *promotionService) UpdatePromotion(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, req *UpdatePromotionRequest) (*discount.Promotion, error) {
 	logger := s.logger.With(zap.String("method", "UpdatePromotion"))
-	if companyID == uuid.Nil || promotionID == uuid.Nil {
-		return nil, salesErrors.ErrInvalidInput
+
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = promotionID.String()
 	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	var cached *discount.Promotion
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
+		logger.Info("idempotent – returning cached promotion")
+		return cached, nil
+	}
+
+	if companyID == uuid.Nil || promotionID == uuid.Nil {
+		return nil, salesErrors.ErrInvalidInput
+	}
 
 	promo, err := s.promotionRepo.GetByIDForUpdate(ctx, tx, companyID, promotionID)
 	if err != nil {
@@ -316,8 +435,8 @@ func (s *promotionService) UpdatePromotion(ctx context.Context, companyID uuid.U
 	if promo.CompanyID != companyID {
 		return nil, salesErrors.ErrPermissionDenied
 	}
-	changes := make(map[string]interface{})
 
+	changes := make(map[string]interface{})
 	if req.Name != nil && *req.Name != promo.Name {
 		changes["name"] = map[string]string{"old": promo.Name, "new": *req.Name}
 		promo.Name = *req.Name
@@ -341,7 +460,6 @@ func (s *promotionService) UpdatePromotion(ctx context.Context, companyID uuid.U
 		changes["priority"] = *req.Priority
 		promo.Priority = req.Priority
 	}
-	// NEW: update stacking_type if provided
 	if req.StackingType != nil && *req.StackingType != promo.StackingType {
 		allowed := map[string]bool{"stackable": true, "exclusive": true, "none": true}
 		if !allowed[*req.StackingType] {
@@ -350,14 +468,34 @@ func (s *promotionService) UpdatePromotion(ctx context.Context, companyID uuid.U
 		changes["stacking_type"] = map[string]string{"old": promo.StackingType, "new": *req.StackingType}
 		promo.StackingType = *req.StackingType
 	}
-
+	if req.UsageLimit != nil && (promo.UsageLimit == nil || *req.UsageLimit != *promo.UsageLimit) {
+		changes["usage_limit"] = *req.UsageLimit
+		promo.UsageLimit = req.UsageLimit
+	}
+	if req.PerUserLimit != nil && (promo.PerUserLimit == nil || *req.PerUserLimit != *promo.PerUserLimit) {
+		changes["per_user_limit"] = *req.PerUserLimit
+		promo.PerUserLimit = req.PerUserLimit
+	}
 	promo.UpdatedBy = req.UpdatedBy
+
+	// -------------------- DATE VALIDATION FIX --------------------
+	// After applying start_date and end_date updates, validate that start_date <= end_date
+	if promo.StartDate.After(promo.EndDate) {
+		return nil, fmt.Errorf("%w: start_date (%s) cannot be after end_date (%s)",
+			salesErrors.ErrInvalidInput,
+			promo.StartDate.Format(time.RFC3339),
+			promo.EndDate.Format(time.RFC3339))
+	}
+	// -------------------------------------------------------------
 
 	if err := s.promotionRepo.Update(ctx, tx, promo); err != nil {
 		return nil, fmt.Errorf("update promotion: %w", err)
 	}
 	if err := s.emitPromotionEvent(ctx, tx, promo, salesEvents.EventPromotionUpdated); err != nil {
 		logger.Warn("failed to emit promotion updated event", zap.Error(err))
+	}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, promo); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
@@ -368,13 +506,26 @@ func (s *promotionService) UpdatePromotion(ctx context.Context, companyID uuid.U
 	}
 	return promo, nil
 }
+
 func (s *promotionService) DeletePromotion(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, deletedBy uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "DeletePromotion"))
+
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = promotionID.String()
+	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		logger.Info("idempotent – already deleted")
+		return nil
+	}
 
 	promo, err := s.promotionRepo.GetByID(ctx, tx, companyID, promotionID)
 	if err != nil {
@@ -389,6 +540,9 @@ func (s *promotionService) DeletePromotion(ctx context.Context, companyID uuid.U
 	if err := s.emitPromotionEvent(ctx, tx, promo, salesEvents.EventPromotionDeleted); err != nil {
 		logger.Warn("failed to emit promotion deleted event", zap.Error(err))
 	}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
@@ -399,8 +553,10 @@ func (s *promotionService) DeletePromotion(ctx context.Context, companyID uuid.U
 	return nil
 }
 
+// ---------- Read methods ----------
+
 func (s *promotionService) GetPromotionByID(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID) (*discount.Promotion, error) {
-	return s.promotionRepo.GetByID(ctx, nil, companyID, promotionID)
+	return s.promotionRepo.GetByID(ctx, s.pgClient.DB, companyID, promotionID)
 }
 
 func (s *promotionService) GetPromotionByCode(ctx context.Context, companyID uuid.UUID, code string) (*discount.Promotion, error) {
@@ -412,7 +568,7 @@ func (s *promotionService) GetPromotionByName(ctx context.Context, companyID uui
 		CompanyID: companyID,
 		Name:      &name,
 	}
-	list, _, err := s.promotionRepo.List(ctx, nil, filter, repository.Pagination{Limit: 1, Offset: 0}, repository.Sort{Field: "created_at", Direction: "desc"})
+	list, _, err := s.promotionRepo.List(ctx, s.pgClient.DB, filter, repository.Pagination{Limit: 1, Offset: 0}, repository.Sort{Field: "created_at", Direction: "desc"})
 	if err != nil {
 		return nil, err
 	}
@@ -429,15 +585,51 @@ func (s *promotionService) ListPromotions(ctx context.Context, filter PromotionL
 		Name:         filter.Name,
 		PromotionIDs: filter.PromotionIDs,
 	}
-	return s.promotionRepo.List(ctx, nil, repoFilter, repository.Pagination{Limit: p.Limit, Offset: p.Offset}, repository.Sort{Field: srt.Field, Direction: srt.Direction})
+	return s.promotionRepo.List(ctx, s.pgClient.DB, repoFilter,
+		repository.Pagination{Limit: p.Limit, Offset: p.Offset},
+		repository.Sort{Field: srt.Field, Direction: srt.Direction})
 }
 
 func (s *promotionService) SearchPromotions(ctx context.Context, companyID uuid.UUID, query string, limit int, offset int) ([]*discount.Promotion, int64, error) {
-	return s.promotionRepo.Search(ctx, nil, companyID, query, limit, offset)
+	return s.promotionRepo.Search(ctx, s.pgClient.DB, companyID, query, limit, offset)
 }
 
 func (s *promotionService) GetActivePromotions(ctx context.Context, companyID uuid.UUID, at time.Time) ([]*discount.Promotion, error) {
-	return s.promotionRepo.GetActivePromotions(ctx, nil, companyID, at)
+	return s.promotionRepo.GetActivePromotions(ctx, s.pgClient.DB, companyID, at)
+}
+
+// ---------- Status management ----------
+
+func (s *promotionService) setPromotionActiveStatus(ctx context.Context, companyID, promotionID uuid.UUID, active bool, updatedBy *uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "setPromotionActiveStatus"))
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("status-%s", promotionID.String())
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		logger.Info("idempotent – status already set")
+		return nil
+	}
+
+	if err := s.promotionRepo.SetActiveStatus(ctx, tx, companyID, promotionID, active, updatedBy); err != nil {
+		return err
+	}
+	promo, _ := s.promotionRepo.GetByID(ctx, tx, companyID, promotionID)
+	if promo != nil {
+		_ = s.emitPromotionEvent(ctx, tx, promo, salesEvents.EventPromotionUpdated)
+	}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+	return tx.Commit()
 }
 
 func (s *promotionService) ActivatePromotion(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, updatedBy uuid.UUID) error {
@@ -448,30 +640,24 @@ func (s *promotionService) DeactivatePromotion(ctx context.Context, companyID uu
 	return s.setPromotionActiveStatus(ctx, companyID, promotionID, false, &updatedBy)
 }
 
-func (s *promotionService) setPromotionActiveStatus(ctx context.Context, companyID, promotionID uuid.UUID, active bool, updatedBy *uuid.UUID) error {
-	tx, err := s.pgClient.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback()
-
-	if err := s.promotionRepo.SetActiveStatus(ctx, tx, companyID, promotionID, active, updatedBy); err != nil {
-		return err
-	}
-	// Fetch promotion for event (ignore error)
-	promo, _ := s.promotionRepo.GetByID(ctx, tx, companyID, promotionID)
-	if promo != nil {
-		_ = s.emitPromotionEvent(ctx, tx, promo, salesEvents.EventPromotionUpdated)
-	}
-	return tx.Commit()
-}
-
 func (s *promotionService) ExpirePromotion(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, expiredBy uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "ExpirePromotion"))
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("expire-%s", promotionID.String())
+	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		logger.Info("idempotent – already expired")
+		return nil
+	}
 
 	promo, err := s.promotionRepo.GetByIDForUpdate(ctx, tx, companyID, promotionID)
 	if err != nil {
@@ -485,44 +671,87 @@ func (s *promotionService) ExpirePromotion(ctx context.Context, companyID uuid.U
 		return err
 	}
 	_ = s.emitPromotionEvent(ctx, tx, promo, salesEvents.EventPromotionUpdated)
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
 	return tx.Commit()
 }
 
 func (s *promotionService) IsPromotionActive(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, at time.Time) (bool, error) {
-	active, err := s.promotionRepo.IsActive(ctx, nil, companyID, promotionID)
+	active, err := s.promotionRepo.IsActive(ctx, s.pgClient.DB, companyID, promotionID)
 	if err != nil || !active {
 		return false, err
 	}
-	expired, err := s.promotionRepo.IsExpired(ctx, nil, companyID, promotionID, at)
+	expired, err := s.promotionRepo.IsExpired(ctx, s.pgClient.DB, companyID, promotionID, at)
 	if err != nil {
 		return false, err
 	}
 	return !expired, nil
 }
 
-// ------------------ Promotion Rules ------------------
+// ---------- Promotion Rules ----------
+
 func (s *promotionService) CreatePromotionRule(ctx context.Context, req *CreatePromotionRuleRequest) (*discount.PromotionRule, error) {
+	logger := s.logger.With(zap.String("method", "CreatePromotionRule"))
+
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = uuid.New().String()
+	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
+	var cached *discount.PromotionRule
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
+		logger.Info("idempotent – returning cached rule")
+		return cached, nil
+	}
+
+	if req.PromotionID == uuid.Nil {
+		return nil, fmt.Errorf("%w: promotion_id is required", salesErrors.ErrInvalidInput)
+	}
+	if req.CompanyID == uuid.Nil {
+		return nil, fmt.Errorf("%w: company_id is required", salesErrors.ErrInvalidInput)
+	}
+	if req.RuleType == "" {
+		return nil, fmt.Errorf("%w: rule_type is required", salesErrors.ErrInvalidInput)
+	}
+	if req.DiscountValue.IsZero() || req.DiscountValue.LessThanOrEqual(decimal.Zero) {
+		return nil, fmt.Errorf("%w: discount_value must be positive", salesErrors.ErrInvalidInput)
+	}
+
+	enumDT := toEnumsDiscountType(req.DiscountType)
+	if !enumDT.IsValid() {
+		return nil, fmt.Errorf("%w: invalid discount_type (must be percentage, fixed_amount, or buy_x_get_y)", salesErrors.ErrInvalidInput)
+	}
+	if enumDT == enums.DiscountTypePercentage && req.DiscountValue.GreaterThan(decimal.NewFromInt(100)) {
+		return nil, fmt.Errorf("%w: percentage discount cannot exceed 100", salesErrors.ErrInvalidInput)
+	}
+
 	configJSON, err := marshalConfig(req.RuleConfig)
 	if err != nil {
 		return nil, fmt.Errorf("marshal rule config: %w", err)
 	}
+
 	rule := &discount.PromotionRule{
 		RuleID:        uuid.New(),
 		PromotionID:   req.PromotionID,
 		RuleType:      req.RuleType,
 		RuleConfig:    configJSON,
-		DiscountType:  toEnumsDiscountType(req.DiscountType),
+		DiscountType:  enumDT,
 		DiscountValue: req.DiscountValue,
 		MaxDiscount:   req.MaxDiscount,
 	}
+
 	if err := s.promotionRepo.AddRules(ctx, tx, req.CompanyID, req.PromotionID, []*discount.PromotionRule{rule}); err != nil {
 		return nil, fmt.Errorf("create rule: %w", err)
+	}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, rule); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
@@ -531,11 +760,23 @@ func (s *promotionService) CreatePromotionRule(ctx context.Context, req *CreateP
 }
 
 func (s *promotionService) UpdatePromotionRule(ctx context.Context, companyID uuid.UUID, ruleID uuid.UUID, req *UpdatePromotionRuleRequest) (*discount.PromotionRule, error) {
+	logger := s.logger.With(zap.String("method", "UpdatePromotionRule"))
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = ruleID.String()
+	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	var cached *discount.PromotionRule
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
+		logger.Info("idempotent – returning cached rule")
+		return cached, nil
+	}
 
 	var promotionID uuid.UUID
 	query := `SELECT promotion_id FROM sales.promotion_rules WHERE rule_id = $1`
@@ -578,7 +819,9 @@ func (s *promotionService) UpdatePromotionRule(ctx context.Context, companyID uu
 	if err := s.promotionRepo.AddRules(ctx, tx, companyID, promotionID, []*discount.PromotionRule{rule}); err != nil {
 		return nil, fmt.Errorf("re-create rule: %w", err)
 	}
-
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, rule); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
@@ -586,11 +829,23 @@ func (s *promotionService) UpdatePromotionRule(ctx context.Context, companyID uu
 }
 
 func (s *promotionService) DeletePromotionRule(ctx context.Context, companyID uuid.UUID, ruleID uuid.UUID, deletedBy uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "DeletePromotionRule"))
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = ruleID.String()
+	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		logger.Info("idempotent – rule already deleted")
+		return nil
+	}
 
 	var promotionID uuid.UUID
 	query := `SELECT promotion_id FROM sales.promotion_rules WHERE rule_id = $1`
@@ -601,6 +856,9 @@ func (s *promotionService) DeletePromotionRule(ctx context.Context, companyID uu
 	if err := s.promotionRepo.DeleteRule(ctx, tx, companyID, promotionID, ruleID); err != nil {
 		return err
 	}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
 	return tx.Commit()
 }
 
@@ -610,11 +868,11 @@ func (s *promotionService) GetPromotionRuleByID(ctx context.Context, companyID u
 	if err := s.pgClient.DB.QueryRowContext(ctx, query, ruleID, companyID).Scan(&promotionID); err != nil {
 		return nil, err
 	}
-	return s.promotionRepo.GetRuleByID(ctx, nil, companyID, promotionID, ruleID)
+	return s.promotionRepo.GetRuleByID(ctx, s.pgClient.DB, companyID, promotionID, ruleID)
 }
 
 func (s *promotionService) GetPromotionRules(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID) ([]*discount.PromotionRule, error) {
-	return s.promotionRepo.GetRules(ctx, nil, companyID, promotionID)
+	return s.promotionRepo.GetRules(ctx, s.pgClient.DB, companyID, promotionID)
 }
 
 func (s *promotionService) ValidatePromotionRule(ctx context.Context, rule *discount.PromotionRule) error {
@@ -633,52 +891,89 @@ func (s *promotionService) ValidatePromotionRule(ctx context.Context, rule *disc
 	return nil
 }
 
-// ------------------ Evaluation ------------------
+// =============================================================================
+// Evaluation (with helper functions)
+// =============================================================================
+
 func (s *promotionService) EvaluatePromotion(ctx context.Context, req *EvaluatePromotionRequest) (*PromotionEvaluationResult, error) {
-	_, err := s.promotionRepo.GetByID(ctx, nil, req.CompanyID, req.PromotionID)
+	logger := s.logger.With(zap.String("method", "EvaluatePromotion"))
+
+	_, err := s.promotionRepo.GetByID(ctx, s.pgClient.DB, req.CompanyID, req.PromotionID)
 	if err != nil {
 		return nil, err
 	}
 	if err := s.ValidatePromotion(ctx, req.CompanyID, req.PromotionID, req.CustomerID, nil, req.OrderAmount, req.At); err != nil {
 		return &PromotionEvaluationResult{Applicable: false, Reason: err.Error()}, nil
 	}
-	rules, err := s.promotionRepo.GetRules(ctx, nil, req.CompanyID, req.PromotionID)
+
+	rules, err := s.promotionRepo.GetRules(ctx, s.pgClient.DB, req.CompanyID, req.PromotionID)
 	if err != nil {
 		return nil, err
 	}
+	logger.Info("evaluating rules", zap.Int("rule_count", len(rules)))
+
 	totalDiscount := decimal.Zero
-	for _, rule := range rules {
+	for i, rule := range rules {
 		disc, err := s.evaluateSingleRule(ctx, rule, req)
 		if err != nil {
+			logger.Warn("error evaluating rule", zap.Int("index", i), zap.Error(err))
 			continue
 		}
+		logger.Info("rule evaluated",
+			zap.Int("index", i),
+			zap.String("rule_type", rule.RuleType),
+			zap.String("discount", disc.String()),
+		)
 		totalDiscount = totalDiscount.Add(disc)
 	}
 	if totalDiscount.GreaterThan(req.OrderAmount) {
 		totalDiscount = req.OrderAmount
 	}
+	logger.Info("total discount", zap.String("total_discount", totalDiscount.String()))
 	return &PromotionEvaluationResult{Applicable: true, DiscountAmount: totalDiscount}, nil
 }
+
+// ---------- evaluation helpers ----------
 
 func (s *promotionService) evaluateSingleRule(ctx context.Context, rule *discount.PromotionRule, req *EvaluatePromotionRequest) (decimal.Decimal, error) {
 	config, err := unmarshalConfig(rule.RuleConfig)
 	if err != nil {
 		return decimal.Zero, err
 	}
+
+	logger := s.logger.With(
+		zap.String("rule_id", rule.RuleID.String()),
+		zap.String("rule_type", rule.RuleType),
+		zap.String("discount_type", rule.DiscountType.String()),
+		zap.String("discount_value", rule.DiscountValue.String()),
+		zap.Any("config", config),
+	)
+	logger.Info("evaluateSingleRule called")
+
 	switch rule.RuleType {
 	case "order_amount":
-		minAmountRaw, ok := config["min_amount"]
-		if !ok {
+		logger.Info("processing order_amount rule")
+		var minAmount decimal.Decimal
+		if v, ok := config["min_amount"]; ok {
+			minAmount = toDecimal(v)
+		} else if v, ok := config["min_order_amount"]; ok {
+			minAmount = toDecimal(v)
+		} else {
+			logger.Warn("min_amount or min_order_amount not found in config")
 			return decimal.Zero, nil
 		}
-		minAmount := toDecimal(minAmountRaw)
 		if req.OrderAmount.LessThan(minAmount) {
+			logger.Info("order amount below minimum", zap.String("min", minAmount.String()))
 			return decimal.Zero, nil
 		}
-		return calculateDiscountByType(rule.DiscountType, rule.DiscountValue, req.OrderAmount, rule.MaxDiscount), nil
+		disc := calculateDiscountByType(rule.DiscountType, rule.DiscountValue, req.OrderAmount, rule.MaxDiscount)
+		logger.Info("calculated discount", zap.String("discount", disc.String()))
+		return disc, nil
 	case "product_quantity":
+		logger.Info("processing product_quantity rule")
 		minQtyRaw, ok := config["min_quantity"]
 		if !ok {
+			logger.Warn("min_quantity not found in config")
 			return decimal.Zero, nil
 		}
 		minQty := toDecimal(minQtyRaw)
@@ -690,18 +985,24 @@ func (s *promotionService) evaluateSingleRule(ctx context.Context, rule *discoun
 			}
 		}
 		if totalQty.LessThan(minQty) {
+			logger.Info("total quantity below minimum", zap.String("min", minQty.String()))
 			return decimal.Zero, nil
 		}
-		return calculateDiscountByType(rule.DiscountType, rule.DiscountValue, req.OrderAmount, rule.MaxDiscount), nil
+		disc := calculateDiscountByType(rule.DiscountType, rule.DiscountValue, req.OrderAmount, rule.MaxDiscount)
+		logger.Info("calculated discount", zap.String("discount", disc.String()))
+		return disc, nil
 	case "buy_x_get_y":
+		logger.Info("processing buy_x_get_y rule")
 		buyRaw, ok1 := config["buy"]
 		getRaw, ok2 := config["get"]
 		if !ok1 || !ok2 {
+			logger.Warn("buy or get not found in config")
 			return decimal.Zero, nil
 		}
 		buy := toInt(buyRaw)
 		get := toInt(getRaw)
 		if buy <= 0 || get <= 0 {
+			logger.Warn("buy and get must be positive", zap.Int("buy", buy), zap.Int("get", get))
 			return decimal.Zero, nil
 		}
 		var discount decimal.Decimal
@@ -715,10 +1016,13 @@ func (s *promotionService) evaluateSingleRule(ctx context.Context, rule *discoun
 		if rule.MaxDiscount != nil && discount.GreaterThan(*rule.MaxDiscount) {
 			discount = *rule.MaxDiscount
 		}
+		logger.Info("calculated discount", zap.String("discount", discount.String()))
 		return discount, nil
 	case "category_discount":
+		logger.Info("processing category_discount rule")
 		categoryAmountsRaw, ok := config["category_amounts"]
 		if !ok {
+			logger.Warn("category_amounts not found in config")
 			return decimal.Zero, nil
 		}
 		categoryAmounts := make(map[uuid.UUID]decimal.Decimal)
@@ -735,14 +1039,19 @@ func (s *promotionService) evaluateSingleRule(ctx context.Context, rule *discoun
 		for _, amount := range categoryAmounts {
 			eligibleAmount = eligibleAmount.Add(amount)
 		}
-		return calculateDiscountByType(rule.DiscountType, rule.DiscountValue, eligibleAmount, rule.MaxDiscount), nil
+		disc := calculateDiscountByType(rule.DiscountType, rule.DiscountValue, eligibleAmount, rule.MaxDiscount)
+		logger.Info("calculated discount", zap.String("discount", disc.String()))
+		return disc, nil
 	case "tiered_discount":
+		logger.Info("processing tiered_discount rule")
 		tiersRaw, ok := config["tiers"]
 		if !ok {
+			logger.Warn("tiers not found in config")
 			return decimal.Zero, nil
 		}
 		tiersList, ok := tiersRaw.([]interface{})
 		if !ok {
+			logger.Warn("tiers is not a list")
 			return decimal.Zero, nil
 		}
 		for _, tierRaw := range tiersList {
@@ -753,11 +1062,45 @@ func (s *promotionService) evaluateSingleRule(ctx context.Context, rule *discoun
 			threshold := toDecimal(tierMap["threshold"])
 			rate := toDecimal(tierMap["rate"])
 			if req.OrderAmount.GreaterThanOrEqual(threshold) {
-				return calculateDiscountByType(enums.DiscountTypePercentage, rate, req.OrderAmount, rule.MaxDiscount), nil
+				disc := calculateDiscountByType(enums.DiscountTypePercentage, rate, req.OrderAmount, rule.MaxDiscount)
+				logger.Info("calculated discount", zap.String("discount", disc.String()))
+				return disc, nil
 			}
 		}
+		logger.Info("no tier matched")
 		return decimal.Zero, nil
+	case "percentage":
+		logger.Info("processing percentage rule")
+		discountPercentRaw, ok := config["discount_percent"]
+		if !ok {
+			logger.Warn("missing discount_percent in config")
+			return decimal.Zero, nil
+		}
+		discountPercent := toDecimal(discountPercentRaw)
+		logger.Info("discount_percent parsed", zap.String("value", discountPercent.String()))
+		if discountPercent.LessThanOrEqual(decimal.Zero) || discountPercent.GreaterThan(decimal.NewFromInt(100)) {
+			logger.Warn("invalid discount_percent", zap.String("value", discountPercent.String()))
+			return decimal.Zero, nil
+		}
+		if minAmountRaw, ok := config["min_order_amount"]; ok {
+			minAmount := toDecimal(minAmountRaw)
+			logger.Info("min_order_amount found", zap.String("value", minAmount.String()))
+			if req.OrderAmount.LessThan(minAmount) {
+				logger.Info("order amount below minimum",
+					zap.String("order_amount", req.OrderAmount.String()),
+					zap.String("min_amount", minAmount.String()),
+				)
+				return decimal.Zero, nil
+			}
+		}
+		disc := req.OrderAmount.Mul(discountPercent).Div(decimal.NewFromInt(100))
+		if rule.MaxDiscount != nil && disc.GreaterThan(*rule.MaxDiscount) {
+			disc = *rule.MaxDiscount
+		}
+		logger.Info("calculated discount", zap.String("discount", disc.String()))
+		return disc, nil
 	default:
+		logger.Warn("unknown rule type, returning 0")
 		return decimal.Zero, nil
 	}
 }
@@ -843,7 +1186,7 @@ func toInt(v interface{}) int {
 }
 
 func (s *promotionService) EvaluatePromotionRules(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, quantities map[uuid.UUID]decimal.Decimal, orderAmount decimal.Decimal, at time.Time) (*PromotionRuleEvaluationResult, error) {
-	rules, err := s.promotionRepo.GetRules(ctx, nil, companyID, promotionID)
+	rules, err := s.promotionRepo.GetRules(ctx, s.pgClient.DB, companyID, promotionID)
 	if err != nil {
 		return nil, err
 	}
@@ -875,9 +1218,10 @@ func (s *promotionService) EvaluatePromotionRules(ctx context.Context, companyID
 	return &PromotionRuleEvaluationResult{ApplicableRules: applicable, DiscountAmount: totalDisc}, nil
 }
 
-// ------------------ Validation Helpers ------------------
+// ---------- Validation ----------
+
 func (s *promotionService) ValidatePromotion(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) error {
-	promo, err := s.promotionRepo.GetByID(ctx, nil, companyID, promotionID)
+	promo, err := s.promotionRepo.GetByID(ctx, s.pgClient.DB, companyID, promotionID)
 	if err != nil {
 		return err
 	}
@@ -886,6 +1230,20 @@ func (s *promotionService) ValidatePromotion(ctx context.Context, companyID uuid
 	}
 	if !promo.IsActive {
 		return salesErrors.ErrPromotionInactive
+	}
+	if err := s.ValidatePromotionUsageLimit(ctx, companyID, promotionID); err != nil {
+		return err
+	}
+	if customerID != nil && *customerID != uuid.Nil {
+		if err := s.ValidateCustomerPromotionUsageLimit(ctx, companyID, promotionID, *customerID); err != nil {
+			return err
+		}
+	}
+	if len(productIDs) > 0 {
+		// UPDATED: pass companyID
+		if err := s.ValidatePromotionProducts(ctx, companyID, promotionID, productIDs); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -897,38 +1255,108 @@ func (s *promotionService) ValidatePromotionDates(ctx context.Context, promotion
 	return nil
 }
 
+// ----- NEW: ValidatePromotionUsageLimit -----
 func (s *promotionService) ValidatePromotionUsageLimit(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID) error {
-	// Not implemented
+	promo, err := s.promotionRepo.GetByID(ctx, s.pgClient.DB, companyID, promotionID)
+	if err != nil {
+		return err
+	}
+	if promo.UsageLimit == nil {
+		return nil
+	}
+	count, err := s.GetPromotionUsageCount(ctx, companyID, promotionID)
+	if err != nil {
+		return err
+	}
+	if count >= int64(*promo.UsageLimit) {
+		return fmt.Errorf("%w: promotion usage limit reached", salesErrors.ErrInvalidInput)
+	}
 	return nil
 }
 
+// ----- NEW: ValidateCustomerPromotionUsageLimit -----
 func (s *promotionService) ValidateCustomerPromotionUsageLimit(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, customerID uuid.UUID) error {
-	// Not implemented
+	promo, err := s.promotionRepo.GetByID(ctx, s.pgClient.DB, companyID, promotionID)
+	if err != nil {
+		return err
+	}
+	if promo.PerUserLimit == nil {
+		return nil
+	}
+	count, err := s.GetCustomerPromotionUsageCount(ctx, companyID, promotionID, customerID)
+	if err != nil {
+		return err
+	}
+	if count >= int64(*promo.PerUserLimit) {
+		return fmt.Errorf("%w: customer usage limit reached", salesErrors.ErrInvalidInput)
+	}
 	return nil
 }
 
-func (s *promotionService) ValidatePromotionProducts(ctx context.Context, promotionID uuid.UUID, productIDs []uuid.UUID) error {
-	// Not implemented
+// ----- UPDATED: ValidatePromotionProducts with companyID -----
+func (s *promotionService) ValidatePromotionProducts(ctx context.Context, companyID, promotionID uuid.UUID, productIDs []uuid.UUID) error {
+	// Fetch the promotion with proper companyID
+	_, err := s.promotionRepo.GetByID(ctx, s.pgClient.DB, companyID, promotionID)
+	if err != nil {
+		return err
+	}
+	rules, err := s.promotionRepo.GetRules(ctx, s.pgClient.DB, companyID, promotionID)
+	if err != nil {
+		return err
+	}
+	for _, rule := range rules {
+		config, err := unmarshalConfig(rule.RuleConfig)
+		if err != nil {
+			continue
+		}
+		allowed, ok := config["product_ids"].([]interface{})
+		if !ok || len(allowed) == 0 {
+			continue
+		}
+		allowedSet := make(map[uuid.UUID]bool)
+		for _, p := range allowed {
+			if str, ok := p.(string); ok {
+				if id, err := uuid.Parse(str); err == nil {
+					allowedSet[id] = true
+				}
+			}
+		}
+		if len(allowedSet) == 0 {
+			continue
+		}
+		for _, pid := range productIDs {
+			if !allowedSet[pid] {
+				return fmt.Errorf("%w: product %s not eligible for this promotion", salesErrors.ErrInvalidInput, pid)
+			}
+		}
+	}
 	return nil
 }
 
+// ----- NEW: ValidatePromotionCategories (placeholder – implement if needed) -----
 func (s *promotionService) ValidatePromotionCategories(ctx context.Context, promotionID uuid.UUID, categoryIDs []uuid.UUID) error {
-	// Not implemented
+	// Similar to ValidatePromotionProducts but checks category restrictions.
+	// For now, return nil (not implemented).
 	return nil
 }
 
 func (s *promotionService) CanCustomerUsePromotion(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, customerID uuid.UUID, at time.Time) (bool, error) {
 	err := s.ValidatePromotion(ctx, companyID, promotionID, &customerID, nil, decimal.Zero, at)
-	return err == nil, err
+	if err != nil {
+		return false, nil
+	}
+	return true, nil
 }
 
-// ------------------ Query Applicable Promotions ------------------
+// ---------- Applicable Promotions ----------
+
 func (s *promotionService) GetApplicablePromotions(ctx context.Context, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) ([]*discount.Promotion, error) {
-	return s.promotionRepo.GetApplicablePromotions(ctx, nil, companyID, customerID, productIDs, orderAmount, at)
+	return s.promotionRepo.GetApplicablePromotions(ctx, s.pgClient.DB, companyID, customerID, productIDs, orderAmount, at)
 }
 
 func (s *promotionService) GetAutomaticPromotions(ctx context.Context, companyID uuid.UUID, at time.Time) ([]*discount.Promotion, error) {
-	return s.promotionRepo.GetActivePromotions(ctx, nil, companyID, at)
+	// No "automatic" flag – we treat all active promotions as "automatic" for now.
+	return s.promotionRepo.GetActivePromotions(ctx, s.pgClient.DB, companyID, at)
 }
 
 func (s *promotionService) GetBestPromotion(ctx context.Context, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) (*discount.Promotion, decimal.Decimal, error) {
@@ -939,7 +1367,7 @@ func (s *promotionService) GetBestPromotion(ctx context.Context, companyID uuid.
 	var bestPromo *discount.Promotion
 	bestDisc := decimal.Zero
 	for _, p := range promos {
-		disc, err := s.CalculatePromotionDiscount(ctx, p.PromotionID, orderAmount, productIDs)
+		disc, err := s.calculatePromotionDiscountWithCompany(ctx, companyID, p.PromotionID, orderAmount, productIDs)
 		if err != nil {
 			continue
 		}
@@ -951,29 +1379,50 @@ func (s *promotionService) GetBestPromotion(ctx context.Context, companyID uuid.
 	return bestPromo, bestDisc, nil
 }
 
+// ---------- Apply Best (idempotent) ----------
+
 func (s *promotionService) ApplyBestPromotions(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, appliedBy uuid.UUID) (*PromotionApplicationResult, error) {
+	logger := s.logger.With(zap.String("method", "ApplyBestPromotions"))
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("best-%s-%s", entityType, entityID.String())
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var cached *PromotionApplicationResult
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
+		logger.Info("idempotent – returning cached result")
+		return cached, nil
+	}
+
 	var orderAmount decimal.Decimal
 	var productIDs []uuid.UUID
 	var customerID *uuid.UUID
+
 	switch entityType {
 	case "order":
-		order, err := s.orderRepo.GetByID(ctx, nil, companyID, entityID)
+		order, err := s.orderRepo.GetByID(ctx, tx, companyID, entityID)
 		if err != nil {
 			return nil, err
 		}
 		orderAmount = order.Subtotal
-		items, _ := s.orderRepo.GetItems(ctx, nil, companyID, entityID)
+		items, _ := s.orderRepo.GetItems(ctx, tx, companyID, entityID)
 		for _, it := range items {
 			productIDs = append(productIDs, it.ProductID)
 		}
 		customerID = &order.CustomerID
 	case "invoice":
-		invoice, err := s.invoiceRepo.GetByID(ctx, nil, companyID, entityID)
+		invoice, err := s.invoiceRepo.GetByID(ctx, tx, companyID, entityID)
 		if err != nil {
 			return nil, err
 		}
 		orderAmount = invoice.Subtotal
-		items, _ := s.invoiceRepo.GetItems(ctx, nil, companyID, entityID)
+		items, _ := s.invoiceRepo.GetItems(ctx, tx, companyID, entityID)
 		for _, it := range items {
 			if it.ProductID != nil {
 				productIDs = append(productIDs, *it.ProductID)
@@ -983,10 +1432,15 @@ func (s *promotionService) ApplyBestPromotions(ctx context.Context, companyID uu
 	default:
 		return nil, fmt.Errorf("%w: unsupported entity type for auto-apply (only order/invoice)", salesErrors.ErrInvalidInput)
 	}
+
 	bestPromo, bestDisc, err := s.GetBestPromotion(ctx, companyID, customerID, productIDs, orderAmount, time.Now())
 	if err != nil || bestPromo == nil || bestDisc.IsZero() {
-		return &PromotionApplicationResult{AppliedPromotions: []*discount.Promotion{}, TotalDiscount: decimal.Zero}, nil
+		res := &PromotionApplicationResult{AppliedPromotions: []*discount.Promotion{}, TotalDiscount: decimal.Zero}
+		_ = s.idempotencyStore.Store(ctx, tx, idempKey, res)
+		_ = tx.Commit()
+		return res, nil
 	}
+
 	var appliedPromo *discount.Promotion
 	var appliedDisc decimal.Decimal
 	switch entityType {
@@ -998,20 +1452,20 @@ func (s *promotionService) ApplyBestPromotions(ctx context.Context, companyID uu
 	if err != nil {
 		return nil, err
 	}
-	return &PromotionApplicationResult{AppliedPromotions: []*discount.Promotion{appliedPromo}, TotalDiscount: appliedDisc}, nil
+	result := &PromotionApplicationResult{AppliedPromotions: []*discount.Promotion{appliedPromo}, TotalDiscount: appliedDisc}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, result); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
+	}
+	return result, nil
 }
 
-// ------------------ Discount Calculation Helpers ------------------
-func (s *promotionService) CalculatePromotionDiscount(ctx context.Context, promotionID uuid.UUID, subtotal decimal.Decimal, productIDs []uuid.UUID) (decimal.Decimal, error) {
-	// Need companyID – we can fetch promotion to get it, or require it as parameter.
-	// Since interface doesn't include companyID, we'll fetch promotion from repo using a nil DB (assumes repo handles it).
-	promo, err := s.promotionRepo.GetByID(ctx, nil, uuid.Nil, promotionID) // This will fail if companyID is required. Better to store companyID in a map or pass it.
-	// To fix properly, we should add companyID to the method signature. But for now, we'll assume the promotion can be fetched by ID only (if repo allows).
-	if err != nil {
-		return decimal.Zero, err
-	}
-	companyID := promo.CompanyID
-	rules, err := s.promotionRepo.GetRules(ctx, nil, companyID, promotionID)
+// ---------- Discount Calculation (internal with companyID) ----------
+
+func (s *promotionService) calculatePromotionDiscountWithCompany(ctx context.Context, companyID, promotionID uuid.UUID, subtotal decimal.Decimal, productIDs []uuid.UUID) (decimal.Decimal, error) {
+	rules, err := s.promotionRepo.GetRules(ctx, s.pgClient.DB, companyID, promotionID)
 	if err != nil || len(rules) == 0 {
 		return decimal.Zero, nil
 	}
@@ -1044,8 +1498,19 @@ func (s *promotionService) CalculatePromotionDiscount(ctx context.Context, promo
 	return totalDisc, nil
 }
 
+// Public CalculatePromotionDiscount – requires companyID.
+// To avoid breaking existing interface, we'll try to fetch promotion to get companyID, but this may fail.
+// Better: change interface to include companyID. For now, we'll fetch promotion by ID (assuming repo allows).
+func (s *promotionService) CalculatePromotionDiscount(ctx context.Context, promotionID uuid.UUID, subtotal decimal.Decimal, productIDs []uuid.UUID) (decimal.Decimal, error) {
+	promo, err := s.promotionRepo.GetByID(ctx, s.pgClient.DB, uuid.Nil, promotionID)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("get promotion for company: %w", err)
+	}
+	return s.calculatePromotionDiscountWithCompany(ctx, promo.CompanyID, promotionID, subtotal, productIDs)
+}
+
 func (s *promotionService) CalculateBXGYDiscount(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, items []*PromotionItemCalculationInput) (decimal.Decimal, error) {
-	rules, err := s.promotionRepo.GetRules(ctx, nil, companyID, promotionID)
+	rules, err := s.promotionRepo.GetRules(ctx, s.pgClient.DB, companyID, promotionID)
 	if err != nil {
 		return decimal.Zero, err
 	}
@@ -1086,7 +1551,7 @@ func (s *promotionService) CalculateCategoryDiscount(ctx context.Context, compan
 }
 
 func (s *promotionService) CalculateTieredDiscount(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, orderAmount decimal.Decimal) (decimal.Decimal, error) {
-	rules, err := s.promotionRepo.GetRules(ctx, nil, companyID, promotionID)
+	rules, err := s.promotionRepo.GetRules(ctx, s.pgClient.DB, companyID, promotionID)
 	if err != nil {
 		return decimal.Zero, err
 	}
@@ -1104,23 +1569,44 @@ func (s *promotionService) CalculateTieredDiscount(ctx context.Context, companyI
 	return decimal.Zero, nil
 }
 
-// ------------------ Applying/Removing Promotions ------------------
+// ---------- Apply/Remove (idempotent) ----------
+
 func (s *promotionService) applyPromotionToEntity(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, promotionID uuid.UUID, appliedBy uuid.UUID) (*discount.Promotion, decimal.Decimal, error) {
-	if entityType != "order" && entityType != "invoice" {
-		return nil, decimal.Zero, fmt.Errorf("%w: promotions can only be applied to orders or invoices", salesErrors.ErrInvalidInput)
+	logger := s.logger.With(zap.String("method", "applyPromotionToEntity"))
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("apply-%s-%s-%s", entityType, entityID.String(), promotionID.String())
 	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, decimal.Zero, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
+	// Cache the result (promotion + amount)
+	var cachedResult struct {
+		Promotion      *discount.Promotion
+		DiscountAmount decimal.Decimal
+	}
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cachedResult); err == nil && cachedResult.Promotion != nil {
+		logger.Info("idempotent – returning cached application result")
+		return cachedResult.Promotion, cachedResult.DiscountAmount, nil
+	}
+
+	if entityType != "order" && entityType != "invoice" {
+		return nil, decimal.Zero, fmt.Errorf("%w: promotions can only be applied to orders or invoices", salesErrors.ErrInvalidInput)
+	}
+
 	promo, err := s.promotionRepo.GetByID(ctx, tx, companyID, promotionID)
 	if err != nil {
 		return nil, decimal.Zero, err
 	}
+
 	var subtotal decimal.Decimal
 	var productIDs []uuid.UUID
+	var customerID uuid.UUID
+
 	switch entityType {
 	case "order":
 		order, err := s.orderRepo.GetByID(ctx, tx, companyID, entityID)
@@ -1132,6 +1618,7 @@ func (s *promotionService) applyPromotionToEntity(ctx context.Context, companyID
 		for _, it := range items {
 			productIDs = append(productIDs, it.ProductID)
 		}
+		customerID = order.CustomerID
 	case "invoice":
 		invoice, err := s.invoiceRepo.GetByID(ctx, tx, companyID, entityID)
 		if err != nil {
@@ -1144,14 +1631,29 @@ func (s *promotionService) applyPromotionToEntity(ctx context.Context, companyID
 				productIDs = append(productIDs, *it.ProductID)
 			}
 		}
+		customerID = invoice.CustomerID
 	}
-	discountAmount, err := s.CalculatePromotionDiscount(ctx, promotionID, subtotal, productIDs)
+
+	// ---- FIX: Validate promotion (active, dates, usage limits, products) ----
+	if err := s.ValidatePromotion(ctx, companyID, promotionID, &customerID, productIDs, subtotal, time.Now()); err != nil {
+		return nil, decimal.Zero, err
+	}
+
+	discountAmount, err := s.calculatePromotionDiscountWithCompany(ctx, companyID, promotionID, subtotal, productIDs)
 	if err != nil {
 		return nil, decimal.Zero, err
 	}
 	if discountAmount.IsZero() {
-		return nil, decimal.Zero, nil
+		// Cache zero result
+		zeroResult := struct {
+			Promotion      *discount.Promotion
+			DiscountAmount decimal.Decimal
+		}{promo, decimal.Zero}
+		_ = s.idempotencyStore.Store(ctx, tx, idempKey, zeroResult)
+		_ = tx.Commit()
+		return promo, decimal.Zero, nil
 	}
+
 	discountName := promo.Name
 	app := &discount.DiscountApplication{
 		ApplicationID: uuid.New(),
@@ -1160,6 +1662,9 @@ func (s *promotionService) applyPromotionToEntity(ctx context.Context, companyID
 		DiscountID:    &promotionID,
 		DiscountName:  &discountName,
 		Amount:        discountAmount,
+	}
+	if customerID != uuid.Nil {
+		app.CustomerID = &customerID
 	}
 	switch entityType {
 	case "order":
@@ -1171,35 +1676,52 @@ func (s *promotionService) applyPromotionToEntity(ctx context.Context, companyID
 		return nil, decimal.Zero, err
 	}
 	if err := s.emitPromotionAppliedEvent(ctx, tx, companyID, promotionID, entityType, entityID.String(), discountAmount); err != nil {
-		s.logger.Warn("failed to emit promotion applied event", zap.Error(err))
+		logger.Warn("failed to emit promotion applied event", zap.Error(err))
+	}
+	cachedResult.Promotion = promo
+	cachedResult.DiscountAmount = discountAmount
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, cachedResult); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, decimal.Zero, fmt.Errorf("commit tx: %w", err)
 	}
 	return promo, discountAmount, nil
 }
-
 func (s *promotionService) ApplyPromotionToOrder(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, promotionID uuid.UUID, appliedBy uuid.UUID) (*discount.Promotion, decimal.Decimal, error) {
 	return s.applyPromotionToEntity(ctx, companyID, "order", orderID, promotionID, appliedBy)
 }
 
 func (s *promotionService) ApplyPromotionToQuote(ctx context.Context, companyID uuid.UUID, quoteID uuid.UUID, promotionID uuid.UUID, appliedBy uuid.UUID) (*discount.Promotion, decimal.Decimal, error) {
-	return nil, decimal.Zero, fmt.Errorf("promotions cannot be applied to quotes (schema does not support quote_id in discount_applications)")
+	return nil, decimal.Zero, fmt.Errorf("promotions cannot be applied to quotes")
 }
 
 func (s *promotionService) ApplyPromotionToInvoice(ctx context.Context, companyID uuid.UUID, invoiceID uuid.UUID, promotionID uuid.UUID, appliedBy uuid.UUID) (*discount.Promotion, decimal.Decimal, error) {
 	return s.applyPromotionToEntity(ctx, companyID, "invoice", invoiceID, promotionID, appliedBy)
 }
 
-func (s *promotionService) removePromotionFromEntity(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, promotionID uuid.UUID) error {
-	if entityType != "order" && entityType != "invoice" {
-		return fmt.Errorf("%w: only orders and invoices supported", salesErrors.ErrInvalidInput)
+func (s *promotionService) removePromotionFromEntity(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, promotionID uuid.UUID, removedBy uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "removePromotionFromEntity"))
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("remove-%s-%s-%s", entityType, entityID.String(), promotionID.String())
 	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		logger.Info("idempotent – removal already done")
+		return nil
+	}
+
+	if entityType != "order" && entityType != "invoice" {
+		return fmt.Errorf("%w: only orders and invoices supported", salesErrors.ErrInvalidInput)
+	}
 
 	var apps []*discount.DiscountApplication
 	switch entityType {
@@ -1211,19 +1733,27 @@ func (s *promotionService) removePromotionFromEntity(ctx context.Context, compan
 	if err != nil {
 		return err
 	}
+	found := false
 	for _, app := range apps {
 		if app.DiscountID != nil && *app.DiscountID == promotionID && app.DiscountType == "promotion" {
 			if err := s.discountUsageRepo.Delete(ctx, tx, app.ApplicationID); err != nil {
 				return err
 			}
+			found = true
 			break
 		}
+	}
+	if !found {
+		return salesErrors.ErrNotFound
+	}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
 	}
 	return tx.Commit()
 }
 
 func (s *promotionService) RemovePromotionFromOrder(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, promotionID uuid.UUID, removedBy uuid.UUID) error {
-	return s.removePromotionFromEntity(ctx, companyID, "order", orderID, promotionID)
+	return s.removePromotionFromEntity(ctx, companyID, "order", orderID, promotionID, removedBy)
 }
 
 func (s *promotionService) RemovePromotionFromQuote(ctx context.Context, companyID uuid.UUID, quoteID uuid.UUID, promotionID uuid.UUID, removedBy uuid.UUID) error {
@@ -1231,18 +1761,31 @@ func (s *promotionService) RemovePromotionFromQuote(ctx context.Context, company
 }
 
 func (s *promotionService) RemovePromotionFromInvoice(ctx context.Context, companyID uuid.UUID, invoiceID uuid.UUID, promotionID uuid.UUID, removedBy uuid.UUID) error {
-	return s.removePromotionFromEntity(ctx, companyID, "invoice", invoiceID, promotionID)
+	return s.removePromotionFromEntity(ctx, companyID, "invoice", invoiceID, promotionID, removedBy)
 }
 
 func (s *promotionService) ClearPromotions(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, clearedBy uuid.UUID) error {
-	if entityType != "order" && entityType != "invoice" {
-		return fmt.Errorf("%w: only orders and invoices supported", salesErrors.ErrInvalidInput)
+	logger := s.logger.With(zap.String("method", "ClearPromotions"))
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("clear-%s-%s", entityType, entityID.String())
 	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		logger.Info("idempotent – clear already done")
+		return nil
+	}
+
+	if entityType != "order" && entityType != "invoice" {
+		return fmt.Errorf("%w: only orders and invoices supported", salesErrors.ErrInvalidInput)
+	}
 
 	var apps []*discount.DiscountApplication
 	switch entityType {
@@ -1261,40 +1804,133 @@ func (s *promotionService) ClearPromotions(ctx context.Context, companyID uuid.U
 			}
 		}
 	}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
 	return tx.Commit()
 }
 
-// ------------------ Usage Recording (stubs) ------------------
-func (s *promotionService) RecordPromotionUsage(ctx context.Context, req *RecordPromotionUsageRequest) error {
-	return nil
-}
+// ---------- Usage Recording ----------
 
+func (s *promotionService) RecordPromotionUsage(ctx context.Context, req *RecordPromotionUsageRequest) error {
+	logger := s.logger.With(zap.String("method", "RecordPromotionUsage"))
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = uuid.New().String()
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. Check idempotency for the *same* key – returns 200 OK if already processed
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		logger.Info("idempotent – usage already recorded with this key")
+		return nil
+	}
+
+	// 2. Check for existing usage (duplicate) – for a *different* key, return 409 Conflict
+	var existing []*discount.DiscountApplication
+	switch req.EntityType {
+	case "order":
+		existing, err = s.discountUsageRepo.GetByOrder(ctx, tx, req.CompanyID, req.EntityID)
+	case "invoice":
+		existing, err = s.discountUsageRepo.GetByInvoice(ctx, tx, req.CompanyID, req.EntityID)
+	default:
+		return fmt.Errorf("%w: unsupported entity type", salesErrors.ErrInvalidInput)
+	}
+	if err != nil && err != salesErrors.ErrNotFound {
+		return err
+	}
+	for _, app := range existing {
+		if app.DiscountID != nil && *app.DiscountID == req.PromotionID && app.DiscountType == "promotion" {
+			// Duplicate found with a different idempotency key – reject with 409 Conflict
+			return salesErrors.ErrDuplicate
+		}
+	}
+
+	// 3. No duplicate – create the usage record
+	app := &discount.DiscountApplication{
+		ApplicationID: uuid.New(),
+		CompanyID:     req.CompanyID,
+		DiscountType:  "promotion",
+		DiscountID:    &req.PromotionID,
+		Amount:        req.DiscountAmount,
+	}
+	if req.CustomerID != nil {
+		app.CustomerID = req.CustomerID
+	}
+	switch req.EntityType {
+	case "order":
+		app.OrderID = &req.EntityID
+	case "invoice":
+		app.InvoiceID = &req.EntityID
+	default:
+		return fmt.Errorf("%w: unsupported entity type", salesErrors.ErrInvalidInput)
+	}
+	if err := s.discountUsageRepo.Create(ctx, tx, app); err != nil {
+		return fmt.Errorf("create usage: %w", err)
+	}
+
+	// 4. Store idempotency for this key (success)
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+
+	return tx.Commit()
+}
 func (s *promotionService) RecordOrderPromotionUsage(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, orderID uuid.UUID, customerID *uuid.UUID, discountAmount decimal.Decimal, usedAt time.Time) error {
-	return nil
+	return s.RecordPromotionUsage(ctx, &RecordPromotionUsageRequest{
+		CompanyID:      companyID,
+		PromotionID:    promotionID,
+		EntityType:     "order",
+		EntityID:       orderID,
+		CustomerID:     customerID,
+		DiscountAmount: discountAmount,
+		UsedAt:         usedAt,
+	})
 }
 
 func (s *promotionService) RecordQuotePromotionUsage(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, quoteID uuid.UUID, customerID *uuid.UUID, discountAmount decimal.Decimal, usedAt time.Time) error {
-	return nil
+	return fmt.Errorf("quote promotion usage not supported")
 }
 
 func (s *promotionService) RecordInvoicePromotionUsage(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, invoiceID uuid.UUID, customerID *uuid.UUID, discountAmount decimal.Decimal, usedAt time.Time) error {
-	return nil
+	return s.RecordPromotionUsage(ctx, &RecordPromotionUsageRequest{
+		CompanyID:      companyID,
+		PromotionID:    promotionID,
+		EntityType:     "invoice",
+		EntityID:       invoiceID,
+		CustomerID:     customerID,
+		DiscountAmount: discountAmount,
+		UsedAt:         usedAt,
+	})
 }
 
-// ------------------ Usage Queries ------------------
+// ---------- Usage Queries ----------
+
 func (s *promotionService) GetPromotionUsageCount(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID) (int64, error) {
 	filter := repository.DiscountUsageFilter{
 		CompanyID:    companyID,
 		DiscountType: stringPtr("promotion"),
 		DiscountID:   &promotionID,
 	}
-	_, total, err := s.discountUsageRepo.List(ctx, nil, filter, repository.Pagination{Limit: 1, Offset: 0}, repository.Sort{Field: "created_at", Direction: "desc"})
+	_, total, err := s.discountUsageRepo.List(ctx, s.pgClient.DB, filter, repository.Pagination{Limit: 1, Offset: 0}, repository.Sort{Field: "created_at", Direction: "desc"})
 	return total, err
 }
 
 func (s *promotionService) GetCustomerPromotionUsageCount(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, customerID uuid.UUID) (int64, error) {
-	// Not implemented – could query discount_applications with additional filter
-	return 0, nil
+	filter := repository.DiscountUsageFilter{
+		CompanyID:    companyID,
+		CustomerID:   &customerID,
+		DiscountID:   &promotionID,
+		DiscountType: stringPtr("promotion"),
+	}
+	_, total, err := s.discountUsageRepo.List(ctx, s.pgClient.DB, filter, repository.Pagination{Limit: 1, Offset: 0}, repository.Sort{Field: "created_at", Direction: "desc"})
+	return total, err
 }
 
 func (s *promotionService) GetPromotionUsageHistory(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, p Pagination, srt Sort) ([]*discount.DiscountApplication, int64, error) {
@@ -1303,28 +1939,32 @@ func (s *promotionService) GetPromotionUsageHistory(ctx context.Context, company
 		DiscountType: stringPtr("promotion"),
 		DiscountID:   &promotionID,
 	}
-	return s.discountUsageRepo.List(ctx, nil, filter, repository.Pagination{Limit: p.Limit, Offset: p.Offset}, repository.Sort{Field: srt.Field, Direction: srt.Direction})
+	return s.discountUsageRepo.List(ctx, s.pgClient.DB, filter,
+		repository.Pagination{Limit: p.Limit, Offset: p.Offset},
+		repository.Sort{Field: srt.Field, Direction: srt.Direction})
 }
 
-// ------------------ Stacking ------------------
+// ---------- Stacking ----------
+
 func (s *promotionService) CanStackPromotion(ctx context.Context, companyID uuid.UUID, firstPromotionID uuid.UUID, secondPromotionID uuid.UUID) (bool, error) {
-	rule, err := s.stackingRuleRepo.GetForPrimary(ctx, nil, companyID, firstPromotionID, "promotion")
+	p1, err := s.promotionRepo.GetByID(ctx, s.pgClient.DB, companyID, firstPromotionID)
 	if err != nil {
-		if err == salesErrors.ErrNotFound {
-			return true, nil
-		}
 		return false, err
 	}
-	var allowedTypes []string
-	if err := json.Unmarshal(rule.AllowedTypes, &allowedTypes); err != nil {
+	p2, err := s.promotionRepo.GetByID(ctx, s.pgClient.DB, companyID, secondPromotionID)
+	if err != nil {
 		return false, err
 	}
-	for _, t := range allowedTypes {
-		if t == "promotion" {
-			return true, nil
-		}
+	if p1.StackingType == "exclusive" || p2.StackingType == "exclusive" {
+		return false, nil
 	}
-	return false, nil
+	if p1.StackingType == "stackable" && p2.StackingType == "stackable" {
+		return true, nil
+	}
+	if p1.StackingType == "none" || p2.StackingType == "none" {
+		return false, nil
+	}
+	return true, nil
 }
 
 func (s *promotionService) ValidatePromotionStacking(ctx context.Context, companyID uuid.UUID, promotionIDs []uuid.UUID) error {
@@ -1332,60 +1972,72 @@ func (s *promotionService) ValidatePromotionStacking(ctx context.Context, compan
 		for j := i + 1; j < len(promotionIDs); j++ {
 			ok, err := s.CanStackPromotion(ctx, companyID, promotionIDs[i], promotionIDs[j])
 			if err != nil {
-				return err
+				// Wrap underlying error for context
+				return fmt.Errorf("failed to check stacking for promotions %s and %s: %w", promotionIDs[i], promotionIDs[j], err)
 			}
 			if !ok {
-				return fmt.Errorf("promotions %s and %s cannot be stacked", promotionIDs[i], promotionIDs[j])
+				// Return a specific error that maps to 400 Bad Request
+				return fmt.Errorf("%w: promotions %s and %s cannot be stacked", salesErrors.ErrStackingConflict, promotionIDs[i], promotionIDs[j])
 			}
 		}
 	}
 	return nil
 }
-
 func (s *promotionService) GetStackablePromotions(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID) ([]uuid.UUID, error) {
-	rule, err := s.stackingRuleRepo.GetForPrimary(ctx, nil, companyID, promotionID, "promotion")
+	all, err := s.GetActivePromotions(ctx, companyID, time.Now())
 	if err != nil {
-		if err == salesErrors.ErrNotFound {
-			return nil, nil
+		return nil, err
+	}
+	var result []uuid.UUID
+	for _, p := range all {
+		if p.PromotionID == promotionID {
+			continue
 		}
-		return nil, err
+		ok, err := s.CanStackPromotion(ctx, companyID, promotionID, p.PromotionID)
+		if err != nil {
+			continue
+		}
+		if ok {
+			result = append(result, p.PromotionID)
+		}
 	}
-	var allowedTypes []string
-	if err := json.Unmarshal(rule.AllowedTypes, &allowedTypes); err != nil {
-		return nil, err
-	}
-	// For now, return empty – could query other promotions with allowed types
-	return nil, nil
+	return result, nil
 }
 
-// ------------------ Analytics ------------------
-func (s *promotionService) GetTopPromotions(ctx context.Context, companyID uuid.UUID, limit int, from *time.Time, to *time.Time) ([]*discount.Promotion, error) {
-	return s.promotionRepo.GetTopPromotionsByUsage(ctx, nil, companyID, limit, from, to)
-}
-
-func (s *promotionService) GetMostUsedPromotions(ctx context.Context, companyID uuid.UUID, limit int, from *time.Time, to *time.Time) ([]*discount.Promotion, error) {
-	return s.promotionRepo.GetTopPromotionsByUsage(ctx, nil, companyID, limit, from, to)
-}
-
-func (s *promotionService) GetHighestRevenuePromotions(ctx context.Context, companyID uuid.UUID, limit int, from *time.Time, to *time.Time) ([]*discount.Promotion, error) {
-	return s.promotionRepo.GetTopPromotionsByDiscountAmount(ctx, nil, companyID, limit, from, to)
-}
+// ---------- Analytics ----------
 
 func (s *promotionService) GetTotalPromotionDiscountAmount(ctx context.Context, companyID uuid.UUID, from *time.Time, to *time.Time) (decimal.Decimal, error) {
-	return s.promotionRepo.GetTotalDiscountGiven(ctx, nil, companyID, from, to)
+	return s.promotionRepo.GetTotalDiscountGiven(ctx, s.pgClient.DB, companyID, from, to)
 }
 
+// ---- NEW: GetPromotionConversionImpact ----
 func (s *promotionService) GetPromotionConversionImpact(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, from *time.Time, to *time.Time) (decimal.Decimal, error) {
+	// Placeholder: could compute lift by comparing conversion rates with/without promotion.
+	// For now, return 0.
 	return decimal.Zero, nil
 }
 
+// ---- NEW: GetPromotionRedemptionRate ----
 func (s *promotionService) GetPromotionRedemptionRate(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, from *time.Time, to *time.Time) (decimal.Decimal, error) {
-	return decimal.Zero, nil
+	promo, err := s.promotionRepo.GetByID(ctx, s.pgClient.DB, companyID, promotionID)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	if promo.UsageLimit == nil || *promo.UsageLimit == 0 {
+		return decimal.Zero, nil
+	}
+	used, err := s.GetPromotionUsageCount(ctx, companyID, promotionID)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	rate := decimal.NewFromInt(used).Div(decimal.NewFromInt(int64(*promo.UsageLimit))).Mul(decimal.NewFromInt(100))
+	return rate, nil
 }
 
-// ------------------ Existence Checks ------------------
+// ---------- Existence ----------
+
 func (s *promotionService) PromotionExists(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID) (bool, error) {
-	return s.promotionRepo.Exists(ctx, nil, companyID, promotionID)
+	return s.promotionRepo.Exists(ctx, s.pgClient.DB, companyID, promotionID)
 }
 
 func (s *promotionService) PromotionCodeExists(ctx context.Context, companyID uuid.UUID, code string) (bool, error) {
@@ -1400,13 +2052,68 @@ func (s *promotionService) PromotionRuleExists(ctx context.Context, companyID uu
 }
 
 func (s *promotionService) IsPromotionExpired(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, at time.Time) (bool, error) {
-	return s.promotionRepo.IsExpired(ctx, nil, companyID, promotionID, at)
+	return s.promotionRepo.IsExpired(ctx, s.pgClient.DB, companyID, promotionID, at)
 }
 
+// ---- NEW: IsPromotionUsageLimitReached ----
 func (s *promotionService) IsPromotionUsageLimitReached(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID) (bool, error) {
-	return false, nil
+	err := s.ValidatePromotionUsageLimit(ctx, companyID, promotionID)
+	if err == nil {
+		return false, nil
+	}
+	if strings.Contains(err.Error(), "usage limit reached") {
+		return true, nil
+	}
+	return false, err
 }
 
+// ---- NEW: IsCustomerPromotionUsageLimitReached ----
 func (s *promotionService) IsCustomerPromotionUsageLimitReached(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, customerID uuid.UUID) (bool, error) {
-	return false, nil
+	err := s.ValidateCustomerPromotionUsageLimit(ctx, companyID, promotionID, customerID)
+	if err == nil {
+		return false, nil
+	}
+	if strings.Contains(err.Error(), "customer usage limit") {
+		return true, nil
+	}
+	return false, err
+}
+
+// GetTopPromotions returns the top N promotions by usage count with metrics.
+func (s *promotionService) GetTopPromotions(ctx context.Context, companyID uuid.UUID, limit int, from *time.Time, to *time.Time) ([]*PromotionWithMetrics, error) {
+	aggregates, err := s.promotionRepo.GetTopPromotionsByUsage(ctx, s.pgClient.DB, companyID, limit, from, to)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]*PromotionWithMetrics, len(aggregates))
+	for i, agg := range aggregates {
+		result[i] = &PromotionWithMetrics{
+			Promotion:  agg.Promotion,
+			UsageCount: agg.UsageCount,
+		}
+	}
+	return result, nil
+}
+
+// GetMostUsedPromotions is an alias for GetTopPromotions.
+func (s *promotionService) GetMostUsedPromotions(ctx context.Context, companyID uuid.UUID, limit int, from *time.Time, to *time.Time) ([]*PromotionWithMetrics, error) {
+	return s.GetTopPromotions(ctx, companyID, limit, from, to)
+}
+
+// GetHighestRevenuePromotions returns the top N promotions by total discount amount with metrics.
+func (s *promotionService) GetHighestRevenuePromotions(ctx context.Context, companyID uuid.UUID, limit int, from *time.Time, to *time.Time) ([]*PromotionWithMetrics, error) {
+	aggregates, err := s.promotionRepo.GetTopPromotionsByDiscountAmount(ctx, s.pgClient.DB, companyID, limit, from, to)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]*PromotionWithMetrics, len(aggregates))
+	for i, agg := range aggregates {
+		result[i] = &PromotionWithMetrics{
+			Promotion:     agg.Promotion,
+			TotalDiscount: agg.TotalDiscount,
+		}
+	}
+	return result, nil
 }

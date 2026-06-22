@@ -80,7 +80,7 @@ type DiscountEngineService interface {
 
 	// Analytics / reporting
 	GetTopCoupons(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*discount.Coupon, error)
-	GetTopPromotions(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*discount.Promotion, error)
+	GetTopPromotions(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*PromotionWithMetrics, error) // <-- CHANGED
 	GetTotalDiscountAmount(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
 	GetTotalCouponDiscountAmount(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
 	GetTotalPromotionDiscountAmount(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
@@ -1542,11 +1542,20 @@ func (s *discountEngineService) GetTopCoupons(ctx context.Context, companyID uui
 	return s.couponRepo.GetTopCouponsByUsage(ctx, db, companyID, limit, from, to)
 }
 
-func (s *discountEngineService) GetTopPromotions(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*discount.Promotion, error) {
-	db := s.pgClient.DB
-	return s.promotionRepo.GetTopPromotionsByDiscountAmount(ctx, db, companyID, limit, from, to)
+func (s *discountEngineService) GetTopPromotions(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*PromotionWithMetrics, error) {
+	aggregates, err := s.promotionRepo.GetTopPromotionsByDiscountAmount(ctx, s.pgClient.DB, companyID, limit, from, to)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]*PromotionWithMetrics, len(aggregates))
+	for i, agg := range aggregates {
+		result[i] = &PromotionWithMetrics{
+			Promotion:     agg.Promotion,
+			TotalDiscount: agg.TotalDiscount,
+		}
+	}
+	return result, nil
 }
-
 func (s *discountEngineService) GetTotalDiscountAmount(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
 	db := s.pgClient.DB
 	return s.discountUsageRepo.GetTotalDiscountAmount(ctx, db, companyID, from, to)

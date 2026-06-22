@@ -78,7 +78,7 @@ func (h *BaseHandler) mapServiceError(err error) (status int, message string) {
 		return http.StatusConflict, err.Error()
 	case errors.Is(err, salesErrors.ErrInvalidState):
 		return http.StatusBadRequest, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidStateTransition): // ✅ NEW: return 409 Conflict
+	case errors.Is(err, salesErrors.ErrInvalidStateTransition):
 		return http.StatusConflict, err.Error()
 	case errors.Is(err, salesErrors.ErrPermissionDenied):
 		return http.StatusForbidden, "permission denied"
@@ -103,16 +103,14 @@ func (h *BaseHandler) mapServiceError(err error) (status int, message string) {
 		return http.StatusBadRequest, "coupon usage limit exceeded"
 	case errors.Is(err, salesErrors.ErrOverRefund):
 		return http.StatusBadRequest, err.Error()
-	case errors.Is(err, salesErrors.ErrStackingConflict): // ✅ NEW: stacking conflict → 400 Bad Request
-		return http.StatusBadRequest, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidInput):
+	case errors.Is(err, salesErrors.ErrStackingConflict):
 		return http.StatusBadRequest, err.Error()
 	case errors.Is(err, salesErrors.ErrAllocationExceedsInvoice):
 		return http.StatusBadRequest, err.Error()
-	case errors.Is(err, salesErrors.ErrOverRefund):
-		return http.StatusBadRequest, err.Error()
 	case errors.Is(err, salesErrors.ErrPaymentTermInactive):
 		return http.StatusBadRequest, "payment term is inactive"
+	case errors.Is(err, salesErrors.ErrPromotionInactive): // NEW: promotion inactive
+		return http.StatusBadRequest, "promotion inactive"
 	default:
 		return http.StatusInternalServerError, "internal server error"
 	}
