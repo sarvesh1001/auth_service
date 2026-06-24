@@ -621,13 +621,23 @@ func (s *orderService) UpdateStatus(ctx context.Context, companyID, orderID uuid
 }
 
 func (s *orderService) ConfirmOrder(ctx context.Context, companyID, orderID uuid.UUID, updatedBy uuid.UUID) error {
-	logger := s.logger.With(zap.String("method", "ConfirmOrder"))
+	logger := s.logger.With(
+		zap.String("method", "ConfirmOrder"),
+		zap.String("order_id", orderID.String()),
+		zap.String("company_id", companyID.String()),
+	)
+	logger.Info("starting order confirmation")
+
 	idempotencyKey, err := s.getIdempotencyKey(ctx)
 	if err != nil {
+		logger.Error("failed to get idempotency key", zap.Error(err))
 		return err
 	}
+	logger = logger.With(zap.String("idempotency_key", idempotencyKey))
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
+		logger.Error("failed to begin transaction", zap.Error(err))
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
@@ -637,15 +647,98 @@ func (s *orderService) ConfirmOrder(ctx context.Context, companyID, orderID uuid
 		logger.Info("idempotent – order already confirmed")
 		return nil
 	}
-	if err := s.confirmOrderInternal(ctx, tx, companyID, orderID, updatedBy); err != nil {
+
+	order, err := s.orderRepo.GetByIDForUpdate(ctx, tx, companyID, orderID)
+	if err != nil {
+		logger.Error("failed to get order for update", zap.Error(err))
 		return err
 	}
+	logger.Info("order retrieved for confirmation",
+		zap.String("current_status", string(order.Status)),
+		zap.String("order_number", order.OrderNumber),
+	)
+
+	if order.CompanyID != companyID {
+		logger.Error("company ID mismatch", zap.String("order_company", order.CompanyID.String()))
+		return salesErrors.ErrPermissionDenied
+	}
+
+	if order.Status != enums.OrderStatusDraft {
+		logger.Warn("order not in draft status", zap.String("status", string(order.Status)))
+		return fmt.Errorf("%w: only draft orders can be confirmed", salesErrors.ErrInvalidTransition)
+	}
+
+	active, err := s.customerSvc.IsCustomerActive(ctx, companyID, order.CustomerID)
+	if err != nil {
+		logger.Error("failed to check customer active status", zap.Error(err))
+		return err
+	}
+	if !active {
+		logger.Warn("customer is inactive", zap.String("customer_id", order.CustomerID.String()))
+		return salesErrors.ErrCustomerInactive
+	}
+
+	items, err := s.orderRepo.GetItems(ctx, tx, companyID, orderID)
+	if err != nil {
+		logger.Error("failed to get order items", zap.Error(err))
+		return err
+	}
+	for _, it := range items {
+		prod, err := s.productRepo.GetByID(ctx, tx, companyID, it.ProductID)
+		if err != nil {
+			logger.Error("failed to get product for validation", zap.String("product_id", it.ProductID.String()), zap.Error(err))
+			return err
+		}
+		if !prod.IsActive {
+			logger.Warn("product inactive", zap.String("product_id", it.ProductID.String()), zap.String("sku", prod.SKU))
+			return fmt.Errorf("%w: product %s is inactive", salesErrors.ErrProductInactive, prod.SKU)
+		}
+	}
+
+	if err := s.validatePricing(ctx, tx, companyID, orderID); err != nil {
+		logger.Error("pricing validation failed", zap.Error(err))
+		return err
+	}
+
+	canPurchase, err := s.customerSvc.CanCustomerPurchaseAmount(ctx, companyID, order.CustomerID, order.GrandTotal)
+	if err != nil {
+		logger.Error("failed to check purchase ability", zap.Error(err))
+		return err
+	}
+	if !canPurchase {
+		logger.Warn("customer cannot purchase amount", zap.String("grand_total", order.GrandTotal.String()))
+		return fmt.Errorf("%w: customer credit limit exceeded or insufficient credit", salesErrors.ErrInvalidAmount)
+	}
+
+	now := time.Now()
+	if err := s.orderRepo.Confirm(ctx, tx, companyID, orderID, now, &updatedBy); err != nil {
+		logger.Error("failed to update order status to confirmed", zap.Error(err))
+		return err
+	}
+	logger.Info("order status updated to confirmed in DB")
+
+	order.Status = enums.OrderStatusConfirmed
+	order.ConfirmedAt = &now
+
+	if err := s.emitOrderEvent(ctx, tx, order, salesEvents.EventOrderConfirmed, nil); err != nil {
+		logger.Error("failed to emit order confirmed event", zap.Error(err))
+		// Do not return error; event will be retried via outbox
+	} else {
+		logger.Info("order confirmed event emitted successfully")
+	}
+
 	if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, true); err != nil {
 		logger.Warn("failed to store idempotency record", zap.Error(err))
 	}
-	return tx.Commit()
-}
 
+	if err := tx.Commit(); err != nil {
+		logger.Error("failed to commit transaction", zap.Error(err))
+		return fmt.Errorf("commit tx: %w", err)
+	}
+
+	logger.Info("order confirmation completed successfully")
+	return nil
+}
 func (s *orderService) MarkProcessing(ctx context.Context, companyID, orderID uuid.UUID, updatedBy uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "MarkProcessing"))
 	idempotencyKey, err := s.getIdempotencyKey(ctx)

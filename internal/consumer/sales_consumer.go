@@ -51,6 +51,7 @@ func NewSalesConsumer(
 }
 
 // Start consumes messages from Kafka indefinitely.
+// Start consumes messages from Kafka indefinitely.
 func (c *SalesConsumer) Start(ctx context.Context) {
 	c.logger.Info("starting sales consumer", zap.String("topic", c.topic))
 	for {
@@ -64,36 +65,47 @@ func (c *SalesConsumer) Start(ctx context.Context) {
 		}
 
 		eventType := c.extractHeader(msg, "event_type")
-		if eventType == "" {
-			c.logger.Warn("missing event_type header, skipping")
-			_ = c.consumer.CommitMessage(ctx, msg)
-			continue
-		}
-
 		eventID := c.extractHeader(msg, "event_id")
-		if eventID == "" {
-			c.logger.Warn("missing event_id header, skipping")
+		// Create a logger with event context
+		logger := c.logger.With(
+			zap.String("event_type", eventType),
+			zap.String("event_id", eventID),
+			zap.Int64("offset", msg.Offset),
+			zap.String("topic", msg.Topic),
+		)
+
+		if eventType == "" {
+			logger.Warn("missing event_type header, skipping")
 			_ = c.consumer.CommitMessage(ctx, msg)
 			continue
 		}
 
-		// Process the event (no idempotency – rely on upstream or handle duplicates in service)
+		if eventID == "" {
+			logger.Warn("missing event_id header, skipping")
+			_ = c.consumer.CommitMessage(ctx, msg)
+			continue
+		}
+
+		// Log the raw payload size (optional)
+		logger.Debug("processing sales event", zap.Int("payload_size", len(msg.Value)))
+
+		// Process the event
 		err = c.analyticsSvc.ProcessSalesEvent(ctx, eventType, msg.Value)
 		if err != nil {
-			c.logger.Error("failed to process sales event",
-				zap.String("event_type", eventType),
-				zap.String("event_id", eventID),
-				zap.Error(err),
-			)
+			logger.Error("failed to process sales event", zap.Error(err))
 
 			retryCount := c.extractRetry(msg)
+			logger.Debug("retry count", zap.Int("retry_count", retryCount))
+
 			if retryCount < c.maxRetries {
+				logger.Info("publishing retry", zap.Int("next_retry", retryCount+1))
 				if pubErr := c.publishRetry(ctx, msg, retryCount+1); pubErr != nil {
-					c.logger.Error("failed to publish retry", zap.Error(pubErr))
+					logger.Error("failed to publish retry", zap.Error(pubErr))
 				}
 			} else {
+				logger.Error("max retries exceeded, sending to DLQ")
 				if dlqErr := c.sendToDLQ(ctx, msg, err); dlqErr != nil {
-					c.logger.Error("failed to send to DLQ", zap.Error(dlqErr))
+					logger.Error("failed to send to DLQ", zap.Error(dlqErr))
 				}
 			}
 			// Commit offset – message moved to retry/DLQ
@@ -101,9 +113,10 @@ func (c *SalesConsumer) Start(ctx context.Context) {
 			continue
 		}
 
-		// Success: commit offset
+		logger.Info("sales event processed successfully")
+		// Commit offset
 		if err := c.consumer.CommitMessage(ctx, msg); err != nil {
-			c.logger.Error("failed to commit Kafka message", zap.Error(err))
+			logger.Error("failed to commit Kafka message", zap.Error(err))
 		}
 	}
 }

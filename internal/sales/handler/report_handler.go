@@ -11,6 +11,7 @@ import (
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 
+	"auth-service/internal/sales/models"
 	"auth-service/internal/sales/service"
 )
 
@@ -222,19 +223,32 @@ func (h *ReportHandler) GetRevenueTrend(w http.ResponseWriter, r *http.Request) 
 	}
 
 	granularityStr := r.URL.Query().Get("granularity")
+
+	// Validate granularity – reject unsupported values
+	allowed := map[string]bool{
+		"daily":   true,
+		"weekly":  true,
+		"monthly": true,
+		"yearly":  true,
+	}
+	if granularityStr != "" && !allowed[granularityStr] {
+		h.respondWithError(w, http.StatusBadRequest,
+			"invalid granularity (allowed: daily, weekly, monthly, yearly)")
+		return
+	}
+
 	var granularity service.AnalyticsGranularity
 	switch granularityStr {
-	case "daily":
-		granularity = service.GranularityDaily
 	case "weekly":
 		granularity = service.GranularityWeekly
 	case "monthly":
 		granularity = service.GranularityMonthly
 	case "yearly":
 		granularity = service.GranularityYearly
-	default:
+	default: // "daily" or empty
 		granularity = service.GranularityDaily
 	}
+
 	from := h.parseTimeQuery(r, "from")
 	to := h.parseTimeQuery(r, "to")
 
@@ -244,6 +258,11 @@ func (h *ReportHandler) GetRevenueTrend(w http.ResponseWriter, r *http.Request) 
 		status, msg := h.mapServiceError(err)
 		h.respondWithError(w, status, msg)
 		return
+	}
+
+	// Ensure we never return nil – always return an empty slice
+	if trend == nil {
+		trend = []*service.RevenueTrendPoint{}
 	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
@@ -591,7 +610,7 @@ func (h *ReportHandler) GetCustomerSalesSummary(w http.ResponseWriter, r *http.R
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	customerID, err := h.parseUUIDParam(r, "customer_id")
+	customerID, err := h.parseUUIDParam(r, "customerId")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid customer_id")
 		return
@@ -638,7 +657,7 @@ func (h *ReportHandler) GetCustomerLifetimeValue(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	customerID, err := h.parseUUIDParam(r, "customer_id")
+	customerID, err := h.parseUUIDParam(r, "customerId")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid customer_id")
 		return
@@ -828,6 +847,11 @@ func (h *ReportHandler) GetNewCustomers(w http.ResponseWriter, r *http.Request) 
 		status, msg := h.mapServiceError(err)
 		h.respondWithError(w, status, msg)
 		return
+	}
+
+	// Ensure we never return nil – always return an empty slice
+	if customers == nil {
+		customers = []*models.Customer{}
 	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
@@ -2792,7 +2816,6 @@ func (h *ReportHandler) GetCreditRiskSummary(w http.ResponseWriter, r *http.Requ
 // @Router /reports/customers-near-credit-limit [get]
 func (h *ReportHandler) GetCustomersNearCreditLimit(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -2807,7 +2830,6 @@ func (h *ReportHandler) GetCustomersNearCreditLimit(w http.ResponseWriter, r *ht
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	thresholdStr := r.URL.Query().Get("threshold_percent")
 	if thresholdStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "threshold_percent parameter is required")
@@ -2818,7 +2840,11 @@ func (h *ReportHandler) GetCustomersNearCreditLimit(w http.ResponseWriter, r *ht
 		h.respondWithError(w, http.StatusBadRequest, "invalid threshold_percent")
 		return
 	}
-
+	// 🆕 Validate that threshold_percent does not exceed 100
+	if threshold.GreaterThan(decimal.NewFromInt(100)) {
+		h.respondWithError(w, http.StatusBadRequest, "threshold_percent cannot exceed 100")
+		return
+	}
 	customers, err := h.queryService.GetCustomersNearCreditLimit(ctx, companyID, threshold)
 	if err != nil {
 		h.logger.Error("failed to get customers near credit limit", zap.Error(err))
@@ -2826,7 +2852,6 @@ func (h *ReportHandler) GetCustomersNearCreditLimit(w http.ResponseWriter, r *ht
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    customers,
@@ -3107,7 +3132,7 @@ func (h *ReportHandler) GetCustomerStatement(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	customerID, err := h.parseUUIDParam(r, "customer_id")
+	customerID, err := h.parseUUIDParam(r, "customerId")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid customer_id")
 		return
@@ -3191,5 +3216,56 @@ func (h *ReportHandler) GetSalesAuditTrail(w http.ResponseWriter, r *http.Reques
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    audit,
+	})
+}
+
+// GetCustomerOverdueInvoices returns overdue invoices for a specific customer.
+func (h *ReportHandler) GetCustomerOverdueInvoices(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	customerID, err := h.parseUUIDParam(r, "customerId")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid customer_id")
+		return
+	}
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "analytics:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	atStr := r.URL.Query().Get("at")
+	if atStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "at parameter is required")
+		return
+	}
+	at, err := time.Parse(time.RFC3339, atStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid at format (RFC3339)")
+		return
+	}
+
+	invoices, err := h.queryService.GetCustomerOverdueInvoices(ctx, companyID, customerID, at)
+	if err != nil {
+		h.logger.Error("failed to get customer overdue invoices", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+
+	if invoices == nil {
+		invoices = []*models.Invoice{}
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    invoices,
 	})
 }

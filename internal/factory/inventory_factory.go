@@ -1,7 +1,6 @@
 package factory
 
 import (
-	"context"
 	"time"
 
 	"auth-service/internal/client"
@@ -25,9 +24,9 @@ type InventoryInfraFactory struct {
 	auditService   *audit.AuditService
 
 	idempotencyStore idempotency.Store
-	outboxRepo       outbox.Repository
-	outboxProcessor  *outbox.Processor
-	outboxCancel     context.CancelFunc
+	outboxRepo       outbox.Repository // ✅ shared outbox repository (no local processor)
+
+	// ❌ Removed: outboxProcessor and outboxCancel fields
 
 	// Repositories
 	itemRepo            repository.ItemRepository
@@ -123,11 +122,12 @@ type InventoryInfraFactory struct {
 	purchaseOrderHandler *handler.PurchaseOrderHandler
 }
 
-// NewInventoryInfraFactory now receives encryptionManager for vendor/purchase repo.
+// NewInventoryInfraFactory now receives the shared outbox repository instead of a kafka producer.
+// EncryptionManager is retained for vendor/purchase repo encryption.
 func NewInventoryInfraFactory(
 	postgresClient *client.PostgresClient,
 	redisClient *client.RedisClient,
-	kafkaProducer *client.KafkaProducer,
+	sharedOutboxRepo outbox.Repository, // ✅ shared outbox repository
 	eventPublisher EventPublisher,
 	auditService *audit.AuditService,
 	encryptionManager *encryption.EncryptionManager,
@@ -139,6 +139,7 @@ func NewInventoryInfraFactory(
 		redisClient:    redisClient,
 		eventPublisher: eventPublisher,
 		auditService:   auditService,
+		outboxRepo:     sharedOutboxRepo, // ✅ use the shared repository
 	}
 
 	// Idempotency store
@@ -146,17 +147,7 @@ func NewInventoryInfraFactory(
 	redisCache := idempotency.NewRedisCache(redisClient, 24*time.Hour)
 	infra.idempotencyStore = idempotency.NewHybridStore(pgStore, redisCache)
 
-	// Outbox
-	if kafkaProducer != nil {
-		infra.outboxRepo = outbox.NewPostgresRepository(postgresClient.DB)
-		infra.outboxProcessor = outbox.NewProcessor(infra.outboxRepo, kafkaProducer, infra.log)
-		ctx, cancel := context.WithCancel(context.Background())
-		infra.outboxCancel = cancel
-		go infra.outboxProcessor.Start(ctx)
-		infra.log.Info("Inventory outbox processor started")
-	} else {
-		infra.log.Warn("Kafka producer not available – inventory outbox disabled")
-	}
+	// ❌ Outbox processor creation removed – the central processor handles it
 
 	// ========== Repositories ==========
 	infra.itemRepo = repository.NewItemRepository(infra.log)
@@ -443,9 +434,7 @@ func (i *InventoryInfraFactory) InventoryAnalyticsService() service.InventoryAna
 	return i.analyticsSvc
 }
 
-// Close shuts down background processes.
+// Close is a no-op because the outbox processor is managed centrally.
 func (i *InventoryInfraFactory) Close() {
-	if i.outboxCancel != nil {
-		i.outboxCancel()
-	}
+	// No longer needed – central outbox handles shutdown
 }

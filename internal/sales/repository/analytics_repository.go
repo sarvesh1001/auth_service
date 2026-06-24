@@ -32,6 +32,7 @@ type AnalyticsRepository interface {
 	IncrementPaymentMethodDaily(ctx context.Context, db DBTX, companyID uuid.UUID, date time.Time, method enums.PaymentMethod, amount decimal.Decimal) error
 	// UpsertPaymentAllocationFact inserts or updates a record of payment allocation to an invoice.
 	UpsertPaymentAllocationFact(ctx context.Context, tx DBTX, fact *sales_analytics.PaymentAllocationFact) error
+	DecrementSalesRepPerformance(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID, date time.Time, orderTotal decimal.Decimal) error
 
 	// IncrementDailyAllocatedAmount updates the total amount allocated on a given day.
 	IncrementDailyAllocatedAmount(ctx context.Context, tx DBTX, companyID uuid.UUID, date time.Time, amount decimal.Decimal) error
@@ -51,7 +52,7 @@ type AnalyticsRepository interface {
 	UpdateCollectionEfficiency(ctx context.Context, db DBTX, companyID uuid.UUID, date time.Time, dso, collectionRate *decimal.Decimal, receivables, collected decimal.Decimal) error
 	// AutomaticDiscountMetrics
 	IncrementAutomaticDiscountMetrics(ctx context.Context, db DBTX, companyID, autoDiscountID uuid.UUID, date time.Time, discountAmount, orderAmount decimal.Decimal, customerID uuid.UUID) error
-
+	DecrementOrderHourlySales(ctx context.Context, db DBTX, companyID uuid.UUID, hourBucket time.Time, orderTotal decimal.Decimal) error
 	// StackingRuleUsage
 	IncrementStackingRuleUsage(ctx context.Context, db DBTX, companyID, ruleID uuid.UUID, date time.Time, combinedDiscount decimal.Decimal) error
 
@@ -274,6 +275,14 @@ func (r *analyticsRepository) UpsertDailySales(ctx context.Context, db DBTX, dai
 }
 
 func (r *analyticsRepository) IncrementDailyOrders(ctx context.Context, db DBTX, companyID uuid.UUID, date time.Time, delta int) error {
+	logger := r.logger.With(
+		zap.String("method", "IncrementDailyOrders"),
+		zap.String("company_id", companyID.String()),
+		zap.String("date", date.Format("2006-01-02")),
+		zap.Int("delta", delta),
+	)
+	logger.Debug("executing daily orders increment")
+
 	query := `
         INSERT INTO sales_analytics.daily_sales (company_id, date, total_orders, updated_at)
         VALUES ($1, $2, $3, NOW())
@@ -281,13 +290,15 @@ func (r *analyticsRepository) IncrementDailyOrders(ctx context.Context, db DBTX,
         SET total_orders = daily_sales.total_orders + EXCLUDED.total_orders,
             updated_at = NOW()
     `
-	_, err := db.ExecContext(ctx, query, companyID, date, delta)
+	result, err := db.ExecContext(ctx, query, companyID, date, delta)
 	if err != nil {
+		logger.Error("failed to increment daily orders", zap.Error(err))
 		return fmt.Errorf("increment daily orders: %w", err)
 	}
+	rows, _ := result.RowsAffected()
+	logger.Debug("daily orders increment executed", zap.Int64("rows_affected", rows))
 	return nil
 }
-
 func (r *analyticsRepository) AddDailyRevenue(ctx context.Context, db DBTX, companyID uuid.UUID, date time.Time, amount decimal.Decimal) error {
 	query := `
         INSERT INTO sales_analytics.daily_sales (company_id, date, total_revenue, updated_at)
@@ -473,19 +484,30 @@ func (r *analyticsRepository) UpsertProductSales(ctx context.Context, db DBTX, f
 }
 
 func (r *analyticsRepository) AddProductSales(ctx context.Context, db DBTX, companyID, productID uuid.UUID, date time.Time, quantity, revenue, discount decimal.Decimal) error {
+	// Idempotent recompute: always set the row to the exact sum from raw orders.
+	// This ensures that duplicate events never cause double-counting.
 	query := `
-        INSERT INTO sales_analytics.product_sales_fact
-            (company_id, product_id, date, quantity_sold, revenue, discount_applied, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, NOW())
+        INSERT INTO sales_analytics.product_sales_fact (company_id, product_id, date, quantity_sold, revenue, discount_applied, updated_at)
+        SELECT $1, $2, $3,
+               COALESCE(SUM(oi.quantity), 0),
+               COALESCE(SUM(oi.quantity * oi.unit_price), 0),
+               COALESCE(SUM(oi.discount_amount), 0),
+               NOW()
+        FROM sales.order_items oi
+        JOIN sales.orders o ON o.order_id = oi.order_id
+        WHERE o.company_id = $1
+          AND oi.product_id = $2
+          AND o.order_date = $3
+          AND o.status NOT IN ('cancelled', 'refunded')
         ON CONFLICT (company_id, product_id, date) DO UPDATE SET
-            quantity_sold = product_sales_fact.quantity_sold + EXCLUDED.quantity_sold,
-            revenue = product_sales_fact.revenue + EXCLUDED.revenue,
-            discount_applied = product_sales_fact.discount_applied + EXCLUDED.discount_applied,
+            quantity_sold = EXCLUDED.quantity_sold,
+            revenue = EXCLUDED.revenue,
+            discount_applied = EXCLUDED.discount_applied,
             updated_at = NOW()
     `
-	_, err := db.ExecContext(ctx, query, companyID, productID, date, quantity, revenue, discount)
+	_, err := db.ExecContext(ctx, query, companyID, productID, date)
 	if err != nil {
-		return fmt.Errorf("add product sales: %w", err)
+		return fmt.Errorf("add product sales (recompute): %w", err)
 	}
 	return nil
 }
@@ -3145,6 +3167,47 @@ func (r *analyticsRepository) IncrementDailyAllocatedAmount(ctx context.Context,
 	_, err := tx.ExecContext(ctx, query, companyID, date, amount)
 	if err != nil {
 		return fmt.Errorf("increment daily allocated amount: %w", err)
+	}
+	return nil
+}
+func (r *analyticsRepository) DecrementOrderHourlySales(ctx context.Context, db DBTX, companyID uuid.UUID, hourBucket time.Time, orderTotal decimal.Decimal) error {
+	query := `
+		UPDATE sales_analytics.order_hourly_sales
+		SET total_orders = total_orders - 1,
+		    total_revenue = total_revenue - $3,
+		    updated_at = NOW()
+		WHERE company_id = $1 AND hour_bucket = $2
+	`
+	result, err := db.ExecContext(ctx, query, companyID, hourBucket, orderTotal)
+	if err != nil {
+		return fmt.Errorf("decrement order hourly sales: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		// No record for this hour – this should not happen if the order was confirmed.
+		r.logger.Warn("no hourly sales record to decrement", zap.String("company_id", companyID.String()), zap.Time("hour", hourBucket))
+	}
+	return nil
+}
+
+func (r *analyticsRepository) DecrementSalesRepPerformance(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID, date time.Time, orderTotal decimal.Decimal) error {
+	// We need to decrement total_orders by 1, total_revenue by orderTotal.
+	// We also need to recalc average_order_value.
+	query := `
+		UPDATE sales_analytics.sales_rep_performance
+		SET total_orders = total_orders - 1,
+		    total_revenue = total_revenue - $4,
+		    average_order_value = CASE WHEN (total_orders - 1) > 0 THEN (total_revenue - $4) / (total_orders - 1) ELSE 0 END,
+		    updated_at = NOW()
+		WHERE company_id = $1 AND sales_rep_id = $2 AND date = $3
+	`
+	result, err := db.ExecContext(ctx, query, companyID, salesRepID, date, orderTotal)
+	if err != nil {
+		return fmt.Errorf("decrement sales rep performance: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		// No record – maybe the rep wasn't assigned; ignore.
 	}
 	return nil
 }

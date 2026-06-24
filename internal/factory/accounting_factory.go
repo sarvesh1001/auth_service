@@ -1,7 +1,6 @@
 package factory
 
 import (
-	"context"
 	"time"
 
 	"auth-service/internal/accounting"
@@ -25,9 +24,7 @@ type AccountingInfraFactory struct {
 	eventPublisher   EventPublisher
 	auditService     *audit.AuditService
 	idempotencyStore idempotency.Store
-	outboxRepo       outbox.Repository
-	outboxProcessor  *outbox.Processor
-	outboxCancel     context.CancelFunc
+	outboxRepo       outbox.Repository // ✅ shared outbox repository (no local processor)
 
 	// Repositories
 	accountRepo        repository.AccountRepository
@@ -35,7 +32,7 @@ type AccountingInfraFactory struct {
 	complianceRepo     repository.ComplianceRepository
 	journalRepo        repository.JournalRepository
 	ledgerRepo         repository.LedgerRepository
-	periodLockRepo     repository.PeriodLockRepository // 👈 NEW
+	periodLockRepo     repository.PeriodLockRepository
 	reconciliationRepo repository.ReconciliationRepository
 	settingsRepo       repository.AccountingSettingsRepository
 	taxProfileRepo     repository.TaxProfileRepository
@@ -43,8 +40,8 @@ type AccountingInfraFactory struct {
 	taxRuleRepo        repository.TaxRuleRepository
 	taxTransactionRepo repository.TaxTransactionRepository
 	analyticsHandler   *handler.AnalyticsHandler
-	periodLockService  service.PeriodLockService  // 👈 NEW
-	periodLockHandler  *handler.PeriodLockHandler // 👈 NEW
+	periodLockService  service.PeriodLockService
+	periodLockHandler  *handler.PeriodLockHandler
 
 	// Services
 	accountingSvc              service.AccountingService
@@ -55,7 +52,7 @@ type AccountingInfraFactory struct {
 	complianceAnalyticsSvc     service.ComplianceAnalyticsService
 	journalSvc                 service.JournalService
 	ledgerSvc                  service.LedgerService
-	ruleEngineSvc              service.AccountingRuleEngine // 👈 NEW
+	ruleEngineSvc              service.AccountingRuleEngine
 	reconciliationSvc          service.ReconciliationService
 	reconciliationAnalyticsSvc service.ReconciliationAnalyticsService
 	taxAnalyticsSvc            service.TaxAnalyticsService
@@ -73,10 +70,11 @@ type AccountingInfraFactory struct {
 }
 
 // NewAccountingInfraFactory creates a new accounting infrastructure factory.
+// It now receives the shared outbox repository from the main factory.
 func NewAccountingInfraFactory(
 	postgresClient *client.PostgresClient,
 	redisClient *client.RedisClient,
-	kafkaProducer *client.KafkaProducer,
+	sharedOutboxRepo outbox.Repository, // ✅ shared outbox repository
 	eventPublisher EventPublisher,
 	auditService *audit.AuditService,
 	sessionService *mainservice.SessionService,
@@ -87,6 +85,7 @@ func NewAccountingInfraFactory(
 		postgresClient: postgresClient,
 		eventPublisher: eventPublisher,
 		auditService:   auditService,
+		outboxRepo:     sharedOutboxRepo, // ✅ use the shared repository
 	}
 
 	// Idempotency store (hybrid)
@@ -94,25 +93,7 @@ func NewAccountingInfraFactory(
 	redisCache := idempotency.NewRedisCache(redisClient, 24*time.Hour)
 	af.idempotencyStore = idempotency.NewHybridStore(pgStore, redisCache)
 
-	// Outbox repository and processor
-	if kafkaProducer != nil {
-		af.outboxRepo = outbox.NewPostgresRepository(postgresClient.DB)
-
-		af.outboxProcessor = outbox.NewProcessor(
-			af.outboxRepo,
-			kafkaProducer,
-			af.log,
-		)
-
-		ctx, cancel := context.WithCancel(context.Background())
-		af.outboxCancel = cancel
-
-		go af.outboxProcessor.Start(ctx)
-
-		af.log.Info("Accounting outbox processor started")
-	} else {
-		af.log.Warn("Kafka producer not available – accounting outbox disabled")
-	}
+	// ❌ Outbox processor creation removed – the central processor handles it
 
 	// Initialize repositories
 	af.accountRepo = repository.NewAccountRepository(af.log)
@@ -120,14 +101,13 @@ func NewAccountingInfraFactory(
 	af.complianceRepo = repository.NewComplianceRepository(af.log)
 	af.journalRepo = repository.NewJournalRepository(af.log)
 	af.ledgerRepo = repository.NewLedgerRepository(af.log)
-	af.periodLockRepo = repository.NewPeriodLockRepository(af.log) // 👈 NEW
-	// Inside NewAccountingInfraFactory, after creating periodLockRepo:
+	af.periodLockRepo = repository.NewPeriodLockRepository(af.log)
 	af.periodLockService = service.NewPeriodLockService(
 		af.periodLockRepo,
-		af.postgresClient, // 👈 ADD THIS
+		af.postgresClient,
 		af.auditService,
 		af.log,
-		af.idempotencyStore, // 👈 ADD THIS
+		af.idempotencyStore,
 	)
 	af.periodLockHandler = handler.NewPeriodLockHandler(af.periodLockService, af.log)
 	af.reconciliationRepo = repository.NewReconciliationRepository(af.log)
@@ -143,7 +123,7 @@ func NewAccountingInfraFactory(
 		af.ledgerRepo,
 		af.journalRepo,
 		af.settingsRepo,
-		af.periodLockRepo, // 👈 NEW
+		af.periodLockRepo,
 		af.postgresClient,
 		af.log,
 		af.outboxRepo,
@@ -165,7 +145,7 @@ func NewAccountingInfraFactory(
 	af.journalSvc = service.NewJournalService(
 		af.journalRepo,
 		af.ledgerSvc,
-		af.ruleEngineSvc, // 👈 NEW
+		af.ruleEngineSvc,
 		af.postgresClient,
 		af.log,
 		af.outboxRepo,
@@ -173,7 +153,7 @@ func NewAccountingInfraFactory(
 		af.auditService,
 	)
 
-	// Remaining services (unchanged except they may use the new journalSvc/ledgerSvc)
+	// Remaining services
 	af.taxEngineSvc = service.NewTaxEngineService(
 		af.taxProfileRepo,
 		af.taxRateRepo,
@@ -389,9 +369,7 @@ func (af *AccountingInfraFactory) RegisterRoutes(r chi.Router, jwtService *mains
 	accounting.RegisterAccountingRoutes(r, accountingHandlers, logger, jwtService)
 }
 
-// Close shuts down the outbox processor.
+// Close is a no-op because the outbox processor is managed centrally.
 func (af *AccountingInfraFactory) Close() {
-	if af.outboxCancel != nil {
-		af.outboxCancel()
-	}
+	// No longer needed – central outbox handles shutdown
 }

@@ -408,57 +408,69 @@ func (s *salesAnalyticsService) onOrderCreated(ctx context.Context, order salesE
 }
 
 func (s *salesAnalyticsService) onOrderConfirmed(ctx context.Context, order salesEvents.OrderPayload) error {
+	logger := s.logger.With(
+		zap.String("method", "onOrderConfirmed"),
+		zap.String("order_id", order.OrderID),
+		zap.String("company_id", order.CompanyID),
+	)
+	logger.Info("processing order confirmed event")
+
 	orderID, err := uuid.Parse(order.OrderID)
 	if err != nil {
+		logger.Error("invalid order_id", zap.Error(err))
 		return fmt.Errorf("invalid order_id: %w", err)
 	}
 	companyID, err := uuid.Parse(order.CompanyID)
 	if err != nil {
+		logger.Error("invalid company_id", zap.Error(err))
 		return fmt.Errorf("invalid company_id: %w", err)
 	}
 	customerID, err := uuid.Parse(order.CustomerID)
 	if err != nil {
+		logger.Error("invalid customer_id", zap.Error(err))
 		return fmt.Errorf("invalid customer_id: %w", err)
 	}
 	orderDate, err := time.Parse(time.RFC3339, order.OrderDate)
 	if err != nil {
+		logger.Error("invalid order_date", zap.Error(err))
 		return fmt.Errorf("invalid order_date: %w", err)
 	}
 	grandTotal, err := decimal.NewFromString(order.GrandTotal)
 	if err != nil {
+		logger.Error("invalid grand_total", zap.Error(err))
 		return fmt.Errorf("invalid grand_total: %w", err)
 	}
-	now := time.Now()
+	logger.Info("parsed order data",
+		zap.String("grand_total", grandTotal.String()),
+		zap.String("order_date", orderDate.Format("2006-01-02")),
+	)
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
+		logger.Error("failed to begin tx", zap.Error(err))
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	// Close draft status
-	if err := s.analyticsRepo.CloseOrderStatusHistory(ctx, tx, orderID, enums.OrderStatusDraft, now); err != nil {
-		s.logger.Warn("failed to close draft status history", zap.Error(err))
-	}
-	history := &sales_analytics.OrderStatusHistory{
-		OrderID:   orderID,
-		CompanyID: companyID,
-		Status:    enums.OrderStatusConfirmed,
-		EnteredAt: now,
-	}
-	if err := s.analyticsRepo.InsertOrderStatusHistory(ctx, tx, history); err != nil {
-		return fmt.Errorf("insert confirmed status history: %w", err)
-	}
-
-	// Daily aggregates
+	// Increment daily orders
 	if err := s.analyticsRepo.IncrementDailyOrders(ctx, tx, companyID, orderDate, 1); err != nil {
+		logger.Error("failed to increment daily orders", zap.Error(err))
 		return err
 	}
+	logger.Info("daily orders incremented", zap.String("date", orderDate.Format("2006-01-02")))
+
+	// Add daily revenue
 	if err := s.analyticsRepo.AddDailyRevenue(ctx, tx, companyID, orderDate, grandTotal); err != nil {
+		logger.Error("failed to add daily revenue", zap.Error(err))
 		return err
 	}
+	logger.Info("daily revenue added", zap.String("amount", grandTotal.String()))
+
+	// Unique customers
 	if err := s.analyticsRepo.IncrementUniqueCustomers(ctx, tx, companyID, orderDate, customerID); err != nil {
-		s.logger.Warn("failed to increment unique customers", zap.Error(err))
+		logger.Warn("failed to increment unique customers", zap.Error(err))
+	} else {
+		logger.Info("unique customer incremented", zap.String("customer_id", customerID.String()))
 	}
 
 	// Customer metrics
@@ -476,40 +488,40 @@ func (s *salesAnalyticsService) onOrderConfirmed(ctx context.Context, order sale
 		TotalSpent:     grandTotal,
 	}
 	if err := s.analyticsRepo.UpdateCustomerMetrics(ctx, tx, metric); err != nil {
-		return err
+		logger.Warn("failed to update customer metrics", zap.Error(err))
+	} else {
+		logger.Info("customer metrics updated")
 	}
 
-	// Product sales and order item analytics
+	// Product sales facts
 	for _, item := range order.Items {
 		productID, err := uuid.Parse(item.ProductID)
 		if err != nil {
-			s.logger.Warn("invalid product_id", zap.String("product_id", item.ProductID), zap.Error(err))
+			logger.Warn("invalid product_id in item", zap.String("product_id", item.ProductID), zap.Error(err))
 			continue
 		}
 		quantity, err := decimal.NewFromString(item.Quantity)
 		if err != nil {
-			s.logger.Warn("invalid quantity", zap.String("quantity", item.Quantity), zap.Error(err))
+			logger.Warn("invalid quantity", zap.String("quantity", item.Quantity), zap.Error(err))
 			continue
 		}
 		unitPrice, err := decimal.NewFromString(item.UnitPrice)
 		if err != nil {
-			s.logger.Warn("invalid unit_price", zap.String("unit_price", item.UnitPrice), zap.Error(err))
+			logger.Warn("invalid unit_price", zap.String("unit_price", item.UnitPrice), zap.Error(err))
 			continue
 		}
-		discount, err := decimal.NewFromString(item.DiscountTotal)
-		if err != nil {
-			discount = decimal.Zero
-		}
-		tax, err := decimal.NewFromString(item.TaxTotal)
-		if err != nil {
-			tax = decimal.Zero
-		}
+		discount, _ := decimal.NewFromString(item.DiscountTotal)
+		tax, _ := decimal.NewFromString(item.TaxTotal)
 		revenue := quantity.Mul(unitPrice)
 		lineAmount := revenue.Sub(discount).Add(tax)
 
 		if err := s.analyticsRepo.AddProductSales(ctx, tx, companyID, productID, orderDate, quantity, revenue, discount); err != nil {
-			s.logger.Error("failed to add product sales", zap.Error(err))
+			logger.Error("failed to add product sales", zap.String("product_id", productID.String()), zap.Error(err))
+		} else {
+			logger.Debug("product sales incremented", zap.String("product_id", productID.String()), zap.String("quantity", quantity.String()), zap.String("revenue", revenue.String()))
 		}
+
+		// Insert order item analytics
 		orderItemID := uuid.Nil
 		if item.OrderItemID != "" {
 			orderItemID, _ = uuid.Parse(item.OrderItemID)
@@ -528,57 +540,62 @@ func (s *salesAnalyticsService) onOrderConfirmed(ctx context.Context, order sale
 			OrderDate:       orderDate,
 		}
 		if err := s.analyticsRepo.UpsertOrderItemAnalytics(ctx, tx, analyticsItem); err != nil {
-			s.logger.Error("failed to upsert order item analytics", zap.Error(err))
+			logger.Error("failed to upsert order item analytics", zap.String("order_item_id", orderItemID.String()), zap.Error(err))
 		}
 	}
 
-	// Sales rep performance & target achievement & commission fact
+	// Sales rep performance
 	if order.SalesRepID != "" {
 		salesRepID, err := uuid.Parse(order.SalesRepID)
 		if err == nil {
-			// Performance
 			commissionRate, err := s.getCommissionRate(ctx, tx, companyID, salesRepID, orderDate)
 			if err != nil {
-				s.logger.Warn("failed to get commission rate, using 0", zap.Error(err))
+				logger.Warn("failed to get commission rate, using 0", zap.Error(err))
 				commissionRate = decimal.Zero
 			}
 			commission := grandTotal.Mul(commissionRate).Div(decimal.NewFromInt(100))
 			if err := s.analyticsRepo.IncrementSalesRepPerformance(ctx, tx, companyID, salesRepID, orderDate, grandTotal, commission); err != nil {
-				s.logger.Error("failed to update sales rep performance", zap.Error(err))
+				logger.Error("failed to update sales rep performance", zap.Error(err))
+			} else {
+				logger.Info("sales rep performance updated", zap.String("sales_rep_id", salesRepID.String()))
 			}
-
-			// Target achievement: add revenue to target period
 			if err := s.updateTargetAchievement(ctx, tx, companyID, salesRepID, orderDate, grandTotal); err != nil {
-				s.logger.Warn("failed to update target achievement", zap.Error(err))
+				logger.Warn("failed to update target achievement", zap.Error(err))
 			}
-
-			// Commission fact
 			if err := s.recordCommissionFact(ctx, tx, companyID, salesRepID, orderID, grandTotal, commissionRate, commission, orderDate); err != nil {
-				s.logger.Warn("failed to record commission fact", zap.Error(err))
+				logger.Warn("failed to record commission fact", zap.Error(err))
 			}
 		} else {
-			s.logger.Warn("invalid sales_rep_id in order payload", zap.String("sales_rep_id", order.SalesRepID))
+			logger.Warn("invalid sales_rep_id in order payload", zap.String("sales_rep_id", order.SalesRepID))
 		}
 	}
 
 	// Hourly sales
 	hourBucket := time.Date(orderDate.Year(), orderDate.Month(), orderDate.Day(), orderDate.Hour(), 0, 0, 0, orderDate.Location())
 	if err := s.analyticsRepo.IncrementOrderHourlySales(ctx, tx, companyID, hourBucket, grandTotal, customerID); err != nil {
-		s.logger.Warn("failed to increment hourly sales", zap.Error(err))
+		logger.Warn("failed to increment hourly sales", zap.Error(err))
+	} else {
+		logger.Info("hourly sales incremented", zap.String("hour", hourBucket.Format("2006-01-02 15:00")))
 	}
 
 	// Fulfillment metrics
+	now := time.Now()
 	fulfillMetrics := &sales_analytics.FulfillmentMetrics{
 		OrderID:     orderID,
 		CompanyID:   companyID,
 		ConfirmedAt: &now,
 	}
 	if err := s.analyticsRepo.UpsertFulfillmentMetrics(ctx, tx, fulfillMetrics); err != nil {
-		s.logger.Warn("failed to upsert fulfillment metrics", zap.Error(err))
+		logger.Warn("failed to upsert fulfillment metrics", zap.Error(err))
 	}
-	return tx.Commit()
-}
 
+	if err := tx.Commit(); err != nil {
+		logger.Error("failed to commit tx", zap.Error(err))
+		return fmt.Errorf("commit tx: %w", err)
+	}
+	logger.Info("order confirmed event processed successfully")
+	return nil
+}
 func (s *salesAnalyticsService) onOrderProcessing(ctx context.Context, order salesEvents.OrderPayload) error {
 	return s.updateOrderStatus(ctx, order, enums.OrderStatusProcessing, enums.OrderStatusConfirmed)
 }
@@ -658,27 +675,58 @@ func (s *salesAnalyticsService) onOrderDelivered(ctx context.Context, order sale
 }
 
 func (s *salesAnalyticsService) onOrderCancelled(ctx context.Context, order salesEvents.OrderPayload) error {
+	logger := s.logger.With(
+		zap.String("method", "onOrderCancelled"),
+		zap.String("order_id", order.OrderID),
+		zap.String("company_id", order.CompanyID),
+		zap.String("status_before_cancel", order.StatusBeforeCancel),
+	)
+	logger.Info("processing order cancelled event")
+
 	orderID, err := uuid.Parse(order.OrderID)
 	if err != nil {
+		logger.Error("invalid order_id", zap.Error(err))
 		return fmt.Errorf("invalid order_id: %w", err)
 	}
 	companyID, err := uuid.Parse(order.CompanyID)
 	if err != nil {
+		logger.Error("invalid company_id", zap.Error(err))
 		return fmt.Errorf("invalid company_id: %w", err)
 	}
-	now := time.Now()
-	statusBefore := enums.OrderStatus(order.StatusBeforeCancel)
-	grandTotal, _ := decimal.NewFromString(order.GrandTotal)
+	customerID, err := uuid.Parse(order.CustomerID)
+	if err != nil {
+		logger.Error("invalid customer_id", zap.Error(err))
+		return fmt.Errorf("invalid customer_id: %w", err)
+	}
+	orderDate, err := time.Parse(time.RFC3339, order.OrderDate)
+	if err != nil {
+		logger.Error("invalid order_date", zap.Error(err))
+		return fmt.Errorf("invalid order_date: %w", err)
+	}
+	grandTotal, err := decimal.NewFromString(order.GrandTotal)
+	if err != nil {
+		logger.Error("invalid grand_total", zap.Error(err))
+		return fmt.Errorf("invalid grand_total: %w", err)
+	}
 
+	statusBefore := enums.OrderStatus(order.StatusBeforeCancel)
+	shouldRevert := statusBefore != enums.OrderStatusDraft && statusBefore != ""
+	logger.Info("cancellation revert decision", zap.Bool("should_revert", shouldRevert), zap.String("status_before", string(statusBefore)))
+
+	now := time.Now()
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
+		logger.Error("failed to begin tx", zap.Error(err))
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
+	// Close previous status and record cancelled status
 	if statusBefore != "" {
 		if err := s.analyticsRepo.CloseOrderStatusHistory(ctx, tx, orderID, statusBefore, now); err != nil {
-			s.logger.Warn("failed to close previous status", zap.Error(err))
+			logger.Warn("failed to close previous status", zap.String("status", string(statusBefore)), zap.Error(err))
+		} else {
+			logger.Info("closed previous status history", zap.String("status", string(statusBefore)))
 		}
 	}
 	history := &sales_analytics.OrderStatusHistory{
@@ -688,8 +736,12 @@ func (s *salesAnalyticsService) onOrderCancelled(ctx context.Context, order sale
 		EnteredAt: now,
 	}
 	if err := s.analyticsRepo.InsertOrderStatusHistory(ctx, tx, history); err != nil {
-		return fmt.Errorf("insert cancelled status: %w", err)
+		logger.Error("failed to insert cancelled status", zap.Error(err))
+		return err
 	}
+	logger.Info("inserted cancelled status history")
+
+	// Record cancellation reason
 	cancelReason := &sales_analytics.OrderCancellationReason{
 		OrderID:                 orderID,
 		CompanyID:               companyID,
@@ -703,9 +755,128 @@ func (s *salesAnalyticsService) onOrderCancelled(ctx context.Context, order sale
 		cancelReason.CancelledBy = &cancelledBy
 	}
 	if err := s.analyticsRepo.InsertOrderCancellationReason(ctx, tx, cancelReason); err != nil {
-		s.logger.Error("failed to insert cancellation reason", zap.Error(err))
+		logger.Error("failed to insert cancellation reason", zap.Error(err))
+	} else {
+		logger.Info("cancellation reason recorded")
 	}
-	return tx.Commit()
+
+	if !shouldRevert {
+		logger.Info("order was draft or unknown status, no revenue revert needed")
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit tx: %w", err)
+		}
+		return nil
+	}
+
+	// --- REVERT COUNTERS ---
+	// Decrement daily orders
+	if err := s.analyticsRepo.IncrementDailyOrders(ctx, tx, companyID, orderDate, -1); err != nil {
+		logger.Error("failed to decrement daily orders", zap.Error(err))
+		return err
+	}
+	logger.Info("daily orders decremented", zap.String("date", orderDate.Format("2006-01-02")))
+
+	// Decrement daily revenue
+	if err := s.analyticsRepo.AddDailyRevenue(ctx, tx, companyID, orderDate, grandTotal.Neg()); err != nil {
+		logger.Error("failed to decrement daily revenue", zap.Error(err))
+		return err
+	}
+	logger.Info("daily revenue decremented", zap.String("amount", grandTotal.Neg().String()))
+
+	// Unique customers - check if any other orders remain for this customer on the same date
+	var otherOrders int
+	query := `
+		SELECT COUNT(*) FROM sales.orders
+		WHERE company_id = $1 AND customer_id = $2 AND order_date = $3
+		  AND status NOT IN ('cancelled', 'refunded')
+		  AND order_id != $4
+	`
+	err = tx.QueryRowContext(ctx, query, companyID, customerID, orderDate, orderID).Scan(&otherOrders)
+	if err != nil {
+		logger.Warn("failed to check other orders for unique customer", zap.Error(err))
+	} else {
+		if otherOrders == 0 {
+			if err := s.analyticsRepo.RemoveUniqueCustomer(ctx, tx, companyID, orderDate, customerID); err != nil {
+				logger.Warn("failed to remove unique customer", zap.Error(err))
+			} else {
+				logger.Info("unique customer removed (no other orders for customer on this date)")
+			}
+		} else {
+			logger.Info("unique customer not removed, other orders exist", zap.Int("other_orders", otherOrders))
+		}
+	}
+
+	// Update customer metrics (negative)
+	metric := &sales_analytics.CustomerMetric{
+		CustomerID:    customerID,
+		CompanyID:     companyID,
+		TotalOrders:   -1,
+		TotalSpent:    grandTotal.Neg(),
+		LifetimeValue: grandTotal.Neg(),
+	}
+	if err := s.analyticsRepo.UpdateCustomerMetrics(ctx, tx, metric); err != nil {
+		logger.Warn("failed to update customer metrics", zap.Error(err))
+	} else {
+		logger.Info("customer metrics decremented")
+	}
+
+	// Product sales facts (negative)
+	for _, item := range order.Items {
+		productID, err := uuid.Parse(item.ProductID)
+		if err != nil {
+			logger.Warn("invalid product_id in order items", zap.String("product_id", item.ProductID), zap.Error(err))
+			continue
+		}
+		quantity, err := decimal.NewFromString(item.Quantity)
+		if err != nil {
+			logger.Warn("invalid quantity", zap.String("quantity", item.Quantity), zap.Error(err))
+			continue
+		}
+		unitPrice, err := decimal.NewFromString(item.UnitPrice)
+		if err != nil {
+			logger.Warn("invalid unit_price", zap.String("unit_price", item.UnitPrice), zap.Error(err))
+			continue
+		}
+		discount, _ := decimal.NewFromString(item.DiscountTotal)
+		revenue := quantity.Mul(unitPrice)
+
+		if err := s.analyticsRepo.AddProductSales(ctx, tx, companyID, productID, orderDate, quantity.Neg(), revenue.Neg(), discount.Neg()); err != nil {
+			logger.Error("failed to revert product sales", zap.String("product_id", productID.String()), zap.Error(err))
+		} else {
+			logger.Debug("product sales reverted", zap.String("product_id", productID.String()), zap.String("quantity", quantity.Neg().String()))
+		}
+	}
+
+	// Sales rep performance (negative)
+	salesRepID := uuid.Nil
+	if order.SalesRepID != "" {
+		salesRepID, _ = uuid.Parse(order.SalesRepID)
+	}
+	if salesRepID != uuid.Nil {
+		if err := s.analyticsRepo.DecrementSalesRepPerformance(ctx, tx, companyID, salesRepID, orderDate, grandTotal); err != nil {
+			logger.Warn("failed to decrement sales rep performance", zap.Error(err))
+		} else {
+			logger.Info("sales rep performance decremented", zap.String("sales_rep_id", salesRepID.String()))
+		}
+		if err := s.analyticsRepo.UpdateSalesRepTargetAchievement(ctx, tx, companyID, salesRepID, orderDate, orderDate, grandTotal.Neg()); err != nil {
+			logger.Warn("failed to decrement target achievement", zap.Error(err))
+		}
+	}
+
+	// Hourly sales (negative)
+	hourBucket := time.Date(orderDate.Year(), orderDate.Month(), orderDate.Day(), orderDate.Hour(), 0, 0, 0, orderDate.Location())
+	if err := s.analyticsRepo.DecrementOrderHourlySales(ctx, tx, companyID, hourBucket, grandTotal); err != nil {
+		logger.Warn("failed to decrement hourly sales", zap.Error(err))
+	} else {
+		logger.Info("hourly sales decremented", zap.String("hour", hourBucket.Format("2006-01-02 15:00")))
+	}
+
+	if err := tx.Commit(); err != nil {
+		logger.Error("failed to commit tx", zap.Error(err))
+		return fmt.Errorf("commit tx: %w", err)
+	}
+	logger.Info("order cancelled event processed with full revert")
+	return nil
 }
 
 // ----------------------------------------------------------------------------

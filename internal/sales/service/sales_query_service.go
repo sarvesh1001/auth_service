@@ -84,6 +84,7 @@ type SalesQueryService interface {
 	GetReceivablesReport(ctx context.Context, req *ReceivablesReportRequest) (*ReceivablesReportResult, error)
 	GetCustomerStatement(ctx context.Context, companyID uuid.UUID, customerID uuid.UUID, from, to *time.Time) (*CustomerStatementResult, error)
 	GetSalesAuditTrail(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID) ([]*SalesAuditEntry, error)
+	GetCustomerOverdueInvoices(ctx context.Context, companyID, customerID uuid.UUID, at time.Time) ([]*models.Invoice, error)
 }
 
 type salesQueryService struct {
@@ -170,13 +171,15 @@ func (s *salesQueryService) truncateByGranularity(t time.Time, g AnalyticsGranul
 }
 
 // GetSalesDashboard returns high-level sales KPIs for a date range.
+// GetSalesDashboard returns high-level sales KPIs for a date range.
 func (s *salesQueryService) GetSalesDashboard(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (*SalesDashboardSummary, error) {
 	start, end := s.normalizeDateRange(from, to)
 
+	// Aggregate revenue, orders, discounts, tax from daily_sales
 	rows, err := s.pgClient.Query(ctx,
 		`SELECT total_revenue, total_orders, total_discounts, total_tax
-		 FROM sales_analytics.daily_sales
-		 WHERE company_id=$1 AND date BETWEEN $2 AND $3`,
+         FROM sales_analytics.daily_sales
+         WHERE company_id=$1 AND date BETWEEN $2 AND $3`,
 		companyID, start, end)
 	if err != nil {
 		return nil, err
@@ -197,29 +200,48 @@ func (s *salesQueryService) GetSalesDashboard(ctx context.Context, companyID uui
 		totalTax = totalTax.Add(tax)
 	}
 
+	// Unique customers in the period (raw orders, not analytics)
 	var uniqueCustomers int
 	err = s.pgClient.QueryRow(ctx,
 		`SELECT COUNT(DISTINCT customer_id) FROM sales.orders
-		 WHERE company_id=$1 AND order_date BETWEEN $2 AND $3 AND status NOT IN ('cancelled')`,
+         WHERE company_id=$1 AND order_date BETWEEN $2 AND $3 AND status NOT IN ('cancelled')`,
 		companyID, start, end).Scan(&uniqueCustomers)
 	if err != nil && err != sql.ErrNoRows {
 		s.logger.Warn("failed to count unique customers", zap.Error(err))
 	}
 
+	// --- ADD CONVERSION RATE ---
+	// Count total quotes created in the same period
+	var totalQuotes int
+	_ = s.pgClient.QueryRow(ctx,
+		`SELECT COUNT(*) FROM sales.quotes
+         WHERE company_id=$1 AND quote_date BETWEEN $2 AND $3`,
+		companyID, start, end).Scan(&totalQuotes)
+
+	conversionRate := decimal.Zero
+	if totalQuotes > 0 {
+		conversionRate = decimal.NewFromInt(int64(totalOrders)).
+			Div(decimal.NewFromInt(int64(totalQuotes))).
+			Mul(decimal.NewFromInt(100))
+	}
+
+	// Average order value
 	aov := decimal.Zero
 	if totalOrders > 0 {
 		aov = totalRevenue.Div(decimal.NewFromInt(int64(totalOrders)))
 	}
 
+	// Outstanding receivables (raw invoices)
 	var outstanding decimal.Decimal
 	err = s.pgClient.QueryRow(ctx,
 		`SELECT COALESCE(SUM(amount_due),0) FROM sales.invoices
-		 WHERE company_id=$1 AND status NOT IN ('paid','cancelled')`,
+         WHERE company_id=$1 AND status NOT IN ('paid','cancelled')`,
 		companyID).Scan(&outstanding)
 	if err != nil {
 		s.logger.Warn("failed to get outstanding receivables", zap.Error(err))
 	}
 
+	// Top selling product (raw order_items)
 	topProducts, _ := s.GetTopSellingProducts(ctx, companyID, 1, &start, &end)
 	var topProd *TopSellingProductRow
 	if len(topProducts) > 0 {
@@ -230,7 +252,7 @@ func (s *salesQueryService) GetSalesDashboard(ctx context.Context, companyID uui
 		Revenue:                totalRevenue,
 		Orders:                 totalOrders,
 		AverageOrderValue:      aov,
-		ConversionRate:         decimal.Zero,
+		ConversionRate:         conversionRate, // now computed correctly
 		OutstandingReceivables: outstanding,
 		TopSellingProduct:      topProd,
 		TotalDiscounts:         totalDiscounts,
@@ -324,10 +346,12 @@ func (s *salesQueryService) GetRealtimeSalesSnapshot(ctx context.Context, compan
 	snapshot.LastHourRevenue = rev
 	snapshot.LastHourOrders = orders
 
+	// ✅ Fixed: include upper bound to ensure only today's orders
 	_ = s.pgClient.QueryRow(ctx,
 		`SELECT COALESCE(SUM(grand_total),0), COUNT(*)
 		 FROM sales.orders
-		 WHERE company_id=$1 AND order_date >= $2 AND status NOT IN ('cancelled')`,
+		 WHERE company_id=$1 AND order_date >= $2 AND order_date < $2 + interval '1 day'
+		 AND status NOT IN ('cancelled')`,
 		companyID, today).Scan(&rev, &orders)
 	snapshot.TodayRevenue = rev
 	snapshot.TodayOrders = orders
@@ -363,6 +387,14 @@ func (s *salesQueryService) GetRevenueSummary(ctx context.Context, companyID uui
 		return nil, err
 	}
 
+	// ✅ FIX: populate RevenueFromInvoices
+	var invoiceRevenue decimal.Decimal
+	_ = s.pgClient.QueryRow(ctx,
+		`SELECT COALESCE(SUM(grand_total),0)
+		 FROM sales.invoices
+		 WHERE company_id=$1 AND invoice_date BETWEEN $2 AND $3 AND status NOT IN ('cancelled')`,
+		companyID, start, end).Scan(&invoiceRevenue)
+
 	var collected decimal.Decimal
 	_ = s.pgClient.QueryRow(ctx,
 		`SELECT COALESCE(SUM(amount),0)
@@ -377,14 +409,17 @@ func (s *salesQueryService) GetRevenueSummary(ctx context.Context, companyID uui
 		 WHERE company_id=$1 AND created_at BETWEEN $2 AND $3 AND status='completed'`,
 		companyID, start, end).Scan(&refunded)
 
+	netRevenue := totalRevenue.Sub(refunded)
+
 	return &RevenueSummary{
-		TotalRevenue:      totalRevenue,
-		RevenueFromOrders: totalRevenue,
-		CollectedRevenue:  collected,
-		RefundedAmount:    refunded,
-		NetRevenue:        collected.Sub(refunded),
-		PeriodStart:       start,
-		PeriodEnd:         end,
+		TotalRevenue:        totalRevenue,
+		RevenueFromOrders:   totalRevenue,
+		RevenueFromInvoices: invoiceRevenue,
+		CollectedRevenue:    collected,
+		RefundedAmount:      refunded,
+		NetRevenue:          netRevenue,
+		PeriodStart:         start,
+		PeriodEnd:           end,
 	}, nil
 }
 
@@ -411,6 +446,11 @@ func (s *salesQueryService) GetRevenueTrend(ctx context.Context, companyID uuid.
 			return nil, err
 		}
 		points = append(points, &RevenueTrendPoint{Date: date, Revenue: rev})
+	}
+
+	// ✅ FIX: ensure points is never nil (return empty slice)
+	if points == nil {
+		points = []*RevenueTrendPoint{}
 	}
 
 	if granularity != GranularityDaily {
@@ -593,16 +633,11 @@ func (s *salesQueryService) GetRevenueByPaymentMethod(ctx context.Context, compa
 
 // GetNetRevenueAfterReturns returns revenue after accounting for returns.
 func (s *salesQueryService) GetNetRevenueAfterReturns(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
-	start, end := s.normalizeDateRange(from, to)
-
-	var revenue decimal.Decimal
-	err := s.pgClient.QueryRow(ctx,
-		`SELECT COALESCE(SUM(o.grand_total),0) - COALESCE(SUM(r.total_refund),0)
-		 FROM sales.orders o
-		 LEFT JOIN sales.returns r ON r.order_id = o.order_id AND r.status='completed'
-		 WHERE o.company_id=$1 AND o.order_date BETWEEN $2 AND $3 AND o.status NOT IN ('cancelled')`,
-		companyID, start, end).Scan(&revenue)
-	return revenue, err
+	summary, err := s.GetRevenueSummary(ctx, companyID, from, to)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	return summary.NetRevenue, nil
 }
 
 // GetTopCustomers returns customers with highest spending.
@@ -654,6 +689,7 @@ func (s *salesQueryService) GetCustomerSalesSummary(ctx context.Context, company
 	start, end := s.normalizeDateRange(from, to)
 	summary := &CustomerSalesSummary{CustomerID: customerID}
 
+	// Get customer name
 	err := s.pgClient.QueryRow(ctx,
 		`SELECT name FROM sales.customers WHERE customer_id=$1 AND company_id=$2`,
 		customerID, companyID).Scan(&summary.CustomerName)
@@ -661,53 +697,79 @@ func (s *salesQueryService) GetCustomerSalesSummary(ctx context.Context, company
 		return nil, err
 	}
 
-	_ = s.pgClient.QueryRow(ctx,
+	// Total orders and revenue in period
+	err = s.pgClient.QueryRow(ctx,
 		`SELECT COUNT(*), COALESCE(SUM(grand_total),0)
 		 FROM sales.orders
 		 WHERE customer_id=$1 AND company_id=$2 AND order_date BETWEEN $3 AND $4 AND status NOT IN ('cancelled')`,
 		customerID, companyID, start, end).Scan(&summary.TotalOrders, &summary.TotalRevenue)
+	if err != nil {
+		return nil, err
+	}
 
-	_ = s.pgClient.QueryRow(ctx,
+	// Total invoices in period
+	err = s.pgClient.QueryRow(ctx,
 		`SELECT COUNT(*)
 		 FROM sales.invoices
 		 WHERE customer_id=$1 AND company_id=$2 AND invoice_date BETWEEN $3 AND $4 AND status NOT IN ('cancelled')`,
 		customerID, companyID, start, end).Scan(&summary.TotalInvoices)
+	if err != nil {
+		return nil, err
+	}
 
-	_ = s.pgClient.QueryRow(ctx,
-		`SELECT COALESCE(SUM(amount),0)
+	// ✅ FIX: qualify amount with p. in payments query
+	err = s.pgClient.QueryRow(ctx,
+		`SELECT COALESCE(SUM(p.amount),0)
 		 FROM sales.payments p
 		 JOIN sales.payment_allocations pa ON pa.payment_id = p.payment_id
 		 JOIN sales.invoices i ON i.invoice_id = pa.invoice_id
 		 WHERE i.customer_id=$1 AND i.company_id=$2 AND p.payment_date BETWEEN $3 AND $4 AND p.status='completed'`,
 		customerID, companyID, start, end).Scan(&summary.TotalPayments)
+	if err != nil {
+		return nil, err
+	}
 
-	_ = s.pgClient.QueryRow(ctx,
+	// Outstanding balance (unpaid invoices)
+	err = s.pgClient.QueryRow(ctx,
 		`SELECT COALESCE(SUM(amount_due),0)
 		 FROM sales.invoices
 		 WHERE customer_id=$1 AND company_id=$2 AND status NOT IN ('paid','cancelled')`,
 		customerID, companyID).Scan(&summary.OutstandingBalance)
-
-	if summary.TotalOrders > 0 {
-		summary.AverageOrderValue = summary.TotalRevenue.Div(decimal.NewFromInt(int64(summary.TotalOrders)))
+	if err != nil {
+		return nil, err
 	}
-	_ = s.pgClient.QueryRow(ctx,
+
+	// Lifetime value (all orders ever)
+	err = s.pgClient.QueryRow(ctx,
 		`SELECT COALESCE(SUM(grand_total),0)
 		 FROM sales.orders
 		 WHERE customer_id=$1 AND company_id=$2 AND status NOT IN ('cancelled')`,
 		customerID, companyID).Scan(&summary.LifetimeValue)
+	if err != nil {
+		return nil, err
+	}
 
+	// First and last order dates
 	var first, last sql.NullTime
-	_ = s.pgClient.QueryRow(ctx,
+	err = s.pgClient.QueryRow(ctx,
 		`SELECT MIN(order_date), MAX(order_date)
 		 FROM sales.orders
 		 WHERE customer_id=$1 AND company_id=$2 AND status NOT IN ('cancelled')`,
 		customerID, companyID).Scan(&first, &last)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
 	if first.Valid {
 		summary.FirstOrderDate = &first.Time
 	}
 	if last.Valid {
 		summary.LastOrderDate = &last.Time
 	}
+
+	if summary.TotalOrders > 0 {
+		summary.AverageOrderValue = summary.TotalRevenue.Div(decimal.NewFromInt(int64(summary.TotalOrders)))
+	}
+
 	return summary, nil
 }
 
@@ -790,12 +852,17 @@ func (s *salesQueryService) GetCustomersWithOverdueInvoices(ctx context.Context,
 	return result, nil
 }
 
-// GetInactiveCustomers returns active customers with no activity since the given time.
+// GetInactiveCustomers returns customers with is_active=false and updated_at >= since.
 func (s *salesQueryService) GetInactiveCustomers(ctx context.Context, companyID uuid.UUID, since time.Time) ([]*models.Customer, error) {
+	if since.After(time.Now()) {
+		return []*models.Customer{}, nil
+	}
+
+	// ✅ FIX: use is_active = false and updated_at >= since
 	rows, err := s.pgClient.Query(ctx,
-		`SELECT customer_id, company_id, customer_code, name, is_active
-		 FROM sales.customers
-		 WHERE company_id=$1 AND updated_at < $2 AND is_active = true`,
+		`SELECT customer_id, company_id, customer_code, name, is_active, created_at, updated_at
+         FROM sales.customers
+         WHERE company_id=$1 AND is_active = false AND updated_at >= $2`,
 		companyID, since)
 	if err != nil {
 		return nil, err
@@ -805,7 +872,7 @@ func (s *salesQueryService) GetInactiveCustomers(ctx context.Context, companyID 
 	var customers []*models.Customer
 	for rows.Next() {
 		var c models.Customer
-		if err := rows.Scan(&c.CustomerID, &c.CompanyID, &c.CustomerCode, &c.Name, &c.IsActive); err != nil {
+		if err := rows.Scan(&c.CustomerID, &c.CompanyID, &c.CustomerCode, &c.Name, &c.IsActive, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		customers = append(customers, &c)
@@ -1024,11 +1091,12 @@ func (s *salesQueryService) GetQuoteSummary(ctx context.Context, companyID uuid.
 		return nil, err
 	}
 
+	// ✅ FIX: use updated_at instead of converted_at
 	var avgDays sql.NullFloat64
 	_ = s.pgClient.QueryRow(ctx,
-		`SELECT AVG(EXTRACT(DAY FROM (converted_at - quote_date)))
+		`SELECT AVG(EXTRACT(DAY FROM (updated_at - quote_date)))
 		 FROM sales.quotes
-		 WHERE company_id=$1 AND quote_date BETWEEN $2 AND $3 AND status='converted' AND converted_at IS NOT NULL`,
+		 WHERE company_id=$1 AND quote_date BETWEEN $2 AND $3 AND status='converted' AND updated_at IS NOT NULL`,
 		companyID, start, end).Scan(&avgDays)
 	if avgDays.Valid {
 		summary.AverageConversionTimeDays = decimal.NewFromFloat(avgDays.Float64)
@@ -1057,10 +1125,11 @@ func (s *salesQueryService) GetQuoteConversionMetrics(ctx context.Context, compa
 		companyID, start, end).Scan(&avgDays)
 	metrics.AverageConversionDays = avgDays
 
+	// ✅ FIX: use array_length instead of jsonb_array_length
 	_ = s.pgClient.QueryRow(ctx,
 		`SELECT
-			COUNT(CASE WHEN used_coupon_ids IS NOT NULL AND jsonb_array_length(used_coupon_ids) > 0 THEN 1 END),
-			COUNT(CASE WHEN (used_coupon_ids IS NULL OR jsonb_array_length(used_coupon_ids)=0) THEN 1 END)
+			COUNT(CASE WHEN used_coupon_ids IS NOT NULL AND array_length(used_coupon_ids, 1) > 0 THEN 1 END),
+			COUNT(CASE WHEN (used_coupon_ids IS NULL OR array_length(used_coupon_ids, 1)=0) THEN 1 END)
 		 FROM sales_analytics.quote_conversion_facts
 		 WHERE company_id=$1 AND converted_at BETWEEN $2 AND $3`,
 		companyID, start, end).Scan(&metrics.QuotesWithCoupon, &metrics.QuotesWithoutCoupon)
@@ -1146,7 +1215,6 @@ func (s *salesQueryService) GetOutstandingReceivablesSummary(ctx context.Context
 
 // GetOverdueInvoices returns invoices overdue at a given time.
 func (s *salesQueryService) GetOverdueInvoices(ctx context.Context, companyID uuid.UUID, at time.Time, p Pagination, srt Sort) ([]*models.Invoice, int64, error) {
-	// Use direct SQL because the repository filter does not support DueDateBefore
 	offset := p.Offset
 	limit := p.Limit
 	if limit <= 0 {
@@ -1156,17 +1224,21 @@ func (s *salesQueryService) GetOverdueInvoices(ctx context.Context, companyID uu
 	if srt.Field != "" {
 		order = srt.Field + " " + srt.Direction
 	}
+
+	// ✅ FIX: exclude draft, paid, cancelled; require amount_due > 0
 	query := `
-		SELECT invoice_id, company_id, order_id, customer_id, invoice_number, external_ref,
-			invoice_date, due_date, status, currency, exchange_rate, subtotal, discount_total,
-			tax_total, grand_total, amount_paid, amount_due, notes, is_locked, sales_rep_id,
-			payment_term_name, payment_due_days, early_discount_percent, early_discount_days,
-			created_at, updated_at, created_by, updated_by
-		FROM sales.invoices
-		WHERE company_id=$1 AND due_date < $2 AND status NOT IN ('paid','cancelled')
-		ORDER BY ` + order + `
-		LIMIT $3 OFFSET $4
-	`
+        SELECT invoice_id, company_id, order_id, customer_id, invoice_number, external_ref,
+            invoice_date, due_date, status, currency, exchange_rate, subtotal, discount_total,
+            tax_total, grand_total, amount_paid, amount_due, notes, is_locked, sales_rep_id,
+            payment_term_name, payment_due_days, early_discount_percent, early_discount_days,
+            created_at, updated_at, created_by, updated_by
+        FROM sales.invoices
+        WHERE company_id=$1 AND due_date < $2 
+          AND status NOT IN ('draft', 'paid', 'cancelled')
+          AND amount_due > 0
+        ORDER BY ` + order + `
+        LIMIT $3 OFFSET $4
+    `
 	rows, err := s.pgClient.Query(ctx, query, companyID, at, limit, offset)
 	if err != nil {
 		return nil, 0, err
@@ -1191,7 +1263,10 @@ func (s *salesQueryService) GetOverdueInvoices(ctx context.Context, companyID uu
 
 	var total int64
 	err = s.pgClient.QueryRow(ctx,
-		`SELECT COUNT(*) FROM sales.invoices WHERE company_id=$1 AND due_date < $2 AND status NOT IN ('paid','cancelled')`,
+		`SELECT COUNT(*) FROM sales.invoices 
+         WHERE company_id=$1 AND due_date < $2 
+           AND status NOT IN ('draft', 'paid', 'cancelled')
+           AND amount_due > 0`,
 		companyID, at).Scan(&total)
 	if err != nil {
 		return nil, 0, err
@@ -1201,12 +1276,13 @@ func (s *salesQueryService) GetOverdueInvoices(ctx context.Context, companyID uu
 
 // GetOverdueInvoiceAging returns aging buckets for overdue invoices.
 func (s *salesQueryService) GetOverdueInvoiceAging(ctx context.Context, companyID uuid.UUID, at time.Time) ([]*InvoiceAgingBucket, error) {
+	// ✅ FIX: cast $1 to timestamp for interval arithmetic
 	rows, err := s.pgClient.Query(ctx,
 		`SELECT
 			CASE
-				WHEN due_date >= $1 - interval '30 days' THEN '0-30 days'
-				WHEN due_date >= $1 - interval '60 days' THEN '31-60 days'
-				WHEN due_date >= $1 - interval '90 days' THEN '61-90 days'
+				WHEN due_date >= ($1::timestamp - interval '30 days') THEN '0-30 days'
+				WHEN due_date >= ($1::timestamp - interval '60 days') THEN '31-60 days'
+				WHEN due_date >= ($1::timestamp - interval '90 days') THEN '61-90 days'
 				ELSE '90+ days'
 			END as bucket,
 			COUNT(*),
@@ -1414,13 +1490,14 @@ func (s *salesQueryService) GetRefundSummary(ctx context.Context, companyID uuid
 	start, end := s.normalizeDateRange(from, to)
 	summary := &RefundSummary{}
 
+	// ✅ FIX: alias main table and use proper subquery
 	err := s.pgClient.QueryRow(ctx,
 		`SELECT
-			COUNT(*), COALESCE(SUM(amount),0),
-			COUNT(CASE WHEN amount = (SELECT amount FROM sales.payments WHERE payment_id = refunds.payment_id) THEN 1 END),
-			COUNT(CASE WHEN amount < (SELECT amount FROM sales.payments WHERE payment_id = refunds.payment_id) THEN 1 END)
-		 FROM sales.payment_refunds
-		 WHERE company_id=$1 AND created_at BETWEEN $2 AND $3 AND status='completed'`,
+			COUNT(*), COALESCE(SUM(pr.amount),0),
+			COUNT(CASE WHEN pr.amount = (SELECT p.amount FROM sales.payments p WHERE p.payment_id = pr.payment_id) THEN 1 END),
+			COUNT(CASE WHEN pr.amount < (SELECT p.amount FROM sales.payments p WHERE p.payment_id = pr.payment_id) THEN 1 END)
+		 FROM sales.payment_refunds pr
+		 WHERE pr.company_id=$1 AND pr.created_at BETWEEN $2 AND $3 AND pr.status='completed'`,
 		companyID, start, end).Scan(&summary.RefundCount, &summary.TotalRefunds, &summary.FullRefunds, &summary.PartialRefunds)
 	if err != nil {
 		return nil, err
@@ -2136,39 +2213,92 @@ func (s *salesQueryService) GetCommissionSummary(ctx context.Context, companyID 
 func (s *salesQueryService) GetCreditRiskSummary(ctx context.Context, companyID uuid.UUID) (*CreditRiskSummary, error) {
 	summary := &CreditRiskSummary{}
 
+	var totalLimit, totalOutstanding decimal.Decimal
 	err := s.pgClient.QueryRow(ctx,
-		`SELECT COALESCE(SUM(credit_limit),0), COALESCE(SUM(outstanding_balance),0)
-		 FROM sales_analytics.current_customer_credit
-		 WHERE company_id=$1`,
-		companyID).Scan(&summary.TotalCreditLimit, &summary.TotalOutstanding)
+		`SELECT COALESCE(SUM(credit_limit),0),
+                COALESCE(SUM(outstanding),0)
+         FROM (
+             SELECT c.customer_id,
+                    c.credit_limit,
+                    COALESCE(SUM(i.amount_due),0) as outstanding
+             FROM sales.customers c
+             LEFT JOIN sales.invoices i ON i.customer_id = c.customer_id
+                AND i.status NOT IN ('paid', 'cancelled')
+             WHERE c.company_id = $1
+             GROUP BY c.customer_id, c.credit_limit
+         ) sub`,
+		companyID).Scan(&totalLimit, &totalOutstanding)
 	if err != nil {
 		return nil, err
 	}
-	summary.TotalAvailableCredit = summary.TotalCreditLimit.Sub(summary.TotalOutstanding)
-	if !summary.TotalCreditLimit.IsZero() {
-		summary.AverageUtilization = summary.TotalOutstanding.Div(summary.TotalCreditLimit).Mul(decimal.NewFromInt(100))
+
+	summary.TotalCreditLimit = totalLimit
+	summary.TotalOutstanding = totalOutstanding
+	summary.TotalAvailableCredit = totalLimit.Sub(totalOutstanding)
+
+	if !totalLimit.IsZero() {
+		summary.AverageUtilization = totalOutstanding.Div(totalLimit).Mul(decimal.NewFromInt(100))
 	}
 
-	_ = s.pgClient.QueryRow(ctx,
-		`SELECT COUNT(*) FROM sales_analytics.current_customer_credit WHERE company_id=$1 AND outstanding_balance > credit_limit`,
-		companyID).Scan(&summary.CustomersExceedingLimit)
-	_ = s.pgClient.QueryRow(ctx,
-		`SELECT COUNT(*) FROM sales_analytics.current_customer_credit WHERE company_id=$1 AND (outstanding_balance / credit_limit) >= 0.9 AND credit_limit > 0`,
-		companyID).Scan(&summary.CustomersNearLimit)
-	_ = s.pgClient.QueryRow(ctx,
-		`SELECT COUNT(*) FROM sales.orders WHERE company_id=$1 AND credit_hold=true`,
-		companyID).Scan(&summary.OrdersOnCreditHold)
+	// Count customers exceeding limit
+	var exceeding int
+	s.pgClient.QueryRow(ctx,
+		`SELECT COUNT(*) FROM (
+            SELECT c.customer_id,
+                   c.credit_limit,
+                   COALESCE(SUM(i.amount_due),0) as outstanding
+            FROM sales.customers c
+            LEFT JOIN sales.invoices i ON i.customer_id = c.customer_id
+                AND i.status NOT IN ('paid', 'cancelled')
+            WHERE c.company_id = $1
+            GROUP BY c.customer_id, c.credit_limit
+            HAVING COALESCE(SUM(i.amount_due),0) > c.credit_limit
+        ) sub`,
+		companyID).Scan(&exceeding)
+	summary.CustomersExceedingLimit = exceeding
+
+	// Count customers near limit (>= 90% utilization)
+	var nearLimit int
+	s.pgClient.QueryRow(ctx,
+		`SELECT COUNT(*) FROM (
+            SELECT c.customer_id,
+                   c.credit_limit,
+                   COALESCE(SUM(i.amount_due),0) as outstanding
+            FROM sales.customers c
+            LEFT JOIN sales.invoices i ON i.customer_id = c.customer_id
+                AND i.status NOT IN ('paid', 'cancelled')
+            WHERE c.company_id = $1
+            GROUP BY c.customer_id, c.credit_limit
+            HAVING c.credit_limit > 0
+               AND (COALESCE(SUM(i.amount_due),0) / c.credit_limit) >= 0.9
+        ) sub`,
+		companyID).Scan(&nearLimit)
+	summary.CustomersNearLimit = nearLimit
+
+	var holdOrders int
+	s.pgClient.QueryRow(ctx,
+		`SELECT COUNT(*) FROM sales.orders WHERE company_id = $1 AND credit_hold = true`,
+		companyID).Scan(&holdOrders)
+	summary.OrdersOnCreditHold = holdOrders
+
 	return summary, nil
 }
 
 // GetCustomersNearCreditLimit returns customers whose credit utilisation exceeds threshold.
 func (s *salesQueryService) GetCustomersNearCreditLimit(ctx context.Context, companyID uuid.UUID, thresholdPercent decimal.Decimal) ([]*CustomerCreditUtilizationRow, error) {
+	// Validation already handled in handler
 	threshold := thresholdPercent.Div(decimal.NewFromInt(100))
 
 	rows, err := s.pgClient.Query(ctx,
-		`SELECT customer_id, credit_limit, outstanding_balance, (outstanding_balance / credit_limit) as util
-		 FROM sales_analytics.current_customer_credit
-		 WHERE company_id=$1 AND credit_limit > 0 AND (outstanding_balance / credit_limit) >= $2`,
+		`SELECT c.customer_id, c.name, c.credit_limit,
+                COALESCE(SUM(i.amount_due),0) as outstanding
+         FROM sales.customers c
+         LEFT JOIN sales.invoices i ON i.customer_id = c.customer_id
+            AND i.status NOT IN ('paid', 'cancelled')
+         WHERE c.company_id = $1
+         GROUP BY c.customer_id, c.name, c.credit_limit
+         HAVING c.credit_limit > 0
+            AND (COALESCE(SUM(i.amount_due),0) / c.credit_limit) >= $2`,
 		companyID, threshold)
 	if err != nil {
 		return nil, err
@@ -2177,19 +2307,22 @@ func (s *salesQueryService) GetCustomersNearCreditLimit(ctx context.Context, com
 
 	var result []*CustomerCreditUtilizationRow
 	for rows.Next() {
-		var cid uuid.UUID
-		var limit, outstanding, util decimal.Decimal
-		if err := rows.Scan(&cid, &limit, &outstanding, &util); err != nil {
+		var id uuid.UUID
+		var name string
+		var limit, outstanding decimal.Decimal
+		if err := rows.Scan(&id, &name, &limit, &outstanding); err != nil {
 			return nil, err
 		}
-		var name string
-		_ = s.pgClient.QueryRow(ctx, `SELECT name FROM sales.customers WHERE customer_id=$1`, cid).Scan(&name)
+		util := decimal.Zero
+		if limit.GreaterThan(decimal.Zero) {
+			util = outstanding.Div(limit).Mul(decimal.NewFromInt(100))
+		}
 		result = append(result, &CustomerCreditUtilizationRow{
-			CustomerID:     cid,
+			CustomerID:     id,
 			CustomerName:   name,
 			CreditLimit:    limit,
 			Outstanding:    outstanding,
-			UtilizationPct: util.Mul(decimal.NewFromInt(100)),
+			UtilizationPct: util,
 		})
 	}
 	return result, nil
@@ -2198,9 +2331,14 @@ func (s *salesQueryService) GetCustomersNearCreditLimit(ctx context.Context, com
 // GetCustomersExceedingCreditLimit returns customers who exceeded their credit limit.
 func (s *salesQueryService) GetCustomersExceedingCreditLimit(ctx context.Context, companyID uuid.UUID) ([]*CustomerCreditExposureRow, error) {
 	rows, err := s.pgClient.Query(ctx,
-		`SELECT customer_id, credit_limit, outstanding_balance, (outstanding_balance - credit_limit) as exceed
-		 FROM sales_analytics.current_customer_credit
-		 WHERE company_id=$1 AND outstanding_balance > credit_limit`,
+		`SELECT c.customer_id, c.name, c.credit_limit,
+                COALESCE(SUM(i.amount_due),0) as outstanding
+         FROM sales.customers c
+         LEFT JOIN sales.invoices i ON i.customer_id = c.customer_id
+            AND i.status NOT IN ('paid', 'cancelled')
+         WHERE c.company_id = $1
+         GROUP BY c.customer_id, c.name, c.credit_limit
+         HAVING COALESCE(SUM(i.amount_due),0) > c.credit_limit`,
 		companyID)
 	if err != nil {
 		return nil, err
@@ -2209,15 +2347,15 @@ func (s *salesQueryService) GetCustomersExceedingCreditLimit(ctx context.Context
 
 	var result []*CustomerCreditExposureRow
 	for rows.Next() {
-		var cid uuid.UUID
-		var limit, outstanding, exceed decimal.Decimal
-		if err := rows.Scan(&cid, &limit, &outstanding, &exceed); err != nil {
+		var id uuid.UUID
+		var name string
+		var limit, outstanding decimal.Decimal
+		if err := rows.Scan(&id, &name, &limit, &outstanding); err != nil {
 			return nil, err
 		}
-		var name string
-		_ = s.pgClient.QueryRow(ctx, `SELECT name FROM sales.customers WHERE customer_id=$1`, cid).Scan(&name)
+		exceed := outstanding.Sub(limit)
 		result = append(result, &CustomerCreditExposureRow{
-			CustomerID:   cid,
+			CustomerID:   id,
 			CustomerName: name,
 			CreditLimit:  limit,
 			Outstanding:  outstanding,
@@ -2423,4 +2561,31 @@ func (s *salesQueryService) GetCustomerStatement(ctx context.Context, companyID 
 // GetSalesAuditTrail returns audit trail entries (stub).
 func (s *salesQueryService) GetSalesAuditTrail(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID) ([]*SalesAuditEntry, error) {
 	return []*SalesAuditEntry{}, nil
+}
+
+// GetCustomerOverdueInvoices returns overdue invoices for a specific customer.
+func (s *salesQueryService) GetCustomerOverdueInvoices(ctx context.Context, companyID, customerID uuid.UUID, at time.Time) ([]*models.Invoice, error) {
+	// ✅ FIX: exclude draft, paid, cancelled; require positive amount_due
+	rows, err := s.pgClient.Query(ctx,
+		`SELECT invoice_id, company_id, customer_id, invoice_number, invoice_date, due_date, status, grand_total, amount_due
+         FROM sales.invoices
+         WHERE company_id=$1 AND customer_id=$2 AND due_date < $3 
+           AND status NOT IN ('draft', 'paid', 'cancelled')
+           AND amount_due > 0`,
+		companyID, customerID, at)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var invoices []*models.Invoice
+	for rows.Next() {
+		var inv models.Invoice
+		if err := rows.Scan(&inv.InvoiceID, &inv.CompanyID, &inv.CustomerID, &inv.InvoiceNumber,
+			&inv.InvoiceDate, &inv.DueDate, &inv.Status, &inv.GrandTotal, &inv.AmountDue); err != nil {
+			return nil, err
+		}
+		invoices = append(invoices, &inv)
+	}
+	return invoices, nil
 }

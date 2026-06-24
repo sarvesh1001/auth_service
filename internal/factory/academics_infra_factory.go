@@ -141,10 +141,8 @@ type AcademicsInfraFactory struct {
 	deviceEmbeddingSyncRepo  repository.DeviceEmbeddingSyncRepository
 
 	// Idempotency & Outbox
-	idempotencyStore         idempotency.Store
-	outboxRepo               outbox.Repository
-	academicsOutboxProcessor *outbox.Processor
-	academicsOutboxCancel    context.CancelFunc
+	idempotencyStore idempotency.Store
+	outboxRepo       outbox.Repository // shared outbox repository (no local processor)
 
 	// Services
 	notificationService academicsvc.NotificationService
@@ -211,11 +209,11 @@ type AcademicsInfraFactory struct {
 	studentBiometricSyncHandler *handler.StudentBiometricSyncHandler
 }
 
-// NewAcademicsInfraFactory constructor
+// NewAcademicsInfraFactory constructor – now receives shared outbox repository
 func NewAcademicsInfraFactory(
 	postgresClient *client.PostgresClient,
 	redisClient *client.RedisClient,
-	kafkaProducer *client.KafkaProducer,
+	sharedOutboxRepo outbox.Repository, // ✅ shared outbox repository
 	encryptionManager *encryption.EncryptionManager,
 	eventPublisher EventPublisher,
 	auditService *audit.AuditService,
@@ -230,6 +228,7 @@ func NewAcademicsInfraFactory(
 		auditService:   auditService,
 		emailSender:    emailSender,
 		sessionService: sessionService,
+		outboxRepo:     sharedOutboxRepo, // ✅ use shared repo
 	}
 
 	// Idempotency store
@@ -270,25 +269,8 @@ func NewAcademicsInfraFactory(
 	af.attendanceSessionRepo = repository.NewAttendanceSessionRepository(af.log)
 	af.biometricMappingRepo = repository.NewStudentBiometricMappingRepository(af.log)
 
-	// Outbox
-	if kafkaProducer != nil {
-		af.outboxRepo = outbox.NewPostgresRepository(postgresClient.DB)
+	// ❌ Outbox creation and local processor removed – the shared processor is used
 
-		af.academicsOutboxProcessor = outbox.NewProcessor(
-			af.outboxRepo,
-			kafkaProducer,
-			af.log,
-		)
-
-		ctx, cancel := context.WithCancel(context.Background())
-		af.academicsOutboxCancel = cancel
-
-		go af.academicsOutboxProcessor.Start(ctx)
-
-		af.log.Info("Academics outbox processor started")
-	} else {
-		af.log.Warn("Kafka producer not available – outbox will be nil")
-	}
 	return af, nil
 }
 
@@ -1132,9 +1114,7 @@ func (af *AcademicsInfraFactory) RegisterRoutes(r chi.Router, jwtService *mainse
 	)
 }
 
-// Close shuts down the outbox processor
+// Close is a no‑op because the outbox processor is managed centrally
 func (af *AcademicsInfraFactory) Close() {
-	if af.academicsOutboxCancel != nil {
-		af.academicsOutboxCancel()
-	}
+	// No longer needed – central outbox handles shutdown
 }

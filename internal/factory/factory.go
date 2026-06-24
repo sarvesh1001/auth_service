@@ -253,6 +253,8 @@ type Factory struct {
 
 	outboxRepo       outbox.Repository
 	idempotencyStore idempotency.Store
+	outboxProcessor  *outbox.Processor
+	outboxCancel     context.CancelFunc
 
 	// Email sender for notifications
 	emailSender email.Sender
@@ -345,12 +347,12 @@ func NewFactory() (*Factory, error) {
 	f.idempotencyStore = idempotency.NewHybridStore(pgStore, redisCache)
 
 	// ============================================================
-	// Initialize Academics Infrastructure Factory
+	// Initialize sub‑factories (they only need outboxRepo)
 	// ============================================================
 	academicsInfra, err := NewAcademicsInfraFactory(
 		f.PostgresClient(),
 		f.RedisClient(),
-		f.KafkaProducer(),
+		f.outboxRepo, // shared
 		f.EncryptionManager(),
 		&kafkaEventPublisher{producer: f.KafkaProducer()},
 		f.GetAuditService(),
@@ -375,13 +377,10 @@ func NewFactory() (*Factory, error) {
 		logger.Warn("Email sender not configured, emails will not be sent")
 	}
 
-	// ============================================================
-	// Initialize Accounting Infrastructure Factory
-	// ============================================================
 	accountingInfra, err := NewAccountingInfraFactory(
 		f.PostgresClient(),
 		f.RedisClient(),
-		f.KafkaProducer(),
+		f.outboxRepo, // shared
 		&kafkaEventPublisher{producer: f.KafkaProducer()},
 		f.GetAuditService(),
 		f.GetSessionService(),
@@ -392,13 +391,10 @@ func NewFactory() (*Factory, error) {
 	}
 	f.accountingInfra = accountingInfra
 
-	// ============================================================
-	// Initialize Inventory Infrastructure Factory
-	// ============================================================
 	inventoryInfra, err := NewInventoryInfraFactory(
 		f.PostgresClient(),
 		f.RedisClient(),
-		f.KafkaProducer(),
+		f.outboxRepo, // shared
 		&kafkaEventPublisher{producer: f.KafkaProducer()},
 		f.GetAuditService(),
 		f.EncryptionManager(),
@@ -409,26 +405,46 @@ func NewFactory() (*Factory, error) {
 	}
 	f.inventoryInfra = inventoryInfra
 
-	// ============================================================
-	// Initialize Sales Infrastructure Factory
-	// ============================================================
 	salesInfra := NewSalesInfraFactory(
 		f.PostgresClient(),
 		f.outboxRepo,
 		f.idempotencyStore,
 		f.GetAuditService(),
 		f.EncryptionManager(),
-		f.accountingInfra.TaxEngineService(), // must exist in AccountingInfraFactory
+		f.accountingInfra.TaxEngineService(),
 		f.logger,
 	)
 	f.salesInfra = salesInfra
 
+	// ============================================================
+	// Initialize Kafka logging – this sets f.kafkaProducer
+	// ============================================================
 	kafkaLoggingMgr, err := f.InitializeKafkaLogging()
 	if err != nil {
 		logger.Error("failed to initialize Kafka logging", zap.Error(err))
 	}
 	f.kafkaLoggingMgr = kafkaLoggingMgr
 
+	// ============================================================
+	// NOW start the central outbox processor (Kafka is ready)
+	// ============================================================
+	if f.kafkaProducer != nil {
+		f.outboxProcessor = outbox.NewProcessor(
+			f.outboxRepo,
+			f.kafkaProducer,
+			f.logger,
+		)
+		ctx, cancel := context.WithCancel(context.Background())
+		f.outboxCancel = cancel
+		go f.outboxProcessor.Start(ctx)
+		f.logger.Info("Central outbox processor started – handles all domains (sales, accounting, inventory, academics, etc.)")
+	} else {
+		f.logger.Error("Kafka producer not available – central outbox disabled")
+	}
+
+	// ============================================================
+	// Continue with other initializations
+	// ============================================================
 	ctx := context.Background()
 	if err := f.InitializeRBAC(ctx); err != nil {
 		return nil, fmt.Errorf("failed to initialize RBAC permission registry: %w", err)
@@ -469,8 +485,11 @@ func NewFactory() (*Factory, error) {
 	// ============================================================
 	// Initialize all Kafka consumers (analytics, student, accounting, inventory, sales)
 	// ============================================================
+	// ============================================================
+	// Initialize all Kafka consumers (analytics, student, accounting, inventory, sales)
+	// ============================================================
 	if f.kafkaProducer != nil && len(f.config.Kafka.Brokers) > 0 {
-		// Analytics consumer – listens to academics-events topic
+		// --- Analytics consumer (academics-events) ---
 		analyticsTopic := "academics-events"
 		analyticsKafkaConsumer, err := client.NewKafkaConsumer(
 			f.config,
@@ -501,7 +520,7 @@ func NewFactory() (*Factory, error) {
 			f.logger.Info("Analytics consumer started", zap.String("topic", analyticsTopic))
 		}
 
-		// Student consumer – listens to academics-events topic
+		// --- Student consumer (academics-events) ---
 		studentTopics := []string{"academics-events"}
 		studentConsumers := make(map[string]*client.KafkaConsumer)
 		for _, topic := range studentTopics {
@@ -531,7 +550,7 @@ func NewFactory() (*Factory, error) {
 			f.logger.Warn("No Kafka consumers created for student consumer – disabled")
 		}
 
-		// Accounting consumer – listens to accounting-events topic
+		// --- Accounting consumer (accounting-events) ---
 		accountingTopic := "accounting-events"
 		accountingKafkaConsumer, err := client.NewKafkaConsumer(
 			f.config,
@@ -562,7 +581,7 @@ func NewFactory() (*Factory, error) {
 			f.logger.Info("Accounting consumer started", zap.String("topic", accountingTopic))
 		}
 
-		// Inventory consumer – listens to inventory-events topic
+		// --- Inventory consumer (inventory-events) ---
 		inventoryTopic := "inventory-events"
 		inventoryKafkaConsumer, err := client.NewKafkaConsumer(
 			f.config,
@@ -594,9 +613,7 @@ func NewFactory() (*Factory, error) {
 			}
 		}
 
-		// ============================================================
-		// NEW: Sales consumer – listens to sales-events topic
-		// ============================================================
+		// ✅ NEW: Sales consumer (sales-events)
 		salesTopic := "sales-events"
 		salesKafkaConsumer, err := client.NewKafkaConsumer(
 			f.config,
@@ -621,12 +638,11 @@ func NewFactory() (*Factory, error) {
 				f.salesConsumer.Start(ctx)
 				f.logger.Info("Sales consumer stopped")
 			}()
-			f.logger.Info("Sales consumer started", zap.String("topic", salesTopic))
+			f.logger.Info("✅ Sales consumer started", zap.String("topic", salesTopic))
 		}
 	} else {
 		f.logger.Warn("Kafka not available – analytics, student, accounting, inventory, and sales consumers disabled")
 	}
-
 	return f, nil
 }
 
@@ -730,19 +746,27 @@ func (f *Factory) Close() error {
 			}
 		}
 
-		// Close accounting infra (outbox processor)
+		// ============================================================
+		// NEW: Stop central outbox processor
+		// ============================================================
+		if f.outboxCancel != nil {
+			f.outboxCancel()
+			f.logger.Info("Central outbox processor stopped")
+		}
+
+		// Close accounting infra (outbox processor) – now no‑op, but keep for safety
 		if f.accountingInfra != nil {
 			f.accountingInfra.Close()
 		}
 
-		// Close inventory infra (outbox processor)
+		// Close inventory infra (outbox processor) – now no‑op
 		if f.inventoryInfra != nil {
 			f.inventoryInfra.Close()
 		}
 
-		// Close sales infra (if it has background tasks)
+		// Close sales infra (if it has background tasks) – now no‑op
 		if f.salesInfra != nil {
-			f.salesInfra.Close() // implement Close() in SalesInfraFactory if needed
+			f.salesInfra.Close()
 		}
 
 		if f.postgresClient != nil {

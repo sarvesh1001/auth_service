@@ -1598,7 +1598,8 @@ func RegisterSalesRoutes(
 		// Dashboard & Summary
 		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 			Get("/dashboard", handlers.ReportHandler.GetSalesDashboard)
-
+		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
+			Get("/customers/{customerId}/overdue-invoices", handlers.ReportHandler.GetCustomerOverdueInvoices)
 		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 			Get("/today-summary", handlers.ReportHandler.GetTodaySalesSummary)
 

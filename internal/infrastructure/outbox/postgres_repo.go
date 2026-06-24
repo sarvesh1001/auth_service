@@ -30,7 +30,7 @@ func (r *PostgresRepository) Store(ctx context.Context, tx *sql.Tx, event *Event
 		return errors.New("event_type cannot be empty")
 	}
 	if event.Topic == "" {
-		return errors.New("topic cannot be empty") // 🔥 NEW
+		return errors.New("topic cannot be empty")
 	}
 	if len(event.Payload) == 0 {
 		return errors.New("payload cannot be empty")
@@ -54,7 +54,7 @@ func (r *PostgresRepository) Store(ctx context.Context, tx *sql.Tx, event *Event
 			aggregate_type,
 			aggregate_id,
 			event_type,
-			topic,              -- 🔥 NEW
+			topic,
 			payload,
 			headers,
 			status,
@@ -67,7 +67,7 @@ func (r *PostgresRepository) Store(ctx context.Context, tx *sql.Tx, event *Event
 		event.AggregateType,
 		event.AggregateID,
 		event.EventType,
-		event.Topic, // 🔥 NEW
+		event.Topic,
 		event.Payload,
 		headers,
 	)
@@ -76,16 +76,18 @@ func (r *PostgresRepository) Store(ctx context.Context, tx *sql.Tx, event *Event
 }
 
 // ============================================================
-// Fetch pending events
+// Fetch pending events with row-level locking
 // ============================================================
 func (r *PostgresRepository) FetchPending(ctx context.Context, limit int) ([]*Event, error) {
+	// ✅ CRITICAL FIX: Use FOR UPDATE SKIP LOCKED to prevent multiple outbox
+	// processors from grabbing the same event concurrently.
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT 
 			event_id,
 			aggregate_type,
 			aggregate_id,
 			event_type,
-			topic,              -- 🔥 NEW
+			topic,
 			payload,
 			headers,
 			retry_count,
@@ -94,6 +96,7 @@ func (r *PostgresRepository) FetchPending(ctx context.Context, limit int) ([]*Ev
 		WHERE status = 'pending'
 		ORDER BY created_at
 		LIMIT $1
+		FOR UPDATE SKIP LOCKED
 	`, limit)
 	if err != nil {
 		return nil, err
@@ -111,7 +114,7 @@ func (r *PostgresRepository) FetchPending(ctx context.Context, limit int) ([]*Ev
 			&e.AggregateType,
 			&e.AggregateID,
 			&e.EventType,
-			&e.Topic, // 🔥 NEW
+			&e.Topic,
 			&e.Payload,
 			&headers,
 			&e.RetryCount,
