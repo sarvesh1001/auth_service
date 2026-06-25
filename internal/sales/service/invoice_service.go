@@ -105,6 +105,7 @@ type invoiceService struct {
 	auditService     *audit.AuditService
 	pgClient         *client.PostgresClient
 	logger           *zap.Logger
+	taxSvc           TaxIntegrationService
 }
 
 func NewInvoiceService(
@@ -123,6 +124,7 @@ func NewInvoiceService(
 	auditService *audit.AuditService,
 	pgClient *client.PostgresClient,
 	logger *zap.Logger,
+	taxSvc TaxIntegrationService,
 ) InvoiceService {
 	return &invoiceService{
 		invoiceRepo:      invoiceRepo,
@@ -140,6 +142,7 @@ func NewInvoiceService(
 		auditService:     auditService,
 		pgClient:         pgClient,
 		logger:           logger.Named("invoice_service"),
+		taxSvc:           taxSvc,
 	}
 }
 
@@ -157,6 +160,12 @@ func (s *invoiceService) generateInvoiceNumber(tx repository.DBTX, companyID uui
 		return fmt.Sprintf("INV-%s-%d-1", prefix, timestamp), nil
 	}
 	return invNumber, nil
+}
+
+// zeroDecimalPtr returns a pointer to decimal.Zero for use as non‑nil default.
+func zeroDecimalPtr() *decimal.Decimal {
+	z := decimal.Zero
+	return &z
 }
 
 // recalculateInvoiceTotals with detailed logging and tax from TaxRate
@@ -368,126 +377,22 @@ func (s *invoiceService) CreateDraftInvoice(ctx context.Context, req *CreateInvo
 		return cached, nil
 	}
 
-	invoiceNumber := req.InvoiceNumber
-	if invoiceNumber == "" {
-		invoiceNumber, err = s.generateInvoiceNumber(tx, req.CompanyID)
-		if err != nil {
-			return nil, fmt.Errorf("generate invoice number: %w", err)
-		}
-	}
-	exists, err := s.invoiceRepo.ExistsByNumber(ctx, tx, req.CompanyID, invoiceNumber)
+	// ------------------------------------------------------------
+	// Delegate creation + tax application to the inner function
+	// ------------------------------------------------------------
+	invoice, err := s.createDraftInvoiceInTx(ctx, tx, req)
 	if err != nil {
 		return nil, err
 	}
-	if exists {
-		return nil, fmt.Errorf("%w: invoice number %s already exists", salesErrors.ErrDuplicate, invoiceNumber)
-	}
 
-	active, err := s.customerSvc.IsCustomerActive(ctx, req.CompanyID, req.CustomerID)
-	if err != nil {
-		return nil, err
-	}
-	if !active {
-		return nil, salesErrors.ErrCustomerInactive
-	}
-
-	invItems := make([]*models.InvoiceItem, 0, len(req.Items))
-	for idx, it := range req.Items {
-		prod, err := s.productRepo.GetByID(ctx, tx, req.CompanyID, it.ProductID)
-		if err != nil {
-			return nil, fmt.Errorf("product %s: %w", it.ProductID, err)
-		}
-		if !prod.IsActive {
-			return nil, fmt.Errorf("%w: product %s is inactive", salesErrors.ErrProductInactive, prod.SKU)
-		}
-		unitPrice := prod.UnitPrice
-		if it.UnitPrice != nil {
-			unitPrice = *it.UnitPrice
-		}
-
-		taxRate := it.TaxRate
-		if taxRate == nil && prod.TaxRate != nil && prod.TaxRate.GreaterThan(decimal.Zero) {
-			taxRate = prod.TaxRate
-			logger.Info("using product's tax rate for invoice item",
-				zap.Int("item_index", idx),
-				zap.String("product_id", prod.ProductID.String()),
-				zap.String("tax_rate", taxRate.String()),
-			)
-		} else if taxRate != nil {
-			logger.Info("using request tax rate for invoice item",
-				zap.Int("item_index", idx),
-				zap.String("product_id", prod.ProductID.String()),
-				zap.String("tax_rate", taxRate.String()),
-			)
-		} else {
-			logger.Info("no tax rate available for invoice item",
-				zap.Int("item_index", idx),
-				zap.String("product_id", prod.ProductID.String()),
-			)
-		}
-
-		invItem := &models.InvoiceItem{
-			InvoiceItemID:       uuid.New(),
-			InvoiceID:           uuid.Nil,
-			ProductID:           &prod.ProductID,
-			ProductNameSnapshot: prod.Name,
-			Quantity:            it.Quantity,
-			UnitPrice:           unitPrice,
-			DiscountAmount:      it.Discount,
-			TaxRate:             taxRate,
-			TaxAmount:           nil,
-			Metadata:            it.Metadata,
-		}
-		invItems = append(invItems, invItem)
-	}
-
-	invoice := &models.Invoice{
-		InvoiceID:            uuid.New(),
-		CompanyID:            req.CompanyID,
-		CustomerID:           req.CustomerID,
-		OrderID:              req.OrderID,
-		InvoiceNumber:        invoiceNumber,
-		ExternalRef:          req.ExternalRef,
-		InvoiceDate:          req.InvoiceDate,
-		DueDate:              req.DueDate,
-		Status:               enums.InvoiceStatusDraft,
-		Currency:             req.Currency,
-		Notes:                req.Notes,
-		AmountPaid:           decimal.Zero,
-		AmountDue:            decimal.Zero,
-		IsLocked:             false,
-		CreatedBy:            req.CreatedBy,
-		UpdatedBy:            req.CreatedBy,
-		SalesRepID:           req.SalesRepID,
-		PaymentTermName:      req.PaymentTermName,
-		PaymentDueDays:       req.PaymentDueDays,
-		EarlyDiscountPercent: req.EarlyDiscountPercent,
-		EarlyDiscountDays:    req.EarlyDiscountDays,
-	}
-	if invoice.Currency == "" {
-		invoice.Currency = "USD"
-	}
-	if invoice.InvoiceDate.IsZero() {
-		invoice.InvoiceDate = time.Now().Truncate(24 * time.Hour)
-	}
-	if invoice.DueDate.IsZero() {
-		invoice.DueDate = invoice.InvoiceDate.Add(30 * 24 * time.Hour)
-	}
-
-	if err := s.invoiceRepo.Create(ctx, tx, invoice, invItems); err != nil {
-		return nil, fmt.Errorf("create invoice: %w", err)
-	}
-	if err := s.recalculateInvoiceTotals(ctx, tx, req.CompanyID, invoice.InvoiceID); err != nil {
-		return nil, err
-	}
-	invoice, err = s.invoiceRepo.GetByID(ctx, tx, req.CompanyID, invoice.InvoiceID)
-	if err != nil {
-		return nil, err
-	}
+	// ------------------------------------------------------------
+	// Emit event and store idempotency
+	// ------------------------------------------------------------
 	if err := s.emitInvoiceEvent(ctx, tx, invoice, salesEvents.EventInvoiceCreated, nil); err != nil {
 		logger.Warn("failed to emit invoice created event", zap.Error(err))
 	}
 	_ = s.idempotencyStore.Store(ctx, tx, idempKey, invoice)
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
@@ -951,6 +856,12 @@ func (s *invoiceService) AddItems(ctx context.Context, companyID, invoiceID uuid
 			)
 		}
 
+		discountAmt := zeroDecimalPtr()
+		if it.Discount != nil {
+			discountAmt = it.Discount
+		}
+		taxAmt := zeroDecimalPtr() // temporary, will be recalculated
+
 		invItem := &models.InvoiceItem{
 			InvoiceItemID:       uuid.New(),
 			InvoiceID:           invoiceID,
@@ -958,9 +869,9 @@ func (s *invoiceService) AddItems(ctx context.Context, companyID, invoiceID uuid
 			ProductNameSnapshot: prod.Name,
 			Quantity:            it.Quantity,
 			UnitPrice:           unitPrice,
-			DiscountAmount:      it.Discount,
+			DiscountAmount:      discountAmt,
 			TaxRate:             taxRate,
-			TaxAmount:           nil,
+			TaxAmount:           taxAmt,
 			Metadata:            it.Metadata,
 		}
 		invItems = append(invItems, invItem)
@@ -1027,6 +938,12 @@ func (s *invoiceService) ReplaceItems(ctx context.Context, companyID, invoiceID 
 				)
 			}
 
+			discountAmt := zeroDecimalPtr()
+			if it.Discount != nil {
+				discountAmt = it.Discount
+			}
+			taxAmt := zeroDecimalPtr()
+
 			invItem := &models.InvoiceItem{
 				InvoiceItemID:       uuid.New(),
 				InvoiceID:           invoiceID,
@@ -1034,9 +951,9 @@ func (s *invoiceService) ReplaceItems(ctx context.Context, companyID, invoiceID 
 				ProductNameSnapshot: prod.Name,
 				Quantity:            it.Quantity,
 				UnitPrice:           unitPrice,
-				DiscountAmount:      it.Discount,
+				DiscountAmount:      discountAmt,
 				TaxRate:             taxRate,
-				TaxAmount:           nil,
+				TaxAmount:           taxAmt,
 				Metadata:            it.Metadata,
 			}
 			invItems = append(invItems, invItem)
@@ -1267,33 +1184,80 @@ func (s *invoiceService) UpdateStatus(ctx context.Context, companyID, invoiceID 
 }
 
 func (s *invoiceService) IssueInvoice(ctx context.Context, companyID, invoiceID uuid.UUID, issuedBy uuid.UUID) error {
+	logger := s.logger.With(
+		zap.String("method", "IssueInvoice"),
+		zap.String("invoice_id", invoiceID.String()),
+		zap.String("company_id", companyID.String()),
+	)
+	logger.Info("starting invoice issuance")
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		logger.Error("failed to begin transaction", zap.Error(err))
+		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
 	invoice, err := s.invoiceRepo.GetByIDForUpdate(ctx, tx, companyID, invoiceID)
 	if err != nil {
+		logger.Error("failed to get invoice for update", zap.Error(err))
 		return err
 	}
+
 	if invoice.Status != enums.InvoiceStatusDraft {
+		logger.Warn("invoice not in draft status", zap.String("status", string(invoice.Status)))
 		return fmt.Errorf("%w: only draft invoices can be issued", salesErrors.ErrInvalidTransition)
 	}
+
 	if err := s.ValidateCustomerCredit(ctx, tx, companyID, invoice.CustomerID, invoice.GrandTotal); err != nil {
+		logger.Error("customer credit validation failed", zap.Error(err))
 		return err
 	}
+
 	if err := s.ValidatePricing(ctx, companyID, invoiceID); err != nil {
+		logger.Error("pricing validation failed", zap.Error(err))
 		return err
 	}
+
 	if err := s.invoiceRepo.Issue(ctx, tx, companyID, invoiceID, time.Now(), &issuedBy); err != nil {
+		logger.Error("failed to update invoice status to issued", zap.Error(err))
 		return err
 	}
+
 	invoice.Status = enums.InvoiceStatusIssued
 	if err := s.emitInvoiceEvent(ctx, tx, invoice, salesEvents.EventInvoiceIssued, nil); err != nil {
-		s.logger.Warn("failed to emit invoice issued event", zap.Error(err))
+		logger.Warn("failed to emit invoice issued event", zap.Error(err))
+		// Do not fail the transaction; event will be retried via outbox
 	}
-	return tx.Commit()
+
+	if err := tx.Commit(); err != nil {
+		logger.Error("failed to commit transaction", zap.Error(err))
+		return fmt.Errorf("commit tx: %w", err)
+	}
+
+	logger.Info("invoice issued successfully")
+
+	// --- HOOK: Apply taxes asynchronously after commit (fallback) ---
+	go func() {
+		taxCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		taxIdempotencyKey := fmt.Sprintf("invoice-%s-tax", invoiceID.String())
+
+		_, err := s.taxSvc.ApplyTaxesToInvoice(taxCtx, companyID, invoiceID, issuedBy, taxIdempotencyKey)
+		if err != nil {
+			logger.Error("failed to apply taxes after invoice issuance",
+				zap.Error(err),
+				zap.String("invoice_id", invoiceID.String()),
+			)
+		} else {
+			logger.Info("taxes applied successfully after invoice issuance",
+				zap.String("invoice_id", invoiceID.String()),
+			)
+		}
+	}()
+
+	return nil
 }
 
 func (s *invoiceService) MarkAsPaid(ctx context.Context, companyID, invoiceID uuid.UUID, paidAt time.Time, updatedBy uuid.UUID) error {
@@ -1814,7 +1778,6 @@ func (s *invoiceService) createDraftInvoiceInTx(ctx context.Context, tx reposito
 			return nil, fmt.Errorf("%w: either product_id or order_item_id required", salesErrors.ErrInvalidInput)
 		}
 
-		// Determine tax rate – same fallback as in CreateDraftInvoice
 		taxRate := it.TaxRate
 		if taxRate == nil {
 			prod, err := s.productRepo.GetByID(ctx, tx, req.CompanyID, productID)
@@ -1822,6 +1785,12 @@ func (s *invoiceService) createDraftInvoiceInTx(ctx context.Context, tx reposito
 				taxRate = prod.TaxRate
 			}
 		}
+
+		discountAmt := zeroDecimalPtr()
+		if it.Discount != nil {
+			discountAmt = it.Discount
+		}
+		taxAmt := zeroDecimalPtr()
 
 		invItem := &models.InvoiceItem{
 			InvoiceItemID:       uuid.New(),
@@ -1831,9 +1800,9 @@ func (s *invoiceService) createDraftInvoiceInTx(ctx context.Context, tx reposito
 			ProductNameSnapshot: productName,
 			Quantity:            it.Quantity,
 			UnitPrice:           unitPrice,
-			DiscountAmount:      it.Discount,
+			DiscountAmount:      discountAmt,
 			TaxRate:             taxRate,
-			TaxAmount:           nil,
+			TaxAmount:           taxAmt,
 			Metadata:            it.Metadata,
 		}
 		invItems = append(invItems, invItem)
@@ -1878,12 +1847,41 @@ func (s *invoiceService) createDraftInvoiceInTx(ctx context.Context, tx reposito
 	if err := s.invoiceRepo.Create(ctx, tx, invoice, invItems); err != nil {
 		return nil, fmt.Errorf("create invoice: %w", err)
 	}
+
+	// --------------------------------------------------------------------
+	// STEP 1: Recalculate subtotal and discount from items
+	// This sets subtotal, discount_total, and calculates initial tax (from product tax_rate)
+	// but we will overwrite tax_total in STEP 2.
+	// --------------------------------------------------------------------
 	if err := s.recalculateInvoiceTotals(ctx, tx, req.CompanyID, invoice.InvoiceID); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("recalculate totals: %w", err)
 	}
+
+	// --------------------------------------------------------------------
+	// STEP 2: Apply accounting‑engine taxes (overwrites tax_total)
+	// --------------------------------------------------------------------
+	appliedBy := uuid.Nil
+	if req.CreatedBy != nil {
+		appliedBy = *req.CreatedBy
+	}
+	taxIdempotencyKey := fmt.Sprintf("invoice-%s-tax", invoice.InvoiceID.String())
+	sqlTx, ok := tx.(*sql.Tx)
+	if !ok {
+		return nil, fmt.Errorf("tx is not a *sql.Tx")
+	}
+	if _, err := s.taxSvc.ApplyTaxesToInvoiceWithTx(ctx, sqlTx, req.CompanyID, invoice.InvoiceID, appliedBy, taxIdempotencyKey); err != nil {
+		s.logger.Error("failed to apply taxes during invoice creation (in tx)",
+			zap.Error(err),
+			zap.String("invoice_id", invoice.InvoiceID.String()),
+		)
+		return nil, fmt.Errorf("failed to apply taxes: %w", err)
+	}
+
+	// Reload invoice with updated totals
 	invoice, err = s.invoiceRepo.GetByID(ctx, tx, req.CompanyID, invoice.InvoiceID)
 	if err != nil {
 		return nil, err
 	}
+
 	return invoice, nil
 }

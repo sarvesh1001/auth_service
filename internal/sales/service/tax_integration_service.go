@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 
@@ -29,10 +30,15 @@ type TaxIntegrationService interface {
 	CalculateLineTax(ctx context.Context, req *CalculateLineTaxRequest) (*TaxLineResult, error)
 	PreviewTaxes(ctx context.Context, req *TaxPreviewRequest) (*TaxPreviewResult, error)
 
-	// Apply and persist taxes to entities
+	// Apply and persist taxes to entities (each starts its own transaction)
 	ApplyTaxesToOrder(ctx context.Context, companyID, orderID uuid.UUID, appliedBy uuid.UUID, idempotencyKey string) (*TaxCalculationResult, error)
 	ApplyTaxesToQuote(ctx context.Context, companyID, quoteID uuid.UUID, appliedBy uuid.UUID, idempotencyKey string) (*TaxCalculationResult, error)
 	ApplyTaxesToInvoice(ctx context.Context, companyID, invoiceID uuid.UUID, appliedBy uuid.UUID, idempotencyKey string) (*TaxCalculationResult, error)
+
+	// Apply taxes using an existing transaction (for atomic operations)
+	ApplyTaxesToOrderWithTx(ctx context.Context, tx *sql.Tx, companyID, orderID uuid.UUID, appliedBy uuid.UUID, idempotencyKey string) (*TaxCalculationResult, error)
+	ApplyTaxesToInvoiceWithTx(ctx context.Context, tx *sql.Tx, companyID, invoiceID uuid.UUID, appliedBy uuid.UUID, idempotencyKey string) (*TaxCalculationResult, error)
+
 	RefreshOrderTaxes(ctx context.Context, companyID, orderID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error
 	RefreshInvoiceTaxes(ctx context.Context, companyID, invoiceID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error
 
@@ -162,28 +168,41 @@ func (s *taxIntegrationService) PreviewTaxes(ctx context.Context, req *TaxPrevie
 }
 
 // ------------------------------------------------------------
-// Apply and Persist (with idempotency)
+// Apply and Persist (with optional transaction)
 // ------------------------------------------------------------
 
+// ApplyTaxesToOrder starts its own transaction.
 func (s *taxIntegrationService) ApplyTaxesToOrder(ctx context.Context, companyID, orderID uuid.UUID, appliedBy uuid.UUID, idempotencyKey string) (*TaxCalculationResult, error) {
-	return s.applyTaxesToEntity(ctx, companyID, "order", orderID, appliedBy, idempotencyKey)
+	return s.applyTaxesToEntity(ctx, nil, companyID, "order", orderID, appliedBy, idempotencyKey)
 }
 
+// ApplyTaxesToOrderWithTx uses the provided transaction.
+func (s *taxIntegrationService) ApplyTaxesToOrderWithTx(ctx context.Context, tx *sql.Tx, companyID, orderID uuid.UUID, appliedBy uuid.UUID, idempotencyKey string) (*TaxCalculationResult, error) {
+	return s.applyTaxesToEntity(ctx, tx, companyID, "order", orderID, appliedBy, idempotencyKey)
+}
+
+// ApplyTaxesToQuote starts its own transaction.
 func (s *taxIntegrationService) ApplyTaxesToQuote(ctx context.Context, companyID, quoteID uuid.UUID, appliedBy uuid.UUID, idempotencyKey string) (*TaxCalculationResult, error) {
-	return s.applyTaxesToEntity(ctx, companyID, "quote", quoteID, appliedBy, idempotencyKey)
+	return s.applyTaxesToEntity(ctx, nil, companyID, "quote", quoteID, appliedBy, idempotencyKey)
 }
 
+// ApplyTaxesToInvoice starts its own transaction.
 func (s *taxIntegrationService) ApplyTaxesToInvoice(ctx context.Context, companyID, invoiceID uuid.UUID, appliedBy uuid.UUID, idempotencyKey string) (*TaxCalculationResult, error) {
-	return s.applyTaxesToEntity(ctx, companyID, "invoice", invoiceID, appliedBy, idempotencyKey)
+	return s.applyTaxesToEntity(ctx, nil, companyID, "invoice", invoiceID, appliedBy, idempotencyKey)
+}
+
+// ApplyTaxesToInvoiceWithTx uses the provided transaction.
+func (s *taxIntegrationService) ApplyTaxesToInvoiceWithTx(ctx context.Context, tx *sql.Tx, companyID, invoiceID uuid.UUID, appliedBy uuid.UUID, idempotencyKey string) (*TaxCalculationResult, error) {
+	return s.applyTaxesToEntity(ctx, tx, companyID, "invoice", invoiceID, appliedBy, idempotencyKey)
 }
 
 func (s *taxIntegrationService) RefreshOrderTaxes(ctx context.Context, companyID, orderID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error {
-	_, err := s.applyTaxesToEntity(ctx, companyID, "order", orderID, updatedBy, idempotencyKey)
+	_, err := s.applyTaxesToEntity(ctx, nil, companyID, "order", orderID, updatedBy, idempotencyKey)
 	return err
 }
 
 func (s *taxIntegrationService) RefreshInvoiceTaxes(ctx context.Context, companyID, invoiceID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error {
-	_, err := s.applyTaxesToEntity(ctx, companyID, "invoice", invoiceID, updatedBy, idempotencyKey)
+	_, err := s.applyTaxesToEntity(ctx, nil, companyID, "invoice", invoiceID, updatedBy, idempotencyKey)
 	return err
 }
 
@@ -220,7 +239,6 @@ func (s *taxIntegrationService) CreateTaxSnapshot(ctx context.Context, req *Crea
 		TaxableAmount: req.TaxableAmount,
 		TaxAmount:     req.TaxAmount,
 	}
-	// Use the underlying DB connection
 	db := s.pgClient.DB
 	if err := s.taxSnapshotRepo.Create(ctx, db, snapshot); err != nil {
 		return nil, err
@@ -280,7 +298,6 @@ func (s *taxIntegrationService) RecalculateTaxSnapshot(ctx context.Context, comp
 	newTax := snapshot.TaxableAmount.Mul(*snapshot.TaxPercentage).Div(decimal.NewFromInt(100))
 	snapshot.TaxAmount = newTax
 
-	// Delete old and insert new (simple update would be better, but we keep as is)
 	if err := s.taxSnapshotRepo.Delete(ctx, tx, companyID, snapshotID); err != nil {
 		return nil, err
 	}
@@ -338,7 +355,6 @@ func (s *taxIntegrationService) TaxSnapshotExists(ctx context.Context, companyID
 // ------------------------------------------------------------
 
 // calculateTaxesForEntity performs tax calculation without persisting.
-// Uses per-line per-rate breakdown from accounting engine.
 func (s *taxIntegrationService) calculateTaxesForEntity(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, items []*LineItemInput, customerID *uuid.UUID, billingAddress *AddressInput) (*TaxCalculationResult, error) {
 	if billingAddress == nil {
 		billingAddress = &AddressInput{CountryCode: "US"}
@@ -390,19 +406,25 @@ func (s *taxIntegrationService) calculateTaxesForEntity(ctx context.Context, com
 	}, nil
 }
 
-// applyTaxesToEntity calculates, persists snapshots, and updates entity totals.
-// applyTaxesToEntity calculates, persists snapshots, and updates entity totals.
-func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, appliedBy uuid.UUID, idempotencyKey string) (*TaxCalculationResult, error) {
-	tx, err := s.pgClient.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
+// applyTaxesToEntity is the core function that can accept an existing transaction.
+// If tx is nil, it starts its own transaction.
+func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, tx *sql.Tx, companyID uuid.UUID, entityType string, entityID uuid.UUID, appliedBy uuid.UUID, idempotencyKey string) (*TaxCalculationResult, error) {
+	var ownTx bool
+	if tx == nil {
+		var err error
+		tx, err = s.pgClient.BeginTx(ctx, nil)
+		if err != nil {
+			return nil, err
+		}
+		ownTx = true
+		defer tx.Rollback()
 	}
-	defer tx.Rollback()
 
 	// Idempotency check
 	if idempotencyKey != "" {
 		var cached *TaxCalculationResult
-		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached != nil {
+		err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached)
+		if err == nil && cached != nil {
 			s.logger.Info("idempotent – returning cached result")
 			return cached, nil
 		}
@@ -415,6 +437,8 @@ func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, companyI
 	var lineItems []*LineItemInput
 	var customerID *uuid.UUID
 	var billingAddress *AddressInput
+	var orderItems []*models.OrderItem
+	var invoiceItems []*models.InvoiceItem
 
 	switch entityType {
 	case "order":
@@ -428,13 +452,20 @@ func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, companyI
 		if err != nil {
 			return nil, err
 		}
+		orderItems = items
 		for _, it := range items {
+			subtotal := it.UnitPrice.Mul(it.Quantity)
+			discount := decimal.Zero
+			if it.DiscountAmount != nil {
+				discount = *it.DiscountAmount
+			}
+			taxable := subtotal.Sub(discount)
 			lineItems = append(lineItems, &LineItemInput{
 				ProductID:     it.ProductID,
 				Quantity:      it.Quantity,
 				UnitPrice:     it.UnitPrice,
-				LineAmount:    it.TotalPrice,
-				TaxableAmount: it.TotalPrice,
+				LineAmount:    subtotal,
+				TaxableAmount: taxable,
 			})
 		}
 	case "quote":
@@ -452,12 +483,15 @@ func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, companyI
 			return nil, err
 		}
 		for _, it := range items {
+			subtotal := it.UnitPrice.Mul(it.Quantity)
+			// 🔧 FIXED: QuoteItem.DiscountAmount is a value type (decimal.Decimal)
+			taxable := subtotal.Sub(it.DiscountAmount)
 			lineItems = append(lineItems, &LineItemInput{
 				ProductID:     it.ProductID,
 				Quantity:      it.Quantity,
 				UnitPrice:     it.UnitPrice,
-				LineAmount:    it.TotalPrice,
-				TaxableAmount: it.TotalPrice,
+				LineAmount:    subtotal,
+				TaxableAmount: taxable,
 			})
 		}
 	case "invoice":
@@ -474,16 +508,23 @@ func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, companyI
 		if err != nil {
 			return nil, err
 		}
+		invoiceItems = items
 		for _, it := range items {
 			if it.ProductID == nil {
 				continue
 			}
+			subtotal := it.UnitPrice.Mul(it.Quantity)
+			discount := decimal.Zero
+			if it.DiscountAmount != nil {
+				discount = *it.DiscountAmount
+			}
+			taxable := subtotal.Sub(discount)
 			lineItems = append(lineItems, &LineItemInput{
 				ProductID:     *it.ProductID,
 				Quantity:      it.Quantity,
 				UnitPrice:     it.UnitPrice,
-				LineAmount:    it.TotalPrice,
-				TaxableAmount: it.TotalPrice,
+				LineAmount:    subtotal,
+				TaxableAmount: taxable,
 			})
 		}
 	default:
@@ -494,16 +535,16 @@ func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, companyI
 		billingAddress = &AddressInput{CountryCode: "US"}
 	}
 
-	// Calculate taxes (with per-rate breakdown)
+	// Calculate taxes
 	calcResult, err := s.calculateTaxesForEntity(ctx, companyID, entityType, entityID, lineItems, customerID, billingAddress)
 	if err != nil {
 		return nil, err
 	}
 
-	// Delete old tax snapshots for this entity
+	// Delete old tax snapshots
 	_ = s.taxSnapshotRepo.DeleteByEntity(ctx, tx, companyID, entityType, entityID)
 
-	// Create one snapshot per tax rate using the aggregated amounts
+	// Create snapshots
 	for rateName, taxAmount := range calcResult.TaxesByJurisdiction {
 		taxableAmount := calcResult.ApplicableRates[rateName]
 		snapshot := &models.TaxSnapshot{
@@ -521,19 +562,44 @@ func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, companyI
 		}
 	}
 
-	// ------------------------------------------------------------
-	// 🔧 UPDATED SECTION: Update entity's tax_total field
-	// ------------------------------------------------------------
+	// Build tax map
+	taxMap := make(map[uuid.UUID]decimal.Decimal)
+	for _, lt := range calcResult.LineTaxes {
+		taxMap[lt.ProductID] = lt.TaxAmount
+	}
+
+	// Update order item tax amounts
+	if entityType == "order" && len(orderItems) > 0 {
+		for _, item := range orderItems {
+			if taxAmt, ok := taxMap[item.ProductID]; ok {
+				if err := s.orderRepo.UpdateItemTaxAmount(ctx, tx, item.OrderItemID, taxAmt); err != nil {
+					return nil, fmt.Errorf("update order item tax amount: %w", err)
+				}
+			}
+		}
+	}
+
+	// Update invoice item tax amounts
+	if entityType == "invoice" && len(invoiceItems) > 0 {
+		for _, item := range invoiceItems {
+			if item.ProductID != nil {
+				if taxAmt, ok := taxMap[*item.ProductID]; ok {
+					if err := s.invoiceRepo.UpdateItemTaxAmount(ctx, tx, item.InvoiceItemID, taxAmt); err != nil {
+						return nil, fmt.Errorf("update invoice item tax amount: %w", err)
+					}
+				}
+			}
+		}
+	}
+
+	// Update entity tax total
 	switch entityType {
 	case "order":
-		// Use the new direct update method to set tax_total from computed result
 		if err := s.orderRepo.UpdateTaxTotal(ctx, tx, companyID, entityID, calcResult.TotalTax, &appliedBy); err != nil {
 			return nil, err
 		}
 	case "invoice":
-		// For invoice, you can either use RecalculateTotals (which may not read snapshots)
-		// or add a similar UpdateTaxTotal method. Keep RecalculateTotals for now.
-		if err := s.invoiceRepo.RecalculateTotals(ctx, tx, companyID, entityID); err != nil {
+		if err := s.invoiceRepo.UpdateTaxTotal(ctx, tx, companyID, entityID, calcResult.TotalTax, &appliedBy); err != nil {
 			return nil, err
 		}
 	case "quote":
@@ -542,12 +608,12 @@ func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, companyI
 		}
 	}
 
-	// Store idempotency result
+	// Store idempotency
 	if idempotencyKey != "" {
 		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, calcResult)
 	}
 
-	// Audit log
+	// Audit
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, tx, &companyID, "sales", "apply_taxes", entityType,
 			&entityID, "user", &appliedBy, nil, nil, map[string]interface{}{
@@ -556,8 +622,10 @@ func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, companyI
 			})
 	}
 
-	if err := tx.Commit(); err != nil {
-		return nil, err
+	if ownTx {
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
 	}
 	return calcResult, nil
 }
@@ -634,5 +702,11 @@ func (s *taxIntegrationService) parseAddressFromString(addrStr string) *AddressI
 
 // Helper to detect idempotency not found error
 func isIdempotencyNotFound(err error) bool {
-	return err != nil && err.Error() == "idempotency: key not found"
+	if err == nil {
+		return false
+	}
+	if err == sql.ErrNoRows {
+		return true
+	}
+	return err.Error() == "idempotency: key not found"
 }

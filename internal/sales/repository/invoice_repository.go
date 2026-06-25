@@ -10,13 +10,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/shopspring/decimal"
-	"go.uber.org/zap"
-
 	salesErrors "auth-service/internal/sales/errors"
 	"auth-service/internal/sales/models"
 	"auth-service/internal/sales/models/enums"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
 )
 
 // -------------------------------------------------------------------------
@@ -30,6 +30,7 @@ type InvoiceRepository interface {
 	GetByNumber(ctx context.Context, db DBTX, companyID uuid.UUID, invoiceNumber string) (*models.Invoice, error)
 	Update(ctx context.Context, db DBTX, invoice *models.Invoice) error
 	Delete(ctx context.Context, db DBTX, companyID, invoiceID uuid.UUID) error
+	UpdateItemTaxAmount(ctx context.Context, tx DBTX, invoiceItemID uuid.UUID, taxAmount decimal.Decimal) error
 
 	// INVOICE ITEMS
 	AddItems(ctx context.Context, db DBTX, companyID, invoiceID uuid.UUID, items []*models.InvoiceItem) error
@@ -81,6 +82,7 @@ type InvoiceRepository interface {
 	GetOutstandingAmount(ctx context.Context, db DBTX, companyID uuid.UUID) (decimal.Decimal, error)
 	GetAverageInvoiceValue(ctx context.Context, db DBTX, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
 	GetTopInvoicesByValue(ctx context.Context, db DBTX, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.Invoice, error)
+	UpdateTaxTotal(ctx context.Context, db DBTX, companyID, invoiceID uuid.UUID, taxTotal decimal.Decimal, updatedBy *uuid.UUID) error
 
 	// CONCURRENCY / LOCKING
 	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, invoiceID uuid.UUID) (*models.Invoice, error)
@@ -1509,4 +1511,32 @@ func (r *invoiceRepository) GetItemByIDForUpdate(ctx context.Context, db DBTX, c
 	`
 	row := db.QueryRowContext(ctx, query, companyID, invoiceID, invoiceItemID)
 	return r.scanInvoiceItem(row)
+}
+func (r *invoiceRepository) UpdateTaxTotal(ctx context.Context, db DBTX, companyID, invoiceID uuid.UUID, taxTotal decimal.Decimal, updatedBy *uuid.UUID) error {
+	query := `
+        UPDATE sales.invoices
+        SET tax_total = $1, updated_at = NOW(), updated_by = $2
+        WHERE company_id = $3 AND invoice_id = $4
+    `
+	result, err := db.ExecContext(ctx, query, taxTotal, r.nullUUIDParam(updatedBy), companyID, invoiceID)
+	if err != nil {
+		return fmt.Errorf("update invoice tax total: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return salesErrors.ErrNotFound
+	}
+	return nil
+}
+func (r *invoiceRepository) UpdateItemTaxAmount(ctx context.Context, tx DBTX, invoiceItemID uuid.UUID, taxAmount decimal.Decimal) error {
+	query := `UPDATE sales.invoice_items SET tax_amount = $1 WHERE invoice_item_id = $2`
+	res, err := tx.ExecContext(ctx, query, taxAmount, invoiceItemID)
+	if err != nil {
+		return fmt.Errorf("update invoice item tax amount: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return salesErrors.ErrNotFound
+	}
+	return nil
 }

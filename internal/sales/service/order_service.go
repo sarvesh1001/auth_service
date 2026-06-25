@@ -91,6 +91,8 @@ type orderService struct {
 	idempotencyStore  idempotency.Store
 	auditService      *audit.AuditService
 	logger            *zap.Logger
+	taxSvc            TaxIntegrationService // NEW
+
 }
 
 func NewOrderService(
@@ -109,6 +111,8 @@ func NewOrderService(
 	idempotencyStore idempotency.Store,
 	auditService *audit.AuditService,
 	logger *zap.Logger,
+	taxSvc TaxIntegrationService, // NEW parameter
+
 ) OrderService {
 	return &orderService{
 		orderRepo:         orderRepo,
@@ -126,6 +130,7 @@ func NewOrderService(
 		idempotencyStore:  idempotencyStore,
 		auditService:      auditService,
 		logger:            logger.Named("order_service"),
+		taxSvc:            taxSvc,
 	}
 }
 
@@ -201,7 +206,6 @@ func (s *orderService) CreateDraftOrder(ctx context.Context, req *CreateOrderReq
 	}
 
 	if err := s.orderRepo.Create(ctx, tx, order, nil); err != nil {
-		// Use errors.As to unwrap possible wrapped pq.Error
 		var pqErr *pq.Error
 		if errors.As(err, &pqErr) && pqErr.Code == "23505" {
 			return nil, fmt.Errorf("%w: order number %s already exists", salesErrors.ErrDuplicate, orderNumber)
@@ -214,10 +218,13 @@ func (s *orderService) CreateDraftOrder(ctx context.Context, req *CreateOrderReq
 			return nil, err
 		}
 	}
+
+	// --- 1. Recalculate baseline totals (subtotal, discount, placeholder tax) ---
 	if err := s.recalculateOrderTotals(ctx, tx, req.CompanyID, order.OrderID); err != nil {
 		return nil, fmt.Errorf("recalculate totals: %w", err)
 	}
 
+	// --- 2. Apply coupons (if any) ---
 	appliedBy := uuid.Nil
 	if req.CreatedBy != nil {
 		appliedBy = *req.CreatedBy
@@ -230,6 +237,15 @@ func (s *orderService) CreateDraftOrder(ctx context.Context, req *CreateOrderReq
 	if err := s.recalculateOrderTotals(ctx, tx, req.CompanyID, order.OrderID); err != nil {
 		return nil, fmt.Errorf("recalculate totals after coupons: %w", err)
 	}
+
+	// --- 3. Apply accounting-engine taxes SYNC using the SAME transaction ---
+	taxIdempotencyKey := fmt.Sprintf("%s-tax", idempotencyKey)
+	if _, err := s.taxSvc.ApplyTaxesToOrderWithTx(ctx, tx, req.CompanyID, order.OrderID, appliedBy, taxIdempotencyKey); err != nil {
+		logger.Error("failed to apply taxes during order creation", zap.Error(err))
+		return nil, fmt.Errorf("failed to apply taxes: %w", err)
+	}
+
+	// --- 4. Emit event and store idempotency ---
 	if err := s.emitOrderEvent(ctx, tx, order, salesEvents.EventOrderCreated, nil); err != nil {
 		logger.Warn("failed to emit order created event", zap.Error(err))
 	}
@@ -738,8 +754,37 @@ func (s *orderService) ConfirmOrder(ctx context.Context, companyID, orderID uuid
 	}
 
 	logger.Info("order confirmation completed successfully")
+
+	// --------------------------------------------------------------------
+	// HOOK: Apply taxes asynchronously after commit
+	// --------------------------------------------------------------------
+	go func() {
+		// Use a fresh context with timeout to avoid blocking indefinitely
+		taxCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		// Generate a unique idempotency key for tax application
+		taxIdempotencyKey := fmt.Sprintf("%s-tax", idempotencyKey)
+
+		_, err := s.taxSvc.ApplyTaxesToOrder(taxCtx, companyID, orderID, updatedBy, taxIdempotencyKey)
+		if err != nil {
+			logger.Error("failed to apply taxes after order confirmation",
+				zap.Error(err),
+				zap.String("order_id", orderID.String()),
+			)
+			// Optionally: publish a retry event to the outbox
+			// or leave it for manual reconciliation.
+			// We choose not to fail the order confirmation.
+		} else {
+			logger.Info("taxes applied successfully after order confirmation",
+				zap.String("order_id", orderID.String()),
+			)
+		}
+	}()
+
 	return nil
 }
+
 func (s *orderService) MarkProcessing(ctx context.Context, companyID, orderID uuid.UUID, updatedBy uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "MarkProcessing"))
 	idempotencyKey, err := s.getIdempotencyKey(ctx)

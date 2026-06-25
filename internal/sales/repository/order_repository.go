@@ -80,6 +80,7 @@ type OrderRepository interface {
 	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, orderID uuid.UUID) (*models.Order, error)
 	GetItemByIDForUpdate(ctx context.Context, db DBTX, companyID, orderID, orderItemID uuid.UUID) (*models.OrderItem, error)
 	UpdateTaxTotal(ctx context.Context, db DBTX, companyID, orderID uuid.UUID, taxTotal decimal.Decimal, updatedBy *uuid.UUID) error
+	UpdateItemTaxAmount(ctx context.Context, tx DBTX, orderItemID uuid.UUID, taxAmount decimal.Decimal) error
 
 	// NEW FOR PARTIAL INVOICING
 	GetRemainingQuantities(ctx context.Context, db DBTX, orderID uuid.UUID) (map[uuid.UUID]decimal.Decimal, error)
@@ -1296,6 +1297,18 @@ func (r *orderRepository) UpdateTaxTotal(ctx context.Context, db DBTX, companyID
 		return fmt.Errorf("update tax total: %w", err)
 	}
 	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return errors.ErrNotFound
+	}
+	return nil
+}
+func (r *orderRepository) UpdateItemTaxAmount(ctx context.Context, tx DBTX, orderItemID uuid.UUID, taxAmount decimal.Decimal) error {
+	query := `UPDATE sales.order_items SET tax_amount = $1 WHERE order_item_id = $2`
+	res, err := tx.ExecContext(ctx, query, taxAmount, orderItemID)
+	if err != nil {
+		return fmt.Errorf("update item tax amount: %w", err)
+	}
+	rows, _ := res.RowsAffected()
 	if rows == 0 {
 		return errors.ErrNotFound
 	}

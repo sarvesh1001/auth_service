@@ -443,6 +443,8 @@ func (f *SalesInfraFactory) InvoiceService() service.InvoiceService {
 			f.auditService,
 			f.pgClient,
 			f.logger,
+			f.TaxIntegrationService(), // NEW: pass tax service
+
 		)
 	}
 	return f.invoiceService
@@ -465,6 +467,8 @@ func (f *SalesInfraFactory) OrderService() service.OrderService {
 			f.idempotencyStore,
 			f.auditService,
 			f.logger,
+			f.TaxIntegrationService(), // NEW: pass tax service
+
 		)
 	}
 	return f.orderService
