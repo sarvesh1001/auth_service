@@ -1,5 +1,3 @@
-// internal/sales/service/sales_rep_service.go
-
 package service
 
 import (
@@ -24,44 +22,35 @@ import (
 	"auth-service/internal/sales/repository"
 )
 
-// ---------------------------------------------------------------------
-// DTOs
-// ---------------------------------------------------------------------
-// ---------------------------------------------------------------------
-// Service Interface (unchanged)
-// ---------------------------------------------------------------------
-
+// SalesRepService defines the interface for sales representative operations.
+// All mutating methods are idempotent using a key extracted from the context.
 type SalesRepService interface {
-	CreateSalesRep(ctx context.Context, req *CreateSalesRepRequest, idempotencyKey string) (*models.SalesRep, error)
-	UpdateSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, req *UpdateSalesRepRequest, idempotencyKey string) (*models.SalesRep, error)
-	DeleteSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, deletedBy uuid.UUID, idempotencyKey string) error
+	CreateSalesRep(ctx context.Context, req *CreateSalesRepRequest) (*models.SalesRep, error)
+	UpdateSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, req *UpdateSalesRepRequest) (*models.SalesRep, error)
+	DeleteSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, deletedBy uuid.UUID) error
 	GetSalesRepByID(ctx context.Context, companyID, salesRepID uuid.UUID) (*models.SalesRep, error)
 	GetSalesRepByUserID(ctx context.Context, companyID, userID uuid.UUID) (*models.SalesRep, error)
 	GetSalesRepByCode(ctx context.Context, companyID uuid.UUID, code string) (*models.SalesRep, error)
 	ListSalesReps(ctx context.Context, filter SalesRepListFilter, p Pagination, s Sort) ([]*models.SalesRep, int64, error)
 	SearchSalesReps(ctx context.Context, companyID uuid.UUID, query string, limit, offset int) ([]*models.SalesRep, int64, error)
 	GetActiveSalesReps(ctx context.Context, companyID uuid.UUID) ([]*models.SalesRep, error)
-	ActivateSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error
-	DeactivateSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error
+	ActivateSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, updatedBy uuid.UUID) error
+	DeactivateSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, updatedBy uuid.UUID) error
 	IsSalesRepActive(ctx context.Context, companyID, salesRepID uuid.UUID) (bool, error)
-
-	// Assignment
-	AssignOrder(ctx context.Context, companyID, salesRepID, orderID uuid.UUID, assignedBy uuid.UUID, idempotencyKey string) error
-	RemoveOrderAssignment(ctx context.Context, companyID, salesRepID, orderID uuid.UUID, removedBy uuid.UUID, idempotencyKey string) error
+	AssignOrder(ctx context.Context, companyID, salesRepID, orderID uuid.UUID, assignedBy uuid.UUID) error
+	RemoveOrderAssignment(ctx context.Context, companyID, salesRepID, orderID uuid.UUID, removedBy uuid.UUID) error
 	GetAssignedOrders(ctx context.Context, companyID, salesRepID uuid.UUID, p Pagination, s Sort) ([]*models.Order, int64, error)
-	AssignQuote(ctx context.Context, companyID, salesRepID, quoteID uuid.UUID, assignedBy uuid.UUID, idempotencyKey string) error
-	RemoveQuoteAssignment(ctx context.Context, companyID, salesRepID, quoteID uuid.UUID, removedBy uuid.UUID, idempotencyKey string) error
+	AssignQuote(ctx context.Context, companyID, salesRepID, quoteID uuid.UUID, assignedBy uuid.UUID) error
+	RemoveQuoteAssignment(ctx context.Context, companyID, salesRepID, quoteID uuid.UUID, removedBy uuid.UUID) error
 	GetAssignedQuotes(ctx context.Context, companyID, salesRepID uuid.UUID, p Pagination, s Sort) ([]*models.Quote, int64, error)
-	AssignInvoice(ctx context.Context, companyID, salesRepID, invoiceID uuid.UUID, assignedBy uuid.UUID, idempotencyKey string) error
-	RemoveInvoiceAssignment(ctx context.Context, companyID, salesRepID, invoiceID uuid.UUID, removedBy uuid.UUID, idempotencyKey string) error
+	AssignInvoice(ctx context.Context, companyID, salesRepID, invoiceID uuid.UUID, assignedBy uuid.UUID) error
+	RemoveInvoiceAssignment(ctx context.Context, companyID, salesRepID, invoiceID uuid.UUID, removedBy uuid.UUID) error
 	GetAssignedInvoices(ctx context.Context, companyID, salesRepID uuid.UUID, p Pagination, s Sort) ([]*models.Invoice, int64, error)
-	AssignCustomer(ctx context.Context, companyID, salesRepID, customerID uuid.UUID, assignedBy uuid.UUID, idempotencyKey string) error
-	RemoveCustomerAssignment(ctx context.Context, companyID, salesRepID, customerID uuid.UUID, removedBy uuid.UUID, idempotencyKey string) error
+	AssignCustomer(ctx context.Context, companyID, salesRepID, customerID uuid.UUID, assignedBy uuid.UUID) error
+	RemoveCustomerAssignment(ctx context.Context, companyID, salesRepID, customerID uuid.UUID, removedBy uuid.UUID) error
 	GetAssignedCustomers(ctx context.Context, companyID, salesRepID uuid.UUID, p Pagination, s Sort) ([]*models.Customer, int64, error)
 	GetCustomerSalesRep(ctx context.Context, companyID, customerID uuid.UUID) (*models.SalesRep, error)
-
-	// Commission & Analytics
-	SetCommissionPlan(ctx context.Context, companyID, salesRepID, commissionPlanID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error
+	SetCommissionPlan(ctx context.Context, companyID, salesRepID, commissionPlanID uuid.UUID, updatedBy uuid.UUID) error
 	CalculateCommission(ctx context.Context, companyID, salesRepID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
 	GetEarnedCommission(ctx context.Context, companyID, salesRepID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
 	GetSalesRevenue(ctx context.Context, companyID, salesRepID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
@@ -70,12 +59,8 @@ type SalesRepService interface {
 	GetConversionRate(ctx context.Context, companyID, salesRepID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
 	GetTopSalesReps(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.SalesRep, error)
 	GetSalesRepLeaderboard(ctx context.Context, companyID uuid.UUID, from, to *time.Time) ([]*SalesRepLeaderboardEntry, error)
-
-	// Sales Targets
-	SetSalesTarget(ctx context.Context, companyID, salesRepID uuid.UUID, req *SetSalesTargetRequest, updatedBy uuid.UUID, idempotencyKey string) error
+	SetSalesTarget(ctx context.Context, companyID, salesRepID uuid.UUID, req *SetSalesTargetRequest, updatedBy uuid.UUID) error
 	GetSalesTarget(ctx context.Context, companyID, salesRepID uuid.UUID, periodStart, periodEnd time.Time) (*models.SalesTarget, error)
-
-	// Validation Helpers
 	ValidateSalesRep(ctx context.Context, rep *models.SalesRep) error
 	ValidateAssignment(ctx context.Context, companyID, salesRepID uuid.UUID, entityType string, entityID uuid.UUID) error
 	CanManageCustomer(ctx context.Context, companyID, salesRepID, customerID uuid.UUID) (bool, error)
@@ -83,10 +68,6 @@ type SalesRepService interface {
 	SalesRepCodeExists(ctx context.Context, companyID uuid.UUID, code string) (bool, error)
 	UserAlreadyLinked(ctx context.Context, companyID, userID uuid.UUID) (bool, error)
 }
-
-// ---------------------------------------------------------------------
-// Service Implementation
-// ---------------------------------------------------------------------
 
 type salesRepService struct {
 	repRepo          repository.SalesRepRepository
@@ -133,9 +114,18 @@ func NewSalesRepService(
 	}
 }
 
-// ---------------------------------------------------------------------
-// Validation Helpers
-// ---------------------------------------------------------------------
+// Helper to get idempotency key from context, generating a fallback if missing.
+func (s *salesRepService) getIdempotencyKey(ctx context.Context) string {
+	key, _ := ctx.Value("idempotency_key").(string)
+	if key == "" {
+		key = uuid.New().String()
+	}
+	return key
+}
+
+// ----------------------------------------------------------------------------
+// Validation helpers
+// ----------------------------------------------------------------------------
 
 func (s *salesRepService) validateCreateSalesRep(req *CreateSalesRepRequest) error {
 	if req.CompanyID == uuid.Nil {
@@ -168,9 +158,9 @@ func (s *salesRepService) validateSalesRepInput(name string, email *string) erro
 	return nil
 }
 
-// ---------------------------------------------------------------------
-// Encryption Helpers (same as CustomerService)
-// ---------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// Encryption helpers
+// ----------------------------------------------------------------------------
 
 func (s *salesRepService) encryptField(ctx context.Context, plainText *string, fieldName string) (encrypted, dek, keyID *string, err error) {
 	if plainText == nil || *plainText == "" {
@@ -199,7 +189,6 @@ func (s *salesRepService) decryptSalesRep(ctx context.Context, rep *models.Sales
 	if rep == nil {
 		return nil
 	}
-	// Decrypt email
 	if rep.EmailEncrypted != nil && rep.EmailDEK != nil && rep.EmailKeyID != nil {
 		plain, err := s.decryptField(ctx, rep.EmailEncrypted, rep.EmailDEK, rep.EmailKeyID)
 		if err != nil {
@@ -209,7 +198,6 @@ func (s *salesRepService) decryptSalesRep(ctx context.Context, rep *models.Sales
 			rep.Email = &plain
 		}
 	}
-	// Decrypt phone
 	if rep.PhoneEncrypted != nil && rep.PhoneDEK != nil && rep.PhoneKeyID != nil {
 		plain, err := s.decryptField(ctx, rep.PhoneEncrypted, rep.PhoneDEK, rep.PhoneKeyID)
 		if err != nil {
@@ -222,19 +210,21 @@ func (s *salesRepService) decryptSalesRep(ctx context.Context, rep *models.Sales
 	return nil
 }
 
-// ---------------------------------------------------------------------
-// CRUD Operations
-// ---------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// CRUD operations (idempotent) – unchanged
+// ----------------------------------------------------------------------------
 
-func (s *salesRepService) CreateSalesRep(ctx context.Context, req *CreateSalesRepRequest, idempotencyKey string) (*models.SalesRep, error) {
-	logger := s.logger.With(zap.String("method", "CreateSalesRep"), zap.String("idempotency_key", idempotencyKey))
-
+func (s *salesRepService) CreateSalesRep(ctx context.Context, req *CreateSalesRepRequest) (*models.SalesRep, error) {
+	logger := s.logger.With(zap.String("method", "CreateSalesRep"))
 	if err := s.validateCreateSalesRep(req); err != nil {
 		return nil, err
 	}
 	if err := s.validateSalesRepInput(req.Name, req.Email); err != nil {
 		return nil, err
 	}
+
+	idempotencyKey := s.getIdempotencyKey(ctx)
+	logger = logger.With(zap.String("idempotency_key", idempotencyKey))
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -244,11 +234,14 @@ func (s *salesRepService) CreateSalesRep(ctx context.Context, req *CreateSalesRe
 
 	var cached *models.SalesRep
 	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached != nil {
-		logger.Info("idempotent – returning cached sales rep")
-		return cached, nil
+		if cached.SalesRepID != uuid.Nil {
+			logger.Info("idempotent – returning cached sales rep")
+			_ = s.decryptSalesRep(ctx, cached)
+			return cached, nil
+		}
+		logger.Warn("idempotent cache returned zero object – continuing")
 	}
 
-	// 1. Check user exists via repository
 	userExists, err := s.repRepo.UserExists(ctx, tx, req.UserID)
 	if err != nil {
 		return nil, fmt.Errorf("check user existence: %w", err)
@@ -257,7 +250,6 @@ func (s *salesRepService) CreateSalesRep(ctx context.Context, req *CreateSalesRe
 		return nil, fmt.Errorf("%w: user_id does not exist", salesErrors.ErrInvalidInput)
 	}
 
-	// 2. Check code uniqueness
 	codeExists, err := s.repRepo.ExistsByCode(ctx, tx, req.CompanyID, req.Code)
 	if err != nil {
 		return nil, fmt.Errorf("check code existence: %w", err)
@@ -266,7 +258,6 @@ func (s *salesRepService) CreateSalesRep(ctx context.Context, req *CreateSalesRe
 		return nil, fmt.Errorf("%w: code %s already exists", salesErrors.ErrDuplicate, req.Code)
 	}
 
-	// 3. Check user not already linked
 	linked, err := s.repRepo.ExistsByUserID(ctx, tx, req.CompanyID, req.UserID)
 	if err != nil {
 		return nil, fmt.Errorf("check user linked: %w", err)
@@ -275,7 +266,6 @@ func (s *salesRepService) CreateSalesRep(ctx context.Context, req *CreateSalesRe
 		return nil, fmt.Errorf("%w: user %s already linked to a sales rep", salesErrors.ErrDuplicate, req.UserID)
 	}
 
-	// 4. Email uniqueness via hash
 	var emailHash *string
 	if req.Email != nil && *req.Email != "" {
 		hash := hashEmail(*req.Email)
@@ -289,7 +279,6 @@ func (s *salesRepService) CreateSalesRep(ctx context.Context, req *CreateSalesRe
 		emailHash = &hash
 	}
 
-	// 5. Encrypt email and phone (store ciphertext, DEK, keyID)
 	emailEncrypted, emailDEK, emailKeyID, err := s.encryptField(ctx, req.Email, "sales_rep_email")
 	if err != nil {
 		return nil, err
@@ -321,19 +310,19 @@ func (s *salesRepService) CreateSalesRep(ctx context.Context, req *CreateSalesRe
 		return nil, fmt.Errorf("create sales rep: %w", err)
 	}
 
-	// Emit event
 	if err := s.emitEvent(ctx, tx, rep, salesEvents.EventSalesRepCreated); err != nil {
 		logger.Warn("failed to emit sales rep created event", zap.Error(err))
 	}
 
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, rep)
+	if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, rep); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	// Decrypt for response
 	_ = s.decryptSalesRep(ctx, rep)
-
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &req.CompanyID, "sales", "create_sales_rep", "sales_rep",
 			&rep.SalesRepID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
@@ -344,12 +333,11 @@ func (s *salesRepService) CreateSalesRep(ctx context.Context, req *CreateSalesRe
 	return rep, nil
 }
 
-func (s *salesRepService) UpdateSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, req *UpdateSalesRepRequest, idempotencyKey string) (*models.SalesRep, error) {
-	logger := s.logger.With(zap.String("method", "UpdateSalesRep"), zap.String("idempotency_key", idempotencyKey))
+func (s *salesRepService) UpdateSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, req *UpdateSalesRepRequest) (*models.SalesRep, error) {
+	logger := s.logger.With(zap.String("method", "UpdateSalesRep"))
 	if companyID == uuid.Nil || salesRepID == uuid.Nil {
 		return nil, salesErrors.ErrInvalidInput
 	}
-
 	if req.Name != nil {
 		if err := s.validateSalesRepInput(*req.Name, req.Email); err != nil {
 			return nil, err
@@ -360,6 +348,9 @@ func (s *salesRepService) UpdateSalesRep(ctx context.Context, companyID, salesRe
 		}
 	}
 
+	idempotencyKey := s.getIdempotencyKey(ctx)
+	logger = logger.With(zap.String("idempotency_key", idempotencyKey))
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
@@ -368,8 +359,12 @@ func (s *salesRepService) UpdateSalesRep(ctx context.Context, companyID, salesRe
 
 	var cached *models.SalesRep
 	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached != nil {
-		logger.Info("idempotent – returning cached sales rep")
-		return cached, nil
+		if cached.SalesRepID != uuid.Nil {
+			logger.Info("idempotent – returning cached sales rep")
+			_ = s.decryptSalesRep(ctx, cached)
+			return cached, nil
+		}
+		logger.Warn("idempotent cache returned zero object – continuing")
 	}
 
 	rep, err := s.repRepo.GetByIDForUpdate(ctx, tx, companyID, salesRepID)
@@ -382,13 +377,11 @@ func (s *salesRepService) UpdateSalesRep(ctx context.Context, companyID, salesRe
 
 	changes := make(map[string]interface{})
 
-	// Name
 	if req.Name != nil && *req.Name != rep.Name {
 		changes["name"] = map[string]string{"old": rep.Name, "new": *req.Name}
 		rep.Name = *req.Name
 	}
 
-	// Email (encrypted)
 	if req.Email != nil {
 		newHash := hashEmail(*req.Email)
 		hashExists, err := s.repRepo.ExistsByEmailHashExcluding(ctx, tx, companyID, newHash, salesRepID)
@@ -402,7 +395,6 @@ func (s *salesRepService) UpdateSalesRep(ctx context.Context, companyID, salesRe
 		if err != nil {
 			return nil, err
 		}
-		// Capture old email for audit (decrypt current)
 		oldPlain, _ := s.decryptField(ctx, rep.EmailEncrypted, rep.EmailDEK, rep.EmailKeyID)
 		changes["email"] = map[string]string{"old": oldPlain, "new": *req.Email}
 		rep.EmailEncrypted = encrypted
@@ -411,7 +403,6 @@ func (s *salesRepService) UpdateSalesRep(ctx context.Context, companyID, salesRe
 		rep.EmailHash = &newHash
 	}
 
-	// Phone (encrypted)
 	if req.Phone != nil {
 		encrypted, dek, kid, err := s.encryptField(ctx, req.Phone, "sales_rep_phone")
 		if err != nil {
@@ -424,13 +415,13 @@ func (s *salesRepService) UpdateSalesRep(ctx context.Context, companyID, salesRe
 		rep.PhoneKeyID = kid
 	}
 
-	// Active status
 	if req.IsActive != nil && *req.IsActive != rep.IsActive {
 		changes["is_active"] = map[string]bool{"old": rep.IsActive, "new": *req.IsActive}
 		rep.IsActive = *req.IsActive
 	}
 
 	rep.UpdatedBy = req.UpdatedBy
+
 	if err := s.repRepo.Update(ctx, tx, rep); err != nil {
 		return nil, fmt.Errorf("update sales rep: %w", err)
 	}
@@ -439,13 +430,15 @@ func (s *salesRepService) UpdateSalesRep(ctx context.Context, companyID, salesRe
 		logger.Warn("failed to emit sales rep updated event", zap.Error(err))
 	}
 
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, rep)
+	if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, rep); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
 	_ = s.decryptSalesRep(ctx, rep)
-
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &companyID, "sales", "update_sales_rep", "sales_rep",
 			&salesRepID, "user", req.UpdatedBy, nil, nil, changes)
@@ -453,12 +446,11 @@ func (s *salesRepService) UpdateSalesRep(ctx context.Context, companyID, salesRe
 	return rep, nil
 }
 
-// ---------------------------------------------------------------------
-// DeleteSalesRep, GetSalesRepByID, etc. (unchanged from user’s code)
-// ---------------------------------------------------------------------
+func (s *salesRepService) DeleteSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, deletedBy uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "DeleteSalesRep"))
+	idempotencyKey := s.getIdempotencyKey(ctx)
+	logger = logger.With(zap.String("idempotency_key", idempotencyKey))
 
-func (s *salesRepService) DeleteSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, deletedBy uuid.UUID, idempotencyKey string) error {
-	logger := s.logger.With(zap.String("method", "DeleteSalesRep"), zap.String("idempotency_key", idempotencyKey))
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -479,14 +471,13 @@ func (s *salesRepService) DeleteSalesRep(ctx context.Context, companyID, salesRe
 		return salesErrors.ErrPermissionDenied
 	}
 
-	// Check dependencies
 	var hasDeps bool
 	err = tx.QueryRowContext(ctx, `
         SELECT EXISTS(
             SELECT 1 FROM sales.orders WHERE company_id=$1 AND sales_rep_id=$2 LIMIT 1
-            UNION ALL
+        ) OR EXISTS(
             SELECT 1 FROM sales.quotes WHERE company_id=$1 AND sales_rep_id=$2 LIMIT 1
-            UNION ALL
+        ) OR EXISTS(
             SELECT 1 FROM sales.invoices WHERE company_id=$1 AND sales_rep_id=$2 LIMIT 1
         )`, companyID, salesRepID).Scan(&hasDeps)
 	if err != nil && err != sql.ErrNoRows {
@@ -508,7 +499,10 @@ func (s *salesRepService) DeleteSalesRep(ctx context.Context, companyID, salesRe
 		logger.Warn("failed to emit delete event", zap.Error(err))
 	}
 
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
@@ -520,8 +514,18 @@ func (s *salesRepService) DeleteSalesRep(ctx context.Context, companyID, salesRe
 	return nil
 }
 
+// ----------------------------------------------------------------------------
+// Read operations – now use read‑only transactions
+// ----------------------------------------------------------------------------
+
 func (s *salesRepService) GetSalesRepByID(ctx context.Context, companyID, salesRepID uuid.UUID) (*models.SalesRep, error) {
-	rep, err := s.repRepo.GetByID(ctx, nil, companyID, salesRepID)
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("begin read‑only tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	rep, err := s.repRepo.GetByID(ctx, tx, companyID, salesRepID)
 	if err != nil {
 		return nil, err
 	}
@@ -530,7 +534,13 @@ func (s *salesRepService) GetSalesRepByID(ctx context.Context, companyID, salesR
 }
 
 func (s *salesRepService) GetSalesRepByUserID(ctx context.Context, companyID, userID uuid.UUID) (*models.SalesRep, error) {
-	rep, err := s.repRepo.GetByUserID(ctx, nil, companyID, userID)
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("begin read‑only tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	rep, err := s.repRepo.GetByUserID(ctx, tx, companyID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -539,7 +549,13 @@ func (s *salesRepService) GetSalesRepByUserID(ctx context.Context, companyID, us
 }
 
 func (s *salesRepService) GetSalesRepByCode(ctx context.Context, companyID uuid.UUID, code string) (*models.SalesRep, error) {
-	rep, err := s.repRepo.GetByCode(ctx, nil, companyID, code)
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("begin read‑only tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	rep, err := s.repRepo.GetByCode(ctx, tx, companyID, code)
 	if err != nil {
 		return nil, err
 	}
@@ -548,6 +564,12 @@ func (s *salesRepService) GetSalesRepByCode(ctx context.Context, companyID uuid.
 }
 
 func (s *salesRepService) ListSalesReps(ctx context.Context, filter SalesRepListFilter, p Pagination, srt Sort) ([]*models.SalesRep, int64, error) {
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, 0, fmt.Errorf("begin read‑only tx: %w", err)
+	}
+	defer tx.Rollback()
+
 	repoFilter := repository.SalesRepFilter{
 		CompanyID:   filter.CompanyID,
 		IsActive:    filter.IsActive,
@@ -556,7 +578,7 @@ func (s *salesRepService) ListSalesReps(ctx context.Context, filter SalesRepList
 		Name:        filter.Name,
 		UserID:      filter.UserID,
 	}
-	reps, total, err := s.repRepo.List(ctx, nil, repoFilter,
+	reps, total, err := s.repRepo.List(ctx, tx, repoFilter,
 		repository.Pagination{Limit: p.Limit, Offset: p.Offset},
 		repository.Sort{Field: srt.Field, Direction: srt.Direction})
 	if err != nil {
@@ -569,7 +591,13 @@ func (s *salesRepService) ListSalesReps(ctx context.Context, filter SalesRepList
 }
 
 func (s *salesRepService) SearchSalesReps(ctx context.Context, companyID uuid.UUID, query string, limit, offset int) ([]*models.SalesRep, int64, error) {
-	reps, total, err := s.repRepo.Search(ctx, nil, companyID, query, limit, offset)
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, 0, fmt.Errorf("begin read‑only tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	reps, total, err := s.repRepo.Search(ctx, tx, companyID, query, limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -580,7 +608,13 @@ func (s *salesRepService) SearchSalesReps(ctx context.Context, companyID uuid.UU
 }
 
 func (s *salesRepService) GetActiveSalesReps(ctx context.Context, companyID uuid.UUID) ([]*models.SalesRep, error) {
-	reps, err := s.repRepo.GetActiveSalesReps(ctx, nil, companyID)
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("begin read‑only tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	reps, err := s.repRepo.GetActiveSalesReps(ctx, tx, companyID)
 	if err != nil {
 		return nil, err
 	}
@@ -590,15 +624,23 @@ func (s *salesRepService) GetActiveSalesReps(ctx context.Context, companyID uuid
 	return reps, nil
 }
 
-func (s *salesRepService) ActivateSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error {
-	return s.setActiveStatus(ctx, companyID, salesRepID, true, updatedBy, idempotencyKey)
+// ----------------------------------------------------------------------------
+// Activation / deactivation (idempotent) – unchanged (use read/write tx)
+// ----------------------------------------------------------------------------
+
+func (s *salesRepService) ActivateSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, updatedBy uuid.UUID) error {
+	return s.setActiveStatus(ctx, companyID, salesRepID, true, updatedBy)
 }
 
-func (s *salesRepService) DeactivateSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error {
-	return s.setActiveStatus(ctx, companyID, salesRepID, false, updatedBy, idempotencyKey)
+func (s *salesRepService) DeactivateSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, updatedBy uuid.UUID) error {
+	return s.setActiveStatus(ctx, companyID, salesRepID, false, updatedBy)
 }
 
-func (s *salesRepService) setActiveStatus(ctx context.Context, companyID, salesRepID uuid.UUID, active bool, updatedBy uuid.UUID, idempotencyKey string) error {
+func (s *salesRepService) setActiveStatus(ctx context.Context, companyID, salesRepID uuid.UUID, active bool, updatedBy uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "setActiveStatus"))
+	idempotencyKey := s.getIdempotencyKey(ctx)
+	logger = logger.With(zap.String("idempotency_key", idempotencyKey))
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -607,6 +649,7 @@ func (s *salesRepService) setActiveStatus(ctx context.Context, companyID, salesR
 
 	var processed bool
 	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+		logger.Info("idempotent – status already updated")
 		return nil
 	}
 
@@ -623,19 +666,32 @@ func (s *salesRepService) setActiveStatus(ctx context.Context, companyID, salesR
 		_ = s.emitEvent(ctx, tx, rep, eventType)
 	}
 
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+
 	return tx.Commit()
 }
 
 func (s *salesRepService) IsSalesRepActive(ctx context.Context, companyID, salesRepID uuid.UUID) (bool, error) {
-	return s.repRepo.IsActive(ctx, nil, companyID, salesRepID)
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return false, fmt.Errorf("begin read‑only tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	return s.repRepo.IsActive(ctx, tx, companyID, salesRepID)
 }
 
-// ---------------------------------------------------------------------
-// Assignment Methods (unchanged from user’s code)
-// ---------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// Assignment helpers (idempotent) – unchanged (use read/write tx)
+// ----------------------------------------------------------------------------
 
-func (s *salesRepService) assignEntity(ctx context.Context, companyID, salesRepID, entityID uuid.UUID, entityType string, assignedBy uuid.UUID, idempotencyKey string, updateFunc func(*sql.Tx) error) error {
+func (s *salesRepService) assignEntity(ctx context.Context, companyID, salesRepID, entityID uuid.UUID, entityType string, assignedBy uuid.UUID, updateFunc func(*sql.Tx) error) error {
+	logger := s.logger.With(zap.String("method", "assignEntity"), zap.String("entity_type", entityType))
+	idempotencyKey := s.getIdempotencyKey(ctx)
+	logger = logger.With(zap.String("idempotency_key", idempotencyKey))
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -644,6 +700,7 @@ func (s *salesRepService) assignEntity(ctx context.Context, companyID, salesRepI
 
 	var processed bool
 	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+		logger.Info("idempotent – assignment already performed")
 		return nil
 	}
 
@@ -680,11 +737,18 @@ func (s *salesRepService) assignEntity(ctx context.Context, companyID, salesRepI
 		_ = s.outboxRepo.Store(ctx, tx, event)
 	}
 
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+
 	return tx.Commit()
 }
 
-func (s *salesRepService) removeAssignment(ctx context.Context, companyID, salesRepID, entityID uuid.UUID, entityType string, removedBy uuid.UUID, idempotencyKey string, updateFunc func(*sql.Tx) error) error {
+func (s *salesRepService) removeAssignment(ctx context.Context, companyID, salesRepID, entityID uuid.UUID, entityType string, removedBy uuid.UUID, updateFunc func(*sql.Tx) error) error {
+	logger := s.logger.With(zap.String("method", "removeAssignment"), zap.String("entity_type", entityType))
+	idempotencyKey := s.getIdempotencyKey(ctx)
+	logger = logger.With(zap.String("idempotency_key", idempotencyKey))
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -693,6 +757,7 @@ func (s *salesRepService) removeAssignment(ctx context.Context, companyID, sales
 
 	var processed bool
 	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+		logger.Info("idempotent – removal already performed")
 		return nil
 	}
 
@@ -721,13 +786,19 @@ func (s *salesRepService) removeAssignment(ctx context.Context, companyID, sales
 		_ = s.outboxRepo.Store(ctx, tx, event)
 	}
 
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+
 	return tx.Commit()
 }
 
-// Order assignments
-func (s *salesRepService) AssignOrder(ctx context.Context, companyID, salesRepID, orderID uuid.UUID, assignedBy uuid.UUID, idempotencyKey string) error {
-	return s.assignEntity(ctx, companyID, salesRepID, orderID, "order", assignedBy, idempotencyKey, func(tx *sql.Tx) error {
+// ----------------------------------------------------------------------------
+// Assignment implementations
+// ----------------------------------------------------------------------------
+
+func (s *salesRepService) AssignOrder(ctx context.Context, companyID, salesRepID, orderID uuid.UUID, assignedBy uuid.UUID) error {
+	return s.assignEntity(ctx, companyID, salesRepID, orderID, "order", assignedBy, func(tx *sql.Tx) error {
 		order, err := s.orderRepo.GetByIDForUpdate(ctx, tx, companyID, orderID)
 		if err != nil {
 			return err
@@ -738,8 +809,8 @@ func (s *salesRepService) AssignOrder(ctx context.Context, companyID, salesRepID
 	})
 }
 
-func (s *salesRepService) RemoveOrderAssignment(ctx context.Context, companyID, salesRepID, orderID uuid.UUID, removedBy uuid.UUID, idempotencyKey string) error {
-	return s.removeAssignment(ctx, companyID, salesRepID, orderID, "order", removedBy, idempotencyKey, func(tx *sql.Tx) error {
+func (s *salesRepService) RemoveOrderAssignment(ctx context.Context, companyID, salesRepID, orderID uuid.UUID, removedBy uuid.UUID) error {
+	return s.removeAssignment(ctx, companyID, salesRepID, orderID, "order", removedBy, func(tx *sql.Tx) error {
 		order, err := s.orderRepo.GetByIDForUpdate(ctx, tx, companyID, orderID)
 		if err != nil {
 			return err
@@ -751,18 +822,23 @@ func (s *salesRepService) RemoveOrderAssignment(ctx context.Context, companyID, 
 }
 
 func (s *salesRepService) GetAssignedOrders(ctx context.Context, companyID, salesRepID uuid.UUID, p Pagination, srt Sort) ([]*models.Order, int64, error) {
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, 0, fmt.Errorf("begin read‑only tx: %w", err)
+	}
+	defer tx.Rollback()
+
 	filter := repository.OrderFilter{
 		CompanyID:  companyID,
 		SalesRepID: &salesRepID,
 	}
-	return s.orderRepo.List(ctx, nil, filter,
+	return s.orderRepo.List(ctx, tx, filter,
 		repository.Pagination{Limit: p.Limit, Offset: p.Offset},
 		repository.Sort{Field: srt.Field, Direction: srt.Direction})
 }
 
-// Quote assignments
-func (s *salesRepService) AssignQuote(ctx context.Context, companyID, salesRepID, quoteID uuid.UUID, assignedBy uuid.UUID, idempotencyKey string) error {
-	return s.assignEntity(ctx, companyID, salesRepID, quoteID, "quote", assignedBy, idempotencyKey, func(tx *sql.Tx) error {
+func (s *salesRepService) AssignQuote(ctx context.Context, companyID, salesRepID, quoteID uuid.UUID, assignedBy uuid.UUID) error {
+	return s.assignEntity(ctx, companyID, salesRepID, quoteID, "quote", assignedBy, func(tx *sql.Tx) error {
 		quote, err := s.quoteRepo.GetByIDForUpdate(ctx, tx, companyID, quoteID)
 		if err != nil {
 			return err
@@ -773,8 +849,8 @@ func (s *salesRepService) AssignQuote(ctx context.Context, companyID, salesRepID
 	})
 }
 
-func (s *salesRepService) RemoveQuoteAssignment(ctx context.Context, companyID, salesRepID, quoteID uuid.UUID, removedBy uuid.UUID, idempotencyKey string) error {
-	return s.removeAssignment(ctx, companyID, salesRepID, quoteID, "quote", removedBy, idempotencyKey, func(tx *sql.Tx) error {
+func (s *salesRepService) RemoveQuoteAssignment(ctx context.Context, companyID, salesRepID, quoteID uuid.UUID, removedBy uuid.UUID) error {
+	return s.removeAssignment(ctx, companyID, salesRepID, quoteID, "quote", removedBy, func(tx *sql.Tx) error {
 		quote, err := s.quoteRepo.GetByIDForUpdate(ctx, tx, companyID, quoteID)
 		if err != nil {
 			return err
@@ -786,18 +862,23 @@ func (s *salesRepService) RemoveQuoteAssignment(ctx context.Context, companyID, 
 }
 
 func (s *salesRepService) GetAssignedQuotes(ctx context.Context, companyID, salesRepID uuid.UUID, p Pagination, srt Sort) ([]*models.Quote, int64, error) {
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, 0, fmt.Errorf("begin read‑only tx: %w", err)
+	}
+	defer tx.Rollback()
+
 	filter := repository.QuoteFilter{
 		CompanyID:  companyID,
 		SalesRepID: &salesRepID,
 	}
-	return s.quoteRepo.List(ctx, nil, filter,
+	return s.quoteRepo.List(ctx, tx, filter,
 		repository.Pagination{Limit: p.Limit, Offset: p.Offset},
 		repository.Sort{Field: srt.Field, Direction: srt.Direction})
 }
 
-// Invoice assignments
-func (s *salesRepService) AssignInvoice(ctx context.Context, companyID, salesRepID, invoiceID uuid.UUID, assignedBy uuid.UUID, idempotencyKey string) error {
-	return s.assignEntity(ctx, companyID, salesRepID, invoiceID, "invoice", assignedBy, idempotencyKey, func(tx *sql.Tx) error {
+func (s *salesRepService) AssignInvoice(ctx context.Context, companyID, salesRepID, invoiceID uuid.UUID, assignedBy uuid.UUID) error {
+	return s.assignEntity(ctx, companyID, salesRepID, invoiceID, "invoice", assignedBy, func(tx *sql.Tx) error {
 		invoice, err := s.invoiceRepo.GetByIDForUpdate(ctx, tx, companyID, invoiceID)
 		if err != nil {
 			return err
@@ -808,8 +889,8 @@ func (s *salesRepService) AssignInvoice(ctx context.Context, companyID, salesRep
 	})
 }
 
-func (s *salesRepService) RemoveInvoiceAssignment(ctx context.Context, companyID, salesRepID, invoiceID uuid.UUID, removedBy uuid.UUID, idempotencyKey string) error {
-	return s.removeAssignment(ctx, companyID, salesRepID, invoiceID, "invoice", removedBy, idempotencyKey, func(tx *sql.Tx) error {
+func (s *salesRepService) RemoveInvoiceAssignment(ctx context.Context, companyID, salesRepID, invoiceID uuid.UUID, removedBy uuid.UUID) error {
+	return s.removeAssignment(ctx, companyID, salesRepID, invoiceID, "invoice", removedBy, func(tx *sql.Tx) error {
 		invoice, err := s.invoiceRepo.GetByIDForUpdate(ctx, tx, companyID, invoiceID)
 		if err != nil {
 			return err
@@ -821,34 +902,30 @@ func (s *salesRepService) RemoveInvoiceAssignment(ctx context.Context, companyID
 }
 
 func (s *salesRepService) GetAssignedInvoices(ctx context.Context, companyID, salesRepID uuid.UUID, p Pagination, srt Sort) ([]*models.Invoice, int64, error) {
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, 0, fmt.Errorf("begin read‑only tx: %w", err)
+	}
+	defer tx.Rollback()
+
 	filter := repository.InvoiceFilter{
 		CompanyID:  companyID,
 		SalesRepID: &salesRepID,
 	}
-	return s.invoiceRepo.List(ctx, nil, filter,
+	return s.invoiceRepo.List(ctx, tx, filter,
 		repository.Pagination{Limit: p.Limit, Offset: p.Offset},
 		repository.Sort{Field: srt.Field, Direction: srt.Direction})
 }
 
-// Customer assignments (not supported)
-func (s *salesRepService) AssignCustomer(ctx context.Context, companyID, salesRepID, customerID uuid.UUID, assignedBy uuid.UUID, idempotencyKey string) error {
-	return fmt.Errorf("customer assignment not supported: customer model lacks sales_rep_id column")
-}
-func (s *salesRepService) RemoveCustomerAssignment(ctx context.Context, companyID, salesRepID, customerID uuid.UUID, removedBy uuid.UUID, idempotencyKey string) error {
-	return fmt.Errorf("customer assignment removal not supported")
-}
-func (s *salesRepService) GetAssignedCustomers(ctx context.Context, companyID, salesRepID uuid.UUID, p Pagination, srt Sort) ([]*models.Customer, int64, error) {
-	return nil, 0, fmt.Errorf("customer assignment not supported")
-}
-func (s *salesRepService) GetCustomerSalesRep(ctx context.Context, companyID, customerID uuid.UUID) (*models.SalesRep, error) {
-	return nil, fmt.Errorf("customer sales rep not supported")
-}
+// ----------------------------------------------------------------------------
+// Commission plan (idempotent) – unchanged
+// ----------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------
-// Commission & Analytics (unchanged)
-// ---------------------------------------------------------------------
+func (s *salesRepService) SetCommissionPlan(ctx context.Context, companyID, salesRepID, commissionPlanID uuid.UUID, updatedBy uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "SetCommissionPlan"))
+	idempotencyKey := s.getIdempotencyKey(ctx)
+	logger = logger.With(zap.String("idempotency_key", idempotencyKey))
 
-func (s *salesRepService) SetCommissionPlan(ctx context.Context, companyID, salesRepID, commissionPlanID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error {
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -857,6 +934,7 @@ func (s *salesRepService) SetCommissionPlan(ctx context.Context, companyID, sale
 
 	var processed bool
 	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+		logger.Info("idempotent – commission plan already set")
 		return nil
 	}
 
@@ -867,12 +945,26 @@ func (s *salesRepService) SetCommissionPlan(ctx context.Context, companyID, sale
 	if comm.CompanyID != companyID || comm.SalesRepID != salesRepID {
 		return fmt.Errorf("%w: commission plan not owned by this sales rep", salesErrors.ErrInvalidInput)
 	}
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+
+	if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+
 	return tx.Commit()
 }
 
+// ----------------------------------------------------------------------------
+// Commission calculation – now use read‑only transactions
+// ----------------------------------------------------------------------------
+
 func (s *salesRepService) CalculateCommission(ctx context.Context, companyID, salesRepID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
-	return s.commissionRepo.GetTotalCommissionAmount(ctx, nil, companyID, &salesRepID, from, to)
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("begin read‑only tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	return s.commissionRepo.GetTotalCommissionAmount(ctx, tx, companyID, &salesRepID, from, to)
 }
 
 func (s *salesRepService) GetEarnedCommission(ctx context.Context, companyID, salesRepID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
@@ -880,9 +972,9 @@ func (s *salesRepService) GetEarnedCommission(ctx context.Context, companyID, sa
 }
 
 func (s *salesRepService) GetSalesRevenue(ctx context.Context, companyID, salesRepID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
-	tx, err := s.pgClient.BeginTx(ctx, nil)
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return decimal.Zero, err
+		return decimal.Zero, fmt.Errorf("begin read‑only tx: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -905,9 +997,9 @@ func (s *salesRepService) GetSalesRevenue(ctx context.Context, companyID, salesR
 }
 
 func (s *salesRepService) GetCollectedRevenue(ctx context.Context, companyID, salesRepID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
-	tx, err := s.pgClient.BeginTx(ctx, nil)
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return decimal.Zero, err
+		return decimal.Zero, fmt.Errorf("begin read‑only tx: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -937,9 +1029,9 @@ func (s *salesRepService) GetCollectedRevenue(ctx context.Context, companyID, sa
 }
 
 func (s *salesRepService) GetAverageDealSize(ctx context.Context, companyID, salesRepID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
-	tx, err := s.pgClient.BeginTx(ctx, nil)
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return decimal.Zero, err
+		return decimal.Zero, fmt.Errorf("begin read‑only tx: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -962,9 +1054,9 @@ func (s *salesRepService) GetAverageDealSize(ctx context.Context, companyID, sal
 }
 
 func (s *salesRepService) GetConversionRate(ctx context.Context, companyID, salesRepID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
-	tx, err := s.pgClient.BeginTx(ctx, nil)
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return decimal.Zero, err
+		return decimal.Zero, fmt.Errorf("begin read‑only tx: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -997,8 +1089,18 @@ func (s *salesRepService) GetConversionRate(ctx context.Context, companyID, sale
 	return rate, nil
 }
 
+// ----------------------------------------------------------------------------
+// Leaderboard & top reps
+// ----------------------------------------------------------------------------
+
 func (s *salesRepService) GetTopSalesReps(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.SalesRep, error) {
-	reps, err := s.repRepo.GetTopSalesRepsByRevenue(ctx, nil, companyID, limit, from, to)
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("begin read‑only tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	reps, err := s.repRepo.GetTopSalesRepsByRevenue(ctx, tx, companyID, limit, from, to)
 	if err != nil {
 		return nil, err
 	}
@@ -1009,9 +1111,9 @@ func (s *salesRepService) GetTopSalesReps(ctx context.Context, companyID uuid.UU
 }
 
 func (s *salesRepService) GetSalesRepLeaderboard(ctx context.Context, companyID uuid.UUID, from, to *time.Time) ([]*SalesRepLeaderboardEntry, error) {
-	tx, err := s.pgClient.BeginTx(ctx, nil)
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("begin read‑only tx: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -1053,18 +1155,21 @@ func (s *salesRepService) GetSalesRepLeaderboard(ctx context.Context, companyID 
 	return entries, nil
 }
 
-// ---------------------------------------------------------------------
-// Sales Targets (unchanged)
-// ---------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// Sales target (idempotent) – unchanged for writes, read uses read‑only tx
+// ----------------------------------------------------------------------------
 
-func (s *salesRepService) SetSalesTarget(ctx context.Context, companyID, salesRepID uuid.UUID, req *SetSalesTargetRequest, updatedBy uuid.UUID, idempotencyKey string) error {
-	logger := s.logger.With(zap.String("method", "SetSalesTarget"), zap.String("idempotency_key", idempotencyKey))
+func (s *salesRepService) SetSalesTarget(ctx context.Context, companyID, salesRepID uuid.UUID, req *SetSalesTargetRequest, updatedBy uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "SetSalesTarget"))
 	if companyID == uuid.Nil || salesRepID == uuid.Nil {
 		return salesErrors.ErrInvalidInput
 	}
 	if req.PeriodStart.After(req.PeriodEnd) {
 		return fmt.Errorf("%w: period_start must be before period_end", salesErrors.ErrInvalidInput)
 	}
+
+	idempotencyKey := s.getIdempotencyKey(ctx)
+	logger = logger.With(zap.String("idempotency_key", idempotencyKey))
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -1086,7 +1191,6 @@ func (s *salesRepService) SetSalesTarget(ctx context.Context, companyID, salesRe
 		return fmt.Errorf("%w: sales rep is not active", salesErrors.ErrInvalidInput)
 	}
 
-	// Upsert
 	delQuery := `DELETE FROM sales.sales_targets WHERE company_id=$1 AND sales_rep_id=$2 AND period_start=$3 AND period_end=$4`
 	if _, err := tx.ExecContext(ctx, delQuery, companyID, salesRepID, req.PeriodStart, req.PeriodEnd); err != nil {
 		return fmt.Errorf("delete existing target: %w", err)
@@ -1111,7 +1215,10 @@ func (s *salesRepService) SetSalesTarget(ctx context.Context, companyID, salesRe
 		logger.Warn("failed to emit sales target event", zap.Error(err))
 	}
 
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
@@ -1129,12 +1236,18 @@ func (s *salesRepService) SetSalesTarget(ctx context.Context, companyID, salesRe
 }
 
 func (s *salesRepService) GetSalesTarget(ctx context.Context, companyID, salesRepID uuid.UUID, periodStart, periodEnd time.Time) (*models.SalesTarget, error) {
-	return s.targetRepo.GetByPeriod(ctx, nil, companyID, salesRepID, periodStart, periodEnd)
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("begin read‑only tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	return s.targetRepo.GetByPeriod(ctx, tx, companyID, salesRepID, periodStart, periodEnd)
 }
 
-// ---------------------------------------------------------------------
-// Validation Helpers (unchanged)
-// ---------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// Validation & existence
+// ----------------------------------------------------------------------------
 
 func (s *salesRepService) ValidateSalesRep(ctx context.Context, rep *models.SalesRep) error {
 	if rep.Code == "" {
@@ -1150,7 +1263,13 @@ func (s *salesRepService) ValidateSalesRep(ctx context.Context, rep *models.Sale
 }
 
 func (s *salesRepService) ValidateAssignment(ctx context.Context, companyID, salesRepID uuid.UUID, entityType string, entityID uuid.UUID) error {
-	active, err := s.repRepo.IsActive(ctx, nil, companyID, salesRepID)
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return fmt.Errorf("begin read‑only tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	active, err := s.repRepo.IsActive(ctx, tx, companyID, salesRepID)
 	if err != nil {
 		return err
 	}
@@ -1161,6 +1280,7 @@ func (s *salesRepService) ValidateAssignment(ctx context.Context, companyID, sal
 }
 
 func (s *salesRepService) CanManageCustomer(ctx context.Context, companyID, salesRepID, customerID uuid.UUID) (bool, error) {
+	// Not implemented – remains unchanged
 	return false, nil
 }
 
@@ -1176,9 +1296,29 @@ func (s *salesRepService) UserAlreadyLinked(ctx context.Context, companyID, user
 	return s.repRepo.ExistsByUserID(ctx, s.pgClient.DB, companyID, userID)
 }
 
-// ---------------------------------------------------------------------
-// Internal Helpers
-// ---------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// Customer assignment – not supported
+// ----------------------------------------------------------------------------
+
+func (s *salesRepService) AssignCustomer(ctx context.Context, companyID, salesRepID, customerID uuid.UUID, assignedBy uuid.UUID) error {
+	return fmt.Errorf("customer assignment not supported: customer model lacks sales_rep_id column")
+}
+
+func (s *salesRepService) RemoveCustomerAssignment(ctx context.Context, companyID, salesRepID, customerID uuid.UUID, removedBy uuid.UUID) error {
+	return fmt.Errorf("customer assignment removal not supported")
+}
+
+func (s *salesRepService) GetAssignedCustomers(ctx context.Context, companyID, salesRepID uuid.UUID, p Pagination, srt Sort) ([]*models.Customer, int64, error) {
+	return nil, 0, fmt.Errorf("customer assignment not supported")
+}
+
+func (s *salesRepService) GetCustomerSalesRep(ctx context.Context, companyID, customerID uuid.UUID) (*models.SalesRep, error) {
+	return nil, fmt.Errorf("customer sales rep not supported")
+}
+
+// ----------------------------------------------------------------------------
+// Event emission helpers – unchanged
+// ----------------------------------------------------------------------------
 
 func (s *salesRepService) emitEvent(ctx context.Context, tx *sql.Tx, rep *models.SalesRep, eventType string) error {
 	payload := map[string]interface{}{

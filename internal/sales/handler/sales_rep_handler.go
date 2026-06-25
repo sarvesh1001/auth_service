@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -15,7 +16,7 @@ import (
 	"auth-service/internal/sales/service"
 )
 
-// SalesRepHandler handles HTTP requests for sales representative management.
+// SalesRepHandler handles HTTP requests for sales representative operations.
 type SalesRepHandler struct {
 	salesRepService service.SalesRepService
 	*BaseHandler
@@ -29,7 +30,19 @@ func NewSalesRepHandler(salesRepService service.SalesRepService, logger *zap.Log
 	}
 }
 
-// ---------- Request/Response Types ----------
+// injectIdempotencyKey reads the Idempotency-Key header and injects it into the context.
+// This follows the pattern used in the payment handler.
+func (h *SalesRepHandler) injectIdempotencyKey(ctx context.Context, r *http.Request) context.Context {
+	key := h.getIdempotencyKey(r)
+	if key != "" {
+		return context.WithValue(ctx, "idempotency_key", key)
+	}
+	return ctx
+}
+
+// ----------------------------------------------------------------------------
+// Request/Response types
+// ----------------------------------------------------------------------------
 
 type createSalesRepRequest struct {
 	UserID string  `json:"user_id"`
@@ -37,19 +50,6 @@ type createSalesRepRequest struct {
 	Name   string  `json:"name"`
 	Email  *string `json:"email,omitempty"`
 	Phone  *string `json:"phone,omitempty"`
-}
-
-type createSalesRepResponse struct {
-	SalesRepID string  `json:"sales_rep_id"`
-	CompanyID  string  `json:"company_id"`
-	UserID     string  `json:"user_id"`
-	Code       string  `json:"code"`
-	Name       string  `json:"name"`
-	Email      *string `json:"email,omitempty"`
-	Phone      *string `json:"phone,omitempty"`
-	IsActive   bool    `json:"is_active"`
-	CreatedAt  string  `json:"created_at"`
-	UpdatedAt  string  `json:"updated_at"`
 }
 
 type updateSalesRepRequest struct {
@@ -133,7 +133,9 @@ type leaderboardResponse struct {
 	Entries []leaderboardEntry `json:"entries"`
 }
 
-// ---------- Helper Functions ----------
+// ----------------------------------------------------------------------------
+// Helper methods (pagination, sorting, mapping)
+// ----------------------------------------------------------------------------
 
 func (h *SalesRepHandler) parsePagination(r *http.Request) (limit, offset int) {
 	limit = 20
@@ -215,18 +217,18 @@ func (h *SalesRepHandler) salesRepToResponse(rep *models.SalesRep) createSalesRe
 	return resp
 }
 
-// ---------- Handler Methods ----------
+// ----------------------------------------------------------------------------
+// Mutating handlers (with idempotency injection)
+// ----------------------------------------------------------------------------
 
 // CreateSalesRep handles POST /sales-reps
 func (h *SalesRepHandler) CreateSalesRep(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -238,7 +240,6 @@ func (h *SalesRepHandler) CreateSalesRep(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
 	if req.UserID == "" {
 		h.respondWithError(w, http.StatusBadRequest, "user_id is required")
 		return
@@ -256,17 +257,13 @@ func (h *SalesRepHandler) CreateSalesRep(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusBadRequest, "name is required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "sales_rep:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
+	// Inject idempotency key from header into context (similar to payment handler)
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	svcReq := &service.CreateSalesRepRequest{
 		CompanyID: companyID,
@@ -278,7 +275,7 @@ func (h *SalesRepHandler) CreateSalesRep(w http.ResponseWriter, r *http.Request)
 		CreatedBy: &userID,
 	}
 
-	rep, err := h.salesRepService.CreateSalesRep(ctx, svcReq, idempotencyKey)
+	rep, err := h.salesRepService.CreateSalesRep(ctx, svcReq) // idempotency key is read from ctx
 	if err != nil {
 		h.logger.Error("failed to create sales rep", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -298,25 +295,21 @@ func (h *SalesRepHandler) CreateSalesRep(w http.ResponseWriter, r *http.Request)
 // UpdateSalesRep handles PUT /sales-reps/{id}
 func (h *SalesRepHandler) UpdateSalesRep(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	salesRepID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "sales_rep:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -328,6 +321,8 @@ func (h *SalesRepHandler) UpdateSalesRep(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	ctx = h.injectIdempotencyKey(ctx, r)
+
 	svcReq := &service.UpdateSalesRepRequest{
 		Name:      req.Name,
 		Email:     req.Email,
@@ -336,13 +331,7 @@ func (h *SalesRepHandler) UpdateSalesRep(w http.ResponseWriter, r *http.Request)
 		UpdatedBy: &userID,
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	rep, err := h.salesRepService.UpdateSalesRep(ctx, companyID, salesRepID, svcReq, idempotencyKey)
+	rep, err := h.salesRepService.UpdateSalesRep(ctx, companyID, salesRepID, svcReq)
 	if err != nil {
 		h.logger.Error("failed to update sales rep", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -360,37 +349,29 @@ func (h *SalesRepHandler) UpdateSalesRep(w http.ResponseWriter, r *http.Request)
 // DeleteSalesRep handles DELETE /sales-reps/{id}
 func (h *SalesRepHandler) DeleteSalesRep(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	salesRepID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "sales_rep:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
-	err = h.salesRepService.DeleteSalesRep(ctx, companyID, salesRepID, userID, idempotencyKey)
+	err = h.salesRepService.DeleteSalesRep(ctx, companyID, salesRepID, userID)
 	if err != nil {
 		h.logger.Error("failed to delete sales rep", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -404,22 +385,495 @@ func (h *SalesRepHandler) DeleteSalesRep(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// GetSalesRepByID handles GET /sales-reps/{id}
-func (h *SalesRepHandler) GetSalesRepByID(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+// ActivateSalesRep handles POST /sales-reps/{id}/activate
+func (h *SalesRepHandler) ActivateSalesRep(w http.ResponseWriter, r *http.Request) {
+	h.updateActivation(w, r, true)
+}
 
+// DeactivateSalesRep handles POST /sales-reps/{id}/deactivate
+func (h *SalesRepHandler) DeactivateSalesRep(w http.ResponseWriter, r *http.Request) {
+	h.updateActivation(w, r, false)
+}
+
+func (h *SalesRepHandler) updateActivation(w http.ResponseWriter, r *http.Request, activate bool) {
+	ctx := r.Context()
 	salesRepID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
 		return
 	}
-
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if !h.hasPermission(ctx, companyID, userID, "sales_rep:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
 
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	if activate {
+		err = h.salesRepService.ActivateSalesRep(ctx, companyID, salesRepID, userID)
+	} else {
+		err = h.salesRepService.DeactivateSalesRep(ctx, companyID, salesRepID, userID)
+	}
+	if err != nil {
+		h.logger.Error("failed to update activation status", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+
+	msg := "deactivated"
+	if activate {
+		msg = "activated"
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("sales rep %s", msg),
+	})
+}
+
+// AssignOrder handles POST /sales-reps/{id}/assign-order
+func (h *SalesRepHandler) AssignOrder(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	salesRepID, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
+		return
+	}
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "sales_rep:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req assignEntityRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	orderID, err := uuid.Parse(req.EntityID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid entity_id")
+		return
+	}
+
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	err = h.salesRepService.AssignOrder(ctx, companyID, salesRepID, orderID, userID)
+	if err != nil {
+		h.logger.Error("failed to assign order", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "order assigned",
+	})
+}
+
+// RemoveOrderAssignment handles DELETE /sales-reps/{id}/assign-order
+func (h *SalesRepHandler) RemoveOrderAssignment(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	salesRepID, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
+		return
+	}
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "sales_rep:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req assignEntityRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	orderID, err := uuid.Parse(req.EntityID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid entity_id")
+		return
+	}
+
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	err = h.salesRepService.RemoveOrderAssignment(ctx, companyID, salesRepID, orderID, userID)
+	if err != nil {
+		h.logger.Error("failed to remove order assignment", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "order assignment removed",
+	})
+}
+
+// AssignQuote handles POST /sales-reps/{id}/assign-quote
+func (h *SalesRepHandler) AssignQuote(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	salesRepID, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
+		return
+	}
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "sales_rep:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req assignEntityRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	quoteID, err := uuid.Parse(req.EntityID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid entity_id")
+		return
+	}
+
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	err = h.salesRepService.AssignQuote(ctx, companyID, salesRepID, quoteID, userID)
+	if err != nil {
+		h.logger.Error("failed to assign quote", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "quote assigned",
+	})
+}
+
+// RemoveQuoteAssignment handles DELETE /sales-reps/{id}/assign-quote
+func (h *SalesRepHandler) RemoveQuoteAssignment(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	salesRepID, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
+		return
+	}
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "sales_rep:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req assignEntityRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	quoteID, err := uuid.Parse(req.EntityID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid entity_id")
+		return
+	}
+
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	err = h.salesRepService.RemoveQuoteAssignment(ctx, companyID, salesRepID, quoteID, userID)
+	if err != nil {
+		h.logger.Error("failed to remove quote assignment", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "quote assignment removed",
+	})
+}
+
+// AssignInvoice handles POST /sales-reps/{id}/assign-invoice
+func (h *SalesRepHandler) AssignInvoice(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	salesRepID, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
+		return
+	}
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "sales_rep:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req assignEntityRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	invoiceID, err := uuid.Parse(req.EntityID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid entity_id")
+		return
+	}
+
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	err = h.salesRepService.AssignInvoice(ctx, companyID, salesRepID, invoiceID, userID)
+	if err != nil {
+		h.logger.Error("failed to assign invoice", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "invoice assigned",
+	})
+}
+
+// RemoveInvoiceAssignment handles DELETE /sales-reps/{id}/assign-invoice
+func (h *SalesRepHandler) RemoveInvoiceAssignment(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	salesRepID, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
+		return
+	}
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "sales_rep:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req assignEntityRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	invoiceID, err := uuid.Parse(req.EntityID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid entity_id")
+		return
+	}
+
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	err = h.salesRepService.RemoveInvoiceAssignment(ctx, companyID, salesRepID, invoiceID, userID)
+	if err != nil {
+		h.logger.Error("failed to remove invoice assignment", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "invoice assignment removed",
+	})
+}
+
+// SetCommissionPlan handles POST /sales-reps/{id}/commission-plan
+func (h *SalesRepHandler) SetCommissionPlan(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	salesRepID, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
+		return
+	}
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "sales_rep:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req setCommissionPlanRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	planID, err := uuid.Parse(req.CommissionPlanID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid commission_plan_id")
+		return
+	}
+
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	err = h.salesRepService.SetCommissionPlan(ctx, companyID, salesRepID, planID, userID)
+	if err != nil {
+		h.logger.Error("failed to set commission plan", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "commission plan set",
+	})
+}
+
+// SetSalesTarget handles POST /sales-reps/{id}/target
+func (h *SalesRepHandler) SetSalesTarget(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	salesRepID, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
+		return
+	}
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "sales_rep:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req setSalesTargetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	targetAmount, err := decimal.NewFromString(req.TargetAmount)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid target_amount")
+		return
+	}
+	periodStart, err := time.Parse(time.RFC3339, req.PeriodStart)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid period_start")
+		return
+	}
+	periodEnd, err := time.Parse(time.RFC3339, req.PeriodEnd)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid period_end")
+		return
+	}
+
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	svcReq := &service.SetSalesTargetRequest{
+		TargetAmount: targetAmount,
+		PeriodStart:  periodStart,
+		PeriodEnd:    periodEnd,
+	}
+
+	err = h.salesRepService.SetSalesTarget(ctx, companyID, salesRepID, svcReq, userID)
+	if err != nil {
+		h.logger.Error("failed to set sales target", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "sales target set",
+	})
+}
+
+// ----------------------------------------------------------------------------
+// Read‑only handlers (no idempotency injection needed)
+// ----------------------------------------------------------------------------
+
+// GetSalesRepByID handles GET /sales-reps/{id}
+func (h *SalesRepHandler) GetSalesRepByID(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	salesRepID, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
+		return
+	}
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -437,7 +891,6 @@ func (h *SalesRepHandler) GetSalesRepByID(w http.ResponseWriter, r *http.Request
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	resp := h.salesRepToResponse(rep)
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -448,13 +901,11 @@ func (h *SalesRepHandler) GetSalesRepByID(w http.ResponseWriter, r *http.Request
 // GetSalesRepByUserID handles GET /sales-reps/by-user
 func (h *SalesRepHandler) GetSalesRepByUserID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userIDStr := r.URL.Query().Get("user_id")
 	if userIDStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "user_id query parameter is required")
@@ -465,7 +916,6 @@ func (h *SalesRepHandler) GetSalesRepByUserID(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusBadRequest, "invalid user_id")
 		return
 	}
-
 	authUserID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -483,7 +933,6 @@ func (h *SalesRepHandler) GetSalesRepByUserID(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	resp := h.salesRepToResponse(rep)
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -494,19 +943,16 @@ func (h *SalesRepHandler) GetSalesRepByUserID(w http.ResponseWriter, r *http.Req
 // GetSalesRepByCode handles GET /sales-reps/by-code
 func (h *SalesRepHandler) GetSalesRepByCode(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	code := r.URL.Query().Get("code")
 	if code == "" {
 		h.respondWithError(w, http.StatusBadRequest, "code query parameter is required")
 		return
 	}
-
 	authUserID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -524,7 +970,6 @@ func (h *SalesRepHandler) GetSalesRepByCode(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	resp := h.salesRepToResponse(rep)
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -535,13 +980,11 @@ func (h *SalesRepHandler) GetSalesRepByCode(w http.ResponseWriter, r *http.Reque
 // ListSalesReps handles GET /sales-reps
 func (h *SalesRepHandler) ListSalesReps(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	authUserID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -572,7 +1015,6 @@ func (h *SalesRepHandler) ListSalesReps(w http.ResponseWriter, r *http.Request) 
 			filter.UserID = &uID
 		}
 	}
-
 	limit, offset := h.parsePagination(r)
 	pagination := service.Pagination{Limit: limit, Offset: offset}
 	sort := h.parseSort(r)
@@ -588,7 +1030,6 @@ func (h *SalesRepHandler) ListSalesReps(w http.ResponseWriter, r *http.Request) 
 	for i, r := range reps {
 		summaries[i] = h.salesRepToSummary(r)
 	}
-
 	resp := listSalesRepsResponse{
 		SalesReps: summaries,
 		Total:     total,
@@ -604,20 +1045,17 @@ func (h *SalesRepHandler) ListSalesReps(w http.ResponseWriter, r *http.Request) 
 // SearchSalesReps handles GET /sales-reps/search
 func (h *SalesRepHandler) SearchSalesReps(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	query := r.URL.Query().Get("q")
 	if query == "" {
 		h.respondWithError(w, http.StatusBadRequest, "q query parameter is required")
 		return
 	}
 	limit, offset := h.parsePagination(r)
-
 	authUserID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -639,7 +1077,6 @@ func (h *SalesRepHandler) SearchSalesReps(w http.ResponseWriter, r *http.Request
 	for i, r := range reps {
 		summaries[i] = h.salesRepToSummary(r)
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data": map[string]interface{}{
@@ -654,13 +1091,11 @@ func (h *SalesRepHandler) SearchSalesReps(w http.ResponseWriter, r *http.Request
 // GetActiveSalesReps handles GET /sales-reps/active
 func (h *SalesRepHandler) GetActiveSalesReps(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	authUserID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -688,204 +1123,19 @@ func (h *SalesRepHandler) GetActiveSalesReps(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-// ActivateSalesRep handles PATCH /sales-reps/{id}/activate
-func (h *SalesRepHandler) ActivateSalesRep(w http.ResponseWriter, r *http.Request) {
-	h.updateActivation(w, r, true)
-}
-
-// DeactivateSalesRep handles PATCH /sales-reps/{id}/deactivate
-func (h *SalesRepHandler) DeactivateSalesRep(w http.ResponseWriter, r *http.Request) {
-	h.updateActivation(w, r, false)
-}
-
-func (h *SalesRepHandler) updateActivation(w http.ResponseWriter, r *http.Request, activate bool) {
-	ctx := r.Context()
-
-	salesRepID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
-		return
-	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "sales_rep:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	if activate {
-		err = h.salesRepService.ActivateSalesRep(ctx, companyID, salesRepID, userID, idempotencyKey)
-	} else {
-		err = h.salesRepService.DeactivateSalesRep(ctx, companyID, salesRepID, userID, idempotencyKey)
-	}
-	if err != nil {
-		h.logger.Error("failed to update activation status", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	msg := "deactivated"
-	if activate {
-		msg = "activated"
-	}
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": fmt.Sprintf("sales rep %s", msg),
-	})
-}
-
-// ----- Assignment methods (direct implementations) -----
-
-// AssignOrder handles POST /sales-reps/{id}/assign-order
-func (h *SalesRepHandler) AssignOrder(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	salesRepID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
-		return
-	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "sales_rep:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	var req assignEntityRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	orderID, err := uuid.Parse(req.EntityID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid entity_id")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.salesRepService.AssignOrder(ctx, companyID, salesRepID, orderID, userID, idempotencyKey)
-	if err != nil {
-		h.logger.Error("failed to assign order", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "order assigned",
-	})
-}
-
-// RemoveOrderAssignment handles DELETE /sales-reps/{id}/assign-order
-func (h *SalesRepHandler) RemoveOrderAssignment(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	salesRepID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
-		return
-	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "sales_rep:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	var req assignEntityRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	orderID, err := uuid.Parse(req.EntityID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid entity_id")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.salesRepService.RemoveOrderAssignment(ctx, companyID, salesRepID, orderID, userID, idempotencyKey)
-	if err != nil {
-		h.logger.Error("failed to remove order assignment", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "order assignment removed",
-	})
-}
-
-// GetAssignedOrders handles GET /sales-reps/{id}/orders
+// GetAssignedOrders handles GET /sales-reps/{id}/assigned-orders
 func (h *SalesRepHandler) GetAssignedOrders(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	salesRepID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	authUserID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -919,138 +1169,19 @@ func (h *SalesRepHandler) GetAssignedOrders(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// AssignQuote handles POST /sales-reps/{id}/assign-quote
-func (h *SalesRepHandler) AssignQuote(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	salesRepID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
-		return
-	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "sales_rep:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	var req assignEntityRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	quoteID, err := uuid.Parse(req.EntityID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid entity_id")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.salesRepService.AssignQuote(ctx, companyID, salesRepID, quoteID, userID, idempotencyKey)
-	if err != nil {
-		h.logger.Error("failed to assign quote", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "quote assigned",
-	})
-}
-
-// RemoveQuoteAssignment handles DELETE /sales-reps/{id}/assign-quote
-func (h *SalesRepHandler) RemoveQuoteAssignment(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	salesRepID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
-		return
-	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "sales_rep:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	var req assignEntityRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	quoteID, err := uuid.Parse(req.EntityID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid entity_id")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.salesRepService.RemoveQuoteAssignment(ctx, companyID, salesRepID, quoteID, userID, idempotencyKey)
-	if err != nil {
-		h.logger.Error("failed to remove quote assignment", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "quote assignment removed",
-	})
-}
-
-// GetAssignedQuotes handles GET /sales-reps/{id}/quotes
+// GetAssignedQuotes handles GET /sales-reps/{id}/assigned-quotes
 func (h *SalesRepHandler) GetAssignedQuotes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	salesRepID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	authUserID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -1084,138 +1215,19 @@ func (h *SalesRepHandler) GetAssignedQuotes(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// AssignInvoice handles POST /sales-reps/{id}/assign-invoice
-func (h *SalesRepHandler) AssignInvoice(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	salesRepID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
-		return
-	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "sales_rep:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	var req assignEntityRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	invoiceID, err := uuid.Parse(req.EntityID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid entity_id")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.salesRepService.AssignInvoice(ctx, companyID, salesRepID, invoiceID, userID, idempotencyKey)
-	if err != nil {
-		h.logger.Error("failed to assign invoice", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "invoice assigned",
-	})
-}
-
-// RemoveInvoiceAssignment handles DELETE /sales-reps/{id}/assign-invoice
-func (h *SalesRepHandler) RemoveInvoiceAssignment(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	salesRepID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
-		return
-	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "sales_rep:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	var req assignEntityRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	invoiceID, err := uuid.Parse(req.EntityID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid entity_id")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.salesRepService.RemoveInvoiceAssignment(ctx, companyID, salesRepID, invoiceID, userID, idempotencyKey)
-	if err != nil {
-		h.logger.Error("failed to remove invoice assignment", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "invoice assignment removed",
-	})
-}
-
-// GetAssignedInvoices handles GET /sales-reps/{id}/invoices
+// GetAssignedInvoices handles GET /sales-reps/{id}/assigned-invoices
 func (h *SalesRepHandler) GetAssignedInvoices(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	salesRepID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	authUserID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -1249,94 +1261,19 @@ func (h *SalesRepHandler) GetAssignedInvoices(w http.ResponseWriter, r *http.Req
 	})
 }
 
-// Customer assignments (not supported)
-func (h *SalesRepHandler) AssignCustomer(w http.ResponseWriter, r *http.Request) {
-	h.respondWithError(w, http.StatusNotImplemented, "customer assignment not supported")
-}
-func (h *SalesRepHandler) RemoveCustomerAssignment(w http.ResponseWriter, r *http.Request) {
-	h.respondWithError(w, http.StatusNotImplemented, "customer assignment removal not supported")
-}
-func (h *SalesRepHandler) GetAssignedCustomers(w http.ResponseWriter, r *http.Request) {
-	h.respondWithError(w, http.StatusNotImplemented, "customer assignment not supported")
-}
-func (h *SalesRepHandler) GetCustomerSalesRep(w http.ResponseWriter, r *http.Request) {
-	h.respondWithError(w, http.StatusNotImplemented, "customer sales rep not supported")
-}
-
-// Commission plan
-func (h *SalesRepHandler) SetCommissionPlan(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	salesRepID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
-		return
-	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "sales_rep:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	var req setCommissionPlanRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	planID, err := uuid.Parse(req.CommissionPlanID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid commission_plan_id")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.salesRepService.SetCommissionPlan(ctx, companyID, salesRepID, planID, userID, idempotencyKey)
-	if err != nil {
-		h.logger.Error("failed to set commission plan", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "commission plan set",
-	})
-}
-
-// Commission and analytics
+// CalculateCommission handles GET /sales-reps/{id}/commission
 func (h *SalesRepHandler) CalculateCommission(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	salesRepID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	authUserID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -1364,25 +1301,24 @@ func (h *SalesRepHandler) CalculateCommission(w http.ResponseWriter, r *http.Req
 	})
 }
 
+// GetEarnedCommission is an alias for CalculateCommission
 func (h *SalesRepHandler) GetEarnedCommission(w http.ResponseWriter, r *http.Request) {
 	h.CalculateCommission(w, r)
 }
 
+// GetSalesRevenue handles GET /sales-reps/{id}/revenue
 func (h *SalesRepHandler) GetSalesRevenue(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	salesRepID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	authUserID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -1410,21 +1346,19 @@ func (h *SalesRepHandler) GetSalesRevenue(w http.ResponseWriter, r *http.Request
 	})
 }
 
+// GetCollectedRevenue handles GET /sales-reps/{id}/collected-revenue
 func (h *SalesRepHandler) GetCollectedRevenue(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	salesRepID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	authUserID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -1452,21 +1386,19 @@ func (h *SalesRepHandler) GetCollectedRevenue(w http.ResponseWriter, r *http.Req
 	})
 }
 
+// GetAverageDealSize handles GET /sales-reps/{id}/average-deal-size
 func (h *SalesRepHandler) GetAverageDealSize(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	salesRepID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	authUserID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -1494,21 +1426,19 @@ func (h *SalesRepHandler) GetAverageDealSize(w http.ResponseWriter, r *http.Requ
 	})
 }
 
+// GetConversionRate handles GET /sales-reps/{id}/conversion-rate
 func (h *SalesRepHandler) GetConversionRate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	salesRepID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	authUserID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -1536,15 +1466,14 @@ func (h *SalesRepHandler) GetConversionRate(w http.ResponseWriter, r *http.Reque
 	})
 }
 
+// GetTopSalesReps handles GET /sales-reps/top
 func (h *SalesRepHandler) GetTopSalesReps(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	limit := 10
 	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
 		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
@@ -1552,7 +1481,6 @@ func (h *SalesRepHandler) GetTopSalesReps(w http.ResponseWriter, r *http.Request
 		}
 	}
 	from, to := h.parseTimeRange(r)
-
 	authUserID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -1583,17 +1511,15 @@ func (h *SalesRepHandler) GetTopSalesReps(w http.ResponseWriter, r *http.Request
 	})
 }
 
+// GetSalesRepLeaderboard handles GET /sales-reps/leaderboard
 func (h *SalesRepHandler) GetSalesRepLeaderboard(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	from, to := h.parseTimeRange(r)
-
 	authUserID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -1631,94 +1557,19 @@ func (h *SalesRepHandler) GetSalesRepLeaderboard(w http.ResponseWriter, r *http.
 	})
 }
 
-// Sales target
-func (h *SalesRepHandler) SetSalesTarget(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	salesRepID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
-		return
-	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "sales_rep:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	var req setSalesTargetRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	targetAmount, err := decimal.NewFromString(req.TargetAmount)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid target_amount")
-		return
-	}
-	periodStart, err := time.Parse(time.RFC3339, req.PeriodStart)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid period_start")
-		return
-	}
-	periodEnd, err := time.Parse(time.RFC3339, req.PeriodEnd)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid period_end")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	svcReq := &service.SetSalesTargetRequest{
-		TargetAmount: targetAmount,
-		PeriodStart:  periodStart,
-		PeriodEnd:    periodEnd,
-	}
-	err = h.salesRepService.SetSalesTarget(ctx, companyID, salesRepID, svcReq, userID, idempotencyKey)
-	if err != nil {
-		h.logger.Error("failed to set sales target", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "sales target set",
-	})
-}
-
+// GetSalesTarget handles GET /sales-reps/{id}/target
 func (h *SalesRepHandler) GetSalesTarget(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	salesRepID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	periodStartStr := r.URL.Query().Get("period_start")
 	if periodStartStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "period_start query parameter is required")
@@ -1739,7 +1590,6 @@ func (h *SalesRepHandler) GetSalesTarget(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusBadRequest, "invalid period_end")
 		return
 	}
-
 	authUserID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -1774,22 +1624,19 @@ func (h *SalesRepHandler) GetSalesTarget(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// Existence checks
+// SalesRepExists handles GET /sales-reps/{id}/exists
 func (h *SalesRepHandler) SalesRepExists(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	salesRepID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid sales rep ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	authUserID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -1806,28 +1653,25 @@ func (h *SalesRepHandler) SalesRepExists(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusInternalServerError, "failed to check existence")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    map[string]bool{"exists": exists},
 	})
 }
 
+// SalesRepCodeExists handles GET /sales-reps/exists?code=...
 func (h *SalesRepHandler) SalesRepCodeExists(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	code := r.URL.Query().Get("code")
 	if code == "" {
 		h.respondWithError(w, http.StatusBadRequest, "code query parameter is required")
 		return
 	}
-
 	authUserID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -1844,22 +1688,20 @@ func (h *SalesRepHandler) SalesRepCodeExists(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusInternalServerError, "failed to check existence")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    map[string]bool{"exists": exists},
 	})
 }
 
+// UserAlreadyLinked handles GET /sales-reps/user-linked?user_id=...
 func (h *SalesRepHandler) UserAlreadyLinked(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userIDStr := r.URL.Query().Get("user_id")
 	if userIDStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "user_id query parameter is required")
@@ -1870,7 +1712,6 @@ func (h *SalesRepHandler) UserAlreadyLinked(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusBadRequest, "invalid user_id")
 		return
 	}
-
 	authUserID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -1887,9 +1728,41 @@ func (h *SalesRepHandler) UserAlreadyLinked(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusInternalServerError, "failed to check")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    map[string]bool{"linked": linked},
 	})
+}
+
+// ----------------------------------------------------------------------------
+// Unimplemented endpoints (customer assignment not supported)
+// ----------------------------------------------------------------------------
+
+func (h *SalesRepHandler) AssignCustomer(w http.ResponseWriter, r *http.Request) {
+	h.respondWithError(w, http.StatusNotImplemented, "customer assignment not supported")
+}
+
+func (h *SalesRepHandler) RemoveCustomerAssignment(w http.ResponseWriter, r *http.Request) {
+	h.respondWithError(w, http.StatusNotImplemented, "customer assignment removal not supported")
+}
+
+func (h *SalesRepHandler) GetAssignedCustomers(w http.ResponseWriter, r *http.Request) {
+	h.respondWithError(w, http.StatusNotImplemented, "customer assignment not supported")
+}
+
+func (h *SalesRepHandler) GetCustomerSalesRep(w http.ResponseWriter, r *http.Request) {
+	h.respondWithError(w, http.StatusNotImplemented, "customer sales rep not supported")
+}
+
+type createSalesRepResponse struct {
+	SalesRepID string  `json:"sales_rep_id"`
+	CompanyID  string  `json:"company_id"`
+	UserID     string  `json:"user_id"`
+	Code       string  `json:"code"`
+	Name       string  `json:"name"`
+	Email      *string `json:"email,omitempty"`
+	Phone      *string `json:"phone,omitempty"`
+	IsActive   bool    `json:"is_active"`
+	CreatedAt  string  `json:"created_at"`
+	UpdatedAt  string  `json:"updated_at"`
 }

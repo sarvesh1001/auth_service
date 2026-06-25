@@ -136,14 +136,10 @@ func (s *taxIntegrationService) CalculateLineTax(ctx context.Context, req *Calcu
 	if len(items) == 0 {
 		return &TaxLineResult{TaxAmount: decimal.Zero, ApplicableRate: decimal.Zero}, nil
 	}
-	// Sum all tax amounts (multiple rates may apply)
 	totalTax := decimal.Zero
 	for _, it := range items {
 		totalTax = totalTax.Add(it.TaxAmount)
 	}
-	// The TaxLineItem from accounting does not include the rate percentage.
-	// To get the effective rate, one would need to query the tax rate repository using it.TaxRateID.
-	// For simplicity, we return zero here.
 	return &TaxLineResult{
 		TaxAmount:      totalTax,
 		ApplicableRate: decimal.Zero,
@@ -224,18 +220,22 @@ func (s *taxIntegrationService) CreateTaxSnapshot(ctx context.Context, req *Crea
 		TaxableAmount: req.TaxableAmount,
 		TaxAmount:     req.TaxAmount,
 	}
-	if err := s.taxSnapshotRepo.Create(ctx, nil, snapshot); err != nil {
+	// Use the underlying DB connection
+	db := s.pgClient.DB
+	if err := s.taxSnapshotRepo.Create(ctx, db, snapshot); err != nil {
 		return nil, err
 	}
 	return snapshot, nil
 }
 
 func (s *taxIntegrationService) GetTaxSnapshotByID(ctx context.Context, companyID, snapshotID uuid.UUID) (*models.TaxSnapshot, error) {
-	return s.taxSnapshotRepo.GetByID(ctx, nil, companyID, snapshotID)
+	db := s.pgClient.DB
+	return s.taxSnapshotRepo.GetByID(ctx, db, companyID, snapshotID)
 }
 
 func (s *taxIntegrationService) GetLatestTaxSnapshot(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID) (*models.TaxSnapshot, error) {
-	snapshots, err := s.taxSnapshotRepo.GetByEntity(ctx, nil, companyID, entityType, entityID)
+	db := s.pgClient.DB
+	snapshots, err := s.taxSnapshotRepo.GetByEntity(ctx, db, companyID, entityType, entityID)
 	if err != nil {
 		return nil, err
 	}
@@ -246,7 +246,8 @@ func (s *taxIntegrationService) GetLatestTaxSnapshot(ctx context.Context, compan
 }
 
 func (s *taxIntegrationService) GetTaxSnapshots(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID) ([]*models.TaxSnapshot, error) {
-	return s.taxSnapshotRepo.GetByEntity(ctx, nil, companyID, entityType, entityID)
+	db := s.pgClient.DB
+	return s.taxSnapshotRepo.GetByEntity(ctx, db, companyID, entityType, entityID)
 }
 
 func (s *taxIntegrationService) RecalculateTaxSnapshot(ctx context.Context, companyID, snapshotID uuid.UUID, recalculatedBy uuid.UUID, idempotencyKey string) (*models.TaxSnapshot, error) {
@@ -328,7 +329,8 @@ func (s *taxIntegrationService) ArchiveTaxSnapshot(ctx context.Context, companyI
 // ------------------------------------------------------------
 
 func (s *taxIntegrationService) TaxSnapshotExists(ctx context.Context, companyID, snapshotID uuid.UUID) (bool, error) {
-	return s.taxSnapshotRepo.Exists(ctx, nil, companyID, snapshotID)
+	db := s.pgClient.DB
+	return s.taxSnapshotRepo.Exists(ctx, db, companyID, snapshotID)
 }
 
 // ------------------------------------------------------------
@@ -347,7 +349,6 @@ func (s *taxIntegrationService) calculateTaxesForEntity(ctx context.Context, com
 
 	var allLineDetails []TaxLineDetail
 	totalTax := decimal.Zero
-	// Aggregations per tax name (or per rate ID – using name for simplicity)
 	perRateTaxable := make(map[string]decimal.Decimal)
 	perRateTax := make(map[string]decimal.Decimal)
 
@@ -361,7 +362,6 @@ func (s *taxIntegrationService) calculateTaxesForEntity(ctx context.Context, com
 			billingAddress.CountryCode,
 			&billingAddress.StateCode,
 		)
-		// Get full breakdown for this line (all applicable taxes)
 		breakdownItems, err := s.accountingTaxEngine.ComputeTaxBreakdown(ctx, companyID, input)
 		if err != nil {
 			return nil, fmt.Errorf("failed to compute tax breakdown for product %s: %w", item.ProductID, err)
@@ -375,7 +375,6 @@ func (s *taxIntegrationService) calculateTaxesForEntity(ctx context.Context, com
 				TaxAmount:     ti.TaxAmount,
 				TaxRateName:   ti.LineType,
 			})
-			// Aggregate per tax name
 			rateName := ti.LineType
 			perRateTaxable[rateName] = perRateTaxable[rateName].Add(ti.TaxableAmount)
 			perRateTax[rateName] = perRateTax[rateName].Add(ti.TaxAmount)
@@ -391,6 +390,7 @@ func (s *taxIntegrationService) calculateTaxesForEntity(ctx context.Context, com
 	}, nil
 }
 
+// applyTaxesToEntity calculates, persists snapshots, and updates entity totals.
 // applyTaxesToEntity calculates, persists snapshots, and updates entity totals.
 func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, appliedBy uuid.UUID, idempotencyKey string) (*TaxCalculationResult, error) {
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -443,7 +443,6 @@ func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, companyI
 			return nil, err
 		}
 		customerID = &quote.CustomerID
-		// Fallback to customer address if quote doesn't have billing address stored
 		cust, _ := s.customerRepo.GetByID(ctx, tx, companyID, *customerID)
 		if cust != nil && cust.BillingAddress != nil {
 			billingAddress = s.parseAddressFromString(*cust.BillingAddress)
@@ -507,8 +506,6 @@ func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, companyI
 	// Create one snapshot per tax rate using the aggregated amounts
 	for rateName, taxAmount := range calcResult.TaxesByJurisdiction {
 		taxableAmount := calcResult.ApplicableRates[rateName]
-		// Note: The percentage is not available from the breakdown. We leave it nil.
-		// Optionally, we could fetch the tax rate from accounting.tax_rates using the rate name.
 		snapshot := &models.TaxSnapshot{
 			TaxSnapshotID: uuid.New(),
 			CompanyID:     companyID,
@@ -524,13 +521,18 @@ func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, companyI
 		}
 	}
 
-	// Update entity's tax_total field
+	// ------------------------------------------------------------
+	// 🔧 UPDATED SECTION: Update entity's tax_total field
+	// ------------------------------------------------------------
 	switch entityType {
 	case "order":
-		if err := s.orderRepo.RecalculateTotals(ctx, tx, companyID, entityID); err != nil {
+		// Use the new direct update method to set tax_total from computed result
+		if err := s.orderRepo.UpdateTaxTotal(ctx, tx, companyID, entityID, calcResult.TotalTax, &appliedBy); err != nil {
 			return nil, err
 		}
 	case "invoice":
+		// For invoice, you can either use RecalculateTotals (which may not read snapshots)
+		// or add a similar UpdateTaxTotal method. Keep RecalculateTotals for now.
 		if err := s.invoiceRepo.RecalculateTotals(ctx, tx, companyID, entityID); err != nil {
 			return nil, err
 		}
@@ -560,8 +562,10 @@ func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, companyI
 	return calcResult, nil
 }
 
+// getEntityTaxBreakdown uses a read‑only DB connection to fetch tax snapshots.
 func (s *taxIntegrationService) getEntityTaxBreakdown(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID) ([]*TaxBreakdownLine, error) {
-	snapshots, err := s.taxSnapshotRepo.GetByEntity(ctx, nil, companyID, entityType, entityID)
+	db := s.pgClient.DB
+	snapshots, err := s.taxSnapshotRepo.GetByEntity(ctx, db, companyID, entityType, entityID)
 	if err != nil {
 		return nil, err
 	}
@@ -630,6 +634,5 @@ func (s *taxIntegrationService) parseAddressFromString(addrStr string) *AddressI
 
 // Helper to detect idempotency not found error
 func isIdempotencyNotFound(err error) bool {
-	// Adjust based on your idempotency.Store implementation
 	return err != nil && err.Error() == "idempotency: key not found"
 }

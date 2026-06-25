@@ -564,19 +564,23 @@ func (r *salesRepRepository) GetActiveSalesReps(ctx context.Context, db DBTX, co
 // -------------------------------------------------------------------------
 
 func (r *salesRepRepository) GetTopSalesRepsByRevenue(ctx context.Context, db DBTX, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.SalesRep, error) {
-	where := "i.company_id = $1 AND i.status NOT IN ('cancelled', 'draft')"
+	// Build WHERE clause for invoice filters inside the LEFT JOIN
 	args := []interface{}{companyID}
 	idx := 2
+	joinConditions := "sr.sales_rep_id = i.sales_rep_id AND i.company_id = $1"
 	if from != nil {
-		where += fmt.Sprintf(" AND i.invoice_date >= $%d", idx)
+		joinConditions += fmt.Sprintf(" AND i.invoice_date >= $%d", idx)
 		args = append(args, *from)
 		idx++
 	}
 	if to != nil {
-		where += fmt.Sprintf(" AND i.invoice_date <= $%d", idx)
+		joinConditions += fmt.Sprintf(" AND i.invoice_date <= $%d", idx)
 		args = append(args, *to)
 		idx++
 	}
+	// Exclude cancelled/draft invoices
+	joinConditions += " AND i.status NOT IN ('cancelled', 'draft')"
+
 	query := fmt.Sprintf(`
 		SELECT 
 			sr.sales_rep_id, sr.company_id, sr.user_id, sr.code, sr.name,
@@ -586,12 +590,12 @@ func (r *salesRepRepository) GetTopSalesRepsByRevenue(ctx context.Context, db DB
 			sr.email_hash,
 			COALESCE(SUM(i.grand_total), 0) as total_revenue
 		FROM sales.sales_reps sr
-		LEFT JOIN sales.invoices i ON sr.sales_rep_id = i.sales_rep_id
-		WHERE %s
+		LEFT JOIN sales.invoices i ON %s
+		WHERE sr.company_id = $1
 		GROUP BY sr.sales_rep_id
 		ORDER BY total_revenue DESC
 		LIMIT $%d
-	`, where, idx)
+	`, joinConditions, idx)
 	args = append(args, limit)
 
 	rows, err := db.QueryContext(ctx, query, args...)
@@ -604,17 +608,43 @@ func (r *salesRepRepository) GetTopSalesRepsByRevenue(ctx context.Context, db DB
 	for rows.Next() {
 		var rep models.SalesRep
 		var totalRevenue decimal.Decimal
+		var createdBy, updatedBy uuid.NullUUID
+		var emailHash sql.NullString
+
 		err := rows.Scan(
-			&rep.SalesRepID, &rep.CompanyID, &rep.UserID, &rep.Code, &rep.Name,
-			&rep.EmailEncrypted, &rep.EmailDEK, &rep.EmailKeyID,
-			&rep.PhoneEncrypted, &rep.PhoneDEK, &rep.PhoneKeyID,
-			&rep.IsActive, &rep.CreatedAt, &rep.UpdatedAt, &rep.CreatedBy, &rep.UpdatedBy,
-			&rep.EmailHash,
+			&rep.SalesRepID,
+			&rep.CompanyID,
+			&rep.UserID,
+			&rep.Code,
+			&rep.Name,
+			&rep.EmailEncrypted,
+			&rep.EmailDEK,
+			&rep.EmailKeyID,
+			&rep.PhoneEncrypted,
+			&rep.PhoneDEK,
+			&rep.PhoneKeyID,
+			&rep.IsActive,
+			&rep.CreatedAt,
+			&rep.UpdatedAt,
+			&createdBy,
+			&updatedBy,
+			&emailHash,
 			&totalRevenue,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan top sales rep: %w", err)
 		}
+
+		if createdBy.Valid {
+			rep.CreatedBy = &createdBy.UUID
+		}
+		if updatedBy.Valid {
+			rep.UpdatedBy = &updatedBy.UUID
+		}
+		if emailHash.Valid {
+			rep.EmailHash = &emailHash.String
+		}
+
 		result = append(result, &rep)
 	}
 	return result, rows.Err()

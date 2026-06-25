@@ -72,6 +72,7 @@ type OrderService interface {
 	OrderNumberExists(ctx context.Context, companyID uuid.UUID, orderNumber string) (bool, error)
 	HasInvoices(ctx context.Context, companyID, orderID uuid.UUID) (bool, error)
 	HasReturns(ctx context.Context, companyID, orderID uuid.UUID) (bool, error)
+	UpdateOrderTaxTotal(ctx context.Context, companyID, orderID uuid.UUID, taxTotal decimal.Decimal, updatedBy uuid.UUID) error
 }
 
 type orderService struct {
@@ -1463,4 +1464,37 @@ func (s *orderService) confirmOrderInternal(ctx context.Context, tx repository.D
 
 func (s *orderService) validatePricing(ctx context.Context, tx repository.DBTX, companyID, orderID uuid.UUID) error {
 	return s.ValidatePricing(ctx, companyID, orderID)
+}
+
+// UpdateOrderTaxTotal updates the tax_total of an order.
+func (s *orderService) UpdateOrderTaxTotal(ctx context.Context, companyID, orderID uuid.UUID, taxTotal decimal.Decimal, updatedBy uuid.UUID) error {
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Optional: lock the order for update to avoid race conditions
+	order, err := s.orderRepo.GetByIDForUpdate(ctx, tx, companyID, orderID)
+	if err != nil {
+		return err
+	}
+	if order.CompanyID != companyID {
+		return salesErrors.ErrPermissionDenied
+	}
+
+	if err := s.orderRepo.UpdateTaxTotal(ctx, tx, companyID, orderID, taxTotal, &updatedBy); err != nil {
+		return err
+	}
+
+	// Audit log
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, &companyID, "sales", "update_tax_total", "order",
+			&orderID, "user", &updatedBy, nil, nil, map[string]interface{}{
+				"previous_tax_total": order.TaxTotal,
+				"new_tax_total":      taxTotal,
+			})
+	}
+
+	return tx.Commit()
 }
