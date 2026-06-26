@@ -40,7 +40,10 @@ type QuoteRepository interface {
 
 	ConvertToOrder(ctx context.Context, db DBTX, companyID, quoteID, orderID uuid.UUID, updatedBy *uuid.UUID) error
 	IsConverted(ctx context.Context, db DBTX, companyID, quoteID uuid.UUID) (bool, error)
-
+	// UpdateItemTaxAmount updates the tax_amount of a single quote item.
+	UpdateItemTaxAmount(ctx context.Context, db DBTX, quoteItemID uuid.UUID, taxAmount decimal.Decimal) error
+	// UpdateTaxTotal updates the tax_total of a quote.
+	UpdateTaxTotal(ctx context.Context, db DBTX, companyID, quoteID uuid.UUID, taxTotal decimal.Decimal, updatedBy *uuid.UUID) error
 	Exists(ctx context.Context, db DBTX, companyID, quoteID uuid.UUID) (bool, error)
 	ExistsByNumber(ctx context.Context, db DBTX, companyID uuid.UUID, quoteNumber string, revision int) (bool, error)
 	IsExpired(ctx context.Context, db DBTX, companyID, quoteID uuid.UUID, at time.Time) (bool, error)
@@ -904,4 +907,35 @@ func (r *quoteRepository) GetByIDForUpdate(ctx context.Context, db DBTX, company
 	`
 	row := db.QueryRowContext(ctx, query, companyID, quoteID)
 	return r.scanQuote(row)
+}
+
+// ---------- Tax Updates ----------
+func (r *quoteRepository) UpdateItemTaxAmount(ctx context.Context, db DBTX, quoteItemID uuid.UUID, taxAmount decimal.Decimal) error {
+	query := `UPDATE sales.quote_items SET tax_amount = $1 WHERE quote_item_id = $2`
+	res, err := db.ExecContext(ctx, query, taxAmount, quoteItemID)
+	if err != nil {
+		return fmt.Errorf("update quote item tax amount: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return salesErrors.ErrNotFound
+	}
+	return nil
+}
+
+func (r *quoteRepository) UpdateTaxTotal(ctx context.Context, db DBTX, companyID, quoteID uuid.UUID, taxTotal decimal.Decimal, updatedBy *uuid.UUID) error {
+	query := `
+        UPDATE sales.quotes
+        SET tax_total = $1, updated_at = NOW(), updated_by = $3
+        WHERE company_id = $2 AND quote_id = $4
+    `
+	res, err := db.ExecContext(ctx, query, taxTotal, companyID, r.nullUUIDParam(updatedBy), quoteID)
+	if err != nil {
+		return fmt.Errorf("update tax total: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return salesErrors.ErrNotFound
+	}
+	return nil
 }

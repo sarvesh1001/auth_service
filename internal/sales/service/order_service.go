@@ -183,6 +183,15 @@ func (s *orderService) CreateDraftOrder(ctx context.Context, req *CreateOrderReq
 		if err != nil {
 			return nil, fmt.Errorf("generate order number: %w", err)
 		}
+	} else {
+		// 🔧 NEW: Pre‑check if the provided order number already exists
+		exists, err := s.orderRepo.ExistsByNumber(ctx, tx, req.CompanyID, orderNumber)
+		if err != nil {
+			return nil, fmt.Errorf("check order number existence: %w", err)
+		}
+		if exists {
+			return nil, fmt.Errorf("%w: order number %s already exists", salesErrors.ErrDuplicate, orderNumber)
+		}
 	}
 
 	order := &models.Order{
@@ -206,6 +215,7 @@ func (s *orderService) CreateDraftOrder(ctx context.Context, req *CreateOrderReq
 	}
 
 	if err := s.orderRepo.Create(ctx, tx, order, nil); err != nil {
+		// Keep the database check as a safety net, but it should rarely trigger now
 		var pqErr *pq.Error
 		if errors.As(err, &pqErr) && pqErr.Code == "23505" {
 			return nil, fmt.Errorf("%w: order number %s already exists", salesErrors.ErrDuplicate, orderNumber)
@@ -219,12 +229,12 @@ func (s *orderService) CreateDraftOrder(ctx context.Context, req *CreateOrderReq
 		}
 	}
 
-	// --- 1. Recalculate baseline totals (subtotal, discount, placeholder tax) ---
+	// --- Recalculate baseline totals ---
 	if err := s.recalculateOrderTotals(ctx, tx, req.CompanyID, order.OrderID); err != nil {
 		return nil, fmt.Errorf("recalculate totals: %w", err)
 	}
 
-	// --- 2. Apply coupons (if any) ---
+	// --- Apply coupons (if any) ---
 	appliedBy := uuid.Nil
 	if req.CreatedBy != nil {
 		appliedBy = *req.CreatedBy
@@ -238,14 +248,14 @@ func (s *orderService) CreateDraftOrder(ctx context.Context, req *CreateOrderReq
 		return nil, fmt.Errorf("recalculate totals after coupons: %w", err)
 	}
 
-	// --- 3. Apply accounting-engine taxes SYNC using the SAME transaction ---
+	// --- Apply taxes using the same transaction ---
 	taxIdempotencyKey := fmt.Sprintf("%s-tax", idempotencyKey)
 	if _, err := s.taxSvc.ApplyTaxesToOrderWithTx(ctx, tx, req.CompanyID, order.OrderID, appliedBy, taxIdempotencyKey); err != nil {
 		logger.Error("failed to apply taxes during order creation", zap.Error(err))
 		return nil, fmt.Errorf("failed to apply taxes: %w", err)
 	}
 
-	// --- 4. Emit event and store idempotency ---
+	// --- Emit event and store idempotency ---
 	if err := s.emitOrderEvent(ctx, tx, order, salesEvents.EventOrderCreated, nil); err != nil {
 		logger.Warn("failed to emit order created event", zap.Error(err))
 	}
@@ -267,7 +277,6 @@ func (s *orderService) CreateDraftOrder(ctx context.Context, req *CreateOrderReq
 	}
 	return finalOrder, nil
 }
-
 func (s *orderService) UpdateOrder(ctx context.Context, companyID, orderID uuid.UUID, req *UpdateOrderRequest, idempotencyKey string) (*models.Order, error) {
 	logger := s.logger.With(zap.String("method", "UpdateOrder"), zap.String("idempotency_key", idempotencyKey))
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -497,38 +506,72 @@ func (s *orderService) RemoveItem(ctx context.Context, companyID, orderID, order
 }
 
 func (s *orderService) ApplyCoupon(ctx context.Context, companyID, orderID uuid.UUID, couponCode string, updatedBy uuid.UUID) (*discount.Coupon, decimal.Decimal, error) {
+	logger := s.logger.With(
+		zap.String("method", "ApplyCoupon"),
+		zap.String("order_id", orderID.String()),
+		zap.String("coupon_code", couponCode),
+	)
+	logger.Info("applying coupon to order")
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, decimal.Zero, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
 	order, err := s.orderRepo.GetByIDForUpdate(ctx, tx, companyID, orderID)
 	if err != nil {
+		logger.Error("failed to get order for update", zap.Error(err))
 		return nil, decimal.Zero, err
 	}
-	if order.CompanyID != companyID {
-		return nil, decimal.Zero, salesErrors.ErrPermissionDenied
-	}
+	logger.Info("order state before coupon application",
+		zap.String("subtotal", order.Subtotal.String()),
+		zap.String("discount_total", order.DiscountTotal.String()),
+		zap.String("tax_total", order.TaxTotal.String()),
+		zap.String("grand_total", order.GrandTotal.String()),
+	)
+
 	if order.Status != enums.OrderStatusDraft {
-		return nil, decimal.Zero, fmt.Errorf("%w: cannot apply coupon to order with status %s", salesErrors.ErrInvalidStatus, order.Status)
+		return nil, decimal.Zero, fmt.Errorf("%w: coupon can only be applied to draft orders", salesErrors.ErrInvalidStatus)
 	}
+
 	coupon, discountAmount, err := s.discountEngine.ApplyCouponWithTx(ctx, tx, companyID, "order", orderID, couponCode, updatedBy)
 	if err != nil {
+		logger.Error("discount engine failed to apply coupon", zap.Error(err))
 		return nil, decimal.Zero, err
 	}
+	logger.Info("coupon applied by engine",
+		zap.String("coupon_id", coupon.CouponID.String()),
+		zap.String("discount_amount", discountAmount.String()),
+	)
+
 	if err := s.recalculateOrderTotals(ctx, tx, companyID, orderID); err != nil {
+		logger.Error("recalculateOrderTotals failed", zap.Error(err))
 		return nil, decimal.Zero, err
 	}
+
+	// Re-fetch order to see updated totals
+	order, err = s.orderRepo.GetByID(ctx, tx, companyID, orderID)
+	if err == nil {
+		logger.Info("order state after coupon application and recalc",
+			zap.String("subtotal", order.Subtotal.String()),
+			zap.String("discount_total", order.DiscountTotal.String()),
+			zap.String("tax_total", order.TaxTotal.String()),
+			zap.String("grand_total", order.GrandTotal.String()),
+		)
+	}
+
 	order.UpdatedBy = &updatedBy
 	if err := s.orderRepo.Update(ctx, tx, order); err != nil {
 		return nil, decimal.Zero, err
 	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, decimal.Zero, fmt.Errorf("commit tx: %w", err)
 	}
+	logger.Info("coupon applied successfully")
 	return coupon, discountAmount, nil
 }
-
 func (s *orderService) RemoveCoupon(ctx context.Context, companyID, orderID uuid.UUID, couponCode string, updatedBy uuid.UUID) error {
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -589,25 +632,52 @@ func (s *orderService) ApplyBestDiscounts(ctx context.Context, companyID, orderI
 }
 
 func (s *orderService) RecalculateTotals(ctx context.Context, companyID, orderID uuid.UUID, updatedBy uuid.UUID) error {
+	logger := s.logger.With(
+		zap.String("method", "RecalculateTotals"),
+		zap.String("order_id", orderID.String()),
+	)
+	logger.Info("RecalculateTotals called")
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
 	order, err := s.orderRepo.GetByIDForUpdate(ctx, tx, companyID, orderID)
 	if err != nil {
+		logger.Error("failed to get order for update", zap.Error(err))
 		return err
 	}
-	if order.CompanyID != companyID {
-		return salesErrors.ErrPermissionDenied
-	}
+
+	logger.Info("order state before recalc",
+		zap.String("subtotal", order.Subtotal.String()),
+		zap.String("discount_total", order.DiscountTotal.String()),
+		zap.String("tax_total", order.TaxTotal.String()),
+		zap.String("grand_total", order.GrandTotal.String()),
+	)
+
 	if err := s.recalculateOrderTotals(ctx, tx, companyID, orderID); err != nil {
+		logger.Error("recalculateOrderTotals failed", zap.Error(err))
 		return err
 	}
+
+	// Re-fetch to get new totals
+	order, err = s.orderRepo.GetByID(ctx, tx, companyID, orderID)
+	if err == nil {
+		logger.Info("order state after recalc",
+			zap.String("subtotal", order.Subtotal.String()),
+			zap.String("discount_total", order.DiscountTotal.String()),
+			zap.String("tax_total", order.TaxTotal.String()),
+			zap.String("grand_total", order.GrandTotal.String()),
+		)
+	}
+
 	order.UpdatedBy = &updatedBy
 	if err := s.orderRepo.Update(ctx, tx, order); err != nil {
 		return err
 	}
+
 	return tx.Commit()
 }
 
@@ -1285,14 +1355,21 @@ func (s *orderService) addOrderItems(ctx context.Context, tx repository.DBTX, or
 }
 
 func (s *orderService) recalculateOrderTotals(ctx context.Context, tx repository.DBTX, companyID, orderID uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "recalculateOrderTotals"), zap.String("order_id", orderID.String()))
+
+	logger.Info("starting recalculateOrderTotals")
+
 	order, err := s.orderRepo.GetByID(ctx, tx, companyID, orderID)
 	if err != nil {
+		logger.Error("failed to get order", zap.Error(err))
 		return err
 	}
 	items, err := s.orderRepo.GetItems(ctx, tx, order.CompanyID, orderID)
 	if err != nil {
+		logger.Error("failed to get order items", zap.Error(err))
 		return err
 	}
+
 	var subtotal, discountTotal, taxTotal decimal.Decimal
 	for _, it := range items {
 		lineSubtotal := it.UnitPrice.Mul(it.Quantity)
@@ -1305,25 +1382,70 @@ func (s *orderService) recalculateOrderTotals(ctx context.Context, tx repository
 		taxable := lineSubtotal.Sub(discountAmt)
 		tax, err := s.pricingRepo.CalculateLineTax(ctx, tx, order.CompanyID, it.ProductID, taxable)
 		if err != nil {
+			logger.Error("calculate line tax failed", zap.Error(err), zap.String("product_id", it.ProductID.String()))
 			return fmt.Errorf("calculate line tax: %w", err)
 		}
 		it.TaxAmount = &tax
 		taxTotal = taxTotal.Add(tax)
 		updateQuery := `UPDATE sales.order_items SET tax_amount = $1 WHERE order_item_id = $2`
 		if _, err := tx.ExecContext(ctx, updateQuery, tax, it.OrderItemID); err != nil {
+			logger.Error("update item tax failed", zap.Error(err), zap.String("order_item_id", it.OrderItemID.String()))
 			return fmt.Errorf("update item tax: %w", err)
 		}
 	}
+
+	logger.Info("after line items",
+		zap.String("subtotal", subtotal.String()),
+		zap.String("line_discount_total", discountTotal.String()),
+		zap.String("tax_total_before_app_discount", taxTotal.String()),
+	)
+
+	// Add coupon/promotion discounts from discount_applications
+	var appDiscount decimal.Decimal
+	query := `SELECT COALESCE(SUM(amount), 0) FROM sales.discount_applications WHERE order_id = $1`
+	logger.Debug("executing discount_applications query", zap.String("order_id", orderID.String()))
+	err = tx.QueryRowContext(ctx, query, orderID).Scan(&appDiscount)
+	if err != nil {
+		logger.Warn("failed to sum discount applications", zap.Error(err))
+		appDiscount = decimal.Zero
+	} else {
+		logger.Info("discount_applications sum",
+			zap.String("appDiscount", appDiscount.String()),
+			zap.String("query", query),
+		)
+	}
+
+	discountTotal = discountTotal.Add(appDiscount)
+	logger.Info("final discount_total",
+		zap.String("discount_total", discountTotal.String()),
+		zap.String("appDiscount", appDiscount.String()),
+		zap.String("line_discount_total", discountTotal.Sub(appDiscount).String()),
+	)
+
 	order.Subtotal = subtotal
 	order.DiscountTotal = discountTotal
 	order.TaxTotal = taxTotal
 	order.GrandTotal = subtotal.Sub(discountTotal).Add(taxTotal)
+
+	logger.Info("order totals before update",
+		zap.String("subtotal", order.Subtotal.String()),
+		zap.String("discount_total", order.DiscountTotal.String()),
+		zap.String("tax_total", order.TaxTotal.String()),
+		zap.String("grand_total", order.GrandTotal.String()),
+	)
+
 	if err := s.orderRepo.Update(ctx, tx, order); err != nil {
+		logger.Error("failed to update order totals", zap.Error(err))
 		return fmt.Errorf("update order totals: %w", err)
 	}
+
+	logger.Info("order updated successfully")
+
+	// Delete old tax snapshots (optional)
 	if err := s.taxSnapshotRepo.DeleteByEntity(ctx, tx, order.CompanyID, "order", order.OrderID); err != nil {
-		s.logger.Warn("failed to delete old tax snapshots", zap.Error(err))
+		logger.Warn("failed to delete old tax snapshots", zap.Error(err))
 	}
+
 	for _, it := range items {
 		taxAmount := decimal.Zero
 		if it.TaxAmount != nil {
@@ -1344,9 +1466,11 @@ func (s *orderService) recalculateOrderTotals(ctx context.Context, tx repository
 			TaxAmount:     taxAmount,
 		}
 		if err := s.taxSnapshotRepo.Create(ctx, tx, snapshot); err != nil {
-			s.logger.Warn("failed to store tax snapshot", zap.Error(err))
+			logger.Warn("failed to store tax snapshot", zap.Error(err))
 		}
 	}
+
+	logger.Info("recalculateOrderTotals completed")
 	return nil
 }
 

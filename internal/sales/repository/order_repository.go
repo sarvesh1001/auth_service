@@ -490,6 +490,16 @@ func (r *orderRepository) GetByNumber(ctx context.Context, db DBTX, companyID uu
 }
 
 func (r *orderRepository) Update(ctx context.Context, db DBTX, order *models.Order) error {
+	r.logger.Info("orderRepository.Update called",
+		zap.String("order_id", order.OrderID.String()),
+		zap.String("company_id", order.CompanyID.String()),
+		zap.String("subtotal", order.Subtotal.String()),
+		zap.String("discount_total", order.DiscountTotal.String()),
+		zap.String("tax_total", order.TaxTotal.String()),
+		zap.String("grand_total", order.GrandTotal.String()),
+		zap.String("status", string(order.Status)),
+	)
+
 	query := `
 		UPDATE sales.orders SET
 			customer_id = $3,
@@ -544,13 +554,18 @@ func (r *orderRepository) Update(ctx context.Context, db DBTX, order *models.Ord
 	).Scan(&order.UpdatedAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
+			r.logger.Warn("orderRepository.Update – no rows updated", zap.String("order_id", order.OrderID.String()))
 			return errors.ErrNotFound
 		}
+		r.logger.Error("orderRepository.Update failed", zap.Error(err))
 		return fmt.Errorf("update order: %w", err)
 	}
+	r.logger.Info("orderRepository.Update succeeded",
+		zap.String("order_id", order.OrderID.String()),
+		zap.Time("updated_at", order.UpdatedAt),
+	)
 	return nil
 }
-
 func (r *orderRepository) Delete(ctx context.Context, db DBTX, companyID, orderID uuid.UUID) error {
 	query := `DELETE FROM sales.orders WHERE company_id = $1 AND order_id = $2`
 	result, err := db.ExecContext(ctx, query, companyID, orderID)
@@ -709,6 +724,11 @@ func (r *orderRepository) ExistsItem(ctx context.Context, db DBTX, companyID, or
 // -------------------------------------------------------------------------
 
 func (r *orderRepository) RecalculateTotals(ctx context.Context, db DBTX, companyID, orderID uuid.UUID) error {
+	r.logger.Info("RecalculateTotals called",
+		zap.String("order_id", orderID.String()),
+		zap.String("company_id", companyID.String()),
+	)
+
 	query := `
 		SELECT 
 			COALESCE(SUM(total_price), 0) as subtotal,
@@ -720,8 +740,15 @@ func (r *orderRepository) RecalculateTotals(ctx context.Context, db DBTX, compan
 	var subtotal, discountTotal, taxTotal decimal.Decimal
 	err := db.QueryRowContext(ctx, query, orderID).Scan(&subtotal, &discountTotal, &taxTotal)
 	if err != nil {
+		r.logger.Error("RecalculateTotals – failed to sum items", zap.Error(err))
 		return fmt.Errorf("recalculate totals: %w", err)
 	}
+	r.logger.Info("RecalculateTotals – sums from items",
+		zap.String("subtotal", subtotal.String()),
+		zap.String("discount_total", discountTotal.String()),
+		zap.String("tax_total", taxTotal.String()),
+	)
+
 	updateQuery := `
 		UPDATE sales.orders
 		SET subtotal = $1, discount_total = $2, tax_total = $3, updated_at = NOW()
@@ -729,11 +756,14 @@ func (r *orderRepository) RecalculateTotals(ctx context.Context, db DBTX, compan
 	`
 	_, err = db.ExecContext(ctx, updateQuery, subtotal, discountTotal, taxTotal, orderID, companyID)
 	if err != nil {
+		r.logger.Error("RecalculateTotals – update failed", zap.Error(err))
 		return fmt.Errorf("update order totals: %w", err)
 	}
+	r.logger.Info("RecalculateTotals completed",
+		zap.String("order_id", orderID.String()),
+	)
 	return nil
 }
-
 func (r *orderRepository) GetTotals(ctx context.Context, db DBTX, companyID, orderID uuid.UUID) (
 	subtotal decimal.Decimal, discountTotal decimal.Decimal, taxTotal decimal.Decimal, grandTotal decimal.Decimal, err error,
 ) {
@@ -1286,22 +1316,6 @@ func (r *orderRepository) DecreaseQuantityInvoiced(ctx context.Context, db DBTX,
 }
 
 // UpdateTaxTotal updates the tax_total of an order.
-func (r *orderRepository) UpdateTaxTotal(ctx context.Context, db DBTX, companyID, orderID uuid.UUID, taxTotal decimal.Decimal, updatedBy *uuid.UUID) error {
-	query := `
-		UPDATE sales.orders
-		SET tax_total = $1, updated_at = NOW(), updated_by = $3
-		WHERE company_id = $2 AND order_id = $4
-	`
-	result, err := db.ExecContext(ctx, query, taxTotal, companyID, r.nullUUIDParam(updatedBy), orderID)
-	if err != nil {
-		return fmt.Errorf("update tax total: %w", err)
-	}
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		return errors.ErrNotFound
-	}
-	return nil
-}
 func (r *orderRepository) UpdateItemTaxAmount(ctx context.Context, tx DBTX, orderItemID uuid.UUID, taxAmount decimal.Decimal) error {
 	query := `UPDATE sales.order_items SET tax_amount = $1 WHERE order_item_id = $2`
 	res, err := tx.ExecContext(ctx, query, taxAmount, orderItemID)
@@ -1309,6 +1323,33 @@ func (r *orderRepository) UpdateItemTaxAmount(ctx context.Context, tx DBTX, orde
 		return fmt.Errorf("update item tax amount: %w", err)
 	}
 	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return errors.ErrNotFound
+	}
+	return nil
+}
+
+// UpdateTaxTotal updates the tax_total of an order.
+func (r *orderRepository) UpdateTaxTotal(ctx context.Context, db DBTX, companyID, orderID uuid.UUID, taxTotal decimal.Decimal, updatedBy *uuid.UUID) error {
+	r.logger.Info("UpdateTaxTotal called",
+		zap.String("order_id", orderID.String()),
+		zap.String("company_id", companyID.String()),
+		zap.String("tax_total", taxTotal.String()),
+		zap.Any("updatedBy", updatedBy),
+	)
+
+	query := `
+		UPDATE sales.orders
+		SET tax_total = $1, updated_at = NOW(), updated_by = $3
+		WHERE company_id = $2 AND order_id = $4
+	`
+	result, err := db.ExecContext(ctx, query, taxTotal, companyID, r.nullUUIDParam(updatedBy), orderID)
+	if err != nil {
+		r.logger.Error("UpdateTaxTotal failed", zap.Error(err))
+		return fmt.Errorf("update tax total: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	r.logger.Info("UpdateTaxTotal executed", zap.Int64("rows_affected", rows))
 	if rows == 0 {
 		return errors.ErrNotFound
 	}

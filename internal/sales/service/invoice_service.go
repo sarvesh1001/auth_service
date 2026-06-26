@@ -1359,6 +1359,12 @@ func (s *invoiceService) VoidInvoice(ctx context.Context, companyID, invoiceID u
 		return err
 	}
 
+	// 🔧 NEW: Clear tax snapshots and reset tax_total to zero
+	_ = s.taxSnapshotRepo.DeleteByEntity(ctx, tx, companyID, "invoice", invoiceID)
+	if err := s.invoiceRepo.UpdateTaxTotal(ctx, tx, companyID, invoiceID, decimal.Zero, &voidedBy); err != nil {
+		return err
+	}
+
 	invoice.Status = enums.InvoiceStatusCancelled
 	if err := s.emitInvoiceEvent(ctx, tx, invoice, salesEvents.EventInvoiceCancelled, nil); err != nil {
 		s.logger.Warn("failed to emit invoice cancelled event", zap.Error(err))

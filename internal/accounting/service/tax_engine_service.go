@@ -295,9 +295,26 @@ func (s *taxEngineService) ComputeTaxBreakdown(ctx context.Context, companyID uu
 	if err != nil {
 		return nil, fmt.Errorf("get applicable rules: %w", err)
 	}
+
+	// Log fetched rules
+	s.logger.Info("applicable rules fetched",
+		zap.Int("count", len(bundles)),
+		zap.String("applies_to", appliesTo),
+		zap.String("company_id", companyID.String()),
+	)
+	for _, b := range bundles {
+		s.logger.Info("rule candidate",
+			zap.String("rule_id", b.Rule.TaxRuleID.String()),
+			zap.String("rule_name", b.Rule.RuleName),
+			zap.Int("priority", b.Rule.Priority),
+		)
+	}
+
+	// --- FIX: Sort by PRIORITY ASCENDING (lower number = higher priority) ---
 	sort.SliceStable(bundles, func(i, j int) bool {
-		return bundles[i].Rule.Priority > bundles[j].Rule.Priority
+		return bundles[i].Rule.Priority < bundles[j].Rule.Priority
 	})
+
 	strategy := FirstMatch
 	if profile.Settings != nil {
 		var settings map[string]interface{}
@@ -307,9 +324,17 @@ func (s *taxEngineService) ComputeTaxBreakdown(ctx context.Context, companyID uu
 		}
 	}
 	ctxData := buildContextData(input)
+
+	s.logger.Info("context data for rule evaluation", zap.Any("data", ctxData))
+
 	var allActions []*tax.TaxAction
 	for _, bundle := range bundles {
 		matched, err := s.evaluateRuleConditions(bundle, ctxData)
+		s.logger.Info("rule evaluation result",
+			zap.String("rule_id", bundle.Rule.TaxRuleID.String()),
+			zap.Bool("matched", matched),
+			zap.Error(err),
+		)
 		if err != nil {
 			s.logger.Warn("rule evaluation error",
 				zap.String("rule_id", bundle.Rule.TaxRuleID.String()),
@@ -329,7 +354,6 @@ func (s *taxEngineService) ComputeTaxBreakdown(ctx context.Context, companyID uu
 	}
 	return mergeTaxLineItems(items), nil
 }
-
 func (s *taxEngineService) ComputePeriodLiability(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) (decimal.Decimal, []TaxLineItem, error) {
 	transactions, err := s.taxTransactionRepo.GetForReturn(ctx, s.pgClient.DB, companyID, startDate, endDate)
 	if err != nil {

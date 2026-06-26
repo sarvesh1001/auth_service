@@ -572,6 +572,8 @@ func (f *SalesInfraFactory) QuoteService() service.QuoteService {
 			f.idempotencyStore,
 			f.auditService,
 			f.logger,
+			f.TaxIntegrationService(), // ✅ NEW: pass tax service
+
 		)
 	}
 	return f.quoteService

@@ -95,6 +95,8 @@ type quoteService struct {
 	idempotencyStore  idempotency.Store
 	auditService      *audit.AuditService
 	logger            *zap.Logger
+	taxSvc            TaxIntegrationService // NEW
+
 }
 
 func NewQuoteService(
@@ -112,6 +114,8 @@ func NewQuoteService(
 	idempotencyStore idempotency.Store,
 	auditService *audit.AuditService,
 	logger *zap.Logger,
+	taxSvc TaxIntegrationService, // NEW parameter
+
 ) QuoteService {
 	return &quoteService{
 		quoteRepo:         quoteRepo,
@@ -128,6 +132,7 @@ func NewQuoteService(
 		idempotencyStore:  idempotencyStore,
 		auditService:      auditService,
 		logger:            logger.Named("quote_service"),
+		taxSvc:            taxSvc,
 	}
 }
 
@@ -314,7 +319,7 @@ func (s *quoteService) emitQuoteEvent(ctx context.Context, tx repository.DBTX, q
 
 func (s *quoteService) validateStatusTransition(current, next enums.QuoteStatus) error {
 	transitions := map[enums.QuoteStatus][]enums.QuoteStatus{
-		enums.QuoteStatusDraft:     {enums.QuoteStatusSent, enums.QuoteStatusRejected},
+		enums.QuoteStatusDraft:     {enums.QuoteStatusSent, enums.QuoteStatusRejected, enums.QuoteStatusAccepted}, // added Accepted
 		enums.QuoteStatusSent:      {enums.QuoteStatusAccepted, enums.QuoteStatusRejected, enums.QuoteStatusExpired},
 		enums.QuoteStatusAccepted:  {enums.QuoteStatusConverted},
 		enums.QuoteStatusRejected:  {},
@@ -332,7 +337,6 @@ func (s *quoteService) validateStatusTransition(current, next enums.QuoteStatus)
 	}
 	return fmt.Errorf("%w: cannot transition from %s to %s", salesErrors.ErrInvalidTransition, current, next)
 }
-
 func (s *quoteService) mapStatusToEvent(status enums.QuoteStatus) string {
 	switch status {
 	case enums.QuoteStatusSent:
@@ -435,21 +439,71 @@ func (s *quoteService) CreateQuote(ctx context.Context, req *CreateQuoteRequest)
 			return nil, err
 		}
 	}
-	if err := s.recalculateQuoteTotals(ctx, tx, req.CompanyID, quote.QuoteID); err != nil {
-		return nil, fmt.Errorf("recalculate totals: %w", err)
-	}
-	quote, err = s.quoteRepo.GetByID(ctx, tx, req.CompanyID, quote.QuoteID)
+
+	// --------------------------------------------------------------------
+	// STEP 1: Calculate subtotal and discount from items (without tax)
+	// --------------------------------------------------------------------
+	items, err := s.quoteRepo.GetItems(ctx, tx, req.CompanyID, quote.QuoteID)
 	if err != nil {
-		return nil, fmt.Errorf("reload quote after recalculation: %w", err)
+		return nil, err
 	}
+	var subtotal, discountTotal decimal.Decimal
+	for _, it := range items {
+		subtotal = subtotal.Add(it.UnitPrice.Mul(it.Quantity))
+		discountTotal = discountTotal.Add(it.DiscountAmount)
+	}
+	quote.Subtotal = subtotal
+	quote.DiscountTotal = discountTotal
+
+	// 🔧 NEW: Persist subtotal and discount before tax apply
+	if err := s.quoteRepo.Update(ctx, tx, quote); err != nil {
+		return nil, fmt.Errorf("update quote totals before tax: %w", err)
+	}
+
+	// --------------------------------------------------------------------
+	// STEP 2: Apply coupons (if any) – they affect discount_total
+	// --------------------------------------------------------------------
 	for _, code := range req.CouponCodes {
 		if _, _, err := s.applyCouponInternal(ctx, tx, req.CompanyID, quote.QuoteID, code); err != nil {
 			logger.Warn("failed to apply coupon", zap.String("code", code), zap.Error(err))
 		}
 	}
-	if err := s.recalculateQuoteTotals(ctx, tx, req.CompanyID, quote.QuoteID); err != nil {
-		return nil, fmt.Errorf("recalculate totals after coupons: %w", err)
+	// Re‑fetch items to get updated discount amounts
+	items, err = s.quoteRepo.GetItems(ctx, tx, req.CompanyID, quote.QuoteID)
+	if err != nil {
+		return nil, err
 	}
+	discountTotal = decimal.Zero
+	for _, it := range items {
+		discountTotal = discountTotal.Add(it.DiscountAmount)
+	}
+	quote.DiscountTotal = discountTotal
+	if err := s.quoteRepo.Update(ctx, tx, quote); err != nil {
+		return nil, fmt.Errorf("update quote totals after coupons: %w", err)
+	}
+
+	// --------------------------------------------------------------------
+	// STEP 3: Apply accounting‑engine taxes inside the SAME transaction
+	// --------------------------------------------------------------------
+	appliedBy := uuid.Nil
+	if req.CreatedBy != nil {
+		appliedBy = *req.CreatedBy
+	}
+	taxIdempotencyKey := fmt.Sprintf("%s-tax", idempKey)
+	if _, err := s.taxSvc.ApplyTaxesToQuoteWithTx(ctx, tx, req.CompanyID, quote.QuoteID, appliedBy, taxIdempotencyKey); err != nil {
+		logger.Error("failed to apply taxes during quote creation", zap.Error(err))
+		return nil, fmt.Errorf("failed to apply taxes: %w", err)
+	}
+
+	// Reload quote with updated totals (tax_total, grand_total)
+	quote, err = s.quoteRepo.GetByID(ctx, tx, req.CompanyID, quote.QuoteID)
+	if err != nil {
+		return nil, err
+	}
+
+	// --------------------------------------------------------------------
+	// STEP 4: Emit event, store idempotency, commit
+	// --------------------------------------------------------------------
 	if err := s.emitQuoteEvent(ctx, tx, quote, salesEvents.EventQuoteCreated, nil); err != nil {
 		logger.Warn("failed to emit quote created event", zap.Error(err))
 	}
@@ -1352,6 +1406,9 @@ func (s *quoteService) ConvertToOrder(ctx context.Context, companyID, quoteID uu
 		})
 	}
 
+	// 🔧 FIX: Generate a NEW idempotency key for the order (avoid using the same key)
+	orderIdempKey := fmt.Sprintf("order-from-quote-%s-%s", quoteID.String(), uuid.New().String())
+
 	orderReq := &CreateOrderRequest{
 		CompanyID:       quote.CompanyID,
 		CustomerID:      quote.CustomerID,
@@ -1364,7 +1421,7 @@ func (s *quoteService) ConvertToOrder(ctx context.Context, companyID, quoteID uu
 		Items:           items,
 		CreatedBy:       req.UpdatedBy,
 	}
-	order, err := s.orderSvc.CreateDraftOrder(ctx, orderReq, idempKey)
+	order, err := s.orderSvc.CreateDraftOrder(ctx, orderReq, orderIdempKey)
 	if err != nil {
 		return nil, fmt.Errorf("create order from quote: %w", err)
 	}
@@ -1385,7 +1442,6 @@ func (s *quoteService) ConvertToOrder(ctx context.Context, companyID, quoteID uu
 	}
 	return result, nil
 }
-
 func (s *quoteService) IsConverted(ctx context.Context, companyID, quoteID uuid.UUID) (bool, error) {
 	return s.quoteRepo.IsConverted(ctx, s.pgClient.DB, companyID, quoteID)
 }

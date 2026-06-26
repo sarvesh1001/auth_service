@@ -80,11 +80,14 @@ func (e *ConditionEvaluator) equal(fieldVal interface{}, cond *tax.TaxCondition)
 		}
 	}
 	if cond.ValueText != nil {
-		return fmt.Sprintf("%v", fieldVal) == *cond.ValueText, nil
+		// Convert fieldVal to string, trim spaces.
+		fieldStr := strings.TrimSpace(fmt.Sprintf("%v", fieldVal))
+		condStr := strings.TrimSpace(*cond.ValueText)
+		// Exact match (case-sensitive – UUIDs are case-insensitive but stored in lowercase)
+		return fieldStr == condStr, nil
 	}
 	return false, nil
 }
-
 func (e *ConditionEvaluator) greaterThan(fieldVal interface{}, cond *tax.TaxCondition) (bool, error) {
 	if fieldVal == nil {
 		return false, nil

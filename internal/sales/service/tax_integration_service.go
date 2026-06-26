@@ -54,6 +54,7 @@ type TaxIntegrationService interface {
 	GetTaxSnapshots(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID) ([]*models.TaxSnapshot, error)
 	RecalculateTaxSnapshot(ctx context.Context, companyID, snapshotID uuid.UUID, recalculatedBy uuid.UUID, idempotencyKey string) (*models.TaxSnapshot, error)
 	ArchiveTaxSnapshot(ctx context.Context, companyID, snapshotID uuid.UUID, archivedBy uuid.UUID, idempotencyKey string) error
+	ApplyTaxesToQuoteWithTx(ctx context.Context, tx *sql.Tx, companyID, quoteID uuid.UUID, appliedBy uuid.UUID, idempotencyKey string) (*TaxCalculationResult, error)
 
 	// Existence checks
 	TaxSnapshotExists(ctx context.Context, companyID, snapshotID uuid.UUID) (bool, error)
@@ -439,6 +440,15 @@ func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, tx *sql.
 	var billingAddress *AddressInput
 	var orderItems []*models.OrderItem
 	var invoiceItems []*models.InvoiceItem
+	var quoteItems []*models.QuoteItem // NEW
+
+	logger := s.logger.With(
+		zap.String("entity_type", entityType),
+		zap.String("entity_id", entityID.String()),
+		zap.String("company_id", companyID.String()),
+	)
+
+	logger.Info("applyTaxesToEntity started")
 
 	switch entityType {
 	case "order":
@@ -446,6 +456,14 @@ func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, tx *sql.
 		if err != nil {
 			return nil, err
 		}
+		logger.Info("order fetched for tax apply",
+			zap.String("order_id", order.OrderID.String()),
+			zap.String("subtotal", order.Subtotal.String()),
+			zap.String("discount_total", order.DiscountTotal.String()),
+			zap.String("tax_total", order.TaxTotal.String()),
+			zap.String("grand_total", order.GrandTotal.String()),
+		)
+
 		customerID = &order.CustomerID
 		billingAddress = s.parseAddressFromJSON(order.BillingAddress)
 		items, err := s.orderRepo.GetItems(ctx, tx, companyID, entityID)
@@ -453,18 +471,39 @@ func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, tx *sql.
 			return nil, err
 		}
 		orderItems = items
+
+		totalSubtotal := decimal.Zero
 		for _, it := range items {
-			subtotal := it.UnitPrice.Mul(it.Quantity)
-			discount := decimal.Zero
+			totalSubtotal = totalSubtotal.Add(it.UnitPrice.Mul(it.Quantity))
+		}
+		logger.Info("order items subtotal sum",
+			zap.String("total_subtotal", totalSubtotal.String()),
+			zap.Int("item_count", len(items)),
+		)
+
+		for _, it := range items {
+			lineSubtotal := it.UnitPrice.Mul(it.Quantity)
+			lineDiscount := decimal.Zero
 			if it.DiscountAmount != nil {
-				discount = *it.DiscountAmount
+				lineDiscount = *it.DiscountAmount
 			}
-			taxable := subtotal.Sub(discount)
+			if totalSubtotal.GreaterThan(decimal.Zero) {
+				proportion := lineSubtotal.Div(totalSubtotal)
+				orderDiscount := order.DiscountTotal.Mul(proportion)
+				lineDiscount = lineDiscount.Add(orderDiscount)
+			}
+			taxable := lineSubtotal.Sub(lineDiscount)
+			logger.Debug("order line tax calculation",
+				zap.String("product_id", it.ProductID.String()),
+				zap.String("line_subtotal", lineSubtotal.String()),
+				zap.String("line_discount", lineDiscount.String()),
+				zap.String("taxable_amount", taxable.String()),
+			)
 			lineItems = append(lineItems, &LineItemInput{
 				ProductID:     it.ProductID,
 				Quantity:      it.Quantity,
 				UnitPrice:     it.UnitPrice,
-				LineAmount:    subtotal,
+				LineAmount:    lineSubtotal,
 				TaxableAmount: taxable,
 			})
 		}
@@ -473,6 +512,11 @@ func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, tx *sql.
 		if err != nil {
 			return nil, err
 		}
+		logger.Info("quote fetched for tax apply",
+			zap.String("quote_id", quote.QuoteID.String()),
+			zap.String("subtotal", quote.Subtotal.String()),
+			zap.String("discount_total", quote.DiscountTotal.String()),
+		)
 		customerID = &quote.CustomerID
 		cust, _ := s.customerRepo.GetByID(ctx, tx, companyID, *customerID)
 		if cust != nil && cust.BillingAddress != nil {
@@ -482,9 +526,9 @@ func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, tx *sql.
 		if err != nil {
 			return nil, err
 		}
+		quoteItems = items // store for later update
 		for _, it := range items {
 			subtotal := it.UnitPrice.Mul(it.Quantity)
-			// 🔧 FIXED: QuoteItem.DiscountAmount is a value type (decimal.Decimal)
 			taxable := subtotal.Sub(it.DiscountAmount)
 			lineItems = append(lineItems, &LineItemInput{
 				ProductID:     it.ProductID,
@@ -499,6 +543,11 @@ func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, tx *sql.
 		if err != nil {
 			return nil, err
 		}
+		logger.Info("invoice fetched for tax apply",
+			zap.String("invoice_id", inv.InvoiceID.String()),
+			zap.String("subtotal", inv.Subtotal.String()),
+			zap.String("discount_total", inv.DiscountTotal.String()),
+		)
 		customerID = &inv.CustomerID
 		cust, _ := s.customerRepo.GetByID(ctx, tx, companyID, *customerID)
 		if cust != nil && cust.BillingAddress != nil {
@@ -536,10 +585,20 @@ func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, tx *sql.
 	}
 
 	// Calculate taxes
+	logger.Info("calling accounting engine for tax calculation",
+		zap.Int("line_items", len(lineItems)),
+		zap.String("jurisdiction", billingAddress.CountryCode),
+	)
 	calcResult, err := s.calculateTaxesForEntity(ctx, companyID, entityType, entityID, lineItems, customerID, billingAddress)
 	if err != nil {
+		logger.Error("tax calculation failed", zap.Error(err))
 		return nil, err
 	}
+	logger.Info("tax calculation result",
+		zap.String("total_tax", calcResult.TotalTax.String()),
+		zap.Int("line_taxes", len(calcResult.LineTaxes)),
+		zap.Any("taxes_by_jurisdiction", calcResult.TaxesByJurisdiction),
+	)
 
 	// Delete old tax snapshots
 	_ = s.taxSnapshotRepo.DeleteByEntity(ctx, tx, companyID, entityType, entityID)
@@ -558,53 +617,130 @@ func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, tx *sql.
 			TaxAmount:     taxAmount,
 		}
 		if err := s.taxSnapshotRepo.Create(ctx, tx, snapshot); err != nil {
+			logger.Error("failed to create tax snapshot", zap.Error(err))
 			return nil, err
 		}
 	}
+	logger.Info("tax snapshots created", zap.Int("count", len(calcResult.TaxesByJurisdiction)))
 
 	// Build tax map
 	taxMap := make(map[uuid.UUID]decimal.Decimal)
 	for _, lt := range calcResult.LineTaxes {
 		taxMap[lt.ProductID] = lt.TaxAmount
 	}
+	logger.Info("tax map built", zap.Int("product_count", len(taxMap)))
 
 	// Update order item tax amounts
 	if entityType == "order" && len(orderItems) > 0 {
+		logger.Info("updating order item tax amounts", zap.Int("item_count", len(orderItems)))
 		for _, item := range orderItems {
 			if taxAmt, ok := taxMap[item.ProductID]; ok {
 				if err := s.orderRepo.UpdateItemTaxAmount(ctx, tx, item.OrderItemID, taxAmt); err != nil {
+					logger.Error("failed to update order item tax amount",
+						zap.String("order_item_id", item.OrderItemID.String()),
+						zap.Error(err),
+					)
 					return nil, fmt.Errorf("update order item tax amount: %w", err)
 				}
+				logger.Debug("order item tax amount updated",
+					zap.String("order_item_id", item.OrderItemID.String()),
+					zap.String("tax_amount", taxAmt.String()),
+				)
 			}
 		}
 	}
 
 	// Update invoice item tax amounts
 	if entityType == "invoice" && len(invoiceItems) > 0 {
+		logger.Info("updating invoice item tax amounts", zap.Int("item_count", len(invoiceItems)))
 		for _, item := range invoiceItems {
 			if item.ProductID != nil {
 				if taxAmt, ok := taxMap[*item.ProductID]; ok {
 					if err := s.invoiceRepo.UpdateItemTaxAmount(ctx, tx, item.InvoiceItemID, taxAmt); err != nil {
+						logger.Error("failed to update invoice item tax amount",
+							zap.String("invoice_item_id", item.InvoiceItemID.String()),
+							zap.Error(err),
+						)
 						return nil, fmt.Errorf("update invoice item tax amount: %w", err)
 					}
+					logger.Debug("invoice item tax amount updated",
+						zap.String("invoice_item_id", item.InvoiceItemID.String()),
+						zap.String("tax_amount", taxAmt.String()),
+					)
 				}
 			}
+		}
+	}
+
+	// Update quote item tax amounts (NEW)
+	if entityType == "quote" && len(quoteItems) > 0 {
+		logger.Info("updating quote item tax amounts", zap.Int("item_count", len(quoteItems)))
+		for _, item := range quoteItems {
+			if taxAmt, ok := taxMap[item.ProductID]; ok {
+				if err := s.quoteRepo.UpdateItemTaxAmount(ctx, tx, item.QuoteItemID, taxAmt); err != nil {
+					logger.Error("failed to update quote item tax amount",
+						zap.String("quote_item_id", item.QuoteItemID.String()),
+						zap.Error(err),
+					)
+					return nil, fmt.Errorf("update quote item tax amount: %w", err)
+				}
+				logger.Debug("quote item tax amount updated",
+					zap.String("quote_item_id", item.QuoteItemID.String()),
+					zap.String("tax_amount", taxAmt.String()),
+				)
+			}
+		}
+	}
+
+	// Re‑fetch order discount (only for logs – not needed)
+	if entityType == "order" {
+		orderCheck, err := s.orderRepo.GetByID(ctx, tx, companyID, entityID)
+		if err == nil {
+			logger.Info("order state BEFORE updating tax_total",
+				zap.String("discount_total", orderCheck.DiscountTotal.String()),
+				zap.String("tax_total", orderCheck.TaxTotal.String()),
+				zap.String("grand_total", orderCheck.GrandTotal.String()),
+			)
 		}
 	}
 
 	// Update entity tax total
 	switch entityType {
 	case "order":
+		logger.Info("updating order tax_total",
+			zap.String("tax_total_to_set", calcResult.TotalTax.String()),
+		)
 		if err := s.orderRepo.UpdateTaxTotal(ctx, tx, companyID, entityID, calcResult.TotalTax, &appliedBy); err != nil {
+			logger.Error("failed to update order tax_total", zap.Error(err))
 			return nil, err
 		}
 	case "invoice":
+		logger.Info("updating invoice tax_total",
+			zap.String("tax_total_to_set", calcResult.TotalTax.String()),
+		)
 		if err := s.invoiceRepo.UpdateTaxTotal(ctx, tx, companyID, entityID, calcResult.TotalTax, &appliedBy); err != nil {
+			logger.Error("failed to update invoice tax_total", zap.Error(err))
 			return nil, err
 		}
 	case "quote":
-		if err := s.quoteRepo.RecalculateTotals(ctx, tx, companyID, entityID); err != nil {
+		logger.Info("updating quote tax_total",
+			zap.String("tax_total_to_set", calcResult.TotalTax.String()),
+		)
+		if err := s.quoteRepo.UpdateTaxTotal(ctx, tx, companyID, entityID, calcResult.TotalTax, &appliedBy); err != nil {
+			logger.Error("failed to update quote tax_total", zap.Error(err))
 			return nil, err
+		}
+	}
+
+	// After update (only for orders – optional)
+	if entityType == "order" {
+		orderAfter, err := s.orderRepo.GetByID(ctx, tx, companyID, entityID)
+		if err == nil {
+			logger.Info("order state AFTER updating tax_total",
+				zap.String("discount_total", orderAfter.DiscountTotal.String()),
+				zap.String("tax_total", orderAfter.TaxTotal.String()),
+				zap.String("grand_total", orderAfter.GrandTotal.String()),
+			)
 		}
 	}
 
@@ -624,9 +760,12 @@ func (s *taxIntegrationService) applyTaxesToEntity(ctx context.Context, tx *sql.
 
 	if ownTx {
 		if err := tx.Commit(); err != nil {
+			logger.Error("failed to commit own transaction", zap.Error(err))
 			return nil, err
 		}
 	}
+
+	logger.Info("applyTaxesToEntity completed successfully")
 	return calcResult, nil
 }
 
@@ -709,4 +848,7 @@ func isIdempotencyNotFound(err error) bool {
 		return true
 	}
 	return err.Error() == "idempotency: key not found"
+}
+func (s *taxIntegrationService) ApplyTaxesToQuoteWithTx(ctx context.Context, tx *sql.Tx, companyID, quoteID uuid.UUID, appliedBy uuid.UUID, idempotencyKey string) (*TaxCalculationResult, error) {
+	return s.applyTaxesToEntity(ctx, tx, companyID, "quote", quoteID, appliedBy, idempotencyKey)
 }
