@@ -189,6 +189,7 @@ services:
       - ./scripts/04-init-accounting.sql:/docker-entrypoint-initdb.d/04-init-accounting.sql:ro  
       - ./scripts/05-init-inventory.sql:/docker-entrypoint-initdb.d/05-init-inventory.sql:ro
       - ./scripts/06-init-sales.sql:/docker-entrypoint-initdb.d/06-init-sales.sql:ro    
+      - ./scripts/07-init-subscriptions.sql:/docker-entrypoint-initdb.d/07-init-subscriptions.sql:ro   # ← ADD THIS
 
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-auth_user} -d ${POSTGRES_DATABASE:-auth_service}"]

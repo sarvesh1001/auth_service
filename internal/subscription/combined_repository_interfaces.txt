@@ -1,0 +1,920 @@
+
+================================================================================
+FILE: ./repository/provider.go
+================================================================================
+
+package repository
+
+type ProviderRepository interface {
+	Create(ctx context.Context, db DBTX, provider *models.Provider) error
+	Update(ctx context.Context, db DBTX, provider *models.Provider) error
+	Delete(ctx context.Context, db DBTX, providerID int16) error
+
+	GetByID(ctx context.Context, db DBTX, providerID int16) (*models.Provider, error)
+	GetByCode(ctx context.Context, db DBTX, code string) (*models.Provider, error)
+	GetByName(ctx context.Context, db DBTX, name string) (*models.Provider, error)
+
+	List(ctx context.Context, db DBTX, filter ProviderFilter, p Pagination, s Sort) ([]*models.Provider, int64, error)
+
+	Exists(ctx context.Context, db DBTX, providerID int16) (bool, error)
+	ExistsByCode(ctx context.Context, db DBTX, code string) (bool, error)
+
+	Search(ctx context.Context, db DBTX, query string, limit int, offset int) ([]*models.Provider, int64, error)
+
+	GetByIDForUpdate(ctx context.Context, db DBTX, providerID int16) (*models.Provider, error)
+}
+
+
+================================================================================
+FILE: ./repository/subscription.go
+================================================================================
+
+package repository
+
+type SubscriptionRepository interface {
+	// ---------------------------------------------------------------------
+	// CRUD
+	// ---------------------------------------------------------------------
+
+	Create(ctx context.Context, db DBTX, subscription *models.Subscription) error
+	Update(ctx context.Context, db DBTX, subscription *models.Subscription) error
+	Delete(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID) error
+
+	// ---------------------------------------------------------------------
+	// Single Fetch
+	// ---------------------------------------------------------------------
+
+	GetByID(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID) (*models.Subscription, error)
+	GetByContractNumber(ctx context.Context, db DBTX, companyID uuid.UUID, contractNumber string) (*models.Subscription, error)
+
+	// ---------------------------------------------------------------------
+	// Aggregate Loading
+	// ---------------------------------------------------------------------
+
+	GetWithItems(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID) (*models.Subscription, error)
+	GetComplete(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID) (*models.Subscription, error)
+
+	// ---------------------------------------------------------------------
+	// Listing
+	// ---------------------------------------------------------------------
+
+	List(ctx context.Context, db DBTX, filter SubscriptionFilter, p Pagination, s Sort) ([]*models.Subscription, int64, error)
+	ListActive(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Subscription, error)
+	ListExpired(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Subscription, error)
+	ListDueForRenewal(ctx context.Context, db DBTX, companyID uuid.UUID, before time.Time) ([]*models.Subscription, error)
+	ListBySubscriber(ctx context.Context, db DBTX, companyID, subscriberID uuid.UUID, subscriberTypeID int16) ([]*models.Subscription, error)
+
+	// ---------------------------------------------------------------------
+	// Status Transitions
+	// ---------------------------------------------------------------------
+
+	UpdateStatus(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID, statusID int16, updatedBy *uuid.UUID) error
+	Activate(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID, updatedBy *uuid.UUID) error
+	Suspend(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID, reason string, updatedBy *uuid.UUID) error
+	Pause(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID, reason string, updatedBy *uuid.UUID) error
+	Resume(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID, updatedBy *uuid.UUID) error
+	Cancel(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID, reason string, updatedBy *uuid.UUID) error
+	Expire(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID, updatedBy *uuid.UUID) error
+
+	// ---------------------------------------------------------------------
+	// Date Updates
+	// ---------------------------------------------------------------------
+
+	UpdateNextBillingDate(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID, nextBillingDate time.Time, updatedBy *uuid.UUID) error
+	UpdateEndDate(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID, endDate time.Time, updatedBy *uuid.UUID) error
+	UpdateTrialEnd(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID, trialEnd time.Time, updatedBy *uuid.UUID) error
+
+	// ---------------------------------------------------------------------
+	// Invoice References
+	// ---------------------------------------------------------------------
+
+	UpdateCurrentInvoice(ctx context.Context, db DBTX, companyID, subscriptionID, invoiceID uuid.UUID, updatedBy *uuid.UUID) error
+	UpdateLastInvoice(ctx context.Context, db DBTX, companyID, subscriptionID, invoiceID uuid.UUID, updatedBy *uuid.UUID) error
+	UpdateNextInvoice(ctx context.Context, db DBTX, companyID, subscriptionID, invoiceID uuid.UUID, updatedBy *uuid.UUID) error
+
+	// ---------------------------------------------------------------------
+	// Contract Management
+	// ---------------------------------------------------------------------
+
+	UpdateContract(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID, contractNumber string, signedAt *time.Time, termsVersion string, documentKey string, updatedBy *uuid.UUID) error
+
+	// ---------------------------------------------------------------------
+	// Version Management
+	// ---------------------------------------------------------------------
+
+	IncrementVersion(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID, updatedBy *uuid.UUID) (int, error)
+
+	// ---------------------------------------------------------------------
+	// Validation
+	// ---------------------------------------------------------------------
+
+	Exists(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID) (bool, error)
+	ExistsByContractNumber(ctx context.Context, db DBTX, companyID uuid.UUID, contractNumber string) (bool, error)
+
+	// ---------------------------------------------------------------------
+	// Search
+	// ---------------------------------------------------------------------
+
+	Search(ctx context.Context, db DBTX, companyID uuid.UUID, query string, limit, offset int) ([]*models.Subscription, int64, error)
+
+	// ---------------------------------------------------------------------
+	// Locking
+	// ---------------------------------------------------------------------
+
+	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID) (*models.Subscription, error)
+}
+
+
+================================================================================
+FILE: ./repository/subscription_version.go
+================================================================================
+
+package repository
+
+type SubscriptionVersionRepository interface {
+	Create(ctx context.Context, db DBTX, version *models.SubscriptionVersion) error
+	GetByID(ctx context.Context, db DBTX, versionID uuid.UUID) (*models.SubscriptionVersion, error)
+	GetLatest(ctx context.Context, db DBTX, subscriptionID uuid.UUID) (*models.SubscriptionVersion, error)
+	GetByVersion(ctx context.Context, db DBTX, subscriptionID uuid.UUID, versionNumber int) (*models.SubscriptionVersion, error)
+	List(ctx context.Context, db DBTX, filter SubscriptionVersionFilter, p Pagination, s Sort) ([]*models.SubscriptionVersion, int64, error)
+	ListBySubscription(ctx context.Context, db DBTX, subscriptionID uuid.UUID, p Pagination, s Sort) ([]*models.SubscriptionVersion, int64, error)
+	Exists(ctx context.Context, db DBTX, versionID uuid.UUID) (bool, error)
+	GetByIDForUpdate(ctx context.Context, db DBTX, versionID uuid.UUID) (*models.SubscriptionVersion, error)
+}
+
+
+================================================================================
+FILE: ./repository/schedule_type.go
+================================================================================
+
+package repository
+
+type ScheduleTypeRepository interface {
+	Create(ctx context.Context, db DBTX, scheduleType *models.ScheduleType) error
+	Update(ctx context.Context, db DBTX, scheduleType *models.ScheduleType) error
+	Delete(ctx context.Context, db DBTX, scheduleTypeID int16) error
+
+	GetByID(ctx context.Context, db DBTX, scheduleTypeID int16) (*models.ScheduleType, error)
+	GetByCode(ctx context.Context, db DBTX, code string) (*models.ScheduleType, error)
+	GetByName(ctx context.Context, db DBTX, name string) (*models.ScheduleType, error)
+
+	List(ctx context.Context, db DBTX, filter ScheduleTypeFilter, p Pagination, s Sort) ([]*models.ScheduleType, int64, error)
+
+	Exists(ctx context.Context, db DBTX, scheduleTypeID int16) (bool, error)
+	ExistsByCode(ctx context.Context, db DBTX, code string) (bool, error)
+
+	Search(ctx context.Context, db DBTX, query string, limit int, offset int) ([]*models.ScheduleType, int64, error)
+
+	GetByIDForUpdate(ctx context.Context, db DBTX, scheduleTypeID int16) (*models.ScheduleType, error)
+}
+
+
+================================================================================
+FILE: ./repository/trial.go
+================================================================================
+
+package repository
+
+type TrialRepository interface {
+	// CRUD
+	Create(ctx context.Context, db DBTX, trial *models.Trial) error
+	Update(ctx context.Context, db DBTX, trial *models.Trial) error
+	Delete(ctx context.Context, db DBTX, companyID, trialID uuid.UUID) error
+
+	// Single Fetch
+	GetByID(ctx context.Context, db DBTX, companyID, trialID uuid.UUID) (*models.Trial, error)
+	GetBySubscription(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID) (*models.Trial, error)
+	GetActiveBySubscription(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID) (*models.Trial, error)
+
+	// Listing
+	List(ctx context.Context, db DBTX, filter TrialFilter, p Pagination, s Sort) ([]*models.Trial, int64, error)
+	ListBySubscription(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID) ([]*models.Trial, error)
+	ListActive(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Trial, error)
+	ListExpired(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Trial, error)
+	ListExpiringSoon(ctx context.Context, db DBTX, companyID uuid.UUID, before time.Time) ([]*models.Trial, error)
+
+	// Trial Operations
+	UpdateStatus(ctx context.Context, db DBTX, companyID, trialID uuid.UUID, status string) error
+	Activate(ctx context.Context, db DBTX, companyID, trialID uuid.UUID) error
+	Expire(ctx context.Context, db DBTX, companyID, trialID uuid.UUID) error
+	Convert(ctx context.Context, db DBTX, companyID, trialID uuid.UUID) error
+	ExtendTrial(ctx context.Context, db DBTX, companyID, trialID uuid.UUID, extraDays int) error
+	SetEndDate(ctx context.Context, db DBTX, companyID, trialID uuid.UUID, endedAt time.Time) error
+
+	// Validation
+	Exists(ctx context.Context, db DBTX, companyID, trialID uuid.UUID) (bool, error)
+	ExistsActiveBySubscription(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID) (bool, error)
+	Search(ctx context.Context, db DBTX, companyID uuid.UUID, query string, limit, offset int) ([]*models.Trial, int64, error)
+
+	// Locking
+	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, trialID uuid.UUID) (*models.Trial, error)
+}
+
+
+================================================================================
+FILE: ./repository/plan.go
+================================================================================
+
+package repository
+
+type PlanRepository interface {
+	Create(ctx context.Context, db DBTX, plan *models.Plan) error
+	Update(ctx context.Context, db DBTX, plan *models.Plan) error
+	Delete(ctx context.Context, db DBTX, companyID, planID uuid.UUID) error
+
+	GetByID(ctx context.Context, db DBTX, companyID, planID uuid.UUID) (*models.Plan, error)
+	GetByName(ctx context.Context, db DBTX, companyID uuid.UUID, name string) (*models.Plan, error)
+	GetWithItems(ctx context.Context, db DBTX, companyID, planID uuid.UUID) (*models.Plan, error)
+	GetWithCatalog(ctx context.Context, db DBTX, companyID, planID uuid.UUID) (*models.Plan, error)
+
+	List(ctx context.Context, db DBTX, filter PlanFilter, p Pagination, s Sort) ([]*models.Plan, int64, error)
+	ListActive(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Plan, error)
+
+	Exists(ctx context.Context, db DBTX, companyID, planID uuid.UUID) (bool, error)
+	ExistsByName(ctx context.Context, db DBTX, companyID uuid.UUID, name string) (bool, error)
+
+	Search(ctx context.Context, db DBTX, companyID uuid.UUID, query string, limit, offset int) ([]*models.Plan, int64, error)
+
+	SetActive(ctx context.Context, db DBTX, companyID, planID uuid.UUID) error
+	SetInactive(ctx context.Context, db DBTX, companyID, planID uuid.UUID) error
+
+	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, planID uuid.UUID) (*models.Plan, error)
+}
+
+
+================================================================================
+FILE: ./repository/feature_registry.go
+================================================================================
+
+package repository
+
+type FeatureRegistryRepository interface {
+	// CRUD
+	Create(ctx context.Context, db DBTX, feature *models.FeatureRegistry) error
+	Update(ctx context.Context, db DBTX, feature *models.FeatureRegistry) error
+	Delete(ctx context.Context, db DBTX, featureKey string) error
+
+	// Single Fetch
+	GetByKey(ctx context.Context, db DBTX, featureKey string) (*models.FeatureRegistry, error)
+
+	// Listing
+	List(ctx context.Context, db DBTX, filter FeatureRegistryFilter, p Pagination, s Sort) ([]*models.FeatureRegistry, int64, error)
+	ListByModule(ctx context.Context, db DBTX, module string) ([]*models.FeatureRegistry, error)
+	ListByPermissionScope(ctx context.Context, db DBTX, scope string) ([]*models.FeatureRegistry, error)
+	ListActive(ctx context.Context, db DBTX) ([]*models.FeatureRegistry, error)
+
+	// Validation
+	Exists(ctx context.Context, db DBTX, featureKey string) (bool, error)
+
+	// Search
+	Search(ctx context.Context, db DBTX, query string, limit int, offset int) ([]*models.FeatureRegistry, int64, error)
+
+	// Concurrency / Locking
+	GetByKeyForUpdate(ctx context.Context, db DBTX, featureKey string) (*models.FeatureRegistry, error)
+}
+
+
+================================================================================
+FILE: ./repository/plan_item.go
+================================================================================
+
+package repository
+
+type PlanItemRepository interface {
+	Create(ctx context.Context, db DBTX, item *models.PlanItem) error
+	Update(ctx context.Context, db DBTX, item *models.PlanItem) error
+	Delete(ctx context.Context, db DBTX, planItemID uuid.UUID) error
+
+	GetByID(ctx context.Context, db DBTX, planItemID uuid.UUID) (*models.PlanItem, error)
+	GetByName(ctx context.Context, db DBTX, planID uuid.UUID, name string) (*models.PlanItem, error)
+
+	List(ctx context.Context, db DBTX, filter PlanItemFilter, p Pagination, s Sort) ([]*models.PlanItem, int64, error)
+	ListByPlan(ctx context.Context, db DBTX, planID uuid.UUID) ([]*models.PlanItem, error)
+
+	Exists(ctx context.Context, db DBTX, planItemID uuid.UUID) (bool, error)
+	ExistsByName(ctx context.Context, db DBTX, planID uuid.UUID, name string) (bool, error)
+
+	Search(ctx context.Context, db DBTX, planID uuid.UUID, query string, limit, offset int) ([]*models.PlanItem, int64, error)
+
+	SetActive(ctx context.Context, db DBTX, planItemID uuid.UUID) error
+	SetInactive(ctx context.Context, db DBTX, planItemID uuid.UUID) error
+
+	GetByIDForUpdate(ctx context.Context, db DBTX, planItemID uuid.UUID) (*models.PlanItem, error)
+}
+
+
+================================================================================
+FILE: ./repository/workflow_step.go
+================================================================================
+
+package repository
+
+type WorkflowStepRepository interface {
+	Create(ctx context.Context, db DBTX, step *models.WorkflowStep) error
+	Update(ctx context.Context, db DBTX, step *models.WorkflowStep) error
+	Delete(ctx context.Context, db DBTX, companyID, workflowStepID uuid.UUID) error
+	DeleteByWorkflow(ctx context.Context, db DBTX, companyID, workflowID uuid.UUID) (int64, error)
+
+	GetByID(ctx context.Context, db DBTX, companyID, workflowStepID uuid.UUID) (*models.WorkflowStep, error)
+	GetByWorkflow(ctx context.Context, db DBTX, companyID, workflowID uuid.UUID) ([]*models.WorkflowStep, error)
+	GetByStepOrder(ctx context.Context, db DBTX, companyID, workflowID uuid.UUID, stepOrder int) (*models.WorkflowStep, error)
+	GetFirstStep(ctx context.Context, db DBTX, companyID, workflowID uuid.UUID) (*models.WorkflowStep, error)
+	GetLastStep(ctx context.Context, db DBTX, companyID, workflowID uuid.UUID) (*models.WorkflowStep, error)
+
+	List(ctx context.Context, db DBTX, filter WorkflowStepFilter, p Pagination, s Sort) ([]*models.WorkflowStep, int64, error)
+	ListByWorkflow(ctx context.Context, db DBTX, companyID, workflowID uuid.UUID) ([]*models.WorkflowStep, error)
+	ListActive(ctx context.Context, db DBTX, companyID, workflowID uuid.UUID) ([]*models.WorkflowStep, error)
+
+	UpdateStepOrder(ctx context.Context, db DBTX, companyID, workflowStepID uuid.UUID, newOrder int) error
+	MoveUp(ctx context.Context, db DBTX, companyID, workflowStepID uuid.UUID) error
+	MoveDown(ctx context.Context, db DBTX, companyID, workflowStepID uuid.UUID) error
+	SetActive(ctx context.Context, db DBTX, companyID, workflowStepID uuid.UUID) error
+	SetInactive(ctx context.Context, db DBTX, companyID, workflowStepID uuid.UUID) error
+
+	Exists(ctx context.Context, db DBTX, companyID, workflowStepID uuid.UUID) (bool, error)
+	ExistsStepOrder(ctx context.Context, db DBTX, companyID, workflowID uuid.UUID, stepOrder int) (bool, error)
+
+	Search(ctx context.Context, db DBTX, companyID uuid.UUID, query string, limit, offset int) ([]*models.WorkflowStep, int64, error)
+
+	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, workflowStepID uuid.UUID) (*models.WorkflowStep, error)
+}
+
+
+================================================================================
+FILE: ./repository/addon.go
+================================================================================
+
+package repository
+
+type AddonRepository interface {
+	Create(ctx context.Context, db DBTX, addon *models.Addon) error
+	Update(ctx context.Context, db DBTX, addon *models.Addon) error
+	Delete(ctx context.Context, db DBTX, companyID, addonID uuid.UUID) error
+
+	GetByID(ctx context.Context, db DBTX, companyID, addonID uuid.UUID) (*models.Addon, error)
+	GetByName(ctx context.Context, db DBTX, companyID uuid.UUID, name string) (*models.Addon, error)
+
+	List(ctx context.Context, db DBTX, filter AddonFilter, p Pagination, s Sort) ([]*models.Addon, int64, error)
+	ListActive(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Addon, error)
+
+	Exists(ctx context.Context, db DBTX, companyID, addonID uuid.UUID) (bool, error)
+	ExistsByName(ctx context.Context, db DBTX, companyID uuid.UUID, name string) (bool, error)
+
+	Search(ctx context.Context, db DBTX, companyID uuid.UUID, query string, limit, offset int) ([]*models.Addon, int64, error)
+
+	SetActive(ctx context.Context, db DBTX, companyID, addonID uuid.UUID) error
+	SetInactive(ctx context.Context, db DBTX, companyID, addonID uuid.UUID) error
+
+	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, addonID uuid.UUID) (*models.Addon, error)
+}
+
+
+================================================================================
+FILE: ./repository/entitlement.go
+================================================================================
+
+package repository
+
+type EntitlementRepository interface {
+	Create(ctx context.Context, db DBTX, entitlement *models.Entitlement) error
+	Update(ctx context.Context, db DBTX, entitlement *models.Entitlement) error
+	Delete(ctx context.Context, db DBTX, entitlementID uuid.UUID) error
+
+	GetByID(ctx context.Context, db DBTX, entitlementID uuid.UUID) (*models.Entitlement, error)
+	GetByFeature(ctx context.Context, db DBTX, planItemID uuid.UUID, featureKey string) (*models.Entitlement, error)
+
+	List(ctx context.Context, db DBTX, filter EntitlementFilter, p Pagination, s Sort) ([]*models.Entitlement, int64, error)
+	ListByPlanItem(ctx context.Context, db DBTX, planItemID uuid.UUID) ([]*models.Entitlement, error)
+
+	Exists(ctx context.Context, db DBTX, entitlementID uuid.UUID) (bool, error)
+	ExistsByFeature(ctx context.Context, db DBTX, planItemID uuid.UUID, featureKey string) (bool, error)
+
+	Search(ctx context.Context, db DBTX, planItemID uuid.UUID, query string, limit, offset int) ([]*models.Entitlement, int64, error)
+
+	GetByIDForUpdate(ctx context.Context, db DBTX, entitlementID uuid.UUID) (*models.Entitlement, error)
+}
+
+
+================================================================================
+FILE: ./repository/billing_type.go
+================================================================================
+
+package repository
+
+type BillingTypeRepository interface {
+	// CRUD
+	Create(ctx context.Context, db DBTX, billingType *models.BillingType) error
+	Update(ctx context.Context, db DBTX, billingType *models.BillingType) error
+	Delete(ctx context.Context, db DBTX, billingTypeID int16) error
+
+	// Single Fetch
+	GetByID(ctx context.Context, db DBTX, billingTypeID int16) (*models.BillingType, error)
+	GetByCode(ctx context.Context, db DBTX, code string) (*models.BillingType, error)
+	GetByName(ctx context.Context, db DBTX, name string) (*models.BillingType, error)
+
+	// Listing
+	List(ctx context.Context, db DBTX, filter BillingTypeFilter, p Pagination, s Sort) ([]*models.BillingType, int64, error)
+
+	// Validation
+	Exists(ctx context.Context, db DBTX, billingTypeID int16) (bool, error)
+	ExistsByCode(ctx context.Context, db DBTX, code string) (bool, error)
+
+	// Search
+	Search(ctx context.Context, db DBTX, query string, limit int, offset int) ([]*models.BillingType, int64, error)
+
+	// Concurrency / Locking
+	GetByIDForUpdate(ctx context.Context, db DBTX, billingTypeID int16) (*models.BillingType, error)
+}
+
+
+================================================================================
+FILE: ./repository/waitlist.go
+================================================================================
+
+package repository
+
+type WaitlistRepository interface {
+	Create(ctx context.Context, db DBTX, waitlist *models.Waitlist) error
+	Update(ctx context.Context, db DBTX, waitlist *models.Waitlist) error
+	Delete(ctx context.Context, db DBTX, companyID, waitlistID uuid.UUID) error
+
+	GetByID(ctx context.Context, db DBTX, companyID, waitlistID uuid.UUID) (*models.Waitlist, error)
+	GetBySubscription(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID) ([]*models.Waitlist, error)
+	GetBySchedule(ctx context.Context, db DBTX, companyID, scheduleID uuid.UUID) ([]*models.Waitlist, error)
+	GetNextInQueue(ctx context.Context, db DBTX, companyID, scheduleID uuid.UUID) (*models.Waitlist, error)
+
+	List(ctx context.Context, db DBTX, filter WaitlistFilter, p Pagination, s Sort) ([]*models.Waitlist, int64, error)
+	ListBySchedule(ctx context.Context, db DBTX, companyID, scheduleID uuid.UUID) ([]*models.Waitlist, error)
+	ListPending(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Waitlist, error)
+
+	AddToQueue(ctx context.Context, db DBTX, waitlist *models.Waitlist) error
+	RemoveFromQueue(ctx context.Context, db DBTX, companyID, waitlistID uuid.UUID) error
+	PromoteNext(ctx context.Context, db DBTX, companyID, scheduleID uuid.UUID) (*models.Waitlist, error)
+	UpdatePosition(ctx context.Context, db DBTX, companyID, waitlistID uuid.UUID, position int) error
+	ClearQueue(ctx context.Context, db DBTX, companyID, scheduleID uuid.UUID) error
+
+	Exists(ctx context.Context, db DBTX, companyID, waitlistID uuid.UUID) (bool, error)
+	IsWaiting(ctx context.Context, db DBTX, companyID, subscriptionID, scheduleID uuid.UUID) (bool, error)
+	Search(ctx context.Context, db DBTX, companyID uuid.UUID, query string, limit, offset int) ([]*models.Waitlist, int64, error)
+
+	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, waitlistID uuid.UUID) (*models.Waitlist, error)
+}
+
+
+================================================================================
+FILE: ./repository/pause_policy.go
+================================================================================
+
+package repository
+
+type PausePolicyRepository interface {
+	Create(ctx context.Context, db DBTX, policy *models.PausePolicy) error
+	Update(ctx context.Context, db DBTX, policy *models.PausePolicy) error
+	Delete(ctx context.Context, db DBTX, companyID, pausePolicyID uuid.UUID) error
+
+	GetByID(ctx context.Context, db DBTX, companyID, pausePolicyID uuid.UUID) (*models.PausePolicy, error)
+	GetByName(ctx context.Context, db DBTX, companyID uuid.UUID, name string) (*models.PausePolicy, error)
+
+	List(ctx context.Context, db DBTX, filter PausePolicyFilter, p Pagination, s Sort) ([]*models.PausePolicy, int64, error)
+	ListActive(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.PausePolicy, error)
+
+	Exists(ctx context.Context, db DBTX, companyID, pausePolicyID uuid.UUID) (bool, error)
+	ExistsByName(ctx context.Context, db DBTX, companyID uuid.UUID, name string) (bool, error)
+
+	Search(ctx context.Context, db DBTX, companyID uuid.UUID, query string, limit int, offset int) ([]*models.PausePolicy, int64, error)
+
+	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, pausePolicyID uuid.UUID) (*models.PausePolicy, error)
+	GetDefault(ctx context.Context, db DBTX, companyID uuid.UUID) (*models.PausePolicy, error)
+}
+
+
+================================================================================
+FILE: ./repository/subscription_timeline.go
+================================================================================
+
+package repository
+
+type SubscriptionTimelineRepository interface {
+	Create(ctx context.Context, db DBTX, timeline *models.SubscriptionTimeline) error
+	GetByID(ctx context.Context, db DBTX, timelineID uuid.UUID) (*models.SubscriptionTimeline, error)
+	List(ctx context.Context, db DBTX, filter SubscriptionTimelineFilter, p Pagination, s Sort) ([]*models.SubscriptionTimeline, int64, error)
+	ListBySubscription(ctx context.Context, db DBTX, subscriptionID uuid.UUID, p Pagination, s Sort) ([]*models.SubscriptionTimeline, int64, error)
+	ListByEvent(ctx context.Context, db DBTX, eventType string, limit int) ([]*models.SubscriptionTimeline, error)
+	ListRecent(ctx context.Context, db DBTX, subscriptionID uuid.UUID, limit int) ([]*models.SubscriptionTimeline, error)
+	Search(ctx context.Context, db DBTX, subscriptionID uuid.UUID, query string, limit, offset int) ([]*models.SubscriptionTimeline, int64, error)
+	Exists(ctx context.Context, db DBTX, timelineID uuid.UUID) (bool, error)
+	GetByIDForUpdate(ctx context.Context, db DBTX, timelineID uuid.UUID) (*models.SubscriptionTimeline, error)
+}
+
+
+================================================================================
+FILE: ./repository/tx_helper.go
+================================================================================
+
+package repository
+
+type DBTX interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+}
+
+type scanner interface {
+	Scan(dest ...interface{}) error
+}
+
+
+================================================================================
+FILE: ./repository/resource_assignment.go
+================================================================================
+
+package repository
+
+type ResourceAssignmentRepository interface {
+	Create(ctx context.Context, db DBTX, resource *models.ResourceAssignment) error
+	Update(ctx context.Context, db DBTX, resource *models.ResourceAssignment) error
+	Delete(ctx context.Context, db DBTX, companyID, resourceAssignmentID uuid.UUID) error
+
+	GetByID(ctx context.Context, db DBTX, companyID, resourceAssignmentID uuid.UUID) (*models.ResourceAssignment, error)
+	GetByResource(ctx context.Context, db DBTX, companyID uuid.UUID, resourceType string, resourceID uuid.UUID) (*models.ResourceAssignment, error)
+	GetBySubscription(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID) ([]*models.ResourceAssignment, error)
+
+	List(ctx context.Context, db DBTX, filter ResourceAssignmentFilter, p Pagination, s Sort) ([]*models.ResourceAssignment, int64, error)
+	ListByResourceType(ctx context.Context, db DBTX, companyID uuid.UUID, resourceType string) ([]*models.ResourceAssignment, error)
+	ListActive(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.ResourceAssignment, error)
+
+	AssignResource(ctx context.Context, db DBTX, resource *models.ResourceAssignment) error
+	UnassignResource(ctx context.Context, db DBTX, companyID, resourceAssignmentID uuid.UUID) error
+	TransferResource(ctx context.Context, db DBTX, companyID, resourceAssignmentID uuid.UUID, newSubscriptionID uuid.UUID) error
+
+	Exists(ctx context.Context, db DBTX, companyID, resourceAssignmentID uuid.UUID) (bool, error)
+	IsAssigned(ctx context.Context, db DBTX, companyID uuid.UUID, resourceType string, resourceID uuid.UUID) (bool, error)
+
+	Search(ctx context.Context, db DBTX, companyID uuid.UUID, query string, limit, offset int) ([]*models.ResourceAssignment, int64, error)
+
+	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, resourceAssignmentID uuid.UUID) (*models.ResourceAssignment, error)
+}
+
+
+================================================================================
+FILE: ./repository/business_model.go
+================================================================================
+
+package repository
+
+type BusinessModelRepository interface {
+	// CRUD
+	Create(ctx context.Context, db DBTX, businessModel *models.BusinessModel) error
+	Update(ctx context.Context, db DBTX, businessModel *models.BusinessModel) error
+	Delete(ctx context.Context, db DBTX, businessModelID int16) error
+
+	// Single Fetch
+	GetByID(ctx context.Context, db DBTX, businessModelID int16) (*models.BusinessModel, error)
+	GetByCode(ctx context.Context, db DBTX, code string) (*models.BusinessModel, error)
+	GetByName(ctx context.Context, db DBTX, name string) (*models.BusinessModel, error)
+
+	// Listing
+	List(ctx context.Context, db DBTX, filter BusinessModelFilter, p Pagination, s Sort) ([]*models.BusinessModel, int64, error)
+
+	// Validation
+	Exists(ctx context.Context, db DBTX, businessModelID int16) (bool, error)
+	ExistsByCode(ctx context.Context, db DBTX, code string) (bool, error)
+
+	// Search
+	Search(ctx context.Context, db DBTX, query string, limit int, offset int) ([]*models.BusinessModel, int64, error)
+
+	// Concurrency / Locking
+	GetByIDForUpdate(ctx context.Context, db DBTX, businessModelID int16) (*models.BusinessModel, error)
+}
+
+
+================================================================================
+FILE: ./repository/proration_policy.go
+================================================================================
+
+package repository
+
+type ProrationPolicyRepository interface {
+	Create(ctx context.Context, db DBTX, policy *models.ProrationPolicy) error
+	Update(ctx context.Context, db DBTX, policy *models.ProrationPolicy) error
+	Delete(ctx context.Context, db DBTX, companyID, prorationPolicyID uuid.UUID) error
+
+	GetByID(ctx context.Context, db DBTX, companyID, prorationPolicyID uuid.UUID) (*models.ProrationPolicy, error)
+	GetByName(ctx context.Context, db DBTX, companyID uuid.UUID, name string) (*models.ProrationPolicy, error)
+
+	List(ctx context.Context, db DBTX, filter ProrationPolicyFilter, p Pagination, s Sort) ([]*models.ProrationPolicy, int64, error)
+	ListActive(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.ProrationPolicy, error)
+
+	Exists(ctx context.Context, db DBTX, companyID, prorationPolicyID uuid.UUID) (bool, error)
+	ExistsByName(ctx context.Context, db DBTX, companyID uuid.UUID, name string) (bool, error)
+
+	Search(ctx context.Context, db DBTX, companyID uuid.UUID, query string, limit int, offset int) ([]*models.ProrationPolicy, int64, error)
+
+	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, prorationPolicyID uuid.UUID) (*models.ProrationPolicy, error)
+	GetDefault(ctx context.Context, db DBTX, companyID uuid.UUID) (*models.ProrationPolicy, error)
+}
+
+
+================================================================================
+FILE: ./repository/subscriber_type.go
+================================================================================
+
+package repository
+
+type SubscriberTypeRepository interface {
+	Create(ctx context.Context, db DBTX, subscriberType *models.SubscriberType) error
+	Update(ctx context.Context, db DBTX, subscriberType *models.SubscriberType) error
+	Delete(ctx context.Context, db DBTX, subscriberTypeID int16) error
+
+	GetByID(ctx context.Context, db DBTX, subscriberTypeID int16) (*models.SubscriberType, error)
+	GetByCode(ctx context.Context, db DBTX, code string) (*models.SubscriberType, error)
+	GetByName(ctx context.Context, db DBTX, name string) (*models.SubscriberType, error)
+
+	List(ctx context.Context, db DBTX, filter SubscriberTypeFilter, p Pagination, s Sort) ([]*models.SubscriberType, int64, error)
+
+	Exists(ctx context.Context, db DBTX, subscriberTypeID int16) (bool, error)
+	ExistsByCode(ctx context.Context, db DBTX, code string) (bool, error)
+
+	Search(ctx context.Context, db DBTX, query string, limit int, offset int) ([]*models.SubscriberType, int64, error)
+
+	GetByIDForUpdate(ctx context.Context, db DBTX, subscriberTypeID int16) (*models.SubscriberType, error)
+}
+
+
+================================================================================
+FILE: ./repository/billing_policy.go
+================================================================================
+
+package repository
+
+type BillingPolicyRepository interface {
+	Create(ctx context.Context, db DBTX, policy *models.BillingPolicy) error
+	Update(ctx context.Context, db DBTX, policy *models.BillingPolicy) error
+	Delete(ctx context.Context, db DBTX, companyID, billingPolicyID uuid.UUID) error
+
+	GetByID(ctx context.Context, db DBTX, companyID, billingPolicyID uuid.UUID) (*models.BillingPolicy, error)
+	GetByName(ctx context.Context, db DBTX, companyID uuid.UUID, name string) (*models.BillingPolicy, error)
+
+	List(ctx context.Context, db DBTX, filter BillingPolicyFilter, p Pagination, s Sort) ([]*models.BillingPolicy, int64, error)
+	ListActive(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.BillingPolicy, error)
+
+	Exists(ctx context.Context, db DBTX, companyID, billingPolicyID uuid.UUID) (bool, error)
+	ExistsByName(ctx context.Context, db DBTX, companyID uuid.UUID, name string) (bool, error)
+
+	Search(ctx context.Context, db DBTX, companyID uuid.UUID, query string, limit int, offset int) ([]*models.BillingPolicy, int64, error)
+
+	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, billingPolicyID uuid.UUID) (*models.BillingPolicy, error)
+
+	// GetDefault returns the default billing policy for the company.
+	GetDefault(ctx context.Context, db DBTX, companyID uuid.UUID) (*models.BillingPolicy, error)
+}
+
+
+================================================================================
+FILE: ./repository/status.go
+================================================================================
+
+package repository
+
+type StatusRepository interface {
+	Create(ctx context.Context, db DBTX, status *models.Status) error
+	Update(ctx context.Context, db DBTX, status *models.Status) error
+	Delete(ctx context.Context, db DBTX, statusID int16) error
+
+	GetByID(ctx context.Context, db DBTX, statusID int16) (*models.Status, error)
+	GetByCode(ctx context.Context, db DBTX, category string, code string) (*models.Status, error)
+	GetByName(ctx context.Context, db DBTX, category string, name string) (*models.Status, error)
+
+	List(ctx context.Context, db DBTX, filter StatusFilter, p Pagination, s Sort) ([]*models.Status, int64, error)
+	ListByCategory(ctx context.Context, db DBTX, category string) ([]*models.Status, error)
+	ListActiveSubscriptionStatuses(ctx context.Context, db DBTX) ([]*models.Status, error)
+
+	Exists(ctx context.Context, db DBTX, statusID int16) (bool, error)
+	ExistsByCode(ctx context.Context, db DBTX, category string, code string) (bool, error)
+
+	Search(ctx context.Context, db DBTX, query string, limit int, offset int) ([]*models.Status, int64, error)
+
+	GetByIDForUpdate(ctx context.Context, db DBTX, statusID int16) (*models.Status, error)
+}
+
+
+================================================================================
+FILE: ./repository/usage.go
+================================================================================
+
+package repository
+
+type UsageRepository interface {
+	Create(ctx context.Context, db DBTX, usage *models.Usage) error
+	Update(ctx context.Context, db DBTX, usage *models.Usage) error
+	Delete(ctx context.Context, db DBTX, companyID, usageID uuid.UUID) error // companyID used for auth check via join
+
+	GetByID(ctx context.Context, db DBTX, companyID, usageID uuid.UUID) (*models.Usage, error)
+	GetBySubscription(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID) ([]*models.Usage, error)
+	GetByFeature(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID, featureKey string) (*models.Usage, error)
+
+	List(ctx context.Context, db DBTX, filter UsageFilter, p Pagination, s Sort) ([]*models.Usage, int64, error)
+	ListExceeded(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Usage, error)
+	ListNearLimit(ctx context.Context, db DBTX, companyID uuid.UUID, percentage int) ([]*models.Usage, error)
+
+	IncrementUsage(ctx context.Context, db DBTX, companyID, usageID uuid.UUID, quantity decimal.Decimal) error
+	DecrementUsage(ctx context.Context, db DBTX, companyID, usageID uuid.UUID, quantity decimal.Decimal) error
+	ResetUsage(ctx context.Context, db DBTX, companyID, usageID uuid.UUID) error
+	UpdateLimit(ctx context.Context, db DBTX, companyID, usageID uuid.UUID, limit decimal.Decimal) error
+
+	Exists(ctx context.Context, db DBTX, companyID, usageID uuid.UUID) (bool, error)
+	Search(ctx context.Context, db DBTX, companyID uuid.UUID, query string, limit, offset int) ([]*models.Usage, int64, error)
+
+	GetTotalUsage(ctx context.Context, db DBTX, companyID uuid.UUID, featureKey string) (decimal.Decimal, error)
+	GetUsagePercentage(ctx context.Context, db DBTX, companyID, usageID uuid.UUID) (decimal.Decimal, error)
+
+	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, usageID uuid.UUID) (*models.Usage, error)
+}
+
+
+================================================================================
+FILE: ./repository/renewal_policy.go
+================================================================================
+
+package repository
+
+type RenewalPolicyRepository interface {
+	Create(ctx context.Context, db DBTX, policy *models.RenewalPolicy) error
+	Update(ctx context.Context, db DBTX, policy *models.RenewalPolicy) error
+	Delete(ctx context.Context, db DBTX, companyID, renewalPolicyID uuid.UUID) error
+
+	GetByID(ctx context.Context, db DBTX, companyID, renewalPolicyID uuid.UUID) (*models.RenewalPolicy, error)
+	GetByName(ctx context.Context, db DBTX, companyID uuid.UUID, name string) (*models.RenewalPolicy, error)
+
+	List(ctx context.Context, db DBTX, filter RenewalPolicyFilter, p Pagination, s Sort) ([]*models.RenewalPolicy, int64, error)
+	ListActive(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.RenewalPolicy, error)
+
+	Exists(ctx context.Context, db DBTX, companyID, renewalPolicyID uuid.UUID) (bool, error)
+	ExistsByName(ctx context.Context, db DBTX, companyID uuid.UUID, name string) (bool, error)
+
+	Search(ctx context.Context, db DBTX, companyID uuid.UUID, query string, limit int, offset int) ([]*models.RenewalPolicy, int64, error)
+
+	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, renewalPolicyID uuid.UUID) (*models.RenewalPolicy, error)
+	GetDefault(ctx context.Context, db DBTX, companyID uuid.UUID) (*models.RenewalPolicy, error)
+}
+
+
+================================================================================
+FILE: ./repository/benefit.go
+================================================================================
+
+package repository
+
+type BenefitRepository interface {
+	Create(ctx context.Context, db DBTX, benefit *models.Benefit) error
+	Update(ctx context.Context, db DBTX, benefit *models.Benefit) error
+	Delete(ctx context.Context, db DBTX, benefitID uuid.UUID) error
+
+	GetByID(ctx context.Context, db DBTX, benefitID uuid.UUID) (*models.Benefit, error)
+
+	List(ctx context.Context, db DBTX, filter BenefitFilter, p Pagination, s Sort) ([]*models.Benefit, int64, error)
+	ListByPlanItem(ctx context.Context, db DBTX, planItemID uuid.UUID) ([]*models.Benefit, error)
+
+	Exists(ctx context.Context, db DBTX, benefitID uuid.UUID) (bool, error)
+
+	Search(ctx context.Context, db DBTX, planItemID uuid.UUID, query string, limit, offset int) ([]*models.Benefit, int64, error)
+
+	GetByIDForUpdate(ctx context.Context, db DBTX, benefitID uuid.UUID) (*models.Benefit, error)
+}
+
+
+================================================================================
+FILE: ./repository/online_session.go
+================================================================================
+
+package repository
+
+type OnlineSessionRepository interface {
+	Create(ctx context.Context, db DBTX, session *models.OnlineSession) error
+	Update(ctx context.Context, db DBTX, session *models.OnlineSession) error
+	Delete(ctx context.Context, db DBTX, companyID, sessionID uuid.UUID) error
+
+	GetByID(ctx context.Context, db DBTX, companyID, sessionID uuid.UUID) (*models.OnlineSession, error)
+	GetBySchedule(ctx context.Context, db DBTX, companyID, scheduleID uuid.UUID) (*models.OnlineSession, error)
+	GetByMeetingID(ctx context.Context, db DBTX, companyID, meetingID string) (*models.OnlineSession, error)
+
+	List(ctx context.Context, db DBTX, filter OnlineSessionFilter, p Pagination, s Sort) ([]*models.OnlineSession, int64, error)
+	ListActive(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.OnlineSession, error)
+
+	StartSession(ctx context.Context, db DBTX, companyID, sessionID uuid.UUID) error
+	EndSession(ctx context.Context, db DBTX, companyID, sessionID uuid.UUID) error
+	UpdateRecording(ctx context.Context, db DBTX, companyID, sessionID uuid.UUID, recordingURL string) error
+	UpdateJoinLink(ctx context.Context, db DBTX, companyID, sessionID uuid.UUID, meetingURL string) error
+
+	Exists(ctx context.Context, db DBTX, companyID, sessionID uuid.UUID) (bool, error)
+	ExistsByMeetingID(ctx context.Context, db DBTX, companyID, meetingID string) (bool, error)
+	Search(ctx context.Context, db DBTX, companyID uuid.UUID, query string, limit, offset int) ([]*models.OnlineSession, int64, error)
+
+	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, sessionID uuid.UUID) (*models.OnlineSession, error)
+}
+
+
+================================================================================
+FILE: ./repository/subscription_item.go
+================================================================================
+
+package repository
+
+type SubscriptionItemRepository interface {
+	// CRUD
+	Create(ctx context.Context, db DBTX, item *models.SubscriptionItem) error
+	Update(ctx context.Context, db DBTX, item *models.SubscriptionItem) error
+	Delete(ctx context.Context, db DBTX, subItemID uuid.UUID) error
+
+	// Single Fetch
+	GetByID(ctx context.Context, db DBTX, subItemID uuid.UUID) (*models.SubscriptionItem, error)
+	GetBySubscriptionAndPlanItem(ctx context.Context, db DBTX, subscriptionID, planItemID uuid.UUID) (*models.SubscriptionItem, error)
+
+	// Listing
+	List(ctx context.Context, db DBTX, filter SubscriptionItemFilter, p Pagination, s Sort) ([]*models.SubscriptionItem, int64, error)
+	ListBySubscription(ctx context.Context, db DBTX, subscriptionID uuid.UUID) ([]*models.SubscriptionItem, error)
+	ListActive(ctx context.Context, db DBTX, subscriptionID uuid.UUID) ([]*models.SubscriptionItem, error)
+
+	// Updates
+	UpdateQuantity(ctx context.Context, db DBTX, subItemID uuid.UUID, quantity float64, updatedBy *uuid.UUID) error
+	UpdatePrice(ctx context.Context, db DBTX, subItemID uuid.UUID, unitPrice float64, updatedBy *uuid.UUID) error
+	UpdateStatus(ctx context.Context, db DBTX, subItemID uuid.UUID, statusID int16, updatedBy *uuid.UUID) error
+
+	// Validation
+	Exists(ctx context.Context, db DBTX, subItemID uuid.UUID) (bool, error)
+	ExistsBySubscriptionAndPlanItem(ctx context.Context, db DBTX, subscriptionID, planItemID uuid.UUID) (bool, error)
+
+	// Search
+	Search(ctx context.Context, db DBTX, subscriptionID uuid.UUID, query string, limit, offset int) ([]*models.SubscriptionItem, int64, error)
+
+	// Locking
+	GetByIDForUpdate(ctx context.Context, db DBTX, subItemID uuid.UUID) (*models.SubscriptionItem, error)
+}
+
+
+================================================================================
+FILE: ./repository/workflow.go
+================================================================================
+
+package repository
+
+type WorkflowRepository interface {
+	Create(ctx context.Context, db DBTX, workflow *models.Workflow) error
+	Update(ctx context.Context, db DBTX, workflow *models.Workflow) error
+	Delete(ctx context.Context, db DBTX, companyID, workflowID uuid.UUID) error
+
+	GetByID(ctx context.Context, db DBTX, companyID, workflowID uuid.UUID) (*models.Workflow, error)
+	GetByName(ctx context.Context, db DBTX, companyID uuid.UUID, name string) (*models.Workflow, error)
+	GetWithSteps(ctx context.Context, db DBTX, companyID, workflowID uuid.UUID) (*models.Workflow, error)
+
+	List(ctx context.Context, db DBTX, filter WorkflowFilter, p Pagination, s Sort) ([]*models.Workflow, int64, error)
+	ListActive(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Workflow, error)
+
+	SetActive(ctx context.Context, db DBTX, companyID, workflowID uuid.UUID) error
+	SetInactive(ctx context.Context, db DBTX, companyID, workflowID uuid.UUID) error
+
+	Exists(ctx context.Context, db DBTX, companyID, workflowID uuid.UUID) (bool, error)
+	ExistsByName(ctx context.Context, db DBTX, companyID uuid.UUID, name string) (bool, error)
+
+	Search(ctx context.Context, db DBTX, companyID uuid.UUID, query string, limit, offset int) ([]*models.Workflow, int64, error)
+
+	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, workflowID uuid.UUID) (*models.Workflow, error)
+}
+
+
+================================================================================
+FILE: ./repository/schedule.go
+================================================================================
+
+package repository
+
+type ScheduleRepository interface {
+	Create(ctx context.Context, db DBTX, schedule *models.Schedule) error
+	Update(ctx context.Context, db DBTX, schedule *models.Schedule) error
+	Delete(ctx context.Context, db DBTX, companyID, scheduleID uuid.UUID) error
+
+	GetByID(ctx context.Context, db DBTX, companyID, scheduleID uuid.UUID) (*models.Schedule, error)
+	GetBySubscription(ctx context.Context, db DBTX, companyID, subscriptionID uuid.UUID) ([]*models.Schedule, error)
+	GetByResource(ctx context.Context, db DBTX, companyID uuid.UUID, resourceType string, resourceID uuid.UUID) ([]*models.Schedule, error)
+
+	List(ctx context.Context, db DBTX, filter ScheduleFilter, p Pagination, s Sort) ([]*models.Schedule, int64, error)
+	ListUpcoming(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Schedule, error)
+	ListToday(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Schedule, error)
+	ListActive(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Schedule, error)
+
+	UpdateCapacity(ctx context.Context, db DBTX, companyID, scheduleID uuid.UUID, capacity int) error
+	IncrementBookedSeats(ctx context.Context, db DBTX, companyID, scheduleID uuid.UUID) error
+	DecrementBookedSeats(ctx context.Context, db DBTX, companyID, scheduleID uuid.UUID) error
+	IsFull(ctx context.Context, db DBTX, companyID, scheduleID uuid.UUID) (bool, error)
+
+	UpdateStatus(ctx context.Context, db DBTX, companyID, scheduleID uuid.UUID, statusID int16) error
+	Start(ctx context.Context, db DBTX, companyID, scheduleID uuid.UUID) error
+	Complete(ctx context.Context, db DBTX, companyID, scheduleID uuid.UUID) error
+	Cancel(ctx context.Context, db DBTX, companyID, scheduleID uuid.UUID) error
+
+	Exists(ctx context.Context, db DBTX, companyID, scheduleID uuid.UUID) (bool, error)
+	Search(ctx context.Context, db DBTX, companyID uuid.UUID, query string, limit, offset int) ([]*models.Schedule, int64, error)
+
+	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, scheduleID uuid.UUID) (*models.Schedule, error)
+}
+
