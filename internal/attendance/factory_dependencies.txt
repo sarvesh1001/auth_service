@@ -1,0 +1,4327 @@
+====================================================================================================
+./handler/admin_handler.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type AttendanceAdminHandler struct {
+	adminService admin.AdminService
+	queryService query.QueryService
+	auditService *audit.AuditService
+	logger       *zap.Logger
+}
+
+type PolicyRequest struct {
+	PolicyCode     string             `json:"policy_code"`
+	PolicyType     string             `json:"policy_type"`
+	PositionID     *uuid.UUID         `json:"position_id,omitempty"`
+	WorkCenterCode *string            `json:"work_center_code,omitempty"`
+	Rules          models.PolicyRules `json:"rules"`
+	IsActive       bool               `json:"is_active"`
+	Description    *string            `json:"description,omitempty"`
+}
+
+type AssignPolicyRequest struct {
+	UserID        uuid.UUID  `json:"user_id"`
+	PolicyID      uuid.UUID  `json:"policy_id"`
+	EffectiveFrom time.Time  `json:"effective_from"`
+	EffectiveTo   *time.Time `json:"effective_to,omitempty"`
+}
+
+type CompanyRulesRequest struct {
+	AllowedSourceTypes    []string `json:"allowed_source_types"`
+	AllowMultipleCheckins bool     `json:"allow_multiple_checkins"`
+	Timezone              string   `json:"timezone"`
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAttendanceAdminHandler(
+	adminService admin.AdminService,
+	queryService query.QueryService,
+	auditService *audit.AuditService,
+	logger *zap.Logger,
+) *AttendanceAdminHandler {
+	return &AttendanceAdminHandler{
+		adminService: adminService,
+		queryService: queryService,
+		auditService: auditService,
+		logger:       logger,
+	}
+}
+
+====================================================================================================
+./handler/batch_failure_handler.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type BatchFailureHandler struct {
+	service batch.BatchFailureService
+	logger  *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewBatchFailureHandler(
+	service batch.BatchFailureService,
+	logger *zap.Logger,
+) *BatchFailureHandler {
+	return &BatchFailureHandler{
+		service: service,
+		logger:  logger,
+	}
+}
+
+====================================================================================================
+./handler/batch_handler.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type BatchPayload struct {
+	BatchRef string                    `json:"batch_ref"`
+	Events   []batch.OfflinePunchEvent `json:"events"`
+}
+
+type BatchHandler struct {
+	batchIngestService batch.BatchIngestService
+	logger             *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewBatchHandler(
+	batchIngestService batch.BatchIngestService,
+	logger *zap.Logger,
+) *BatchHandler {
+	return &BatchHandler{
+		batchIngestService: batchIngestService,
+		logger:             logger,
+	}
+}
+
+====================================================================================================
+./handler/biometric_enrollment_handler.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type BiometricEnrollmentHandler struct {
+	enrollmentService service.BiometricEnrollmentService
+	logger            *zap.Logger
+}
+
+type enrollFaceRequest struct {
+	SubjectType     string    `json:"subject_type"`
+	SubjectID       uuid.UUID `json:"subject_id"`
+	EmbeddingVector []float64 `json:"embedding_vector"`
+	ModelVersion    string    `json:"model_version"`
+}
+
+type deactivateRequest struct {
+	SubjectType string    `json:"subject_type"`
+	SubjectID   uuid.UUID `json:"subject_id"`
+	Reason      string    `json:"reason"`
+}
+
+type activateRequest struct {
+	SubjectType string    `json:"subject_type"`
+	SubjectID   uuid.UUID `json:"subject_id"`
+	Reason      string    `json:"reason"`
+}
+
+type rotateRequest struct {
+	EmbeddingID uuid.UUID `json:"embedding_id"`
+	NewVersion  string    `json:"new_version"`
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewBiometricEnrollmentHandler(
+	enrollmentService service.BiometricEnrollmentService,
+	logger *zap.Logger,
+) *BiometricEnrollmentHandler {
+	return &BiometricEnrollmentHandler{
+		enrollmentService: enrollmentService,
+		logger:            logger,
+	}
+}
+
+====================================================================================================
+./handler/biometric_sync_handler.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type BiometricSyncHandler struct {
+	syncService service.BiometricSyncService
+	logger      *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewBiometricSyncHandler(
+	syncService service.BiometricSyncService,
+	logger *zap.Logger,
+) *BiometricSyncHandler {
+	return &BiometricSyncHandler{
+		syncService: syncService,
+		logger:      logger,
+	}
+}
+
+====================================================================================================
+./handler/correction_handler.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type AttendanceCorrectionHandler struct {
+	correctionSvc admin.CorrectionService // ✅ Use CorrectionService
+	logger        *zap.Logger
+}
+
+type CorrectionRequest struct {
+	TargetUserID   uuid.UUID `json:"target_user_id"`
+	BusinessDate   string    `json:"business_date"`
+	CorrectionType string    `json:"correction_type"`
+	EventTime      string    `json:"event_time,omitempty"`
+	OverrideStatus string    `json:"override_status,omitempty"`
+	Reason         string    `json:"reason"`
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAttendanceCorrectionHandler(
+	correctionSvc admin.CorrectionService, // ✅ inject CorrectionService
+	logger *zap.Logger,
+) *AttendanceCorrectionHandler {
+	return &AttendanceCorrectionHandler{
+		correctionSvc: correctionSvc,
+		logger:        logger,
+	}
+}
+
+====================================================================================================
+./handler/device_handler.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type DeviceHandler struct {
+	deviceService       device.DeviceService
+	attendanceSourceSvc source.SourceAdminService
+	auditService        *audit.AuditService
+	logger              *zap.Logger
+}
+
+type DeviceRequest struct {
+	SourceType     string                 `json:"source_type"`
+	DeviceCode     string                 `json:"device_code"`
+	DeviceName     *string                `json:"device_name,omitempty"`
+	Manufacturer   *string                `json:"manufacturer,omitempty"`
+	Model          *string                `json:"model,omitempty"`
+	WorkCenterCode *string                `json:"work_center_code,omitempty"`
+	LocationID     *uuid.UUID             `json:"location_id,omitempty"`
+	IPAddress      *string                `json:"ip_address,omitempty"`
+	MacAddress     *string                `json:"mac_address,omitempty"`
+	IsActive       *bool                  `json:"is_active,omitempty"`
+	InstalledAt    *time.Time             `json:"installed_at,omitempty"`
+	Metadata       map[string]interface{} `json:"metadata,omitempty"`
+}
+
+type DeviceResponse struct {
+	DeviceID       string                 `json:"device_id"`
+	CompanyID      uuid.UUID              `json:"company_id"`
+	SourceType     string                 `json:"source_type"`
+	DeviceCode     string                 `json:"device_code"`
+	DeviceName     *string                `json:"device_name,omitempty"`
+	Manufacturer   *string                `json:"manufacturer,omitempty"`
+	Model          *string                `json:"model,omitempty"`
+	WorkCenterCode *string                `json:"work_center_code,omitempty"`
+	LocationID     *uuid.UUID             `json:"location_id,omitempty"`
+	IPAddress      *string                `json:"ip_address,omitempty"`
+	MacAddress     *string                `json:"mac_address,omitempty"`
+	IsActive       bool                   `json:"is_active"`
+	IsTrusted      bool                   `json:"is_trusted"`
+	LastSeenAt     *time.Time             `json:"last_seen_at,omitempty"`
+	InstalledAt    *time.Time             `json:"installed_at,omitempty"`
+	Metadata       map[string]interface{} `json:"metadata,omitempty"`
+	CreatedAt      time.Time              `json:"created_at"`
+}
+
+type DeviceListResponse struct {
+	Devices    []DeviceResponse `json:"devices"`
+	Total      int              `json:"total"`
+	Page       int              `json:"page"`
+	PageSize   int              `json:"page_size"`
+	TotalPages int              `json:"total_pages"`
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewDeviceHandler(
+	deviceService device.DeviceService,
+	attendanceSourceSvc source.SourceAdminService,
+	auditService *audit.AuditService,
+	logger *zap.Logger,
+) *DeviceHandler {
+	return &DeviceHandler{
+		deviceService:       deviceService,
+		attendanceSourceSvc: attendanceSourceSvc,
+		auditService:        auditService,
+		logger:              logger,
+	}
+}
+
+====================================================================================================
+./handler/enrollment_handler.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type AttendanceDeviceEnrollmentHandler struct {
+	enrollmentService enrollment.EnrollmentService
+	logger            *zap.Logger
+}
+
+type enrollmentRequest struct {
+	UserID         uuid.UUID `json:"user_id"`
+	DeviceUserCode string    `json:"device_user_code"`
+	SourceType     string    `json:"source_type"`
+}
+
+type revokeRequest struct {
+	DeviceUserCode string `json:"device_user_code"`
+	SourceType     string `json:"source_type"`
+	Reason         string `json:"reason"`
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAttendanceDeviceEnrollmentHandler(
+	enrollmentService enrollment.EnrollmentService,
+	logger *zap.Logger,
+) *AttendanceDeviceEnrollmentHandler {
+	return &AttendanceDeviceEnrollmentHandler{
+		enrollmentService: enrollmentService,
+		logger:            logger,
+	}
+}
+
+====================================================================================================
+./handler/exemption_handler.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type AttendanceExemptionHandler struct {
+	exemptionRepo repository.AttendanceExemptionRepository
+	logger        *zap.Logger
+}
+
+type CreateExemptionRequest struct {
+	CompanyID   uuid.UUID  `json:"company_id"`
+	SubjectType string     `json:"subject_type"`
+	SubjectID   uuid.UUID  `json:"subject_id"`
+	FromDate    time.Time  `json:"from_date"`
+	ToDate      time.Time  `json:"to_date"`
+	Reason      *string    `json:"reason"`
+	ApprovedBy  *uuid.UUID `json:"approved_by"`
+	CreatedBy   *uuid.UUID `json:"created_by"`
+}
+
+type UpdateExemptionRequest struct {
+	FromDate   *time.Time `json:"from_date"`
+	ToDate     *time.Time `json:"to_date"`
+	Reason     *string    `json:"reason"`
+	ApprovedBy *uuid.UUID `json:"approved_by"`
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAttendanceExemptionHandler(
+	exemptionRepo repository.AttendanceExemptionRepository,
+	logger *zap.Logger,
+) *AttendanceExemptionHandler {
+	return &AttendanceExemptionHandler{
+		exemptionRepo: exemptionRepo,
+		logger:        logger,
+	}
+}
+
+====================================================================================================
+./handler/heartbeat_handler.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type DeviceHeartbeatHandler struct {
+	heartbeatService device.HeartbeatService
+	logger           *zap.Logger
+}
+
+type DeviceHeartbeatPayload struct {
+	DeviceTime      *time.Time `json:"device_time"`
+	FirmwareVersion *string    `json:"firmware_version"`
+	IPAddress       *string    `json:"ip_address"`
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewDeviceHeartbeatHandler(
+	heartbeatService device.HeartbeatService,
+	logger *zap.Logger,
+) *DeviceHeartbeatHandler {
+	return &DeviceHeartbeatHandler{
+		heartbeatService: heartbeatService,
+		logger:           logger,
+	}
+}
+
+====================================================================================================
+./handler/ingest_handler.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type AttendanceIngestHandler struct {
+	ingestService ingest.IngestService
+	logger        *zap.Logger
+}
+
+type PunchHTTPRequest struct {
+	TargetUserID uuid.UUID  `json:"target_user_id"`
+	SubjectType  string     `json:"subject_type,omitempty"` // 👈 NEW: allows "student", "employee", etc.
+	EventType    string     `json:"event_type"`
+	EventTime    *time.Time `json:"event_time,omitempty"`
+	Source       struct {
+		SourceType string     `json:"source_type"`
+		SourceID   *uuid.UUID `json:"source_id"`
+		DeviceID   *string    `json:"device_id"`
+		IPAddress  *string    `json:"ip_address"`
+	} `json:"source"`
+	Context *models.EventContext `json:"context,omitempty"`
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAttendanceIngestHandler(
+	ingestService ingest.IngestService,
+	logger *zap.Logger,
+) *AttendanceIngestHandler {
+	return &AttendanceIngestHandler{
+		ingestService: ingestService,
+		logger:        logger,
+	}
+}
+
+====================================================================================================
+./handler/query_handler.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type AttendanceQueryHandler struct {
+	queryService query.QueryService
+	logger       *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAttendanceQueryHandler(
+	queryService query.QueryService,
+	logger *zap.Logger,
+) *AttendanceQueryHandler {
+	return &AttendanceQueryHandler{
+		queryService: queryService,
+		logger:       logger,
+	}
+}
+
+====================================================================================================
+./handler/report_handler.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type AttendanceReportHandler struct {
+	reportService report.ReportService
+	queryService  query.QueryService
+	logger        *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAttendanceReportHandler(
+	reportService report.ReportService,
+	queryService query.QueryService,
+	logger *zap.Logger,
+) *AttendanceReportHandler {
+	return &AttendanceReportHandler{
+		reportService: reportService,
+		queryService:  queryService,
+		logger:        logger,
+	}
+}
+
+====================================================================================================
+./handler/resolution_handler.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type AttendanceResolutionHandler struct {
+	resolutionService resolution.ResolutionService
+	logger            *zap.Logger
+}
+
+type ResolveEventRequest struct {
+	EventID uuid.UUID `json:"event_id"`
+}
+
+type ResolveDayRequest struct {
+	UserID      uuid.UUID `json:"user_id"`
+	Date        time.Time `json:"date"`
+	Recalculate bool      `json:"recalculate,omitempty"`
+}
+
+type BatchResolveRequest struct {
+	EventIDs []uuid.UUID `json:"event_ids"`
+}
+
+type BatchResolveByPeriodRequest struct {
+	UserIDs     []uuid.UUID `json:"user_ids"`
+	StartDate   time.Time   `json:"start_date"`
+	EndDate     time.Time   `json:"end_date"`
+	Recalculate bool        `json:"recalculate,omitempty"`
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAttendanceResolutionHandler(
+	resolutionService resolution.ResolutionService,
+	logger *zap.Logger,
+) *AttendanceResolutionHandler {
+	return &AttendanceResolutionHandler{
+		resolutionService: resolutionService,
+		logger:            logger,
+	}
+}
+
+====================================================================================================
+./handler/scheduling_handler.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type SchedulingHandler struct {
+	schedulingService      scheduling.SchedulingService
+	schedulingQueryService scheduling.SchedulingQueryService
+	logger                 *zap.Logger
+}
+
+type CreateScheduleInstanceRequest struct {
+	UserID             uuid.UUID                `json:"user_id"`
+	ScheduleDate       string                   `json:"schedule_date"`
+	ScheduleTemplateID uuid.UUID                `json:"schedule_template_id"`
+	Timezone           string                   `json:"timezone,omitempty"`
+	Metadata           *models.InstanceMetadata `json:"metadata,omitempty"`
+}
+
+type GenerateScheduleRequest struct {
+	StartDate       string `json:"start_date"`
+	EndDate         string `json:"end_date"`
+	Timezone        string `json:"timezone"`
+	IncludeHolidays bool   `json:"include_holidays"`
+	Overwrite       bool   `json:"overwrite"`
+	BatchSize       int    `json:"batch_size"`
+}
+
+type CreateScheduleOverrideRequest struct {
+	UserID       uuid.UUID `json:"user_id"`
+	OverrideDate string    `json:"override_date"`
+	OverrideType string    `json:"override_type"`
+	Reason       *string   `json:"reason,omitempty"`
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewSchedulingHandler(
+	schedulingService scheduling.SchedulingService,
+	schedulingQueryService scheduling.SchedulingQueryService,
+	logger *zap.Logger,
+) *SchedulingHandler {
+	return &SchedulingHandler{
+		schedulingService:      schedulingService,
+		schedulingQueryService: schedulingQueryService,
+		logger:                 logger,
+	}
+}
+
+====================================================================================================
+./handler/source_handler.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type AttendanceSourceAdminHandler struct {
+	sourceService source.SourceAdminService
+	logger        *zap.Logger
+}
+
+type CreateAttendanceSourceRequest struct {
+	SourceType string `json:"source_type"`
+	Name       string `json:"name,omitempty"`
+}
+
+type UpdateAttendanceSourceStatusRequest struct {
+	IsActive bool `json:"is_active"`
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAttendanceSourceAdminHandler(
+	sourceService source.SourceAdminService,
+	logger *zap.Logger,
+) *AttendanceSourceAdminHandler {
+	return &AttendanceSourceAdminHandler{
+		sourceService: sourceService,
+		logger:        logger,
+	}
+}
+
+====================================================================================================
+./handler/token_handler.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type DeviceTokenAdminHandler struct {
+	tokenService device.TokenService
+	logger       *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewDeviceTokenAdminHandler(
+	tokenService device.TokenService,
+	logger *zap.Logger,
+) *DeviceTokenAdminHandler {
+	return &DeviceTokenAdminHandler{
+		tokenService: tokenService,
+		logger:       logger,
+	}
+}
+
+====================================================================================================
+./handler/work_center_handler.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type WorkCenterHandler struct {
+	workCenterService      workcenter.Service
+	workCenterQueryService workcenter.QueryService
+	auditService           *audit.AuditService
+	logger                 *zap.Logger
+}
+
+type CreateWorkCenterRequest struct {
+	WorkCenterCode string  `json:"work_center_code"`
+	Name           string  `json:"name"`
+	Description    *string `json:"description,omitempty"`
+	Timezone       string  `json:"timezone"`
+	IsActive       bool    `json:"is_active"`
+}
+
+type UpdateWorkCenterRequest struct {
+	Name        *string `json:"name,omitempty"`
+	Description *string `json:"description,omitempty"`
+	Timezone    *string `json:"timezone,omitempty"`
+	IsActive    *bool   `json:"is_active,omitempty"`
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewWorkCenterHandler(
+	workCenterService workcenter.Service,
+	workCenterQueryService workcenter.QueryService,
+	auditService *audit.AuditService,
+	logger *zap.Logger,
+) *WorkCenterHandler {
+	return &WorkCenterHandler{
+		workCenterService:      workCenterService,
+		workCenterQueryService: workCenterQueryService,
+		auditService:           auditService,
+		logger:                 logger,
+	}
+}
+
+====================================================================================================
+./middleware/device_auth_middleware.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type DeviceAuthMiddleware struct {
+	tokenService device.TokenService
+	logger       *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewDeviceAuthMiddleware(
+	tokenService device.TokenService,
+	logger *zap.Logger,
+) *DeviceAuthMiddleware {
+	return &DeviceAuthMiddleware{
+		tokenService: tokenService,
+		logger:       logger,
+	}
+}
+
+====================================================================================================
+./repository/attendance_exemption_repository.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type AttendanceExemptionRepository interface {
+	// Create inserts a new exemption record.
+	Create(ctx context.Context, tx *sql.Tx, exemption *models.AttendanceExemption) error
+	// Update modifies an existing exemption.
+	Update(ctx context.Context, tx *sql.Tx, exemption *models.AttendanceExemption) error
+	// Delete removes an exemption by ID.
+	Delete(ctx context.Context, tx *sql.Tx, exemptionID uuid.UUID) error
+	// GetByID retrieves an exemption by its ID.
+	GetByID(ctx context.Context, tx *sql.Tx, exemptionID uuid.UUID) (*models.AttendanceExemption, error)
+	// GetActiveForSubject returns all active exemptions for a given subject on a specific date.
+	GetActiveForSubject(ctx context.Context, tx *sql.Tx, companyID, subjectID uuid.UUID, subjectType string, date time.Time) ([]*models.AttendanceExemption, error)
+	// GetForDateRange returns exemptions for a subject within a date range.
+	GetForDateRange(ctx context.Context, tx *sql.Tx, companyID, subjectID uuid.UUID, subjectType string, from, to time.Time) ([]*models.AttendanceExemption, error)
+	// List returns a paginated list of exemptions matching the filter.
+	List(ctx context.Context, tx *sql.Tx, filter ExemptionFilter, pag Pagination) ([]*models.AttendanceExemption, error)
+	// Count returns the total number of exemptions matching the filter.
+	Count(ctx context.Context, tx *sql.Tx, filter ExemptionFilter) (int64, error)
+}
+
+type ExemptionFilter struct {
+	CompanyID   *uuid.UUID
+	SubjectType *string
+	SubjectID   *uuid.UUID
+	FromDate    *time.Time
+	ToDate      *time.Time
+}
+
+====================================================================================================
+./repository/attendance_session_summary_repository.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type AttendanceSessionSummaryRepository interface {
+	// Upsert creates or updates a session summary (unique on company+subject_type+subject_id+session_id).
+	Upsert(ctx context.Context, tx *sql.Tx, summary *models.AttendanceSessionSummary) error
+	// GetBySessionAndSubject retrieves a summary for a specific session and subject.
+	GetBySessionAndSubject(ctx context.Context, tx *sql.Tx, sessionID, subjectID uuid.UUID, subjectType string) (*models.AttendanceSessionSummary, error)
+	// GetBySession returns all summaries for a given session.
+	GetBySession(ctx context.Context, tx *sql.Tx, sessionID uuid.UUID) ([]*models.AttendanceSessionSummary, error)
+	// GetBySubject returns all summaries for a subject within a date range.
+	GetBySubject(ctx context.Context, tx *sql.Tx, companyID, subjectID uuid.UUID, subjectType string, fromDate, toDate time.Time) ([]*models.AttendanceSessionSummary, error)
+	// List returns a paginated list of session summaries matching the filter.
+	List(ctx context.Context, tx *sql.Tx, filter SessionSummaryFilter, pag Pagination) ([]*models.AttendanceSessionSummary, error)
+	// Count returns the total number of session summaries matching the filter.
+	Count(ctx context.Context, tx *sql.Tx, filter SessionSummaryFilter) (int64, error)
+}
+
+type SessionSummaryFilter struct {
+	CompanyID   *uuid.UUID
+	SubjectType *string
+	SubjectID   *uuid.UUID
+	SessionID   *uuid.UUID
+	SessionDate *time.Time
+	Status      *string
+}
+
+====================================================================================================
+./repository/batch_repository.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type AttendancePunchBatch struct {
+	BatchID       uuid.UUID  `db:"batch_id"`
+	CompanyID     uuid.UUID  `db:"company_id"`
+	DeviceID      string     `db:"device_id"`
+	BatchRef      string     `db:"batch_ref"`
+	TotalEvents   int        `db:"total_events"`
+	Status        string     `db:"status"`
+	FailureReason *string    `db:"failure_reason"`
+	ReceivedAt    time.Time  `db:"received_at"`
+	ProcessedAt   *time.Time `db:"processed_at"`
+}
+
+type AttendanceBatchStatus struct {
+	BatchRef      string     `db:"batch_ref"`
+	Status        string     `db:"status"`
+	TotalEvents   int        `db:"total_events"`
+	ReceivedAt    time.Time  `db:"received_at"`
+	ProcessedAt   *time.Time `db:"processed_at"`
+	FailureReason *string    `db:"failure_reason"`
+}
+
+type AttendancePunchFailure struct {
+	FailureID      uuid.UUID  `db:"failure_id"`
+	BatchID        uuid.UUID  `db:"batch_id"`
+	CompanyID      uuid.UUID  `db:"company_id"`
+	DeviceID       string     `db:"device_id"`
+	DeviceUserCode *string    `db:"device_user_code"`
+	EventType      *string    `db:"event_type"`
+	EventTime      *time.Time `db:"event_time"`
+	FailureReason  string     `db:"failure_reason"`
+	RawEvent       []byte     `db:"raw_event"` // JSONB
+	CreatedAt      time.Time  `db:"created_at"`
+}
+
+type AttendancePunchFailureView struct {
+	FailureID      uuid.UUID              `json:"failure_id"`
+	DeviceUserCode *string                `json:"device_user_code"`
+	EventType      *string                `json:"event_type"`
+	EventTime      *time.Time             `json:"event_time"`
+	FailureReason  string                 `json:"failure_reason"`
+	RawEvent       map[string]interface{} `json:"raw_event"`
+	CreatedAt      time.Time              `json:"created_at"`
+}
+
+type AttendanceBatchRepository interface {
+	// CreateBatch inserts a new batch record
+	CreateBatch(ctx context.Context, batch *AttendancePunchBatch) error
+	ListFailuresByBatchRef(ctx context.Context, batchRef string) ([]*AttendancePunchFailureView, error)
+
+	// MarkProcessed updates batch status to 'processed'
+	MarkProcessed(ctx context.Context, batchID uuid.UUID) error
+
+	// MarkFailed updates batch status to 'failed' with a reason
+	MarkFailed(ctx context.Context, batchID uuid.UUID, reason string) error
+
+	// ExistsByRef checks if a batch with given ref already exists (idempotency)
+	ExistsByRef(ctx context.Context, companyID uuid.UUID, deviceID, batchRef string) (bool, error)
+
+	// InsertFailure stores a single failure record for a batch
+	InsertFailure(ctx context.Context, failure *AttendancePunchFailure) error
+
+	// ListFailuresByBatch retrieves failures for a specific batch with pagination
+	ListFailuresByBatch(ctx context.Context, companyID uuid.UUID, deviceID, batchRef string, limit, offset int) ([]AttendancePunchFailureView, error)
+
+	// GetByRef returns batch status by reference
+	GetByRef(ctx context.Context, companyID uuid.UUID, deviceID, batchRef string) (*AttendanceBatchStatus, error)
+}
+
+====================================================================================================
+./repository/calendar_repository.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type CalendarRepository interface {
+	// Create inserts a new work calendar
+	Create(ctx context.Context, calendar *models.WorkCalendar) error
+
+	// GetByID retrieves a calendar by its ID
+	GetByID(ctx context.Context, calendarID uuid.UUID) (*models.WorkCalendar, error)
+
+	// GetByCompanyAndYear retrieves a calendar for a specific company and year
+	GetByCompanyAndYear(ctx context.Context, companyID uuid.UUID, year int) (*models.WorkCalendar, error)
+
+	// GetByCompany retrieves all calendars for a company (optionally active only)
+	GetByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.WorkCalendar, error)
+
+	// Update updates an existing calendar
+	Update(ctx context.Context, calendar *models.WorkCalendar) error
+
+	// Delete soft-deletes a calendar (sets is_active = false) or hard deletes
+	Delete(ctx context.Context, calendarID uuid.UUID) error
+
+	// CheckExists checks if a calendar exists for the given company and year
+	Exists(ctx context.Context, companyID uuid.UUID, year int) (bool, error)
+
+	// List returns paginated calendars for a company with optional filters
+	List(ctx context.Context, companyID uuid.UUID, filter CalendarFilter, pagination Pagination) ([]*models.WorkCalendar, int64, error)
+}
+
+type CalendarFilter struct {
+	Year     *int   `json:"year,omitempty"`
+	IsActive *bool  `json:"is_active,omitempty"`
+	Name     string `json:"name,omitempty"` // partial match
+}
+
+type Pagination struct {
+	Limit  int `json:"limit"`
+	Offset int `json:"offset"`
+}
+
+====================================================================================================
+./repository/device_repository.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type DeviceStatistics struct {
+	TotalDevices      int            `json:"total_devices"`
+	ActiveDevices     int            `json:"active_devices"`
+	TrustedDevices    int            `json:"trusted_devices"`
+	BySourceType      map[string]int `json:"by_source_type"`
+	ByWorkCenter      map[string]int `json:"by_work_center"`
+	AverageUptimeDays float64        `json:"average_uptime_days"`
+}
+
+type DeviceRepository interface {
+	// GetDevice retrieves a device by ID and company
+	GetDevice(ctx context.Context, companyID uuid.UUID, deviceID string) (*models.AttendanceDevice, error)
+
+	// GetActiveDevice retrieves an active device (is_active = true)
+	GetActiveDevice(ctx context.Context, companyID uuid.UUID, deviceID string) (*models.AttendanceDevice, error)
+
+	// GetDeviceByCode retrieves a device by its device_code (unique per company)
+	GetDeviceByCode(ctx context.Context, companyID uuid.UUID, deviceCode string) (*models.AttendanceDevice, error)
+
+	// GetDevicesByCompany lists devices for a company (optionally only active)
+	GetDevicesByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.AttendanceDevice, error)
+
+	// GetDevicesByWorkCenter lists devices by work center code
+	GetDevicesByWorkCenter(ctx context.Context, companyID uuid.UUID, workCenterCode string, activeOnly bool) ([]*models.AttendanceDevice, error)
+
+	// GetDevicesBySourceType lists devices by source type
+	GetDevicesBySourceType(ctx context.Context, companyID uuid.UUID, sourceType string, activeOnly bool) ([]*models.AttendanceDevice, error)
+
+	// CreateDevice inserts a new device
+	CreateDevice(ctx context.Context, device *models.AttendanceDevice) error
+
+	// UpdateDevice updates an existing device
+	UpdateDevice(ctx context.Context, device *models.AttendanceDevice) error
+
+	// UpdateLastSeen updates the last_seen_at timestamp for a device
+	UpdateLastSeen(ctx context.Context, deviceID string) error
+
+	// DeactivateDevice sets is_active = false
+	DeactivateDevice(ctx context.Context, companyID uuid.UUID, deviceID string) error
+
+	// ActivateDevice sets is_active = true
+	ActivateDevice(ctx context.Context, companyID uuid.UUID, deviceID string) error
+
+	// MarkAsTrusted sets is_trusted = true
+	MarkAsTrusted(ctx context.Context, companyID uuid.UUID, deviceID string) error
+
+	// RevokeTrust sets is_trusted = false
+	RevokeTrust(ctx context.Context, companyID uuid.UUID, deviceID string) error
+
+	// UpdateDeviceMetadata updates the metadata JSONB field
+	UpdateDeviceMetadata(ctx context.Context, deviceID string, metadata map[string]interface{}) error
+
+	// CountDevicesByCompany counts devices for a company (optionally active only)
+	CountDevicesByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) (int, error)
+
+	// GetDeviceStatistics returns aggregated stats
+	GetDeviceStatistics(ctx context.Context, companyID uuid.UUID) (*DeviceStatistics, error)
+
+	// HealthCheck verifies DB connectivity
+	HealthCheck(ctx context.Context) error
+}
+
+====================================================================================================
+./repository/enrollment_repository.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type DeviceEnrollmentRepository interface {
+	Create(ctx context.Context, enrollment *models.DeviceEnrollment) error
+
+	GetActive(ctx context.Context, companyID uuid.UUID, deviceID, sourceType, deviceUserCode string) (*models.DeviceEnrollment, error)
+
+	GetRevoked(ctx context.Context, companyID uuid.UUID, deviceID, sourceType, deviceUserCode string) (*models.DeviceEnrollment, error)
+
+	GetActiveBySubject(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string) ([]*models.DeviceEnrollment, error)
+
+	GetByDevice(ctx context.Context, companyID uuid.UUID, deviceID string) ([]*models.DeviceEnrollment, error)
+
+	GetRevokedByDevice(ctx context.Context, companyID uuid.UUID, deviceID string) ([]*models.DeviceEnrollment, error)
+
+	Revoke(ctx context.Context, mappingID uuid.UUID, reason string, revokedBy *uuid.UUID) error
+
+	Unrevoke(ctx context.Context, mappingID uuid.UUID, reason string, actedBy *uuid.UUID) error
+
+	UpdateLastUsed(ctx context.Context, mappingID uuid.UUID) error
+
+	ExistsActive(ctx context.Context, companyID uuid.UUID, deviceID, sourceType, deviceUserCode string) (bool, error)
+
+	IncrementVersion(ctx context.Context, mappingID uuid.UUID) error
+}
+
+====================================================================================================
+./repository/event_repository.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type EventFilter struct {
+	CompanyID   uuid.UUID
+	SubjectType *string    // optional: filter by subject type
+	SubjectID   *uuid.UUID // optional: filter by subject ID (requires SubjectType)
+	EventTypes  []string   // optional: list of event types
+	SourceType  *string    // optional: source type
+	DeviceID    *string    // optional: device ID
+	StartDate   time.Time
+	EndDate     time.Time
+	Page        int
+	PageSize    int
+}
+
+type EventRepository interface {
+	// CreateEvent inserts a new event (supports transaction)
+	CreateEvent(ctx context.Context, tx *sql.Tx, event *models.AttendanceEvent) error
+
+	// CreateBulkEvents inserts multiple events in a transaction
+	CreateBulkEvents(ctx context.Context, events []*models.AttendanceEvent) error
+
+	// GetEventByID retrieves an event by its ID
+	GetEventByID(ctx context.Context, eventID uuid.UUID) (*models.AttendanceEvent, error)
+
+	// GetEventsBySubject retrieves all events for a subject within a date range
+	GetEventsBySubject(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, from, to time.Time) ([]*models.AttendanceEvent, error)
+
+	// GetEventsByCompany retrieves events for a company with pagination
+	GetEventsByCompany(ctx context.Context, companyID uuid.UUID, from, to time.Time, page, pageSize int) ([]*models.AttendanceEvent, int64, error)
+
+	// GetEventsByDevice retrieves events from a specific device within a date range
+	GetEventsByDevice(ctx context.Context, companyID uuid.UUID, deviceID string, from, to time.Time) ([]*models.AttendanceEvent, error)
+
+	// CheckDuplicateRecent checks if a similar event exists within a time window (idempotency)
+	CheckDuplicateRecent(ctx context.Context, companyID, subjectID uuid.UUID, subjectType, eventType string, eventTime time.Time, windowMinutes int) (bool, error)
+
+	// ListEvents applies filters and returns paginated results
+	ListEvents(ctx context.Context, filter EventFilter) ([]*models.AttendanceEvent, int64, error)
+
+	// CountEvents counts events matching the filter (helper for pagination)
+	CountEvents(ctx context.Context, filter EventFilter) (int64, error)
+	// BeginTx starts a new transaction
+	BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
+
+	// FindCorrection checks if a correction already exists for given parameters
+	FindCorrection(ctx context.Context, companyID, subjectID uuid.UUID, subjectType, correctionType string, eventTime time.Time) (*models.AttendanceEvent, error)
+
+	// HealthCheck verifies database connectivity
+	HealthCheck(ctx context.Context) error
+	// GetDistinctSubjects returns unique subject IDs that have events in the given range
+	GetDistinctSubjects(ctx context.Context, companyID uuid.UUID, from, to time.Time) ([]SubjectRef, error)
+}
+
+type SubjectRef struct {
+	SubjectType string    `json:"subject_type"`
+	SubjectID   uuid.UUID `json:"subject_id"`
+}
+
+====================================================================================================
+./repository/heartbeat_repository.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type DeviceHeartbeatRepository interface {
+	// Insert stores a new heartbeat record
+	Insert(ctx context.Context, hb *models.DeviceHeartbeat) error
+
+	// GetLatestByDevice returns the most recent heartbeat for a given device
+	GetLatestByDevice(ctx context.Context, companyID uuid.UUID, deviceID string) (*models.DeviceHeartbeat, error)
+}
+
+====================================================================================================
+./repository/location_repository.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type LocationRepository interface {
+	// Create inserts a new location.
+	Create(ctx context.Context, tx *sql.Tx, location *models.AttendanceLocation) error
+
+	// GetByID retrieves a location by its ID.
+	GetByID(ctx context.Context, locationID uuid.UUID) (*models.AttendanceLocation, error)
+
+	// GetByCompany retrieves all locations for a company, optionally filtering by active status.
+	GetByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.AttendanceLocation, error)
+
+	// GetByCode retrieves a location by company and location_code.
+	GetByCode(ctx context.Context, companyID uuid.UUID, locationCode string) (*models.AttendanceLocation, error)
+
+	// Update updates an existing location.
+	Update(ctx context.Context, tx *sql.Tx, location *models.AttendanceLocation) error
+
+	// Delete soft‑deletes (or hard‑deletes) a location. We'll use a soft delete by setting is_active = false,
+	// but we can also physically delete if required. This implementation does a hard delete.
+	Delete(ctx context.Context, locationID uuid.UUID) error
+
+	// HealthCheck verifies database connectivity.
+	HealthCheck(ctx context.Context) error
+}
+
+====================================================================================================
+./repository/outbox_repository.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type OutboxEvent struct {
+	EventID       uuid.UUID         `db:"event_id"`
+	AggregateType string            `db:"aggregate_type"`
+	AggregateID   uuid.UUID         `db:"aggregate_id"`
+	EventType     string            `db:"event_type"`
+	Topic         string            `db:"topic"`
+	Payload       []byte            `db:"payload"`
+	Headers       map[string]string `db:"headers"`
+	Status        string            `db:"status"`
+	RetryCount    int               `db:"retry_count"`
+	CreatedAt     time.Time         `db:"created_at"`
+	ProcessedAt   *time.Time        `db:"processed_at"`
+}
+
+type OutboxRepository interface {
+	Store(ctx context.Context, tx *sql.Tx, event *OutboxEvent) error
+	FetchUnprocessed(ctx context.Context, limit int) ([]*OutboxEvent, error)
+	MarkProcessed(ctx context.Context, eventIDs []uuid.UUID) error
+	MarkFailed(ctx context.Context, eventID uuid.UUID, errorMsg string) error
+	CountUnprocessed(ctx context.Context) (int64, error)
+	HealthCheck(ctx context.Context) error
+}
+
+====================================================================================================
+./repository/policy_repository.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type PolicyRepository interface {
+	// CreatePolicy inserts a new attendance policy.
+	CreatePolicy(ctx context.Context, tx *sql.Tx, policy *models.AttendancePolicy) error
+
+	// GetPolicyByID retrieves a policy by its ID.
+	GetPolicyByID(ctx context.Context, policyID uuid.UUID) (*models.AttendancePolicy, error)
+
+	// GetPoliciesByCompany retrieves all policies for a company, optionally filtering by active.
+	GetPoliciesByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.AttendancePolicy, error)
+
+	// GetPolicyByCode retrieves a policy by company and policy code.
+	GetPolicyByCode(ctx context.Context, companyID uuid.UUID, policyCode string) (*models.AttendancePolicy, error)
+
+	// GetPositionPolicy retrieves the active policy for a position.
+	GetPositionPolicy(ctx context.Context, positionID uuid.UUID) (*models.AttendancePolicy, error)
+
+	// GetWorkCenterPolicy retrieves the active policy for a work center.
+	GetWorkCenterPolicy(ctx context.Context, companyID uuid.UUID, workCenterCode string) (*models.AttendancePolicy, error)
+
+	// UpdatePolicy updates an existing policy.
+	UpdatePolicy(ctx context.Context, tx *sql.Tx, policy *models.AttendancePolicy) error
+
+	// DeletePolicy hard-deletes a policy by ID.
+	DeletePolicy(ctx context.Context, policyID uuid.UUID) error
+
+	// AssignUserPolicy creates a user-policy assignment.
+	AssignUserPolicy(ctx context.Context, tx *sql.Tx, assignment *models.UserAttendancePolicy) error
+
+	// GetUserActivePolicy retrieves the active policy for a user at a given date.
+	GetUserActivePolicy(ctx context.Context, userID uuid.UUID, at time.Time) (*models.AttendancePolicy, error)
+
+	// EndUserPolicy ends an active user-policy assignment (sets effective_to).
+	EndUserPolicy(ctx context.Context, userID, policyID uuid.UUID, endDate time.Time) error
+
+	// GetUsersByPolicy retrieves user IDs assigned to a policy at a given date.
+	GetUsersByPolicy(ctx context.Context, policyID uuid.UUID, effectiveDate time.Time) ([]uuid.UUID, error)
+
+	// HealthCheck verifies database connectivity.
+	HealthCheck(ctx context.Context) error
+}
+
+====================================================================================================
+./repository/rule_repository.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type RuleRepository interface {
+	// ── Company Rules ──
+	GetCompanyRules(ctx context.Context, companyID uuid.UUID) (*models.CompanyAttendanceRules, error)
+	UpsertCompanyRules(ctx context.Context, tx *sql.Tx, rules *models.CompanyAttendanceRules) error
+
+	// ── Department Rules ──
+	GetDepartmentRules(ctx context.Context, companyID, departmentID uuid.UUID) (*models.DepartmentAttendanceRules, error)
+	UpsertDepartmentRules(ctx context.Context, tx *sql.Tx, rules *models.DepartmentAttendanceRules) error
+
+	// ── User Attendance Profile ──
+	GetUserProfile(ctx context.Context, userID uuid.UUID) (*models.UserAttendanceProfile, error)
+	UpsertUserProfile(ctx context.Context, tx *sql.Tx, profile *models.UserAttendanceProfile) error
+
+	HealthCheck(ctx context.Context) error
+}
+
+====================================================================================================
+./repository/schedule_repository.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type ScheduleRepository interface {
+	// ── Work Centers ──
+	GetWorkCenter(ctx context.Context, companyID uuid.UUID, workCenterCode string) (*models.WorkCenter, error)
+	GetWorkCentersByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.WorkCenter, error)
+
+	// ── Work Calendars ──
+	// Existing: GetWorkCalendar by company+year
+	GetWorkCalendar(ctx context.Context, companyID uuid.UUID, year int) (*models.WorkCalendar, error)
+	GetWorkCalendarsByCompany(ctx context.Context, companyID uuid.UUID) ([]*models.WorkCalendar, error)
+
+	// NEW: CRUD operations for calendars
+	CreateWorkCalendar(ctx context.Context, calendar *models.WorkCalendar) error
+	GetWorkCalendarByID(ctx context.Context, calendarID uuid.UUID) (*models.WorkCalendar, error)
+	UpdateWorkCalendar(ctx context.Context, calendar *models.WorkCalendar) error
+	DeleteWorkCalendar(ctx context.Context, calendarID uuid.UUID) error
+
+	// ── Schedule Templates ──
+	// Existing
+	GetScheduleTemplate(ctx context.Context, templateID uuid.UUID) (*models.ScheduleTemplate, error)
+	GetScheduleTemplatesByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.ScheduleTemplate, error)
+
+	// NEW: CRUD for templates
+	CreateScheduleTemplate(ctx context.Context, template *models.ScheduleTemplate) error
+	GetScheduleTemplatesByCalendar(ctx context.Context, calendarID uuid.UUID) ([]*models.ScheduleTemplate, error)
+	UpdateScheduleTemplate(ctx context.Context, template *models.ScheduleTemplate) error
+	DeleteScheduleTemplate(ctx context.Context, templateID uuid.UUID) error
+
+	// ── Schedule Instances ──
+	// Existing
+	GetScheduleInstance(ctx context.Context, instanceID uuid.UUID) (*models.ScheduleInstance, error)
+	GetScheduleInstancesByUserDate(ctx context.Context, userID uuid.UUID, date time.Time) ([]*models.ScheduleInstance, error)
+	CreateScheduleInstance(ctx context.Context, tx *sql.Tx, instance *models.ScheduleInstance) error
+	UpdateScheduleInstanceStatus(ctx context.Context, tx *sql.Tx, instanceID uuid.UUID, status string, cancelReason *string) error
+
+	// NEW: extended CRUD for instances
+	GetScheduleInstancesByUser(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
+	GetScheduleInstancesByCompany(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
+	GetScheduleInstancesByTemplate(ctx context.Context, templateID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
+	GetScheduleInstancesByWorkCenter(ctx context.Context, companyID uuid.UUID, workCenterCode string, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
+	UpdateScheduleInstance(ctx context.Context, instance *models.ScheduleInstance) error
+	DeleteScheduleInstance(ctx context.Context, instanceID uuid.UUID) error
+	CancelScheduleInstance(ctx context.Context, instanceID uuid.UUID, reason string) error
+	HasActiveSchedule(ctx context.Context, companyID, userID uuid.UUID, date time.Time) (bool, error)
+
+	// ── Schedule Overrides ──
+	// NEW: full CRUD
+	CreateScheduleOverride(ctx context.Context, override *models.ScheduleOverride) error
+	GetScheduleOverrideByID(ctx context.Context, overrideID uuid.UUID) (*models.ScheduleOverride, error)
+	GetScheduleOverridesByUser(ctx context.Context, userID uuid.UUID, startDate, endDate *time.Time, overrideType *string) ([]*models.ScheduleOverride, error)
+	GetScheduleOverridesByCompany(ctx context.Context, companyID uuid.UUID, startDate, endDate *time.Time, overrideType *string) ([]*models.ScheduleOverride, error)
+	GetScheduleOverrideByUserDate(ctx context.Context, userID uuid.UUID, date time.Time) (*models.ScheduleOverride, error)
+	UpdateScheduleOverride(ctx context.Context, override *models.ScheduleOverride) error
+	DeleteScheduleOverride(ctx context.Context, overrideID uuid.UUID) error
+	DeleteScheduleOverridesByReason(ctx context.Context, companyID, userID uuid.UUID, reason string) error
+
+	// ── Work Center Shift Mappings ──
+	CreateWorkCenterShiftMapping(ctx context.Context, mapping *models.WorkCenterShift) error
+	GetWorkCenterShiftByCode(ctx context.Context, companyID uuid.UUID, workCenterCode string, date time.Time) (*models.WorkCenterShift, error)
+	GetWorkCenterShiftMappingsByShift(ctx context.Context, shiftID uuid.UUID) ([]*models.WorkCenterShift, error)
+	UpdateWorkCenterShiftMapping(ctx context.Context, mapping *models.WorkCenterShift) error
+
+	// ── User Work Center Assignments ──
+	GetUserWorkCenterAssignment(ctx context.Context, userID uuid.UUID, at time.Time) (*models.UserWorkCenterAssignment, error)
+	GetUserWorkCenterAssignments(ctx context.Context, userID uuid.UUID) ([]*models.UserWorkCenterAssignment, error)
+
+	// ── Off Entitlements ──
+	GetUserOffEntitlement(ctx context.Context, userID uuid.UUID, at time.Time) (*models.UserOffEntitlement, error)
+
+	// ── Off Requests ──
+	GetOffRequests(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time) ([]*models.OffRequest, error)
+
+	// ── Schedule Override (legacy, kept for compatibility) ──
+	GetScheduleOverride(ctx context.Context, userID uuid.UUID, date time.Time) (*models.ScheduleOverride, error)
+
+	// ── Health ──
+	HealthCheck(ctx context.Context) error
+}
+
+====================================================================================================
+./repository/source_repository.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type SourceRepository interface {
+	// ── Source Types ──
+	// GetSourceTypes retrieves all source types (optionally active only).
+	GetSourceTypes(ctx context.Context, activeOnly bool) ([]*models.AttendanceSourceType, error)
+
+	// GetSourceTypeByType retrieves a specific source type by its type string.
+	GetSourceTypeByType(ctx context.Context, sourceType string) (*models.AttendanceSourceType, error)
+
+	// ── Sources ──
+	// Create inserts a new attendance source.
+	Create(ctx context.Context, tx *sql.Tx, source *models.AttendanceSource) error
+
+	// GetByID retrieves a source by its ID.
+	GetByID(ctx context.Context, sourceID uuid.UUID) (*models.AttendanceSource, error)
+	GetEventTypes(ctx context.Context, activeOnly bool) ([]*models.AttendanceEventType, error)
+
+	// GetByCompany retrieves all sources for a company, optionally filtering by active status.
+	GetByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.AttendanceSource, error)
+
+	// GetByType retrieves a source by company and source_type (should be unique per company+type).
+	GetByType(ctx context.Context, companyID uuid.UUID, sourceType string) (*models.AttendanceSource, error)
+
+	// Update updates an existing source.
+	Update(ctx context.Context, tx *sql.Tx, source *models.AttendanceSource) error
+
+	// Delete soft-deletes or hard-deletes a source. We'll use hard delete for simplicity.
+	Delete(ctx context.Context, sourceID uuid.UUID) error
+
+	// HealthCheck verifies database connectivity.
+	HealthCheck(ctx context.Context) error
+}
+
+====================================================================================================
+./repository/summary_repository.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type SummaryRepository interface {
+	// UpsertSummary creates or updates a daily summary.
+	UpsertSummary(ctx context.Context, tx *sql.Tx, summary *models.AttendanceDailySummary) error
+
+	// GetBySubjectDate retrieves a summary for a specific subject on a given date.
+	GetBySubjectDate(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) (*models.AttendanceDailySummary, error)
+
+	// GetBySubjectRange retrieves summaries for a subject within a date range.
+	GetBySubjectRange(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, from, to time.Time) ([]*models.AttendanceDailySummary, error)
+
+	// GetByCompanyRange retrieves summaries for all subjects in a company within a date range (optional pagination).
+	GetByCompanyRange(ctx context.Context, companyID uuid.UUID, from, to time.Time, limit, offset int) ([]*models.AttendanceDailySummary, int64, error)
+
+	// LockForPayroll sets is_payroll_locked = true for a specific summary (uses FOR UPDATE).
+	LockForPayroll(ctx context.Context, tx *sql.Tx, summaryID uuid.UUID) error
+
+	// LockBySubjectDateRange locks all summaries for a subject in a date range (for payroll).
+	LockBySubjectDateRange(ctx context.Context, tx *sql.Tx, companyID, subjectID uuid.UUID, subjectType string, from, to time.Time) error
+
+	// MarkFinalized sets is_finalized = true for a summary.
+	MarkFinalized(ctx context.Context, summaryID uuid.UUID) error
+
+	// DeleteByID deletes a summary (soft or hard? We'll hard delete; but we may want to soft delete later).
+	DeleteByID(ctx context.Context, summaryID uuid.UUID) error
+
+	// HealthCheck checks database connectivity.
+	HealthCheck(ctx context.Context) error
+}
+
+====================================================================================================
+./repository/token_repository.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type TokenRepository interface {
+	// CreateToken inserts a new device token.
+	CreateToken(ctx context.Context, tx *sql.Tx, token *models.DeviceToken) error
+
+	// GetActiveTokenByHash retrieves an active token by its hash for a specific device.
+	GetActiveTokenByHash(ctx context.Context, companyID uuid.UUID, deviceID, tokenHash string) (*models.DeviceToken, error)
+
+	// GetActiveTokensForDevice retrieves all active tokens for a device.
+	GetActiveTokensForDevice(ctx context.Context, companyID uuid.UUID, deviceID string) ([]*models.DeviceToken, error)
+
+	// RevokeToken revokes a specific token.
+	RevokeToken(ctx context.Context, tokenID uuid.UUID, revokedBy *uuid.UUID, reason string) error
+
+	// RevokeAllDeviceTokens revokes all active tokens for a device.
+	RevokeAllDeviceTokens(ctx context.Context, companyID uuid.UUID, deviceID string, revokedBy *uuid.UUID, reason string) error
+
+	// RotateToken revokes the old token and creates a new one in a transaction.
+	RotateToken(ctx context.Context, oldTokenID uuid.UUID, newToken *models.DeviceToken, revokedBy *uuid.UUID, reason string) error
+
+	// UpdateTokenLastUsed updates the last_used_at timestamp in metadata.
+	UpdateTokenLastUsed(ctx context.Context, tokenID uuid.UUID) error
+
+	// CleanupExpiredTokens removes tokens that expired or were revoked before a given time.
+	CleanupExpiredTokens(ctx context.Context, before time.Time) (int64, error)
+
+	// GetTokenByID retrieves a token by its ID.
+	GetTokenByID(ctx context.Context, tokenID uuid.UUID) (*models.DeviceToken, error)
+
+	// HealthCheck verifies database connectivity.
+	HealthCheck(ctx context.Context) error
+}
+
+====================================================================================================
+./repository/work_center_repository.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type WorkCenterRepository interface {
+	// Create inserts a new work center.
+	Create(ctx context.Context, tx *sql.Tx, wc *models.WorkCenter) error
+
+	// GetByCode retrieves a work center by company and code.
+	GetByCode(ctx context.Context, companyID uuid.UUID, workCenterCode string) (*models.WorkCenter, error)
+
+	// Update updates an existing work center.
+	Update(ctx context.Context, tx *sql.Tx, wc *models.WorkCenter) error
+
+	// Delete permanently removes a work center.
+	Delete(ctx context.Context, companyID uuid.UUID, workCenterCode string) error
+
+	// List retrieves work centers for a company with pagination.
+	List(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]*models.WorkCenter, int, error)
+
+	// Search searches work centers with filters.
+	Search(ctx context.Context, companyID uuid.UUID, filters map[string]interface{}, limit, offset int) ([]*models.WorkCenter, int, error)
+
+	// GetActive retrieves all active work centers for a company.
+	GetActive(ctx context.Context, companyID uuid.UUID) ([]*models.WorkCenter, error)
+
+	// Exists checks if a work center exists by code.
+	Exists(ctx context.Context, companyID uuid.UUID, workCenterCode string) (bool, error)
+
+	// ExistsByName checks if a work center exists by name (within a company).
+	ExistsByName(ctx context.Context, companyID uuid.UUID, name string) (bool, error)
+
+	// HealthCheck verifies database connectivity.
+	HealthCheck(ctx context.Context) error
+}
+
+====================================================================================================
+./repository/postgres/attendance_exemption_repository_pg.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type exemptionRepo struct {
+	client *client.PostgresClient
+	logger *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAttendanceExemptionRepository(pg *client.PostgresClient, logger *zap.Logger) repository.AttendanceExemptionRepository {
+	return &exemptionRepo{client: pg, logger: logger.Named("exemption_repo")}
+}
+
+====================================================================================================
+./repository/postgres/attendance_session_summary_repository_pg.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type sessionSummaryRepo struct {
+	client *client.PostgresClient
+	logger *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAttendanceSessionSummaryRepository(pg *client.PostgresClient, logger *zap.Logger) repository.AttendanceSessionSummaryRepository {
+	return &sessionSummaryRepo{client: pg, logger: logger.Named("session_summary_repo")}
+}
+
+====================================================================================================
+./repository/postgres/batch_repository_pg.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type batchRepository struct {
+	client *client.PostgresClient
+	logger *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAttendanceBatchRepository(pg *client.PostgresClient, logger *zap.Logger) repository.AttendanceBatchRepository {
+	return &batchRepository{
+		client: pg,
+		logger: logger.Named("batch_repo"),
+	}
+}
+
+====================================================================================================
+./repository/postgres/calendar_repository_pg.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type calendarRepository struct {
+	client *client.PostgresClient
+	logger *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewCalendarRepository(pg *client.PostgresClient, logger *zap.Logger) repository.CalendarRepository {
+	return &calendarRepository{
+		client: pg,
+		logger: logger.Named("calendar_repo"),
+	}
+}
+
+====================================================================================================
+./repository/postgres/device_repository_pg.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type deviceRepository struct {
+	client *client.PostgresClient
+	logger *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewDeviceRepository(pg *client.PostgresClient, logger *zap.Logger) repository.DeviceRepository {
+	return &deviceRepository{
+		client: pg,
+		logger: logger.Named("device_repo"),
+	}
+}
+
+====================================================================================================
+./repository/postgres/enrollment_repository_pg.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type enrollmentRepository struct {
+	client *client.PostgresClient
+	logger *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewDeviceEnrollmentRepository(pg *client.PostgresClient, logger *zap.Logger) repository.DeviceEnrollmentRepository {
+	return &enrollmentRepository{
+		client: pg,
+		logger: logger.Named("enrollment_repo"),
+	}
+}
+
+====================================================================================================
+./repository/postgres/event_repository_pg.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type eventRepository struct {
+	client *client.PostgresClient
+	logger *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewEventRepository(pg *client.PostgresClient, logger *zap.Logger) repository.EventRepository {
+	return &eventRepository{
+		client: pg,
+		logger: logger.Named("event_repo"),
+	}
+}
+
+====================================================================================================
+./repository/postgres/heartbeat_repository_pg.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type heartbeatRepository struct {
+	client *client.PostgresClient
+	logger *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewDeviceHeartbeatRepository(pg *client.PostgresClient, logger *zap.Logger) repository.DeviceHeartbeatRepository {
+	return &heartbeatRepository{
+		client: pg,
+		logger: logger.Named("heartbeat_repo"),
+	}
+}
+
+====================================================================================================
+./repository/postgres/location_repository_pg.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type locationRepository struct {
+	client *client.PostgresClient
+	logger *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewLocationRepository(pg *client.PostgresClient, logger *zap.Logger) repository.LocationRepository {
+	return &locationRepository{
+		client: pg,
+		logger: logger.Named("location_repo"),
+	}
+}
+
+====================================================================================================
+./repository/postgres/outbox_repository_pg.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type outboxRepositoryPG struct {
+	client *client.PostgresClient
+	logger *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewOutboxRepository(pgClient *client.PostgresClient, logger *zap.Logger) repository.OutboxRepository {
+	return &outboxRepositoryPG{
+		client: pgClient,
+		logger: logger,
+	}
+}
+
+====================================================================================================
+./repository/postgres/policy_repository_pg.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type policyRepository struct {
+	client *client.PostgresClient
+	logger *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewPolicyRepository(pg *client.PostgresClient, logger *zap.Logger) repository.PolicyRepository {
+	return &policyRepository{
+		client: pg,
+		logger: logger.Named("policy_repo"),
+	}
+}
+
+====================================================================================================
+./repository/postgres/rule_repository_pg.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type ruleRepository struct {
+	client *client.PostgresClient
+	logger *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewRuleRepository(pg *client.PostgresClient, logger *zap.Logger) repository.RuleRepository {
+	return &ruleRepository{
+		client: pg,
+		logger: logger.Named("rule_repo"),
+	}
+}
+
+====================================================================================================
+./repository/postgres/schedule_repository_pg.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type scheduleRepository struct {
+	client *client.PostgresClient
+	logger *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewScheduleRepository(pg *client.PostgresClient, logger *zap.Logger) repository.ScheduleRepository {
+	return &scheduleRepository{
+		client: pg,
+		logger: logger.Named("schedule_repo"),
+	}
+}
+
+====================================================================================================
+./repository/postgres/source_repository_pg.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type sourceRepository struct {
+	client *client.PostgresClient
+	logger *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewSourceRepository(pg *client.PostgresClient, logger *zap.Logger) repository.SourceRepository {
+	return &sourceRepository{
+		client: pg,
+		logger: logger.Named("source_repo"),
+	}
+}
+
+====================================================================================================
+./repository/postgres/summary_repository_pg.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type summaryRepository struct {
+	client *client.PostgresClient
+	logger *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewSummaryRepository(pg *client.PostgresClient, logger *zap.Logger) repository.SummaryRepository {
+	return &summaryRepository{
+		client: pg,
+		logger: logger.Named("summary_repo"),
+	}
+}
+
+====================================================================================================
+./repository/postgres/token_repository_pg.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type tokenRepository struct {
+	client *client.PostgresClient
+	logger *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewTokenRepository(pg *client.PostgresClient, logger *zap.Logger) repository.TokenRepository {
+	return &tokenRepository{
+		client: pg,
+		logger: logger.Named("token_repo"),
+	}
+}
+
+====================================================================================================
+./repository/postgres/work_center_repository_pg.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type workCenterRepository struct {
+	client *client.PostgresClient
+	logger *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewWorkCenterRepository(pg *client.PostgresClient, logger *zap.Logger) repository.WorkCenterRepository {
+	return &workCenterRepository{
+		client: pg,
+		logger: logger.Named("work_center_repo"),
+	}
+}
+
+====================================================================================================
+./models/attendance_exemption.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type AttendanceExemption struct {
+	ExemptionID uuid.UUID  `db:"exemption_id"`
+	CompanyID   uuid.UUID  `db:"company_id"`
+	SubjectType string     `db:"subject_type"`
+	SubjectID   uuid.UUID  `db:"subject_id"`
+	FromDate    time.Time  `db:"from_date"`
+	ToDate      time.Time  `db:"to_date"`
+	Reason      *string    `db:"reason"`
+	ApprovedBy  *uuid.UUID `db:"approved_by"`
+	CreatedAt   time.Time  `db:"created_at"`
+	UpdatedAt   time.Time  `db:"updated_at"`
+	CreatedBy   *uuid.UUID `db:"created_by"`
+}
+
+====================================================================================================
+./models/attendance_session_summary.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type AttendanceSessionSummary struct {
+	SummaryID   uuid.UUID  `db:"summary_id"`
+	CompanyID   uuid.UUID  `db:"company_id"`
+	SubjectType string     `db:"subject_type"`
+	SubjectID   uuid.UUID  `db:"subject_id"`
+	SessionID   uuid.UUID  `db:"session_id"`
+	SessionDate time.Time  `db:"session_date"`
+	Status      string     `db:"status"` // present, absent, late, excused
+	MarkedAt    time.Time  `db:"marked_at"`
+	MarkedBy    *uuid.UUID `db:"marked_by"`
+	SourceType  string     `db:"source_type"`
+	DeviceID    *string    `db:"device_id"`
+	IsAuto      bool       `db:"is_auto"`
+	Remarks     *string    `db:"remarks"`
+	Metadata    JSONB      `db:"metadata"`
+	CreatedAt   time.Time  `db:"created_at"`
+	UpdatedAt   time.Time  `db:"updated_at"`
+}
+
+====================================================================================================
+./models/batch.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type OfflinePunchEvent struct {
+	EventType      string    `json:"event_type"`
+	EventTime      time.Time `json:"event_time"`
+	DeviceUserCode string    `json:"device_user_code"`
+}
+
+type AttendancePunchBatch struct {
+	BatchID       uuid.UUID  `json:"batch_id" db:"batch_id"`
+	CompanyID     uuid.UUID  `json:"company_id" db:"company_id"`
+	DeviceID      string     `json:"device_id" db:"device_id"`
+	BatchRef      string     `json:"batch_ref" db:"batch_ref"`
+	TotalEvents   int        `json:"total_events" db:"total_events"`
+	Status        string     `json:"status" db:"status"`
+	FailureReason *string    `json:"failure_reason,omitempty" db:"failure_reason"`
+	ReceivedAt    time.Time  `json:"received_at" db:"received_at"`
+	ProcessedAt   *time.Time `json:"processed_at,omitempty" db:"processed_at"`
+}
+
+type AttendanceBatchIngestRequest struct {
+	CompanyID  uuid.UUID
+	DeviceID   string
+	SourceType string
+	BatchRef   string
+	Events     []OfflinePunchEvent
+}
+
+====================================================================================================
+./models/calendar.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type WorkCalendar struct {
+	CalendarID  uuid.UUID `json:"calendar_id" db:"calendar_id"`
+	CompanyID   uuid.UUID `json:"company_id" db:"company_id"`
+	Year        int       `json:"year" db:"year"`
+	Name        string    `json:"name" db:"name"`
+	Timezone    string    `json:"timezone" db:"timezone"`
+	WorkingDays []int     `json:"working_days" db:"working_days"`
+	Holidays    JSONB     `json:"holidays" db:"holidays"`
+	IsActive    bool      `json:"is_active" db:"is_active"`
+	CreatedAt   time.Time `json:"created_at" db:"created_at"`
+}
+
+====================================================================================================
+./models/correction.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type AttendanceCorrectionRequest struct {
+	CompanyID      uuid.UUID  `json:"company_id"`
+	ActorID        uuid.UUID  `json:"actor_id"`
+	ActorType      string     `json:"actor_type"`
+	SubjectType    string     `json:"subject_type"`
+	SubjectID      uuid.UUID  `json:"subject_id"`
+	BusinessDate   time.Time  `json:"business_date"`
+	CorrectionType string     `json:"correction_type"` // manual_check_in, manual_check_out, attendance_adjustment, manual_override
+	EventTime      *time.Time `json:"event_time,omitempty"`
+	OverrideStatus *string    `json:"override_status,omitempty"`
+	Reason         string     `json:"reason"`
+}
+
+====================================================================================================
+./models/device.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type AttendanceDevice struct {
+	DeviceID       string                 `json:"device_id" db:"device_id"`
+	CompanyID      uuid.UUID              `json:"company_id" db:"company_id"`
+	SourceType     string                 `json:"source_type" db:"source_type"`
+	DeviceCode     string                 `json:"device_code" db:"device_code"`
+	DeviceName     *string                `json:"device_name,omitempty" db:"device_name"`
+	Manufacturer   *string                `json:"manufacturer,omitempty" db:"manufacturer"`
+	Model          *string                `json:"model,omitempty" db:"model"`
+	WorkCenterCode *string                `json:"work_center_code,omitempty" db:"work_center_code"`
+	LocationID     *uuid.UUID             `json:"location_id,omitempty" db:"location_id"`
+	IPAddress      *string                `json:"ip_address,omitempty" db:"ip_address"`
+	MacAddress     *string                `json:"mac_address,omitempty" db:"mac_address"`
+	IsActive       bool                   `json:"is_active" db:"is_active"`
+	IsTrusted      bool                   `json:"is_trusted" db:"is_trusted"`
+	LastSeenAt     *time.Time             `json:"last_seen_at,omitempty" db:"last_seen_at"`
+	InstalledAt    *time.Time             `json:"installed_at,omitempty" db:"installed_at"`
+	Metadata       map[string]interface{} `json:"metadata,omitempty" db:"metadata"`
+	CreatedAt      time.Time              `json:"created_at" db:"created_at"`
+}
+
+====================================================================================================
+./models/device_enrollment.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type DeviceEnrollment struct {
+	MappingID         uuid.UUID  `json:"mapping_id" db:"mapping_id"`
+	CompanyID         uuid.UUID  `json:"company_id" db:"company_id"`
+	SubjectType       string     `json:"subject_type" db:"subject_type"`
+	SubjectID         uuid.UUID  `json:"subject_id" db:"subject_id"`
+	DeviceID          string     `json:"device_id" db:"device_id"`
+	SourceType        string     `json:"source_type" db:"source_type"`
+	DeviceUserCode    string     `json:"device_user_code" db:"device_user_code"`
+	IsActive          bool       `json:"is_active" db:"is_active"`
+	EnrollmentVersion int        `json:"enrollment_version" db:"enrollment_version"`
+	EnrolledAt        time.Time  `json:"enrolled_at" db:"enrolled_at"`
+	UnenrolledAt      *time.Time `json:"unenrolled_at,omitempty" db:"unenrolled_at"`
+	RevokedReason     *string    `json:"revoked_reason,omitempty" db:"revoked_reason"`
+	RevokedBy         *uuid.UUID `json:"revoked_by,omitempty" db:"revoked_by"`
+	CreatedBy         *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
+	LastUsedAt        *time.Time `json:"last_used_at,omitempty" db:"last_used_at"`
+}
+
+====================================================================================================
+./models/device_heartbeat.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type DeviceHeartbeat struct {
+	HeartbeatID     uuid.UUID  `json:"heartbeat_id" db:"heartbeat_id"`
+	CompanyID       uuid.UUID  `json:"company_id" db:"company_id"`
+	DeviceID        string     `json:"device_id" db:"device_id"`
+	SourceType      string     `json:"source_type" db:"source_type"`
+	DeviceTime      *time.Time `json:"device_time,omitempty" db:"device_time"`
+	ServerTime      time.Time  `json:"server_time" db:"server_time"`
+	FirmwareVersion *string    `json:"firmware_version,omitempty" db:"firmware_version"`
+	IPAddress       *string    `json:"ip_address,omitempty" db:"ip_address"`
+	Status          string     `json:"status" db:"status"`
+	CreatedAt       time.Time  `json:"created_at" db:"created_at"`
+}
+
+type DeviceHeartbeatRequest struct {
+	DeviceTime      *time.Time `json:"device_time"`
+	FirmwareVersion *string    `json:"firmware_version"`
+	IPAddress       *string    `json:"ip_address"`
+}
+
+====================================================================================================
+./models/device_token.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type DeviceToken struct {
+	TokenID      uuid.UUID  `json:"token_id" db:"token_id"`
+	CompanyID    uuid.UUID  `json:"company_id" db:"company_id"`
+	DeviceID     string     `json:"device_id" db:"device_id"`
+	SourceType   string     `json:"source_type" db:"source_type"`
+	TokenHash    string     `json:"token_hash" db:"token_hash"`
+	TokenVersion int        `json:"token_version" db:"token_version"`
+	IsActive     bool       `json:"is_active" db:"is_active"`
+	IssuedAt     time.Time  `json:"issued_at" db:"issued_at"`
+	ExpiresAt    *time.Time `json:"expires_at,omitempty" db:"expires_at"`
+	RevokedAt    *time.Time `json:"revoked_at,omitempty" db:"revoked_at"`
+	IssuedBy     *uuid.UUID `json:"issued_by,omitempty" db:"issued_by"`
+	RevokedBy    *uuid.UUID `json:"revoked_by,omitempty" db:"revoked_by"`
+	RevokeReason *string    `json:"revoke_reason,omitempty" db:"revoke_reason"`
+	Metadata     JSONB      `json:"metadata,omitempty" db:"metadata"`
+	CreatedAt    time.Time  `json:"created_at" db:"created_at"`
+}
+
+type DeviceAuthContext struct {
+	CompanyID    uuid.UUID `json:"company_id"`
+	DeviceID     string    `json:"device_id"`
+	SourceType   string    `json:"source_type"`
+	TokenID      uuid.UUID `json:"token_id"`
+	IsTrusted    bool      `json:"is_trusted"`
+	WorkCenterID *string   `json:"work_center_id,omitempty"`
+}
+
+type IssueTokenRequest struct {
+	CompanyID  uuid.UUID  `json:"company_id"`
+	DeviceID   string     `json:"device_id"`
+	SourceType string     `json:"source_type"`
+	ExpiresIn  *int64     `json:"expires_in,omitempty"`
+	IssuedBy   *uuid.UUID `json:"issued_by,omitempty"`
+	Metadata   JSONB      `json:"metadata,omitempty"`
+}
+
+type ValidateTokenRequest struct {
+	RawToken  string    `json:"raw_token"`
+	CompanyID uuid.UUID `json:"company_id"`
+	DeviceID  string    `json:"device_id"`
+}
+
+type TokenValidationResult struct {
+	IsValid     bool               `json:"is_valid"`
+	Token       *DeviceToken       `json:"token,omitempty"`
+	AuthContext *DeviceAuthContext `json:"auth_context,omitempty"`
+	Error       string             `json:"error,omitempty"`
+}
+
+====================================================================================================
+./models/event.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type EventContext struct {
+	WorkCenterCode   *string    `json:"work_center_code,omitempty"`
+	LocationID       *uuid.UUID `json:"location_id,omitempty"`
+	Reason           *string    `json:"reason,omitempty"`
+	ExternalRef      *string    `json:"external_ref,omitempty"`
+	CorrectionReason *string    `json:"correction_reason,omitempty"`
+	SessionID        *uuid.UUID `json:"session_id,omitempty"` // 👈 new field
+}
+
+type EventMetadata struct {
+	ShiftID         *uuid.UUID `json:"shift_id,omitempty"`
+	ClassID         *uuid.UUID `json:"class_id,omitempty"`
+	IsAutoGenerated *bool      `json:"is_auto_generated,omitempty"`
+	IsCorrection    *bool      `json:"is_correction,omitempty"`
+	OverrideStatus  *string    `json:"override_status,omitempty"`
+	CorrectedBy     *uuid.UUID `json:"corrected_by,omitempty"`
+}
+
+type AttendanceEvent struct {
+	AttendanceEventID uuid.UUID       `json:"attendance_event_id" db:"attendance_event_id"`
+	CompanyID         uuid.UUID       `json:"company_id" db:"company_id"`
+	SubjectType       string          `json:"subject_type" db:"subject_type"` // employee / student / customer
+	SubjectID         uuid.UUID       `json:"subject_id" db:"subject_id"`
+	EventType         string          `json:"event_type" db:"event_type"`
+	EventTime         time.Time       `json:"event_time" db:"event_time"`
+	SourceType        string          `json:"source_type" db:"source_type"`
+	SourceID          *uuid.UUID      `json:"source_id,omitempty" db:"source_id"`
+	DeviceID          *string         `json:"device_id,omitempty" db:"device_id"`
+	DeviceUserCode    *string         `json:"device_user_code,omitempty" db:"device_user_code"`
+	IPAddress         *string         `json:"ip_address,omitempty" db:"ip_address"`
+	Context           EventContext    `json:"context" db:"context"`
+	Metadata          EventMetadata   `json:"metadata" db:"metadata"`
+	RawEventPayload   json.RawMessage `json:"raw_event_payload,omitempty" db:"raw_event_payload"`
+	CreatedAt         time.Time       `json:"created_at" db:"created_at"`
+	CreatedBy         *uuid.UUID      `json:"created_by,omitempty" db:"created_by"`
+	EventDate         time.Time       `json:"event_date" db:"event_date"` // generated column
+}
+
+====================================================================================================
+./models/event_type.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type AttendanceEventType struct {
+	EventType         string  `json:"event_type" db:"event_type"`
+	Category          string  `json:"category" db:"category"`
+	Description       *string `json:"description,omitempty" db:"description"`
+	IsUserTriggered   bool    `json:"is_user_triggered" db:"is_user_triggered"`
+	IsSystemGenerated bool    `json:"is_system_generated" db:"is_system_generated"`
+	IsActive          bool    `json:"is_active" db:"is_active"`
+}
+
+====================================================================================================
+./models/location.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type AttendanceLocation struct {
+	LocationID   uuid.UUID `json:"location_id" db:"location_id"`
+	CompanyID    uuid.UUID `json:"company_id" db:"company_id"`
+	Name         *string   `json:"name" db:"name"`
+	LocationCode *string   `json:"location_code,omitempty" db:"location_code"`
+	LocationType *string   `json:"location_type" db:"location_type"`
+	Zone         *string   `json:"zone,omitempty" db:"zone"`
+	GeoLat       *float64  `json:"geo_lat" db:"geo_lat"`
+	GeoLng       *float64  `json:"geo_lng" db:"geo_lng"`
+	IsActive     bool      `json:"is_active" db:"is_active"`
+	CreatedAt    time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at" db:"updated_at"`
+}
+
+====================================================================================================
+./models/off_request.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type OffRequest struct {
+	OffRequestID uuid.UUID  `json:"off_request_id" db:"off_request_id"`
+	CompanyID    uuid.UUID  `json:"company_id" db:"company_id"`
+	UserID       uuid.UUID  `json:"user_id" db:"user_id"`
+	RequestDates []string   `json:"request_dates" db:"request_dates"` // DATE[] as strings
+	Status       string     `json:"status" db:"status"`
+	RequestedBy  *uuid.UUID `json:"requested_by,omitempty" db:"requested_by"`
+	ApprovedBy   *uuid.UUID `json:"approved_by,omitempty" db:"approved_by"`
+	ApprovedAt   *time.Time `json:"approved_at,omitempty" db:"approved_at"`
+	CreatedAt    time.Time  `json:"created_at" db:"created_at"`
+}
+
+====================================================================================================
+./models/policy.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type AttendancePolicy struct {
+	PolicyID       uuid.UUID   `json:"policy_id" db:"policy_id"`
+	CompanyID      uuid.UUID   `json:"company_id" db:"company_id"`
+	WorkCenterCode *string     `json:"work_center_code,omitempty" db:"work_center_code"`
+	PositionID     *uuid.UUID  `json:"position_id,omitempty" db:"position_id"`
+	PolicyCode     string      `json:"policy_code" db:"policy_code"`
+	PolicyType     string      `json:"policy_type" db:"policy_type"`
+	Rules          PolicyRules `json:"rules" db:"rules"`
+	IsActive       bool        `json:"is_active" db:"is_active"`
+	CreatedAt      time.Time   `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time   `json:"updated_at" db:"updated_at"`
+}
+
+type PolicyRules struct {
+	GracePeriod         *int     `json:"grace_period,omitempty"`
+	MaxLateAllowed      *int     `json:"max_late_allowed,omitempty"`
+	HalfDayAfter        *int     `json:"half_day_after,omitempty"`
+	AutoCheckout        *bool    `json:"auto_checkout,omitempty"`
+	RequireWorkCenter   *bool    `json:"require_work_center,omitempty"`
+	AllowedWorkCenters  []string `json:"allowed_work_centers,omitempty"`
+	AllowShiftOverlap   *bool    `json:"allow_shift_overlap,omitempty"`
+	MaxOverlapMinutes   *int     `json:"max_overlap_minutes,omitempty"`
+	OvertimeThreshold   *int     `json:"overtime_threshold,omitempty"`
+	AutoApproveOvertime *bool    `json:"auto_approve_overtime,omitempty"`
+	AllowedSourceTypes  []string `json:"allowed_source_types,omitempty"`
+	AllowSelfService    *bool    `json:"allow_self_service,omitempty"`
+	AllowAdminMarking   *bool    `json:"allow_admin_marking,omitempty"`
+	AllowDeviceMarking  *bool    `json:"allow_device_marking,omitempty"`
+}
+
+type UserAttendancePolicy struct {
+	UserID        uuid.UUID  `json:"user_id" db:"user_id"`
+	PolicyID      uuid.UUID  `json:"policy_id" db:"policy_id"`
+	EffectiveFrom time.Time  `json:"effective_from" db:"effective_from"`
+	EffectiveTo   *time.Time `json:"effective_to,omitempty" db:"effective_to"`
+	AssignedBy    *uuid.UUID `json:"assigned_by,omitempty" db:"assigned_by"`
+	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
+}
+
+====================================================================================================
+./models/rule.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type CompanyAttendanceRules struct {
+	CompanyID             uuid.UUID `json:"company_id" db:"company_id"`
+	AllowedSourceTypes    []string  `json:"allowed_source_types" db:"allowed_source_types"`
+	AllowMultipleCheckins bool      `json:"allow_multiple_checkins" db:"allow_multiple_checkins"`
+	Timezone              string    `json:"timezone" db:"timezone"`
+	CreatedAt             time.Time `json:"created_at" db:"created_at"`
+}
+
+type DepartmentAttendanceRules struct {
+	RuleID             uuid.UUID `json:"rule_id" db:"rule_id"`
+	CompanyID          uuid.UUID `json:"company_id" db:"company_id"`
+	DepartmentID       uuid.UUID `json:"department_id" db:"department_id"`
+	AllowedSourceTypes []string  `json:"allowed_source_types" db:"allowed_source_types"`
+	AllowedEventTypes  []string  `json:"allowed_event_types" db:"allowed_event_types"`
+	RequireLocation    bool      `json:"require_location" db:"require_location"`
+	RequireDevice      bool      `json:"require_device" db:"require_device"`
+	CreatedAt          time.Time `json:"created_at" db:"created_at"`
+}
+
+type UserAttendanceProfile struct {
+	UserID              uuid.UUID `json:"user_id" db:"user_id"`
+	CompanyID           uuid.UUID `json:"company_id" db:"company_id"`
+	OverrideSourceTypes []string  `json:"override_source_types,omitempty" db:"override_source_types"`
+	OverrideEventTypes  []string  `json:"override_event_types,omitempty" db:"override_event_types"`
+	CreatedAt           time.Time `json:"created_at" db:"created_at"`
+}
+
+type ResolvedAttendanceRules struct {
+	CompanyID             uuid.UUID       `json:"company_id"`
+	Timezone              string          `json:"timezone"`
+	AllowMultipleCheckins bool            `json:"allow_multiple_checkins"`
+	AllowedSourceTypesMap map[string]bool `json:"-"`
+	AllowedEventTypesMap  map[string]bool `json:"-"`
+	AllowAllEventTypes    bool            `json:"allow_all_event_types"`
+	AllowedSourceTypes    []string        `json:"allowed_source_types"`
+	AllowedEventTypes     []string        `json:"allowed_event_types"`
+	RequireLocation       bool            `json:"require_location"`
+	RequireDevice         bool            `json:"require_device"`
+	RequireReference      bool            `json:"require_reference"`
+	SourceLevel           string          `json:"source_level"`
+	AppliedAt             time.Time       `json:"applied_at"`
+	PolicyID              *uuid.UUID      `json:"policy_id,omitempty"`
+	PolicyRules           *PolicyRules    `json:"policy_rules,omitempty"`
+	WorkCenterCode        *string         `json:"work_center_code,omitempty"`
+	PositionID            *uuid.UUID      `json:"position_id,omitempty"`
+	PolicySource          string          `json:"policy_source"`
+}
+
+====================================================================================================
+./models/schedule.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type ScheduleTemplate struct {
+	ScheduleTemplateID uuid.UUID     `json:"schedule_template_id" db:"schedule_template_id"`
+	CompanyID          uuid.UUID     `json:"company_id" db:"company_id"`
+	CalendarID         uuid.UUID     `json:"calendar_id" db:"calendar_id"`
+	TemplateType       string        `json:"template_type" db:"template_type"`
+	Name               string        `json:"name" db:"name"`
+	Rules              TemplateRules `json:"rules" db:"rules"`
+	IsActive           bool          `json:"is_active" db:"is_active"`
+	CreatedAt          time.Time     `json:"created_at" db:"created_at"`
+}
+
+type TemplateRules struct {
+	StartTime    *string       `json:"start_time,omitempty"`
+	EndTime      *string       `json:"end_time,omitempty"`
+	BreakMinutes *int          `json:"break_minutes,omitempty"`
+	Periods      []ClassPeriod `json:"periods,omitempty"`
+}
+
+type ClassPeriod struct {
+	Period int    `json:"period"`
+	Start  string `json:"start"`
+	End    string `json:"end"`
+}
+
+type ScheduleInstance struct {
+	ScheduleInstanceID uuid.UUID        `json:"schedule_instance_id" db:"schedule_instance_id"`
+	CompanyID          uuid.UUID        `json:"company_id" db:"company_id"`
+	UserID             uuid.UUID        `json:"user_id" db:"user_id"`
+	ScheduleDate       time.Time        `json:"schedule_date" db:"schedule_date"`
+	ScheduleTemplateID uuid.UUID        `json:"schedule_template_id" db:"schedule_template_id"`
+	ExpectedStart      *time.Time       `json:"expected_start" db:"expected_start"`
+	ExpectedEnd        *time.Time       `json:"expected_end" db:"expected_end"`
+	Timezone           string           `json:"timezone" db:"timezone"`
+	Metadata           InstanceMetadata `json:"metadata" db:"metadata"`
+	WorkCenterCode     *string          `json:"work_center_code,omitempty" db:"work_center_code"`
+	GeneratedAt        time.Time        `json:"generated_at" db:"generated_at"`
+	Status             string           `json:"status" db:"status"`
+	CancelReason       *string          `json:"cancel_reason,omitempty" db:"cancel_reason"`
+	CancelledAt        *time.Time       `json:"cancelled_at,omitempty" db:"cancelled_at"`
+}
+
+type InstanceMetadata struct {
+	ClassID *uuid.UUID `json:"class_id,omitempty"`
+	Periods *int       `json:"periods,omitempty"`
+}
+
+type UserScheduleAssignment struct {
+	UserID             uuid.UUID  `json:"user_id" db:"user_id"`
+	ScheduleTemplateID uuid.UUID  `json:"schedule_template_id" db:"schedule_template_id"`
+	EffectiveFrom      time.Time  `json:"effective_from" db:"effective_from"`
+	EffectiveTo        *time.Time `json:"effective_to" db:"effective_to"`
+	AssignedBy         *uuid.UUID `json:"assigned_by" db:"assigned_by"`
+	CreatedAt          time.Time  `json:"created_at" db:"created_at"`
+}
+
+====================================================================================================
+./models/schedule_override.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type ScheduleOverride struct {
+	OverrideID   uuid.UUID  `json:"override_id" db:"override_id"`
+	CompanyID    uuid.UUID  `json:"company_id" db:"company_id"`
+	UserID       uuid.UUID  `json:"user_id" db:"user_id"`
+	OverrideDate time.Time  `json:"override_date" db:"override_date"`
+	OverrideType string     `json:"override_type" db:"override_type"`
+	Reason       *string    `json:"reason,omitempty" db:"reason"`
+	CreatedBy    *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
+	CreatedAt    time.Time  `json:"created_at" db:"created_at"`
+}
+
+====================================================================================================
+./models/source.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type AttendanceSource struct {
+	SourceID      uuid.UUID  `json:"source_id" db:"source_id"`
+	CompanyID     uuid.UUID  `json:"company_id" db:"company_id"`
+	SourceType    string     `json:"source_type" db:"source_type"`
+	Name          string     `json:"name" db:"name"`
+	ReferenceType *string    `json:"reference_type,omitempty" db:"reference_type"`
+	ReferenceID   *uuid.UUID `json:"reference_id,omitempty" db:"reference_id"`
+	IsActive      bool       `json:"is_active" db:"is_active"`
+	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
+	CreatedBy     *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
+}
+
+type AttendanceSourceType struct {
+	SourceType     string    `json:"source_type" db:"source_type"`
+	Description    *string   `json:"description,omitempty" db:"description"`
+	Category       string    `json:"category" db:"category"`
+	RequiresDevice bool      `json:"requires_device" db:"requires_device"`
+	IsSystem       bool      `json:"is_system" db:"is_system"`
+	AllowBackdated bool      `json:"allow_backdated" db:"allow_backdated"`
+	AllowFuture    bool      `json:"allow_future" db:"allow_future"`
+	TrustLevel     int16     `json:"trust_level" db:"trust_level"`
+	IsSelfService  bool      `json:"is_self_service" db:"is_self_service"`
+	CreatedAt      time.Time `json:"created_at" db:"created_at"`
+}
+
+====================================================================================================
+./models/summary.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type PairedEvent struct {
+	CheckInEventID  uuid.UUID  `json:"check_in_event_id"`
+	CheckOutEventID *uuid.UUID `json:"check_out_event_id,omitempty"`
+	CheckInTime     time.Time  `json:"check_in_time"`
+	CheckOutTime    *time.Time `json:"check_out_time,omitempty"`
+	WorkedMinutes   *int       `json:"worked_minutes,omitempty"`
+	IsAutoClosed    bool       `json:"is_auto_closed"`
+	Anomalies       []string   `json:"anomalies,omitempty"`
+}
+
+type SummaryMetadata struct {
+	ClassesAttended *int          `json:"classes_attended,omitempty"`
+	PeriodsTaken    *int          `json:"periods_taken,omitempty"`
+	ShiftID         *uuid.UUID    `json:"shift_id,omitempty"`
+	PolicyID        *uuid.UUID    `json:"policy_id,omitempty"`
+	WorkCenterCode  *string       `json:"work_center_code,omitempty"`
+	CheckInTime     *time.Time    `json:"check_in_time,omitempty"`
+	CheckOutTime    *time.Time    `json:"check_out_time,omitempty"`
+	TotalCheckIns   *int          `json:"total_checkins,omitempty"`
+	TotalCheckOuts  *int          `json:"total_checkouts,omitempty"`
+	BreakMinutes    *int          `json:"break_minutes,omitempty"`
+	ScheduleStatus  *string       `json:"schedule_status,omitempty"`
+	Timezone        *string       `json:"timezone,omitempty"`
+	Anomalies       []string      `json:"anomalies,omitempty"`
+	PairedEvents    []PairedEvent `json:"paired_events,omitempty"`
+	LeaveTypeID     *uuid.UUID    `json:"leave_type_id,omitempty"`
+	LeaveRequestID  *uuid.UUID    `json:"leave_request_id,omitempty"`
+	IsLeavePaid     *bool         `json:"is_leave_paid,omitempty"`
+}
+
+type AttendanceDailySummary struct {
+	AttendanceSummaryID uuid.UUID       `json:"attendance_summary_id" db:"attendance_summary_id"`
+	CompanyID           uuid.UUID       `json:"company_id" db:"company_id"`
+	SubjectType         string          `json:"subject_type" db:"subject_type"`
+	SubjectID           uuid.UUID       `json:"subject_id" db:"subject_id"`
+	AttendanceDate      time.Time       `json:"attendance_date" db:"attendance_date"`
+	Status              string          `json:"status" db:"status"`
+	WorkedMinutes       *int            `json:"worked_minutes" db:"worked_minutes"`
+	ExpectedMinutes     *int            `json:"expected_minutes" db:"expected_minutes"`
+	OvertimeMinutes     *int            `json:"overtime_minutes" db:"overtime_minutes"`
+	LateMinutes         *int            `json:"late_minutes" db:"late_minutes"`
+	IsFinalized         bool            `json:"is_finalized" db:"is_finalized"`
+	IsPayable           bool            `json:"is_payable" db:"is_payable"`
+	IsPayrollLocked     bool            `json:"is_payroll_locked" db:"is_payroll_locked"`
+	Metadata            SummaryMetadata `json:"metadata" db:"metadata"`
+	GeneratedAt         time.Time       `json:"generated_at" db:"generated_at"`
+	GeneratedBy         string          `json:"generated_by" db:"generated_by"`
+}
+
+type AttendanceStats struct {
+	CompanyID          uuid.UUID `json:"company_id"`
+	StartDate          time.Time `json:"start_date"`
+	EndDate            time.Time `json:"end_date"`
+	TotalEmployees     int       `json:"total_employees"`
+	PresentCount       int       `json:"present_count"`
+	AbsentCount        int       `json:"absent_count"`
+	LateCount          int       `json:"late_count"`
+	HalfDayCount       int       `json:"half_day_count"`
+	LeaveCount         int       `json:"leave_count"`
+	HolidayCount       int       `json:"holiday_count"`
+	TotalWorkedHours   float64   `json:"total_worked_hours"`
+	TotalOvertimeHours float64   `json:"total_overtime_hours"`
+	AverageAttendance  float64   `json:"average_attendance"`
+}
+
+type UserAttendanceStats struct {
+	UserID             uuid.UUID `json:"user_id"`
+	StartDate          time.Time `json:"start_date"`
+	EndDate            time.Time `json:"end_date"`
+	PresentDays        int       `json:"present_days"`
+	AbsentDays         int       `json:"absent_days"`
+	LateDays           int       `json:"late_days"`
+	HalfDays           int       `json:"half_days"`
+	LeaveDays          int       `json:"leave_days"`
+	TotalWorkedHours   float64   `json:"total_worked_hours"`
+	TotalOvertimeHours float64   `json:"total_overtime_hours"`
+	AverageInTime      string    `json:"average_in_time"`
+	AverageOutTime     string    `json:"average_out_time"`
+	AttendancePercent  float64   `json:"attendance_percent"`
+}
+
+====================================================================================================
+./models/user_off_entitlement.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type UserOffEntitlement struct {
+	EntitlementID    uuid.UUID  `json:"entitlement_id" db:"entitlement_id"`
+	CompanyID        uuid.UUID  `json:"company_id" db:"company_id"`
+	UserID           uuid.UUID  `json:"user_id" db:"user_id"`
+	PeriodType       string     `json:"period_type" db:"period_type"`
+	OffCount         int        `json:"off_count" db:"off_count"`
+	RequiresApproval bool       `json:"requires_approval" db:"requires_approval"`
+	EffectiveFrom    time.Time  `json:"effective_from" db:"effective_from"`
+	EffectiveTo      *time.Time `json:"effective_to,omitempty" db:"effective_to"`
+	CreatedAt        time.Time  `json:"created_at" db:"created_at"`
+}
+
+====================================================================================================
+./models/user_work_center_assignment.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type UserWorkCenterAssignment struct {
+	AssignmentID   uuid.UUID  `json:"assignment_id" db:"assignment_id"`
+	CompanyID      uuid.UUID  `json:"company_id" db:"company_id"`
+	UserID         uuid.UUID  `json:"user_id" db:"user_id"`
+	WorkCenterCode string     `json:"work_center_code" db:"work_center_code"`
+	EffectiveFrom  time.Time  `json:"effective_from" db:"effective_from"`
+	EffectiveTo    *time.Time `json:"effective_to,omitempty" db:"effective_to"`
+	IsActive       bool       `json:"is_active" db:"is_active"`
+	CreatedAt      time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at" db:"updated_at"`
+}
+
+====================================================================================================
+./models/work_center.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type WorkCenter struct {
+	WorkCenterCode string    `json:"work_center_code" db:"work_center_code"`
+	CompanyID      uuid.UUID `json:"company_id" db:"company_id"`
+	Name           string    `json:"name" db:"name"`
+	Description    *string   `json:"description,omitempty" db:"description"`
+	Timezone       string    `json:"timezone" db:"timezone"`
+	IsActive       bool      `json:"is_active" db:"is_active"`
+	CreatedAt      time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at" db:"updated_at"`
+}
+
+====================================================================================================
+./models/work_center_shift.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type WorkCenterShift struct {
+	MappingID      uuid.UUID  `json:"mapping_id" db:"mapping_id"`
+	CompanyID      uuid.UUID  `json:"company_id" db:"company_id"`
+	WorkCenterCode string     `json:"work_center_code" db:"work_center_code"`
+	ShiftID        uuid.UUID  `json:"shift_id" db:"shift_id"`
+	EffectiveFrom  time.Time  `json:"effective_from" db:"effective_from"`
+	EffectiveTo    *time.Time `json:"effective_to,omitempty" db:"effective_to"`
+	IsActive       bool       `json:"is_active" db:"is_active"`
+	CreatedAt      time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at" db:"updated_at"`
+}
+
+====================================================================================================
+./biometric/repository/device_sync_repository.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type DeviceEmbeddingSyncRepository interface {
+	// Get sync record for a device
+	GetByDevice(ctx context.Context, companyID uuid.UUID, deviceID string) (*models.DeviceEmbeddingSync, error)
+
+	// Insert or update the sync record (upsert)
+	Upsert(ctx context.Context, sync *models.DeviceEmbeddingSync) error
+
+	// Update only the last_synced_at timestamp
+	UpdateLastSyncedAt(ctx context.Context, companyID uuid.UUID, deviceID string, lastSyncedAt time.Time) error
+
+	// Update last_full_sync and model_version (after a full sync)
+	UpdateFullSync(ctx context.Context, companyID uuid.UUID, deviceID string, lastFullSync time.Time, modelVersion string) error
+}
+
+====================================================================================================
+./biometric/repository/face_embedding_repository.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type FaceEmbeddingRepository interface {
+	// Create a new embedding
+	Create(ctx context.Context, embedding *models.FaceEmbedding) error
+
+	// Update an existing embedding (by ID)
+	Update(ctx context.Context, embedding *models.FaceEmbedding) error
+
+	// Upsert (insert or update) based on (company_id, subject_type, subject_id)
+	Upsert(ctx context.Context, embedding *models.FaceEmbedding) error
+
+	// Deactivate (soft delete) embedding for a subject
+	Deactivate(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string) error
+
+	// Get embedding by subject
+	GetBySubject(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string) (*models.FaceEmbedding, error)
+
+	// Get all active embeddings for a company
+	GetActiveByCompany(ctx context.Context, companyID uuid.UUID) ([]*models.FaceEmbedding, error)
+
+	// Get active embeddings updated after a given time (for incremental sync)
+	GetActiveByCompanySince(ctx context.Context, companyID uuid.UUID, since time.Time) ([]*models.FaceEmbedding, error)
+
+	// Get active embeddings for a specific model version
+	GetActiveByCompanyWithModel(ctx context.Context, companyID uuid.UUID, modelVersion string) ([]*models.FaceEmbedding, error)
+
+	// Get embedding by its ID
+	GetByEmbeddingID(ctx context.Context, embeddingID uuid.UUID) (*models.FaceEmbedding, error)
+
+	// Device-scoped: get active embeddings for a specific device and model version
+	GetActiveByDeviceAndModel(ctx context.Context, companyID uuid.UUID, deviceID, modelVersion string) ([]*models.DeviceScopedEmbedding, error)
+
+	// Device-scoped: get embeddings changed since a given time for a device
+	GetChangesSinceForDevice(ctx context.Context, companyID uuid.UUID, deviceID, modelVersion string, since time.Time) ([]*models.DeviceScopedEmbedding, error)
+
+	// Transaction-aware methods (optional, but included for consistency)
+	CreateTx(ctx context.Context, tx *sql.Tx, embedding *models.FaceEmbedding) error
+	UpsertTx(ctx context.Context, tx *sql.Tx, embedding *models.FaceEmbedding) error
+	DeactivateTx(ctx context.Context, tx *sql.Tx, companyID, subjectID uuid.UUID, subjectType string) error
+}
+
+====================================================================================================
+./biometric/repository/postgres/device_sync_pg.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type deviceSyncRepo struct {
+	client *client.PostgresClient
+	logger *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewDeviceEmbeddingSyncRepository(pg *client.PostgresClient, logger *zap.Logger) repository.DeviceEmbeddingSyncRepository {
+	return &deviceSyncRepo{
+		client: pg,
+		logger: logger,
+	}
+}
+
+====================================================================================================
+./biometric/repository/postgres/face_embedding_pg.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type faceEmbeddingRepo struct {
+	client *client.PostgresClient
+	logger *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewFaceEmbeddingRepository(pg *client.PostgresClient, logger *zap.Logger) repository.FaceEmbeddingRepository {
+	return &faceEmbeddingRepo{
+		client: pg,
+		logger: logger,
+	}
+}
+
+====================================================================================================
+./biometric/models/device_sync.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type DeviceEmbeddingSync struct {
+	SyncID       uuid.UUID  `json:"sync_id" db:"sync_id"`
+	CompanyID    uuid.UUID  `json:"company_id" db:"company_id"`
+	DeviceID     string     `json:"device_id" db:"device_id"`
+	ModelVersion string     `json:"model_version" db:"model_version"`
+	LastSyncedAt *time.Time `json:"last_synced_at,omitempty" db:"last_synced_at"`
+	LastFullSync *time.Time `json:"last_full_sync,omitempty" db:"last_full_sync"`
+	CreatedAt    time.Time  `json:"created_at" db:"created_at"`
+}
+
+type SyncEmbeddingsInput struct {
+	CompanyID    uuid.UUID `json:"company_id"`
+	DeviceID     string    `json:"device_id"`
+	ModelVersion string    `json:"model_version"`
+}
+
+type SyncEmbeddingsResponse struct {
+	SyncType     string            `json:"sync_type"`
+	CompanyID    uuid.UUID         `json:"company_id"`
+	DeviceID     string            `json:"device_id"`
+	ModelVersion string            `json:"model_version"`
+	ServerTime   time.Time         `json:"server_time"`
+	Embeddings   []EmbeddingRecord `json:"embeddings"`
+}
+
+type EmbeddingRecord struct {
+	DeviceUserCode  string    `json:"device_user_code"`
+	EmbeddingVector []float64 `json:"embedding_vector"`
+	EmbeddingDim    int       `json:"embedding_dim"`
+	UpdatedAt       time.Time `json:"updated_at"`
+	IsActive        bool      `json:"is_active"`
+}
+
+type DeviceScopedEmbedding struct {
+	DeviceUserCode  string    `json:"device_user_code"`
+	EmbeddingVector []float64 `json:"embedding_vector"`
+	EmbeddingDim    int       `json:"embedding_dim"`
+	UpdatedAt       time.Time `json:"updated_at"`
+	IsActive        bool      `json:"is_active"`
+}
+
+====================================================================================================
+./biometric/models/face_embedding.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type FaceEmbedding struct {
+	EmbeddingID     uuid.UUID  `json:"embedding_id" db:"embedding_id"`
+	CompanyID       uuid.UUID  `json:"company_id" db:"company_id"`
+	SubjectType     string     `json:"subject_type" db:"subject_type"`
+	SubjectID       uuid.UUID  `json:"subject_id" db:"subject_id"`
+	EmbeddingVector []float64  `json:"embedding_vector" db:"embedding_vector"`
+	ModelVersion    string     `json:"model_version" db:"model_version"`
+	EmbeddingDim    int        `json:"embedding_dim" db:"embedding_dim"`
+	IsActive        bool       `json:"is_active" db:"is_active"`
+	CreatedAt       time.Time  `json:"created_at" db:"created_at"`
+	CreatedBy       *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
+	UpdatedAt       time.Time  `json:"updated_at" db:"updated_at"`
+}
+
+type EnrollFaceInput struct {
+	CompanyID       uuid.UUID `json:"company_id"`
+	SubjectType     string    `json:"subject_type"`
+	SubjectID       uuid.UUID `json:"subject_id"`
+	EmbeddingVector []float64 `json:"embedding_vector"`
+	ModelVersion    string    `json:"model_version"`
+	CreatedBy       uuid.UUID `json:"created_by"`
+}
+
+====================================================================================================
+./biometric/service/enrollment_service.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type BiometricEnrollmentService interface {
+	EnrollFace(ctx context.Context, input *models.EnrollFaceInput) (*models.FaceEmbedding, error)
+	ReEnrollFace(ctx context.Context, input *models.EnrollFaceInput) (*models.FaceEmbedding, error)
+	DeactivateFace(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, actedBy uuid.UUID, reason string) error
+	ActivateFace(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, actedBy uuid.UUID, reason string) error
+	GetFaceEmbedding(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string) (*models.FaceEmbedding, error)
+	GetActiveFaceEmbeddingsByCompany(ctx context.Context, companyID uuid.UUID) ([]*models.FaceEmbedding, error)
+	RotateEmbeddingModel(ctx context.Context, companyID, embeddingID uuid.UUID, newVersion string, actorID uuid.UUID) error
+}
+
+type biometricEnrollmentService struct {
+	repo       repository.FaceEmbeddingRepository
+	subjectRes resolver.SubjectResolver
+	audit      *auditservice.AuditService
+	logger     *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewBiometricEnrollmentService(
+	repo repository.FaceEmbeddingRepository,
+	subjectRes resolver.SubjectResolver,
+	audit *auditservice.AuditService,
+	logger *zap.Logger,
+) BiometricEnrollmentService {
+	return &biometricEnrollmentService{
+		repo:       repo,
+		subjectRes: subjectRes,
+		audit:      audit,
+		logger:     logger,
+	}
+}
+
+====================================================================================================
+./biometric/service/sync_service.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type BiometricSyncService interface {
+	SyncEmbeddings(ctx context.Context, input *models.SyncEmbeddingsInput) (*models.SyncEmbeddingsResponse, error)
+	FullSync(ctx context.Context, companyID uuid.UUID, deviceID, modelVersion string) (*models.SyncEmbeddingsResponse, error)
+	IncrementalSync(ctx context.Context, companyID uuid.UUID, deviceID, modelVersion string, since time.Time) (*models.SyncEmbeddingsResponse, error)
+	ForceDeviceResync(ctx context.Context, companyID uuid.UUID, deviceID string) error
+}
+
+type biometricSyncService struct {
+	faceRepo repository.FaceEmbeddingRepository
+	syncRepo repository.DeviceEmbeddingSyncRepository
+	audit    *auditservice.AuditService
+	logger   *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewBiometricSyncService(
+	faceRepo repository.FaceEmbeddingRepository,
+	syncRepo repository.DeviceEmbeddingSyncRepository,
+	audit *auditservice.AuditService,
+	logger *zap.Logger,
+) BiometricSyncService {
+	return &biometricSyncService{
+		faceRepo: faceRepo,
+		syncRepo: syncRepo,
+		audit:    audit,
+		logger:   logger,
+	}
+}
+
+====================================================================================================
+./consumer/attendance_resolution_consumer.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type AttendanceResolutionConsumer struct {
+	kafkaConsumer     *client.KafkaConsumer
+	resolutionService resolution.ResolutionService
+	logger            *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAttendanceResolutionConsumer(
+	kafkaConsumer *client.KafkaConsumer,
+	resolutionService resolution.ResolutionService,
+	logger *zap.Logger,
+) *AttendanceResolutionConsumer {
+	return &AttendanceResolutionConsumer{
+		kafkaConsumer:     kafkaConsumer,
+		resolutionService: resolutionService,
+		logger:            logger,
+	}
+}
+
+====================================================================================================
+./service/outbox/batch_outbox_processor.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type BatchOutboxProcessor struct {
+	outboxRepo repository.OutboxRepository
+	kafka      KafkaProducer
+	logger     *zap.Logger
+	batchSize  int
+	interval   time.Duration
+	stopChan   chan struct{}
+	isRunning  bool
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewBatchOutboxProcessor(
+	outboxRepo repository.OutboxRepository,
+	kafka KafkaProducer,
+	logger *zap.Logger,
+	batchSize int,
+	interval time.Duration,
+) *BatchOutboxProcessor {
+	return &BatchOutboxProcessor{
+		outboxRepo: outboxRepo,
+		kafka:      kafka,
+		logger:     logger,
+		batchSize:  batchSize,
+		interval:   interval,
+		stopChan:   make(chan struct{}),
+	}
+}
+
+====================================================================================================
+./service/outbox/outbox_service.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type KafkaProducer interface {
+	ProduceMessage(ctx context.Context, topic string, key []byte, value []byte, headers map[string]string) error
+}
+
+type OutboxService struct {
+	outboxRepo   repository.OutboxRepository
+	kafka        KafkaProducer
+	logger       *zap.Logger
+	batchSize    int
+	pollInterval time.Duration
+	topicName    string
+	stopChan     chan struct{}
+	isRunning    bool
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewOutboxService(
+	outboxRepo repository.OutboxRepository,
+	kafka KafkaProducer,
+	logger *zap.Logger,
+	batchSize int,
+	pollInterval time.Duration,
+	topicName string,
+) *OutboxService {
+	return &OutboxService{
+		outboxRepo:   outboxRepo,
+		kafka:        kafka,
+		logger:       logger,
+		batchSize:    batchSize,
+		pollInterval: pollInterval,
+		topicName:    topicName,
+		stopChan:     make(chan struct{}),
+	}
+}
+
+====================================================================================================
+./service/scheduling/scheduling_query_service.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type SchedulingQueryService interface {
+	// Work Calendars
+	GetWorkCalendarByID(ctx context.Context, calendarID uuid.UUID) (*models.WorkCalendar, error)
+	GetWorkCalendarsByCompany(ctx context.Context, companyID uuid.UUID) ([]*models.WorkCalendar, error)
+	GetWorkCalendarAvailability(ctx context.Context, calendarID uuid.UUID, startDate, endDate time.Time) ([]CalendarAvailability, error)
+
+	// Schedule Templates
+	GetScheduleTemplateByID(ctx context.Context, templateID uuid.UUID) (*models.ScheduleTemplate, error)
+	GetScheduleTemplatesByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.ScheduleTemplate, error)
+	GetScheduleTemplatesByCalendar(ctx context.Context, calendarID uuid.UUID) ([]*models.ScheduleTemplate, error)
+
+	// Schedule Instances
+	GetScheduleInstanceByID(ctx context.Context, instanceID uuid.UUID) (*models.ScheduleInstance, error)
+	GetScheduleInstancesByUser(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
+	GetScheduleInstancesByCompany(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
+	GetScheduleInstancesByTemplate(ctx context.Context, templateID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
+	GetScheduleInstancesByPosition(ctx context.Context, positionID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
+	GetScheduleInstancesByWorkCenter(ctx context.Context, companyID uuid.UUID, workCenterCode string, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
+
+	// Work Centers
+	GetWorkCenterByCode(ctx context.Context, companyID uuid.UUID, workCenterCode string) (*models.WorkCenter, error)
+	GetWorkCentersByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.WorkCenter, error)
+	GetWorkCenterShifts(ctx context.Context, companyID uuid.UUID, workCenterCode string, date time.Time) ([]*models.WorkCenterShift, error)
+
+	// Overrides
+	GetScheduleOverrideByID(ctx context.Context, overrideID uuid.UUID) (*models.ScheduleOverride, error)
+	GetScheduleOverridesByUser(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time, overrideType *string) ([]*models.ScheduleOverride, error)
+	GetScheduleOverridesByCompany(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time, overrideType *string) ([]*models.ScheduleOverride, error)
+	GetScheduleOverrideByUserDate(ctx context.Context, userID uuid.UUID, date time.Time) (*models.ScheduleOverride, error)
+
+	// Stats
+	GetScheduleStats(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) (*ScheduleStats, error)
+
+	// Health
+	HealthCheck(ctx context.Context) error
+}
+
+type CalendarAvailability struct {
+	Date         time.Time `json:"date"`
+	IsWorkingDay bool      `json:"is_working_day"`
+	IsHoliday    bool      `json:"is_holiday"`
+	HolidayName  string    `json:"holiday_name,omitempty"`
+}
+
+type ScheduleStats struct {
+	TotalInstances    int64                     `json:"total_instances"`
+	TotalUsers        int64                     `json:"total_users"`
+	TotalTemplates    int64                     `json:"total_templates"`
+	ByTemplateType    map[string]int64          `json:"by_template_type"`
+	ByDate            map[string]int64          `json:"by_date"`
+	ByWorkCenter      map[string]int64          `json:"by_work_center"`
+	UpcomingSchedules []ScheduleInstanceSummary `json:"upcoming_schedules"`
+}
+
+type ScheduleInstanceSummary struct {
+	InstanceID     uuid.UUID  `json:"instance_id"`
+	UserID         uuid.UUID  `json:"user_id"`
+	ScheduleDate   time.Time  `json:"schedule_date"`
+	ExpectedStart  *time.Time `json:"expected_start,omitempty"`
+	ExpectedEnd    *time.Time `json:"expected_end,omitempty"`
+	TemplateName   string     `json:"template_name"`
+	TemplateType   string     `json:"template_type"`
+	PositionTitle  string     `json:"position_title,omitempty"`
+	WorkCenterCode string     `json:"work_center_code,omitempty"`
+}
+
+type schedulingQueryServiceImpl struct {
+	schedulingRepo  repository.ScheduleRepository
+	subjectResolver resolver.ScheduleSubjectResolver
+	logger          *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewSchedulingQueryService(
+	schedulingRepo repository.ScheduleRepository,
+	subjectResolver resolver.ScheduleSubjectResolver,
+	logger *zap.Logger,
+) SchedulingQueryService {
+	return &schedulingQueryServiceImpl{
+		schedulingRepo:  schedulingRepo,
+		subjectResolver: subjectResolver,
+		logger:          logger,
+	}
+}
+
+====================================================================================================
+./service/scheduling/scheduling_service.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type ScheduleOverrideUpdate struct {
+	OverrideType *string `json:"override_type,omitempty"`
+	Reason       *string `json:"reason,omitempty"`
+}
+
+type WorkCenterShiftUpdate struct {
+	ShiftID     *uuid.UUID `json:"shift_id,omitempty"`
+	EffectiveTo *time.Time `json:"effective_to,omitempty"`
+}
+
+type Holiday struct {
+	Date string `json:"date"`
+	Name string `json:"name"`
+}
+
+type SchedulingService interface {
+	// Work Calendars
+	CreateWorkCalendar(ctx context.Context, calendar *models.WorkCalendar, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.WorkCalendar, error)
+	UpdateWorkCalendar(ctx context.Context, calendarID uuid.UUID, update WorkCalendarUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.WorkCalendar, error)
+	DeleteWorkCalendar(ctx context.Context, calendarID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
+	AddHolidayToCalendar(ctx context.Context, calendarID uuid.UUID, date, name string, actorType string, actorID uuid.UUID) error
+	ProcessHolidayForDate(ctx context.Context, companyID uuid.UUID, date time.Time, actorType string, actorID uuid.UUID) error
+
+	// Schedule Templates
+	CreateScheduleTemplate(ctx context.Context, template *models.ScheduleTemplate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleTemplate, error)
+	UpdateScheduleTemplate(ctx context.Context, templateID uuid.UUID, update ScheduleTemplateUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleTemplate, error)
+	DeleteScheduleTemplate(ctx context.Context, templateID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
+
+	// Schedule Instances
+	CreateScheduleInstance(ctx context.Context, instance *models.ScheduleInstance, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleInstance, error)
+	UpdateScheduleInstance(ctx context.Context, instanceID uuid.UUID, update ScheduleInstanceUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleInstance, error)
+	DeleteScheduleInstance(ctx context.Context, instanceID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
+	BulkCreateScheduleInstances(ctx context.Context, instances []*models.ScheduleInstance, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
+	// Leave Integration
+	ApplyApprovedLeave(ctx context.Context, leaveData *LeaveScheduleData, actorType string, actorID uuid.UUID) error
+	RollbackCancelledLeave(ctx context.Context, leaveData *LeaveScheduleData, actorType string, actorID uuid.UUID) error
+	// Schedule Generation
+	GenerateScheduleForUser(ctx context.Context, userID uuid.UUID, config ScheduleGenerationConfig, actorType string, actorID uuid.UUID) ([]*models.ScheduleInstance, error)
+	GenerateScheduleForCompany(ctx context.Context, companyID uuid.UUID, config ScheduleGenerationConfig, actorType string, actorID uuid.UUID) ([]*models.ScheduleInstance, error)
+
+	// Overrides
+	CreateScheduleOverride(ctx context.Context, companyID uuid.UUID, override *models.ScheduleOverride, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleOverride, error)
+	UpdateScheduleOverride(ctx context.Context, overrideID uuid.UUID, update ScheduleOverrideUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleOverride, error)
+	DeleteScheduleOverride(ctx context.Context, overrideID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
+
+	// Work Center Shift Mappings
+	CreateWorkCenterShiftMapping(ctx context.Context, companyID uuid.UUID, mapping *models.WorkCenterShift, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
+	UpdateWorkCenterShiftMappingByKey(ctx context.Context, companyID uuid.UUID, workCenterCode string, update WorkCenterShiftUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
+
+	// Schedule Resolution
+	ResolveUserDay(ctx context.Context, companyID, userID uuid.UUID, date time.Time) (*PositionBasedResolvedDay, error)
+	CreateScheduleInstanceFromPosition(ctx context.Context, companyID, userID uuid.UUID, date time.Time, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleInstance, error)
+
+	// Availability
+	CheckScheduleAvailability(ctx context.Context, companyID, userID uuid.UUID, date time.Time, timezone string) ([]time.Time, error)
+	ValidateScheduleConflict(ctx context.Context, userID uuid.UUID, startTime, endTime time.Time, excludeInstanceID *uuid.UUID) (bool, error)
+
+	// Health
+	HealthCheck(ctx context.Context) error
+}
+
+type WorkCalendarUpdate struct {
+	Name        *string   `json:"name,omitempty"`
+	Timezone    *string   `json:"timezone,omitempty"`
+	WorkingDays []int     `json:"working_days,omitempty"`
+	Holidays    []Holiday `json:"holidays,omitempty"`
+	IsActive    *bool     `json:"is_active,omitempty"`
+}
+
+type ScheduleTemplateUpdate struct {
+	Name         *string               `json:"name,omitempty"`
+	CalendarID   *uuid.UUID            `json:"calendar_id,omitempty"`
+	TemplateType *string               `json:"template_type,omitempty"`
+	Rules        *models.TemplateRules `json:"rules,omitempty"`
+	IsActive     *bool                 `json:"is_active,omitempty"`
+}
+
+type ScheduleInstanceUpdate struct {
+	ExpectedStart *time.Time               `json:"expected_start,omitempty"`
+	ExpectedEnd   *time.Time               `json:"expected_end,omitempty"`
+	Timezone      *string                  `json:"timezone,omitempty"`
+	Metadata      *models.InstanceMetadata `json:"metadata,omitempty"`
+}
+
+type ScheduleGenerationConfig struct {
+	StartDate       time.Time `json:"start_date"`
+	EndDate         time.Time `json:"end_date"`
+	Timezone        string    `json:"timezone"`
+	IncludeHolidays bool      `json:"include_holidays"`
+	Overwrite       bool      `json:"overwrite"`
+	BatchSize       int       `json:"batch_size"`
+}
+
+type PositionBasedResolvedDay struct {
+	Date               time.Time  `json:"date"`
+	Timezone           string     `json:"timezone"`
+	IsSchedulable      bool       `json:"is_schedulable"`
+	AttendanceRequired bool       `json:"attendance_required"`
+	OvertimeAllowed    bool       `json:"overtime_allowed"`
+	ExpectedStart      *time.Time `json:"expected_start,omitempty"`
+	ExpectedEnd        *time.Time `json:"expected_end,omitempty"`
+	PositionID         *uuid.UUID `json:"position_id,omitempty"`
+	PositionTitle      *string    `json:"position_title,omitempty"`
+	DepartmentID       *uuid.UUID `json:"department_id,omitempty"`
+	WorkCenterCode     *string    `json:"work_center_code,omitempty"`
+	WorkCenterName     *string    `json:"work_center_name,omitempty"`
+	ShiftID            *uuid.UUID `json:"shift_id,omitempty"`
+	ShiftName          *string    `json:"shift_name,omitempty"`
+	ScheduleInstanceID *uuid.UUID `json:"schedule_instance_id,omitempty"`
+	ScheduleStatus     string     `json:"schedule_status"`
+	IsOverride         bool       `json:"is_override"`
+	OverrideType       *string    `json:"override_type,omitempty"`
+	IsOnLeave          bool       `json:"is_on_leave"`
+	LeaveRequestID     *uuid.UUID `json:"leave_request_id,omitempty"`
+	IsLeavePaid        bool       `json:"is_leave_paid"`
+	LeaveTypeID        *uuid.UUID `json:"leave_type_id,omitempty"`
+}
+
+type schedulingServiceImpl struct {
+	schedulingRepo  repository.ScheduleRepository
+	subjectResolver resolver.ScheduleSubjectResolver
+	auditService    *audit.AuditService
+	logger          *zap.Logger
+	mu              sync.RWMutex
+}
+
+type LeaveScheduleData struct {
+	LeaveRequestID uuid.UUID
+	UserID         uuid.UUID
+	CompanyID      uuid.UUID
+	StartDate      time.Time
+	EndDate        time.Time
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewSchedulingService(
+	schedulingRepo repository.ScheduleRepository,
+	subjectResolver resolver.ScheduleSubjectResolver,
+	auditService *audit.AuditService,
+	logger *zap.Logger,
+) SchedulingService {
+	return &schedulingServiceImpl{
+		schedulingRepo:  schedulingRepo,
+		subjectResolver: subjectResolver,
+		auditService:    auditService,
+		logger:          logger,
+	}
+}
+
+====================================================================================================
+./service/enrollment/enrollment_service.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type EnrollmentService interface {
+	EnrollSubject(ctx context.Context, companyID uuid.UUID, subjectType string, subjectID uuid.UUID, deviceID, sourceType, deviceUserCode string, enrolledBy *uuid.UUID) error
+	RevokeEnrollment(ctx context.Context, companyID uuid.UUID, deviceID, sourceType, deviceUserCode string, reason string, revokedBy *uuid.UUID) error
+	UnrevokeEnrollment(ctx context.Context, companyID uuid.UUID, deviceID, sourceType, deviceUserCode string, reason string, actedBy *uuid.UUID) (*models.DeviceEnrollment, error)
+	ResolveEnrollment(ctx context.Context, companyID uuid.UUID, deviceID, sourceType, deviceUserCode string) (*models.DeviceEnrollment, error)
+	GetEnrollmentsByDevice(ctx context.Context, companyID uuid.UUID, deviceID string) ([]*models.DeviceEnrollment, error)
+	GetEnrollmentsBySubject(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string) ([]*models.DeviceEnrollment, error)
+	GetRevokedEnrollmentsByDevice(ctx context.Context, companyID uuid.UUID, deviceID string) ([]*models.DeviceEnrollment, error)
+}
+
+type enrollmentService struct {
+	enrollmentRepo repository.DeviceEnrollmentRepository
+	deviceRepo     repository.DeviceRepository
+	sourceRepo     repository.SourceRepository
+	audit          *auditservice.AuditService
+	logger         *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewEnrollmentService(
+	enrollmentRepo repository.DeviceEnrollmentRepository,
+	deviceRepo repository.DeviceRepository,
+	sourceRepo repository.SourceRepository,
+	audit *auditservice.AuditService,
+	logger *zap.Logger,
+) EnrollmentService {
+	return &enrollmentService{
+		enrollmentRepo: enrollmentRepo,
+		deviceRepo:     deviceRepo,
+		sourceRepo:     sourceRepo,
+		audit:          audit,
+		logger:         logger,
+	}
+}
+
+====================================================================================================
+./service/workcenter/service.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type Service interface {
+	CreateWorkCenter(ctx context.Context, wc *models.WorkCenter, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.WorkCenter, error)
+	UpdateWorkCenter(ctx context.Context, companyID uuid.UUID, code string, name, description, timezone *string, isActive *bool, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.WorkCenter, error)
+	DeleteWorkCenter(ctx context.Context, companyID uuid.UUID, code string, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
+	HealthCheck(ctx context.Context) error
+}
+
+type QueryService interface {
+	GetWorkCenter(ctx context.Context, companyID uuid.UUID, code string) (*models.WorkCenter, error)
+	ListWorkCenters(ctx context.Context, companyID uuid.UUID, page, pageSize int) ([]*models.WorkCenter, int, error)
+	SearchWorkCenters(ctx context.Context, companyID uuid.UUID, filters map[string]interface{}, page, pageSize int) ([]*models.WorkCenter, int, error)
+	GetActiveWorkCenters(ctx context.Context, companyID uuid.UUID) ([]*models.WorkCenter, error)
+	HealthCheck(ctx context.Context) error
+}
+
+====================================================================================================
+./service/workcenter/workcenter_query_service.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type workcenterQueryService struct {
+	repo repository.WorkCenterRepository
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewQueryService(repo repository.WorkCenterRepository) QueryService {
+	return &workcenterQueryService{repo: repo}
+}
+
+====================================================================================================
+./service/workcenter/workcenter_service.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type workcenterService struct {
+	repo         repository.WorkCenterRepository
+	auditService *audit.AuditService
+	logger       *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewService(
+	repo repository.WorkCenterRepository,
+	auditService *audit.AuditService,
+	logger *zap.Logger,
+) Service {
+	return &workcenterService{
+		repo:         repo,
+		auditService: auditService,
+		logger:       logger,
+	}
+}
+
+====================================================================================================
+./service/ingest/ingest_service.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type PunchRequest struct {
+	CompanyID      uuid.UUID
+	ActorID        uuid.UUID
+	SubjectType    string
+	SubjectID      uuid.UUID
+	EventType      string
+	EventTime      *time.Time
+	Source         PunchSource
+	Context        *models.EventContext
+	DeviceUserCode *string
+}
+
+type PunchSource struct {
+	SourceType string
+	SourceID   *uuid.UUID
+	DeviceID   *string
+	IPAddress  *string
+}
+
+type IngestService interface {
+	IngestPunch(ctx context.Context, req *PunchRequest) (*models.AttendanceEvent, error)
+}
+
+type OMService interface {
+	CanPunchAttendance(ctx context.Context, companyID uuid.UUID, actorID *uuid.UUID, subjectType string, subjectID uuid.UUID, sourceType string, workCenterCode *string) (bool, string)
+}
+
+type ingestService struct {
+	eventRepo          repository.EventRepository
+	deviceRepo         repository.DeviceRepository
+	sourceRepo         repository.SourceRepository
+	enrollmentService  enrollment.EnrollmentService
+	sourceResolver     source.SourceResolver
+	adminService       admin.AdminService
+	omService          OMService
+	audit              *auditservice.AuditService
+	logger             *zap.Logger
+	sessionSummaryRepo repository.AttendanceSessionSummaryRepository
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewIngestService(
+	eventRepo repository.EventRepository,
+	deviceRepo repository.DeviceRepository,
+	sourceRepo repository.SourceRepository,
+	enrollmentService enrollment.EnrollmentService,
+	sourceResolver source.SourceResolver,
+	adminService admin.AdminService,
+	omService OMService,
+	audit *auditservice.AuditService,
+	logger *zap.Logger,
+	sessionSummaryRepo repository.AttendanceSessionSummaryRepository,
+) IngestService {
+	return &ingestService{
+		eventRepo:          eventRepo,
+		deviceRepo:         deviceRepo,
+		sourceRepo:         sourceRepo,
+		enrollmentService:  enrollmentService,
+		sourceResolver:     sourceResolver,
+		adminService:       adminService,
+		omService:          omService,
+		audit:              audit,
+		logger:             logger,
+		sessionSummaryRepo: sessionSummaryRepo,
+	}
+}
+
+====================================================================================================
+./service/source/source_admin_service.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type SourceAdminService interface {
+	// GetSourcesByCompany lists all sources for a company
+	GetSourcesByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.AttendanceSource, error)
+
+	// CreateSource explicitly creates a new attendance source (admin use)
+	CreateSource(ctx context.Context, companyID uuid.UUID, sourceType, name string, actor *uuid.UUID) (*models.AttendanceSource, error)
+
+	// UpdateSourceStatus enables or disables a source
+	UpdateSourceStatus(ctx context.Context, companyID uuid.UUID, sourceType string, isActive bool, actor *uuid.UUID) error
+}
+
+type sourceAdminService struct {
+	sourceRepo repository.SourceRepository
+	audit      *auditservice.AuditService
+	logger     *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewSourceAdminService(
+	sourceRepo repository.SourceRepository,
+	audit *auditservice.AuditService,
+	logger *zap.Logger,
+) SourceAdminService {
+	return &sourceAdminService{
+		sourceRepo: sourceRepo,
+		audit:      audit,
+		logger:     logger,
+	}
+}
+
+====================================================================================================
+./service/source/source_resolver.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type ResolvedSourceRules struct {
+	SourceType     string
+	Category       string
+	RequiresDevice bool
+	IsSystem       bool
+	AllowBackdated bool
+	AllowFuture    bool
+	TrustLevel     int16
+	IsSelfService  bool
+}
+
+type SourceResolver interface {
+	Resolve(ctx context.Context, sourceType string) (*ResolvedSourceRules, error)
+	GetAvailableSourceTypes(ctx context.Context) []*ResolvedSourceRules
+}
+
+type sourceResolver struct {
+	logger *zap.Logger
+	cache  sync.Map
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewSourceResolver(logger *zap.Logger) SourceResolver {
+	return &sourceResolver{
+		logger: logger,
+	}
+}
+
+====================================================================================================
+./service/admin/admin_service.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type AdminService interface {
+	// Policy management
+	CreateAttendancePolicy(ctx context.Context, policy *models.AttendancePolicy, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.AttendancePolicy, error)
+	UpdateAttendancePolicy(ctx context.Context, policy *models.AttendancePolicy) error
+	DeleteAttendancePolicy(ctx context.Context, policyID uuid.UUID) error
+	AssignUserAttendancePolicy(ctx context.Context, userPolicy *models.UserAttendancePolicy, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
+	EndUserAttendancePolicy(ctx context.Context, userID, policyID uuid.UUID, endDate time.Time) error
+	GetPositionAttendancePolicy(ctx context.Context, positionID uuid.UUID) (*models.AttendancePolicy, error)
+	GetUsersByAttendancePolicy(ctx context.Context, policyID uuid.UUID, effectiveDate time.Time) ([]uuid.UUID, error)
+
+	// Company & department rules
+	GetCompanyAttendanceRules(ctx context.Context, companyID uuid.UUID) (*models.CompanyAttendanceRules, error)
+	UpdateCompanyAttendanceRules(ctx context.Context, rules *models.CompanyAttendanceRules, updatedBy uuid.UUID) error
+	GetDepartmentAttendanceRules(ctx context.Context, companyID, departmentID uuid.UUID) (*models.DepartmentAttendanceRules, error)
+	UpsertDepartmentAttendanceRules(ctx context.Context, rules *models.DepartmentAttendanceRules) error
+
+	// User attendance profile (overrides)
+	GetUserAttendanceProfile(ctx context.Context, userID uuid.UUID) (*models.UserAttendanceProfile, error)
+	UpsertUserAttendanceProfile(ctx context.Context, profile *models.UserAttendanceProfile) error
+
+	// Rule resolution (used by ingest)
+	ResolveAttendanceRules(ctx context.Context, userID, companyID uuid.UUID, workCenterCode string, positionID *uuid.UUID, date time.Time) (*models.ResolvedAttendanceRules, error)
+
+	// Validation helpers
+	ValidateAttendanceEventType(ctx context.Context, eventType string) error
+	ValidateAttendanceSourceType(ctx context.Context, sourceType string, sourceID *uuid.UUID) error
+
+	// Health
+	HealthCheck(ctx context.Context) error
+}
+
+type adminService struct {
+	eventRepo    repository.EventRepository
+	policyRepo   repository.PolicyRepository
+	ruleRepo     repository.RuleRepository
+	sourceRepo   repository.SourceRepository
+	scheduleRepo repository.ScheduleRepository // for work center lookup, etc.
+	resolver     resolver.SubjectResolver
+	logger       *zap.Logger
+	audit        *auditservice.AuditService
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAdminService(
+	eventRepo repository.EventRepository,
+	policyRepo repository.PolicyRepository,
+	ruleRepo repository.RuleRepository,
+	sourceRepo repository.SourceRepository,
+	scheduleRepo repository.ScheduleRepository,
+	resolver resolver.SubjectResolver,
+	logger *zap.Logger,
+	audit *auditservice.AuditService,
+) AdminService {
+	return &adminService{
+		eventRepo:    eventRepo,
+		policyRepo:   policyRepo,
+		ruleRepo:     ruleRepo,
+		sourceRepo:   sourceRepo,
+		scheduleRepo: scheduleRepo,
+		resolver:     resolver,
+		logger:       logger,
+		audit:        audit,
+	}
+}
+
+====================================================================================================
+./service/admin/correction_service.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type CorrectionRequest struct {
+	CompanyID      uuid.UUID
+	ActorID        uuid.UUID
+	ActorType      string
+	SubjectType    string
+	SubjectID      uuid.UUID
+	BusinessDate   time.Time
+	CorrectionType string // manual_check_in, manual_check_out, attendance_adjustment, manual_override
+	EventTime      *time.Time
+	OverrideStatus string // present, absent, late, half_day, etc. (for manual_override or adjustment)
+	Reason         string
+}
+
+type CorrectionService interface {
+	CreateCorrection(ctx context.Context, req *CorrectionRequest) error
+}
+
+type correctionService struct {
+	eventRepo   repository.EventRepository
+	summaryRepo repository.SummaryRepository
+	admin       AdminService // for validation of event types, etc.
+	resolver    resolver.SubjectResolver
+	resolution  ResolutionService // we'll define this interface later; for now we call RecalculateDay
+	logger      *zap.Logger
+	audit       *auditservice.AuditService
+}
+
+type ResolutionService interface {
+	RecalculateDay(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) error
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewCorrectionService(
+	eventRepo repository.EventRepository,
+	summaryRepo repository.SummaryRepository,
+	admin AdminService,
+	resolver resolver.SubjectResolver,
+	resolution ResolutionService,
+	logger *zap.Logger,
+	audit *auditservice.AuditService,
+) CorrectionService {
+	return &correctionService{
+		eventRepo:   eventRepo,
+		summaryRepo: summaryRepo,
+		admin:       admin,
+		resolver:    resolver,
+		resolution:  resolution,
+		logger:      logger,
+		audit:       audit,
+	}
+}
+
+====================================================================================================
+./service/resolution/resolution_service.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type PairedEvent struct {
+	CheckIn      *models.AttendanceEvent
+	CheckOut     *models.AttendanceEvent
+	CheckInTime  *time.Time
+	CheckOutTime *time.Time
+	BreakStart   *time.Time
+	BreakEnd     *time.Time
+}
+
+type DailyMetrics struct {
+	WorkedMinutes   *int
+	OvertimeMinutes *int
+	LateMinutes     *int
+	BreakMinutes    *int
+	ExpectedMinutes *int
+	CheckIns        int
+	CheckOuts       int
+	FirstCheckIn    *time.Time
+	LastCheckOut    *time.Time
+	Status          string
+	PairedEvents    []PairedEvent
+}
+
+type ResolutionService interface {
+	ResolveEvent(ctx context.Context, eventID uuid.UUID) error
+	ResolveDay(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) error
+	ResolvePeriod(ctx context.Context, companyID uuid.UUID, subjectIDs []uuid.UUID, subjectType string, startDate, endDate time.Time, recalculate bool) error
+	BatchResolveEvents(ctx context.Context, eventIDs []uuid.UUID) error
+	RecalculateDay(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) error
+}
+
+type resolutionService struct {
+	eventRepo     repository.EventRepository
+	summaryRepo   repository.SummaryRepository
+	scheduleRepo  repository.ScheduleRepository
+	policyRepo    repository.PolicyRepository
+	subjectRes    resolver.SubjectResolver
+	adminSvc      admin.AdminService
+	exemptionRepo repository.AttendanceExemptionRepository // 👈 NEW
+	logger        *zap.Logger
+	audit         *auditservice.AuditService
+}
+
+type dayKey struct {
+		CompanyID    uuid.UUID
+		SubjectType  string
+		SubjectID    uuid.UUID
+		BusinessDate time.Time
+	}
+
+	processed := make(map[dayKey]bool)
+
+	for _, id := range eventIDs {
+		evt, err := s.eventRepo.GetEventByID(ctx, id)
+		if err != nil {
+			s.logger.Error("Failed to load event in batch", zap.String("event_id", id.String()), zap.Error(err))
+			continue
+		}
+		if evt == nil {
+			continue
+		}
+
+		key := dayKey{
+			CompanyID:    evt.CompanyID,
+			SubjectType:  evt.SubjectType,
+			SubjectID:    evt.SubjectID,
+			BusinessDate: evt.EventTime.UTC().Truncate(24 * time.Hour),
+		}
+
+		if processed[key] {
+			continue
+		}
+		processed[key] = true
+
+		if err := s.resolveSubjectDay(ctx, evt.CompanyID, evt.SubjectID, evt.SubjectType, evt.EventTime); err != nil {
+			s.logger.Error("Failed to resolve day in batch",
+				zap.String("subject_type", evt.SubjectType),
+				zap.String("subject_id", evt.SubjectID.String()),
+				zap.Time("date", evt.EventTime),
+				zap.Error(err),
+			)
+		}
+	}
+	return nil
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewResolutionService(
+	eventRepo repository.EventRepository,
+	summaryRepo repository.SummaryRepository,
+	scheduleRepo repository.ScheduleRepository,
+	policyRepo repository.PolicyRepository,
+	subjectRes resolver.SubjectResolver,
+	adminSvc admin.AdminService,
+	exemptionRepo repository.AttendanceExemptionRepository, // 👈 NEW PARAM
+	logger *zap.Logger,
+	audit *auditservice.AuditService,
+) ResolutionService {
+	return &resolutionService{
+		eventRepo:     eventRepo,
+		summaryRepo:   summaryRepo,
+		scheduleRepo:  scheduleRepo,
+		policyRepo:    policyRepo,
+		subjectRes:    subjectRes,
+		adminSvc:      adminSvc,
+		exemptionRepo: exemptionRepo,
+		logger:        logger,
+		audit:         audit,
+	}
+}
+
+====================================================================================================
+./service/batch/batch_failure_service.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type BatchFailureService interface {
+	// GetFailures returns all failures for a batch reference.
+	GetFailures(ctx context.Context, batchRef string) ([]*repository.AttendancePunchFailureView, error)
+}
+
+type batchFailureService struct {
+	batchRepo repository.AttendanceBatchRepository
+	logger    *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewBatchFailureService(batchRepo repository.AttendanceBatchRepository, logger *zap.Logger) BatchFailureService {
+	return &batchFailureService{
+		batchRepo: batchRepo,
+		logger:    logger,
+	}
+}
+
+====================================================================================================
+./service/batch/batch_ingest_service.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type OfflinePunchEvent struct {
+	EventType   string    `json:"event_type"`
+	EventTime   time.Time `json:"event_time"`
+	ExternalRef string    `json:"external_ref"` // device_user_code
+}
+
+type BatchIngestRequest struct {
+	CompanyID  uuid.UUID
+	DeviceID   string
+	SourceType string
+	BatchRef   string
+	Events     []OfflinePunchEvent
+}
+
+type BatchIngestService interface {
+	IngestBatch(ctx context.Context, req *BatchIngestRequest) error
+	GetFailures(ctx context.Context, companyID uuid.UUID, deviceID, batchRef string, limit, offset int) ([]repository.AttendancePunchFailureView, error)
+	GetStatus(ctx context.Context, companyID uuid.UUID, deviceID, batchRef string) (*repository.AttendanceBatchStatus, error)
+}
+
+type batchIngestService struct {
+	batchRepo  repository.AttendanceBatchRepository
+	outboxRepo repository.OutboxRepository
+	deviceRepo repository.DeviceRepository
+	ingestSvc  ingest.IngestService
+	enrollSvc  enrollment.EnrollmentService
+	subjectRes resolver.SubjectResolver
+	logger     *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewBatchIngestService(
+	batchRepo repository.AttendanceBatchRepository,
+	outboxRepo repository.OutboxRepository,
+	deviceRepo repository.DeviceRepository,
+	ingestSvc ingest.IngestService,
+	enrollSvc enrollment.EnrollmentService,
+	subjectRes resolver.SubjectResolver,
+	logger *zap.Logger,
+) BatchIngestService {
+	return &batchIngestService{
+		batchRepo:  batchRepo,
+		outboxRepo: outboxRepo,
+		deviceRepo: deviceRepo,
+		ingestSvc:  ingestSvc,
+		enrollSvc:  enrollSvc,
+		subjectRes: subjectRes,
+		logger:     logger,
+	}
+}
+
+====================================================================================================
+./service/report/report_service.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type ReportService interface {
+	GenerateReport(ctx context.Context, req *ReportRequest) ([]byte, string, error)
+	StreamEvents(ctx context.Context, companyID uuid.UUID, filter query.EventFilter, writer io.Writer, format string) error
+}
+
+type ReportRequest struct {
+	CompanyID     uuid.UUID
+	SubjectType   *string
+	SubjectID     *uuid.UUID
+	StartDate     time.Time
+	EndDate       time.Time
+	ReportType    string // "csv" or "json"
+	IncludeEvents bool
+}
+
+type reportService struct {
+	queryService query.QueryService
+	logger       *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewReportService(queryService query.QueryService, logger *zap.Logger) ReportService {
+	return &reportService{
+		queryService: queryService,
+		logger:       logger,
+	}
+}
+
+====================================================================================================
+./service/device/auth_context.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type DeviceAuthContext struct {
+	DeviceID       string
+	CompanyID      uuid.UUID
+	SourceType     string
+	IsTrusted      bool
+	DeviceCode     string
+	WorkCenterCode *string
+	LocationID     *uuid.UUID
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewDeviceAuthContext(deviceID string, companyID uuid.UUID, sourceType string, isTrusted bool) *DeviceAuthContext {
+	return &DeviceAuthContext{
+		DeviceID:   deviceID,
+		CompanyID:  companyID,
+		SourceType: sourceType,
+		IsTrusted:  isTrusted,
+	}
+}
+
+====================================================================================================
+./service/device/device_service.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type DeviceFilter struct {
+	SourceType      *string
+	WorkCenterCode  *string
+	LocationID      *uuid.UUID
+	IsActive        *bool
+	IsTrusted       *bool
+	IncludeInactive bool
+	Page            int
+	PageSize        int
+}
+
+type DeviceValidationResult struct {
+	IsValid    bool   `json:"is_valid"`
+	IsActive   bool   `json:"is_active"`
+	IsTrusted  bool   `json:"is_trusted"`
+	DeviceName string `json:"device_name"`
+	Message    string `json:"message,omitempty"`
+}
+
+type DeviceService interface {
+	RegisterDevice(ctx context.Context, device *models.AttendanceDevice) error
+	UpdateDevice(ctx context.Context, device *models.AttendanceDevice) error
+	GetDevice(ctx context.Context, companyID uuid.UUID, deviceID string) (*models.AttendanceDevice, error)
+	ListDevices(ctx context.Context, companyID uuid.UUID, filter DeviceFilter) ([]*models.AttendanceDevice, error)
+	DeleteDevice(ctx context.Context, companyID uuid.UUID, deviceID string) error
+	ActivateDevice(ctx context.Context, companyID uuid.UUID, deviceID string) error
+	DeactivateDevice(ctx context.Context, companyID uuid.UUID, deviceID string) error
+	MarkAsTrusted(ctx context.Context, companyID uuid.UUID, deviceID string) error
+	RevokeTrust(ctx context.Context, companyID uuid.UUID, deviceID string) error
+	ValidateDevice(ctx context.Context, companyID uuid.UUID, deviceID, sourceType string) (*DeviceValidationResult, error)
+	GetDeviceStatistics(ctx context.Context, companyID uuid.UUID) (*repository.DeviceStatistics, error)
+}
+
+type deviceService struct {
+	deviceRepo repository.DeviceRepository
+	logger     *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewDeviceService(
+	deviceRepo repository.DeviceRepository,
+	logger *zap.Logger,
+) DeviceService {
+	return &deviceService{
+		deviceRepo: deviceRepo,
+		logger:     logger,
+	}
+}
+
+====================================================================================================
+./service/device/heartbeat_service.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type HeartbeatRequest struct {
+	CompanyID       uuid.UUID
+	DeviceID        string
+	SourceType      string
+	DeviceTime      *time.Time
+	FirmwareVersion *string
+	IPAddress       *string
+}
+
+type HeartbeatService interface {
+	Heartbeat(ctx context.Context, req *HeartbeatRequest) error
+}
+
+type heartbeatService struct {
+	heartbeatRepo repository.DeviceHeartbeatRepository // ✅ fixed
+	deviceRepo    repository.DeviceRepository
+	logger        *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewHeartbeatService(
+	heartbeatRepo repository.DeviceHeartbeatRepository, // ✅ fixed
+	deviceRepo repository.DeviceRepository,
+	logger *zap.Logger,
+) HeartbeatService {
+	return &heartbeatService{
+		heartbeatRepo: heartbeatRepo,
+		deviceRepo:    deviceRepo,
+		logger:        logger,
+	}
+}
+
+====================================================================================================
+./service/device/token_service.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type TokenService interface {
+	IssueToken(ctx context.Context, req *models.IssueTokenRequest) (*models.DeviceToken, string, error)
+	ValidateToken(ctx context.Context, rawToken string, deviceID string) (*models.DeviceAuthContext, error)
+	ValidateTokenForRequest(ctx context.Context, req *models.ValidateTokenRequest) (*models.TokenValidationResult, error)
+	RevokeToken(ctx context.Context, tokenID uuid.UUID, revokedBy *uuid.UUID, reason string) error
+	RevokeAllDeviceTokens(ctx context.Context, companyID uuid.UUID, deviceID string, revokedBy *uuid.UUID, reason string) error
+	RotateToken(ctx context.Context, oldTokenID uuid.UUID, revokedBy *uuid.UUID, reason string) (*models.DeviceToken, string, error)
+	GetCurrentDeviceToken(ctx context.Context, companyID uuid.UUID, deviceID string) (*models.DeviceToken, error)
+}
+
+type tokenService struct {
+	tokenRepo     repository.TokenRepository
+	deviceRepo    repository.DeviceRepository
+	pgClient      *client.PostgresClient // ✅ added
+	logger        *zap.Logger
+	tokenPrefix   string
+	tokenSecret   string
+	tokenValidity time.Duration
+}
+
+type TokenServiceConfig struct {
+	TokenPrefix   string
+	TokenSecret   string
+	TokenValidity time.Duration
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewTokenService(
+	tokenRepo repository.TokenRepository,
+	deviceRepo repository.DeviceRepository,
+	pgClient *client.PostgresClient, // ✅ added
+	logger *zap.Logger,
+	config TokenServiceConfig,
+) TokenService {
+	if config.TokenValidity == 0 {
+		config.TokenValidity = 30 * 24 * time.Hour
+	}
+	return &tokenService{
+		tokenRepo:     tokenRepo,
+		deviceRepo:    deviceRepo,
+		pgClient:      pgClient,
+		logger:        logger,
+		tokenPrefix:   config.TokenPrefix,
+		tokenSecret:   config.TokenSecret,
+		tokenValidity: config.TokenValidity,
+	}
+}
+
+====================================================================================================
+./service/query/query_service.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type QueryService interface {
+	// --- Existing methods ---
+	GetEventByID(ctx context.Context, eventID uuid.UUID) (*models.AttendanceEvent, error)
+	ListEvents(ctx context.Context, filter EventFilter) ([]*models.AttendanceEvent, int64, error)
+	GetDailySummary(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) (*models.AttendanceDailySummary, error)
+	ListDailySummaries(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, from, to time.Time) ([]*models.AttendanceDailySummary, error)
+	ListCompanySummaries(ctx context.Context, companyID uuid.UUID, from, to time.Time) ([]*models.AttendanceDailySummary, error)
+	GetCompanyStats(ctx context.Context, companyID uuid.UUID, from, to time.Time) (*models.AttendanceStats, error)
+	GetSubjectStats(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, from, to time.Time) (*models.UserAttendanceStats, error)
+	GetAttendancePercentage(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, from, to time.Time) (float64, error)
+	ListEventTypes(ctx context.Context, activeOnly bool) ([]*models.AttendanceEventType, error)
+	ListSourceTypes(ctx context.Context) ([]*models.AttendanceSourceType, error)
+	GetAttendancePolicyByID(ctx context.Context, policyID uuid.UUID) (*models.AttendancePolicy, error)
+	GetAttendancePoliciesByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.AttendancePolicy, error)
+
+	// --- NEW: Session Summary methods ---
+	GetSessionSummary(ctx context.Context, sessionID, subjectID uuid.UUID, subjectType string) (*models.AttendanceSessionSummary, error)
+	ListSessionSummaries(ctx context.Context, filter repository.SessionSummaryFilter, page, pageSize int) ([]*models.AttendanceSessionSummary, int64, error)
+
+	// --- NEW: Exemption methods ---
+	GetExemptionsForSubject(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) ([]*models.AttendanceExemption, error)
+	ListExemptions(ctx context.Context, filter repository.ExemptionFilter, page, pageSize int) ([]*models.AttendanceExemption, int64, error)
+}
+
+type EventFilter struct {
+	CompanyID   uuid.UUID
+	SubjectType *string
+	SubjectID   *uuid.UUID
+	EventTypes  []string
+	SourceType  *string
+	DeviceID    *string
+	StartDate   time.Time
+	EndDate     time.Time
+	Page        int
+	PageSize    int
+}
+
+type queryService struct {
+	eventRepo          repository.EventRepository
+	summaryRepo        repository.SummaryRepository
+	sourceRepo         repository.SourceRepository
+	policyRepo         repository.PolicyRepository
+	sessionSummaryRepo repository.AttendanceSessionSummaryRepository // 👈 NEW
+	exemptionRepo      repository.AttendanceExemptionRepository      // 👈 NEW
+	logger             *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewQueryService(
+	eventRepo repository.EventRepository,
+	summaryRepo repository.SummaryRepository,
+	sourceRepo repository.SourceRepository,
+	policyRepo repository.PolicyRepository,
+	sessionSummaryRepo repository.AttendanceSessionSummaryRepository, // 👈 NEW PARAM
+	exemptionRepo repository.AttendanceExemptionRepository, // 👈 NEW PARAM
+	logger *zap.Logger,
+) QueryService {
+	return &queryService{
+		eventRepo:          eventRepo,
+		summaryRepo:        summaryRepo,
+		sourceRepo:         sourceRepo,
+		policyRepo:         policyRepo,
+		sessionSummaryRepo: sessionSummaryRepo,
+		exemptionRepo:      exemptionRepo,
+		logger:             logger,
+	}
+}
+
+====================================================================================================
+./service/resolver/composite_resolver.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type CompositeResolver struct {
+	resolvers map[string]SubjectResolver
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewCompositeResolver(resolvers map[string]SubjectResolver) *CompositeResolver {
+	return &CompositeResolver{resolvers: resolvers}
+}
+
+====================================================================================================
+./service/resolver/customer_resolver.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type CustomerResolver struct {
+	// Could fetch company timezone from company repo
+	logger *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewCustomerResolver(logger *zap.Logger) *CustomerResolver {
+	return &CustomerResolver{logger: logger}
+}
+
+====================================================================================================
+./service/resolver/employee_resolver.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type EmployeeDataProvider interface {
+	GetEmployee(ctx context.Context, companyID, userID uuid.UUID) (active bool, positionID *uuid.UUID, workCenterCode *string, err error)
+	GetWorkCenterAssignment(ctx context.Context, userID uuid.UUID, date time.Time) (workCenterCode *string, err error)
+}
+
+type LeaveDataProvider interface {
+	GetLeaveStatus(ctx context.Context, companyID, userID uuid.UUID, date time.Time) (isOnLeave bool, isPaid bool, leaveTypeID, leaveRequestID *uuid.UUID, err error)
+}
+
+type EmployeeResolver struct {
+	workCenterRepo repository.WorkCenterRepository
+	scheduleRepo   repository.ScheduleRepository
+	policyRepo     repository.PolicyRepository
+	employeeRepo   EmployeeDataProvider
+	leaveRepo      LeaveDataProvider
+	logger         *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewEmployeeResolver(
+	workCenterRepo repository.WorkCenterRepository,
+	scheduleRepo repository.ScheduleRepository,
+	policyRepo repository.PolicyRepository,
+	employeeRepo EmployeeDataProvider,
+	leaveRepo LeaveDataProvider,
+	logger *zap.Logger,
+) *EmployeeResolver {
+	return &EmployeeResolver{
+		workCenterRepo: workCenterRepo,
+		scheduleRepo:   scheduleRepo,
+		policyRepo:     policyRepo,
+		employeeRepo:   employeeRepo,
+		leaveRepo:      leaveRepo,
+		logger:         logger,
+	}
+}
+
+====================================================================================================
+./service/resolver/resolver.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type ResolvedSubject struct {
+	// Basic
+	IsActive bool
+	Timezone string
+
+	// Schedule
+	ScheduleStatus     string     // "working", "weekly_off", "holiday", "on_leave", "not_schedulable"
+	ExpectedStart      *time.Time // local time in the subject's timezone
+	ExpectedEnd        *time.Time
+	ScheduleInstanceID *uuid.UUID
+
+	// Work Center & Position (for employees)
+	WorkCenterCode *string
+	PositionID     *uuid.UUID
+	DepartmentID   *uuid.UUID
+
+	// Leave context
+	IsOnLeave      bool
+	IsLeavePaid    bool
+	LeaveTypeID    *uuid.UUID
+	LeaveRequestID *uuid.UUID
+
+	// Override info
+	IsOverride   bool
+	OverrideType *string
+
+	// Policies (attendance rules)
+	PolicyID    *uuid.UUID
+	PolicyCode  *string
+	PolicyType  *string
+	PolicyRules interface{} // can be *models.PolicyRules or JSON
+}
+
+type SubjectResolver interface {
+	Resolve(ctx context.Context, companyID uuid.UUID, subjectType string, subjectID uuid.UUID, date time.Time) (*ResolvedSubject, error)
+}
+
+====================================================================================================
+./service/resolver/schedule_resolver.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type ScheduleSubjectInfo struct {
+	SubjectID          uuid.UUID
+	SubjectType        string // "employee", "student", etc.
+	IsActive           bool
+	PositionID         *uuid.UUID
+	PositionTitle      string
+	IsSchedulable      bool
+	AttendanceRequired bool
+	OvertimeAllowed    bool
+	DepartmentID       *uuid.UUID
+	DepartmentName     string
+	WorkCenterCode     *string
+	WorkCenterName     string
+	WorkCenterTimezone string
+	CompanyID          uuid.UUID
+}
+
+type ScheduleOverrideInfo struct {
+	IsOverride     bool
+	OverrideType   string // "off", "force_work", "holiday_override"
+	Reason         *string
+	IsOnLeave      bool
+	LeaveTypeID    *uuid.UUID
+	IsLeavePaid    bool
+	LeaveRequestID *uuid.UUID
+}
+
+type ScheduleSubjectResolver interface {
+	// ResolveSubject returns schedule-relevant data for a subject on a given date.
+	ResolveSubject(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) (*ScheduleSubjectInfo, error)
+
+	// ResolveOverride returns override/leave info for a subject on a given date.
+	ResolveOverride(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) (*ScheduleOverrideInfo, error)
+
+	// GetUsersByPosition returns subject IDs assigned to a given position.
+	GetUsersByPosition(ctx context.Context, positionID uuid.UUID) ([]uuid.UUID, error)
+
+	// GetActiveSubjectsByCompany returns active subject IDs for a company (optionally filtered by position/work center).
+	GetActiveSubjectsByCompany(ctx context.Context, companyID uuid.UUID, filters map[string]interface{}) ([]uuid.UUID, error)
+}
+
+====================================================================================================
+./service/resolver/student_resolver.go
+====================================================================================================
+
+STRUCTS / INTERFACES
+------------------------------------------------------------
+
+type StudentDataProvider interface {
+	GetStudent(ctx context.Context, companyID, studentID uuid.UUID) (active bool, err error)
+}
+
+type EnrollmentDataProvider interface {
+	GetActiveEnrollment(ctx context.Context, companyID, studentID uuid.UUID, date time.Time) (sectionID *uuid.UUID, academicYearID *uuid.UUID, err error)
+}
+
+type TimetableEntry struct {
+	EntryID   uuid.UUID // renamed from TimetableEntryID
+	SubjectID uuid.UUID
+	TeacherID uuid.UUID
+	RoomID    *uuid.UUID
+	StartTime time.Time
+	EndTime   time.Time
+	SlotID    uuid.UUID
+	DayOfWeek int
+}
+
+type TimetableDataProvider interface {
+	GetTimetableForSection(ctx context.Context, sectionID uuid.UUID, date time.Time) (timetableID *uuid.UUID, entries []TimetableEntry, err error)
+}
+
+type SessionDataProvider interface {
+	GetAcademicSession(ctx context.Context, timetableEntryID uuid.UUID, date time.Time) (sessionID *uuid.UUID, startTime, endTime *time.Time, err error)
+}
+
+type StudentResolver struct {
+	studentRepo    StudentDataProvider
+	enrollmentRepo EnrollmentDataProvider
+	timetableRepo  TimetableDataProvider
+	sessionRepo    SessionDataProvider
+	workCenterRepo repository.WorkCenterRepository
+	logger         *zap.Logger
+}
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewStudentResolver(
+	studentRepo StudentDataProvider,
+	enrollmentRepo EnrollmentDataProvider,
+	timetableRepo TimetableDataProvider,
+	sessionRepo SessionDataProvider,
+	workCenterRepo repository.WorkCenterRepository,
+	logger *zap.Logger,
+) *StudentResolver {
+	return &StudentResolver{
+		studentRepo:    studentRepo,
+		enrollmentRepo: enrollmentRepo,
+		timetableRepo:  timetableRepo,
+		sessionRepo:    sessionRepo,
+		workCenterRepo: workCenterRepo,
+		logger:         logger,
+	}
+}
+

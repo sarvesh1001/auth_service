@@ -301,39 +301,89 @@ func (r *salaryStructureRepository) getStructureCompanyID(ctx context.Context, s
 }
 
 func (r *salaryStructureRepository) AddComponent(ctx context.Context, comp *models.SalaryStructureComponent) error {
+	r.logger.Info("AddComponent called",
+		zap.String("structure_id", comp.SalaryStructureID.String()),
+		zap.String("component_code", comp.ComponentCode),
+		zap.String("company_id_in_request", comp.CompanyID.String()),
+	)
+
 	// Ensure the component's company ID is set; if not, derive it from the structure.
 	if comp.CompanyID == uuid.Nil {
+		r.logger.Info("CompanyID is nil, resolving from structure",
+			zap.String("structure_id", comp.SalaryStructureID.String()),
+		)
+
 		companyID, err := r.getStructureCompanyID(ctx, comp.SalaryStructureID)
 		if err != nil {
+			r.logger.Error("Failed to resolve structure's company ID",
+				zap.String("structure_id", comp.SalaryStructureID.String()),
+				zap.Error(err),
+			)
 			return fmt.Errorf("failed to resolve structure's company: %w", err)
 		}
 		comp.CompanyID = companyID
+		r.logger.Info("Resolved company ID for component",
+			zap.String("structure_id", comp.SalaryStructureID.String()),
+			zap.String("resolved_company_id", comp.CompanyID.String()),
+		)
+	} else {
+		r.logger.Info("CompanyID already set in request",
+			zap.String("company_id", comp.CompanyID.String()),
+		)
 	}
 
 	// Validate that the component exists and is active for the company.
+	r.logger.Info("Checking if component exists for company",
+		zap.String("company_id", comp.CompanyID.String()),
+		zap.String("component_code", comp.ComponentCode),
+	)
+
 	exists, err := r.componentExistsForCompany(ctx, comp.CompanyID, comp.ComponentCode)
 	if err != nil {
+		r.logger.Error("Failed to check component existence",
+			zap.String("company_id", comp.CompanyID.String()),
+			zap.String("component_code", comp.ComponentCode),
+			zap.Error(err),
+		)
 		return err
 	}
 	if !exists {
+		r.logger.Warn("Component not active for company",
+			zap.String("company_id", comp.CompanyID.String()),
+			zap.String("component_code", comp.ComponentCode),
+		)
 		return fmt.Errorf("component %s is not active for company %s", comp.ComponentCode, comp.CompanyID)
 	}
 
-	query := `
-		INSERT INTO payroll.salary_structure_component (
-			mapping_id, salary_structure_id, component_code,
-			calculation_type, value, based_on_component, sequence_order, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-	`
+	// Prepare component for insertion
 	if comp.MappingID == uuid.Nil {
 		comp.MappingID = uuid.New()
 	}
 	if comp.CreatedAt.IsZero() {
 		comp.CreatedAt = time.Now().UTC()
 	}
+
+	r.logger.Info("Inserting salary structure component",
+		zap.String("mapping_id", comp.MappingID.String()),
+		zap.String("structure_id", comp.SalaryStructureID.String()),
+		zap.String("company_id", comp.CompanyID.String()),
+		zap.String("component_code", comp.ComponentCode),
+		zap.String("calculation_type", comp.CalculationType),
+		zap.Float64("value", comp.Value),
+		zap.Int("sequence_order", comp.SequenceOrder),
+	)
+
+	// ✅ Updated: include company_id column and value
+	query := `
+        INSERT INTO payroll.salary_structure_component (
+            mapping_id, salary_structure_id, company_id, component_code,
+            calculation_type, value, based_on_component, sequence_order, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    `
 	_, err = r.client.Exec(ctx, query,
 		comp.MappingID,
 		comp.SalaryStructureID,
+		comp.CompanyID,
 		comp.ComponentCode,
 		comp.CalculationType,
 		comp.Value,
@@ -342,13 +392,21 @@ func (r *salaryStructureRepository) AddComponent(ctx context.Context, comp *mode
 		comp.CreatedAt,
 	)
 	if err != nil {
-		r.logger.Error("failed to add structure component",
-			util.String("structure_id", comp.SalaryStructureID.String()),
-			util.String("component", comp.ComponentCode),
-			util.ErrorField(err),
+		r.logger.Error("Failed to add structure component",
+			zap.String("structure_id", comp.SalaryStructureID.String()),
+			zap.String("component", comp.ComponentCode),
+			zap.String("company_id", comp.CompanyID.String()),
+			zap.Error(err),
 		)
 		return fmt.Errorf("add structure component: %w", err)
 	}
+
+	r.logger.Info("Successfully added structure component",
+		zap.String("mapping_id", comp.MappingID.String()),
+		zap.String("structure_id", comp.SalaryStructureID.String()),
+		zap.String("component_code", comp.ComponentCode),
+	)
+
 	return nil
 }
 

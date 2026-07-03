@@ -21,6 +21,11 @@ type SessionGenerationHandler struct {
 
 // NewSessionGenerationHandler creates a new handler.
 func NewSessionGenerationHandler(sessionGenSvc service.SessionGenerationService, logger *zap.Logger) *SessionGenerationHandler {
+	if sessionGenSvc == nil {
+		logger.Warn("SessionGenerationHandler created with nil service – this will cause panics")
+	} else {
+		logger.Info("SessionGenerationHandler created successfully")
+	}
 	return &SessionGenerationHandler{
 		sessionGenSvc: sessionGenSvc,
 		logger:        logger.Named("session_generation_handler"),
@@ -28,7 +33,6 @@ func NewSessionGenerationHandler(sessionGenSvc service.SessionGenerationService,
 }
 
 // GenerateSessionsRequest represents the request body for triggering session generation.
-// NOTE: job_id is no longer accepted from the client – it is generated server‑side as a UUID.
 type GenerateSessionsRequest struct {
 	StartDate time.Time `json:"start_date"`
 	EndDate   time.Time `json:"end_date"`
@@ -36,7 +40,24 @@ type GenerateSessionsRequest struct {
 
 // GenerateSessions manually triggers generation of academic sessions from active timetables.
 // POST /api/v1/companies/{companyID}/academics/sessions/generate
-func (h *SessionGenerationHandler) GenerateSessions(w http.ResponseWriter, r *http.Request) {
+func (h *SessionGenerationHandler) GenerateSession(w http.ResponseWriter, r *http.Request) {
+	// ============================================================
+	// DEFENSIVE NIL RECEIVER CHECK – prevents panic if h is nil
+	// ============================================================
+	if h == nil {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// ============================================================
+	// Check if the service is nil (should not happen if initialised)
+	// ============================================================
+	if h.sessionGenSvc == nil {
+		h.logger.Error("Session generation service is nil – cannot process request")
+		h.respondWithError(w, http.StatusInternalServerError, "session generation service not available")
+		return
+	}
+
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -69,6 +90,14 @@ func (h *SessionGenerationHandler) GenerateSessions(w http.ResponseWriter, r *ht
 	// Generate a random UUID for this job – this will be used as the aggregate_id in outbox events
 	jobID := uuid.New().String()
 
+	// Log the request details
+	h.logger.Info("Generating sessions",
+		zap.String("company_id", companyID.String()),
+		zap.Time("start_date", req.StartDate),
+		zap.Time("end_date", req.EndDate),
+		zap.String("job_id", jobID),
+	)
+
 	count, err := h.sessionGenSvc.GenerateSessions(ctx, req.StartDate, req.EndDate, jobID)
 	if err != nil {
 		h.logger.Error("Failed to generate sessions",
@@ -79,6 +108,11 @@ func (h *SessionGenerationHandler) GenerateSessions(w http.ResponseWriter, r *ht
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	h.logger.Info("Session generation completed successfully",
+		zap.Int("sessions_generated", count),
+		zap.String("job_id", jobID),
+	)
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,

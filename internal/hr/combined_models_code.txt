@@ -1,0 +1,1603 @@
+
+================================================================================
+FILE: ./models/audit_log.go
+================================================================================
+
+// models/audit_log.go
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type AuditLog struct {
+	AuditID     uuid.UUID  `db:"audit_id"`
+	CompanyID   *uuid.UUID `db:"company_id"`
+	Module      string     `db:"module"`
+	Action      string     `db:"action"`
+	EntityType  string     `db:"entity_type"`
+	EntityID    *uuid.UUID `db:"entity_id"`
+	ActorType   string     `db:"actor_type"`
+	ActorID     *uuid.UUID `db:"actor_id"`
+	BeforeState []byte     `db:"before_state"` // JSONB
+	AfterState  []byte     `db:"after_state"`  // JSONB
+	Metadata    []byte     `db:"metadata"`     // JSONB
+	CreatedAt   time.Time  `db:"created_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/attendance/AttendanceEventType.go
+================================================================================
+
+package attendance
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// AttendanceSourceType represents a valid attendance source type
+
+// CompanyAttendanceRules represents company-level attendance rules
+type CompanyAttendanceRules struct {
+	CompanyID             uuid.UUID `json:"company_id"`
+	AllowedSourceTypes    []string  `json:"allowed_source_types"`
+	AllowMultipleCheckins bool      `json:"allow_multiple_checkins"`
+	Timezone              string    `json:"timezone"`
+	CreatedAt             time.Time `json:"created_at"`
+}
+
+// DepartmentAttendanceRules represents department-level attendance rules
+type DepartmentAttendanceRules struct {
+	RuleID             uuid.UUID `json:"rule_id"`
+	CompanyID          uuid.UUID `json:"company_id"`
+	DepartmentID       uuid.UUID `json:"department_id"`
+	AllowedSourceTypes []string  `json:"allowed_source_types"`
+	AllowedEventTypes  []string  `json:"allowed_event_types"`
+	RequireLocation    bool      `json:"require_location"`
+	RequireDevice      bool      `json:"require_device"`
+	CreatedAt          time.Time `json:"created_at"`
+}
+
+// UserAttendanceProfile represents user-level attendance overrides
+type UserAttendanceProfile struct {
+	UserID              uuid.UUID `json:"user_id"`
+	CompanyID           uuid.UUID `json:"company_id"`
+	OverrideSourceTypes []string  `json:"override_source_types,omitempty"`
+	OverrideEventTypes  []string  `json:"override_event_types,omitempty"`
+	CreatedAt           time.Time `json:"created_at"`
+}
+
+type ResolvedAttendanceRules struct {
+	// Company
+	CompanyID             uuid.UUID
+	Timezone              string
+	AllowMultipleCheckins bool
+
+	// Internal (fast validation)
+	AllowedSourceTypesMap map[string]bool
+	AllowedEventTypesMap  map[string]bool
+	AllowAllEventTypes    bool
+
+	// API output
+	AllowedSourceTypes []string
+	AllowedEventTypes  []string
+
+	// Requirements
+	RequireLocation  bool
+	RequireDevice    bool
+	RequireReference bool
+
+	// Metadata
+	SourceLevel string // company | work_center | position | user_override
+	AppliedAt   time.Time
+
+	// New fields for work-center and position-based policies
+	PolicyID       *uuid.UUID   `json:"policy_id,omitempty"`
+	PolicyRules    *PolicyRules `json:"policy_rules,omitempty"`
+	WorkCenterCode *string      `json:"work_center_code,omitempty"`
+	PositionID     *uuid.UUID   `json:"position_id,omitempty"`
+	PolicySource   string       `json:"policy_source"` // user | work_center | position | default
+}
+
+// AttendanceStats for analytics
+type AttendanceStats struct {
+	CompanyID          uuid.UUID `json:"company_id"`
+	StartDate          time.Time `json:"start_date"`
+	EndDate            time.Time `json:"end_date"`
+	TotalEmployees     int       `json:"total_employees"`
+	PresentCount       int       `json:"present_count"`
+	AbsentCount        int       `json:"absent_count"`
+	LateCount          int       `json:"late_count"`
+	HalfDayCount       int       `json:"half_day_count"`
+	LeaveCount         int       `json:"leave_count"`
+	HolidayCount       int       `json:"holiday_count"`
+	TotalWorkedHours   float64   `json:"total_worked_hours"`
+	TotalOvertimeHours float64   `json:"total_overtime_hours"`
+	AverageAttendance  float64   `json:"average_attendance"`
+}
+
+// UserAttendanceStats for user analytics
+type UserAttendanceStats struct {
+	UserID             uuid.UUID `json:"user_id"`
+	StartDate          time.Time `json:"start_date"`
+	EndDate            time.Time `json:"end_date"`
+	PresentDays        int       `json:"present_days"`
+	AbsentDays         int       `json:"absent_days"`
+	LateDays           int       `json:"late_days"`
+	HalfDays           int       `json:"half_days"`
+	LeaveDays          int       `json:"leave_days"`
+	TotalWorkedHours   float64   `json:"total_worked_hours"`
+	TotalOvertimeHours float64   `json:"total_overtime_hours"`
+	AverageInTime      string    `json:"average_in_time"`
+	AverageOutTime     string    `json:"average_out_time"`
+	AttendancePercent  float64   `json:"attendance_percent"`
+}
+
+// WorkCenterShift maps work centers to shifts
+type WorkCenterShift struct {
+	MappingID      uuid.UUID  `json:"mapping_id" db:"mapping_id"`
+	CompanyID      uuid.UUID  `json:"company_id" db:"company_id"`
+	WorkCenterCode string     `json:"work_center_code" db:"work_center_code"`
+	ShiftID        uuid.UUID  `json:"shift_id" db:"shift_id"` // References schedule_templates
+	EffectiveFrom  time.Time  `json:"effective_from" db:"effective_from"`
+	EffectiveTo    *time.Time `json:"effective_to" db:"effective_to"`
+	IsActive       bool       `json:"is_active" db:"is_active"`
+	CreatedAt      time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at" db:"updated_at"`
+}
+
+// SAPBusinessRules contains SAP-specific business rules
+type SAPBusinessRules struct {
+	// Work Center Validation
+	MinWorkCenterHours *int `json:"min_work_center_hours,omitempty"`
+	MaxWorkCenterHours *int `json:"max_work_center_hours,omitempty"`
+
+	// Overtime Rules
+	OvertimeThreshold   *int  `json:"overtime_threshold,omitempty"` // Minutes
+	AutoApproveOvertime *bool `json:"auto_approve_overtime,omitempty"`
+
+	// Shift Overlap Rules
+	AllowShiftOverlap *bool `json:"allow_shift_overlap,omitempty"`
+	MaxOverlapMinutes *int  `json:"max_overlap_minutes,omitempty"`
+
+	// Late Arrival Rules
+	GracePeriodMinutes *int `json:"grace_period_minutes,omitempty"`
+	MaxLateAllowed     *int `json:"max_late_allowed,omitempty"`
+
+	// Validation Flags
+	ValidateWorkCenter *bool `json:"validate_work_center,omitempty"`
+	ValidateCostCenter *bool `json:"validate_cost_center,omitempty"`
+	ValidateEmployeeID *bool `json:"validate_employee_id,omitempty"`
+}
+
+// AttendanceEventType represents a valid attendance event type
+type AttendanceEventType struct {
+	EventType         string  `json:"event_type"`
+	Category          string  `json:"category"`
+	Description       *string `json:"description,omitempty"`
+	IsUserTriggered   bool    `json:"is_user_triggered"`
+	IsSystemGenerated bool    `json:"is_system_generated"`
+	IsActive          bool    `json:"is_active"`
+}
+
+// AttendanceSourceType represents a valid attendance source type
+
+// AttendanceEvent represents an attendance event
+type AttendanceEvent struct {
+	AttendanceEventID uuid.UUID `json:"attendance_event_id" db:"attendance_event_id"`
+	CompanyID         uuid.UUID `json:"company_id" db:"company_id"`
+	UserID            uuid.UUID `json:"user_id" db:"user_id"`
+	EventType         string    `json:"event_type" db:"event_type"`
+	EventTime         time.Time `json:"event_time" db:"event_time"`
+
+	// Source
+	SourceType string     `json:"source_type" db:"source_type"`
+	SourceID   *uuid.UUID `json:"source_id,omitempty" db:"source_id"`
+	DeviceID   *string    `json:"device_id,omitempty" db:"device_id"`
+
+	// 🔥 ADD THIS (REQUIRED)
+	DeviceUserCode     *string    `json:"device_user_code,omitempty" db:"device_user_code"`
+	DeviceEnrollmentID *uuid.UUID `db:"device_enrollment_id"`
+
+	IPAddress *string `json:"ip_address,omitempty" db:"ip_address"`
+
+	Context  EventContext  `json:"context,omitempty" db:"context"`
+	Metadata EventMetadata `json:"metadata,omitempty" db:"metadata"`
+
+	CreatedAt time.Time  `json:"created_at" db:"created_at"`
+	CreatedBy *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
+}
+type EventContext struct {
+	WorkCenterCode   *string    `json:"work_center_code,omitempty"`
+	LocationID       *uuid.UUID `json:"location_id,omitempty"`
+	Reason           *string    `json:"reason,omitempty"`
+	ExternalRef      *string    `json:"external_ref,omitempty"`
+	CorrectionReason *string    `json:"correction_reason,omitempty"`
+}
+
+type EventMetadata struct {
+	ShiftID *uuid.UUID `json:"shift_id,omitempty"`
+	ClassID *uuid.UUID `json:"class_id,omitempty"`
+
+	// system derived
+	IsAutoGenerated *bool      `json:"is_auto_generated,omitempty"`
+	IsCorrection    *bool      `json:"is_correction,omitempty"`
+	OverrideStatus  *string    `json:"override_status,omitempty"`
+	CorrectedBy     *uuid.UUID `json:"corrected_by,omitempty"`
+}
+
+// AttendancePolicy - Updated for position-based policies
+// Add to your attendance/models.go file or update the existing AttendancePolicy struct:
+
+// AttendancePolicy - Updated for work center and position-based policies
+type AttendancePolicy struct {
+	PolicyID       uuid.UUID   `json:"policy_id" db:"policy_id"`
+	CompanyID      uuid.UUID   `json:"company_id" db:"company_id"`
+	WorkCenterCode *string     `json:"work_center_code,omitempty" db:"work_center_code"`
+	PositionID     *uuid.UUID  `json:"position_id,omitempty" db:"position_id"`
+	PolicyCode     string      `json:"policy_code" db:"policy_code"`
+	PolicyType     string      `json:"policy_type" db:"policy_type"`
+	Rules          PolicyRules `json:"rules" db:"rules"`
+	IsActive       bool        `json:"is_active" db:"is_active"`
+	CreatedAt      time.Time   `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time   `json:"updated_at" db:"updated_at"`
+}
+type PolicyRules struct {
+	GracePeriod    *int  `json:"grace_period,omitempty"`     // minutes
+	MaxLateAllowed *int  `json:"max_late_allowed,omitempty"` // minutes
+	HalfDayAfter   *int  `json:"half_day_after,omitempty"`   // hours
+	AutoCheckout   *bool `json:"auto_checkout,omitempty"`
+	// Work center specific rules
+	RequireWorkCenter  *bool    `json:"require_work_center,omitempty"`
+	AllowedWorkCenters []string `json:"allowed_work_centers,omitempty"`
+	// Shift rules
+	AllowShiftOverlap *bool `json:"allow_shift_overlap,omitempty"`
+	MaxOverlapMinutes *int  `json:"max_overlap_minutes,omitempty"`
+	// Overtime rules
+	OvertimeThreshold   *int  `json:"overtime_threshold,omitempty"`
+	AutoApproveOvertime *bool `json:"auto_approve_overtime,omitempty"`
+	// === 🔥 NEW: ATTENDANCE CAPABILITY RULES ===
+	AllowedSourceTypes []string `json:"allowed_source_types,omitempty"`
+	AllowSelfService   *bool    `json:"allow_self_service,omitempty"`
+	AllowAdminMarking  *bool    `json:"allow_admin_marking,omitempty"`
+	AllowDeviceMarking *bool    `json:"allow_device_marking,omitempty"`
+}
+
+// UserAttendancePolicy links users to attendance policies
+type UserAttendancePolicy struct {
+	UserID        uuid.UUID  `json:"user_id" db:"user_id"`
+	PolicyID      uuid.UUID  `json:"policy_id" db:"policy_id"`
+	EffectiveFrom time.Time  `json:"effective_from" db:"effective_from"`
+	EffectiveTo   *time.Time `json:"effective_to" db:"effective_to"`
+	AssignedBy    *uuid.UUID `json:"assigned_by" db:"assigned_by"`
+	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
+}
+
+// EmployeeRFIDMapping maps RFID tags to employees
+type EmployeeRFIDMapping struct {
+	RFIDID       uuid.UUID  `json:"rfid_id" db:"rfid_id"`
+	UserID       uuid.UUID  `json:"user_id" db:"user_id"`
+	CompanyID    uuid.UUID  `json:"company_id" db:"company_id"`
+	RFIDTag      string     `json:"rfid_tag" db:"rfid_tag"`
+	IsActive     bool       `json:"is_active" db:"is_active"`
+	AssignedAt   time.Time  `json:"assigned_at" db:"assigned_at"`
+	UnassignedAt *time.Time `json:"unassigned_at" db:"unassigned_at"`
+	CreatedAt    time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at" db:"updated_at"`
+}
+
+type AttendanceSource struct {
+	SourceID      uuid.UUID  `json:"source_id" db:"source_id"`
+	CompanyID     uuid.UUID  `json:"company_id" db:"company_id"`
+	SourceType    string     `json:"source_type" db:"source_type"`
+	Name          string     `json:"name" db:"name"`
+	ReferenceType *string    `json:"reference_type" db:"reference_type"`
+	ReferenceID   *uuid.UUID `json:"reference_id" db:"reference_id"`
+	IsActive      bool       `json:"is_active" db:"is_active"`
+	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
+	CreatedBy     *uuid.UUID `json:"created_by" db:"created_by"`
+}
+
+type AttendanceDailySummary struct {
+	AttendanceSummaryID uuid.UUID `json:"attendance_summary_id" db:"attendance_summary_id"`
+	CompanyID           uuid.UUID `json:"company_id" db:"company_id"`
+	UserID              uuid.UUID `json:"user_id" db:"user_id"`
+	AttendanceDate      time.Time `json:"attendance_date" db:"attendance_date"`
+	Status              string    `json:"status" db:"status"`
+
+	WorkedMinutes   *int `json:"worked_minutes" db:"worked_minutes"`
+	ExpectedMinutes *int `json:"expected_minutes" db:"expected_minutes"` // NEW
+	OvertimeMinutes *int `json:"overtime_minutes" db:"overtime_minutes"`
+	LateMinutes     *int `json:"late_minutes" db:"late_minutes"`
+
+	IsFinalized     bool `json:"is_finalized" db:"is_finalized"` // NEW
+	IsPayable       bool `json:"is_payable" db:"is_payable"`     // NEW
+	IsPayrollLocked bool `json:"is_payroll_locked" db:"is_payroll_locked"`
+
+	Metadata    SummaryMetadata `json:"metadata" db:"metadata"`
+	GeneratedAt time.Time       `json:"generated_at" db:"generated_at"`
+	GeneratedBy string          `json:"generated_by" db:"generated_by"`
+}
+
+// type SummaryMetadata struct {
+// 	ClassesAttended *int       `json:"classes_attended,omitempty"`
+// 	PeriodsTaken    *int       `json:"periods_taken,omitempty"`
+// 	ShiftID         *uuid.UUID `json:"shift_id,omitempty"`
+// 	PolicyID        *uuid.UUID `json:"policy_id,omitempty"`
+// 	WorkCenterCode  *string    `json:"work_center_code,omitempty"`
+// }
+
+type AttendanceLocation struct {
+	LocationID   uuid.UUID `json:"location_id" db:"location_id"`
+	CompanyID    uuid.UUID `json:"company_id" db:"company_id"`
+	Name         *string   `json:"name" db:"name"`
+	LocationCode *string   `json:"location_code,omitempty" db:"location_code"`
+	LocationType *string   `json:"location_type" db:"location_type"`
+	Zone         *string   `json:"zone,omitempty" db:"zone"`
+	GeoLat       *float64  `json:"geo_lat" db:"geo_lat"`
+	GeoLng       *float64  `json:"geo_lng" db:"geo_lng"`
+	IsActive     bool      `json:"is_active" db:"is_active"`
+}
+
+// PositionBasedPolicy represents a policy applied to a position
+type PositionBasedPolicy struct {
+	PolicyID       uuid.UUID   `json:"policy_id"`
+	PositionID     uuid.UUID   `json:"position_id"`
+	PositionTitle  string      `json:"position_title"`
+	DepartmentID   uuid.UUID   `json:"department_id"`
+	DepartmentName string      `json:"department_name"`
+	PolicyCode     string      `json:"policy_code"`
+	PolicyType     string      `json:"policy_type"`
+	Rules          PolicyRules `json:"rules"`
+	IsActive       bool        `json:"is_active"`
+	TotalEmployees int         `json:"total_employees,omitempty"`
+}
+
+// UserPolicyAssignment represents a user's current policy assignment
+type UserPolicyAssignment struct {
+	UserID         uuid.UUID  `json:"user_id"`
+	Username       string     `json:"username"`
+	FullName       string     `json:"full_name"`
+	PositionID     uuid.UUID  `json:"position_id"`
+	PositionTitle  string     `json:"position_title"`
+	PolicyID       uuid.UUID  `json:"policy_id"`
+	PolicyCode     string     `json:"policy_code"`
+	PolicyType     string     `json:"policy_type"`
+	EffectiveFrom  time.Time  `json:"effective_from"`
+	EffectiveTo    *time.Time `json:"effective_to,omitempty"`
+	AssignedBy     *uuid.UUID `json:"assigned_by,omitempty"`
+	AssignedByName *string    `json:"assigned_by_name,omitempty"`
+}
+
+type AttendanceDevice struct {
+	DeviceID string `json:"device_id" db:"device_id"`
+
+	CompanyID  uuid.UUID `json:"company_id" db:"company_id"`
+	SourceType string    `json:"source_type" db:"source_type"`
+
+	DeviceCode string  `json:"device_code" db:"device_code"`
+	DeviceName *string `json:"device_name,omitempty" db:"device_name"`
+
+	Manufacturer *string `json:"manufacturer,omitempty" db:"manufacturer"`
+	Model        *string `json:"model,omitempty" db:"model"`
+
+	WorkCenterCode *string    `json:"work_center_code,omitempty" db:"work_center_code"`
+	LocationID     *uuid.UUID `json:"location_id,omitempty" db:"location_id"`
+
+	IPAddress  *string `json:"ip_address,omitempty" db:"ip_address"`
+	MacAddress *string `json:"mac_address,omitempty" db:"mac_address"`
+
+	IsActive  bool `json:"is_active" db:"is_active"`
+	IsTrusted bool `json:"is_trusted" db:"is_trusted"`
+
+	LastSeenAt  *time.Time `json:"last_seen_at,omitempty" db:"last_seen_at"`
+	InstalledAt *time.Time `json:"installed_at,omitempty" db:"installed_at"`
+
+	Metadata map[string]interface{} `json:"metadata,omitempty" db:"metadata"`
+
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+}
+
+type AttendanceIdentity struct {
+	MappingID uuid.UUID `json:"mapping_id" db:"mapping_id"`
+
+	CompanyID uuid.UUID `json:"company_id" db:"company_id"`
+	UserID    uuid.UUID `json:"user_id" db:"user_id"`
+
+	DeviceID   string `json:"device_id" db:"device_id"`
+	SourceType string `json:"source_type" db:"source_type"`
+
+	DeviceUserCode string `json:"device_user_code" db:"device_user_code"`
+
+	IsActive bool `json:"is_active" db:"is_active"`
+
+	EnrolledAt   time.Time  `json:"enrolled_at" db:"enrolled_at"`
+	UnenrolledAt *time.Time `json:"unenrolled_at,omitempty" db:"unenrolled_at"`
+
+	CreatedBy *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
+}
+
+type AttendanceSourceType struct {
+	SourceType  string  `json:"source_type" db:"source_type"`
+	Description *string `json:"description,omitempty" db:"description"`
+
+	Category       string `json:"category" db:"category"`
+	RequiresDevice bool   `json:"requires_device" db:"requires_device"`
+	IsSystem       bool   `json:"is_system" db:"is_system"`
+
+	AllowBackdated bool `json:"allow_backdated" db:"allow_backdated"`
+	AllowFuture    bool `json:"allow_future" db:"allow_future"`
+
+	TrustLevel    int16 `json:"trust_level" db:"trust_level"`
+	IsSelfService bool  `json:"is_self_service" db:"is_self_service"`
+
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+}
+
+// Add to your attendance/models.go:
+
+// AttendanceResolutionRequest represents a request to resolve attendance
+type AttendanceResolutionRequest struct {
+	EventID     *uuid.UUID `json:"event_id,omitempty"`
+	UserID      *uuid.UUID `json:"user_id,omitempty"`
+	CompanyID   *uuid.UUID `json:"company_id,omitempty"`
+	Date        *time.Time `json:"date,omitempty"`
+	Recalculate bool       `json:"recalculate"`
+} // Add to your attendance/models.go:
+
+// ShiftContext contains all shift information needed for resolution
+type ShiftContext struct {
+	ShiftID        *uuid.UUID `json:"shift_id,omitempty"`
+	ShiftName      *string    `json:"shift_name,omitempty"`
+	ExpectedStart  *time.Time `json:"expected_start,omitempty"`
+	ExpectedEnd    *time.Time `json:"expected_end,omitempty"`
+	ScheduleDate   time.Time  `json:"schedule_date"`
+	ScheduleStatus string     `json:"schedule_status"`
+	Timezone       string     `json:"timezone"`
+	IsOnLeave      bool       `json:"is_on_leave"`
+	IsOverride     bool       `json:"is_override"`
+	OverrideType   *string    `json:"override_type,omitempty"`
+	WorkCenterCode *string    `json:"work_center_code,omitempty"`
+	PositionID     *uuid.UUID `json:"position_id,omitempty"`
+	DepartmentID   *uuid.UUID `json:"department_id,omitempty"`
+}
+
+// Update SummaryMetadata to include anomalies:
+type SummaryMetadata struct {
+	ClassesAttended *int `json:"classes_attended,omitempty"`
+	PeriodsTaken    *int `json:"periods_taken,omitempty"`
+
+	ShiftID        *uuid.UUID `json:"shift_id,omitempty"`
+	PolicyID       *uuid.UUID `json:"policy_id,omitempty"`
+	WorkCenterCode *string    `json:"work_center_code,omitempty"`
+
+	CheckInTime    *time.Time `json:"check_in_time,omitempty"`
+	CheckOutTime   *time.Time `json:"check_out_time,omitempty"`
+	TotalCheckIns  *int       `json:"total_checkins,omitempty"`
+	TotalCheckOuts *int       `json:"total_checkouts,omitempty"`
+	BreakMinutes   *int       `json:"break_minutes,omitempty"`
+
+	ScheduleStatus *string `json:"schedule_status,omitempty"`
+	Timezone       *string `json:"timezone,omitempty"`
+
+	Anomalies    []string      `json:"anomalies,omitempty"`
+	PairedEvents []PairedEvent `json:"paired_events,omitempty"`
+
+	// ✅ NEW — Leave Financial Context
+	LeaveTypeID    *uuid.UUID `json:"leave_type_id,omitempty"`
+	LeaveRequestID *uuid.UUID `json:"leave_request_id,omitempty"`
+	IsLeavePaid    *bool      `json:"is_leave_paid,omitempty"`
+}
+
+type PairedEvent struct {
+	CheckInEventID  uuid.UUID  `json:"check_in_event_id"`
+	CheckOutEventID *uuid.UUID `json:"check_out_event_id,omitempty"`
+
+	CheckInTime  time.Time  `json:"check_in_time"`
+	CheckOutTime *time.Time `json:"check_out_time,omitempty"`
+
+	WorkedMinutes *int `json:"worked_minutes,omitempty"`
+
+	// Flags
+	IsAutoClosed bool     `json:"is_auto_closed"`
+	Anomalies    []string `json:"anomalies,omitempty"`
+}
+type BulkAttendanceRequest struct {
+	CompanyID     uuid.UUID
+	ActorID       uuid.UUID
+	ActorType     string
+	OrgUnitID     uuid.UUID // class / section / team
+	EventType     string    // present / absent / manual_check_in
+	EventTime     time.Time
+	TargetUserIDs []uuid.UUID
+	Reason        *string
+}
+
+const (
+	StatusPresent      = "present"
+	StatusAbsent       = "absent"
+	StatusLate         = "late"
+	StatusHalfDay      = "half_day"
+	StatusLeavePaid    = "leave"
+	StatusLeaveUnpaid  = "leave_unpaid"
+	StatusHoliday      = "holiday"
+	StatusWeeklyOff    = "weekly_off"
+	StatusNotScheduled = "not_scheduled"
+)
+
+
+
+================================================================================
+FILE: ./models/attendance/device_enrollment.go
+================================================================================
+
+package attendance
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// UserDeviceIdentifier represents the enrollment of a user to a device
+type UserDeviceIdentifier struct {
+	MappingID         uuid.UUID  `json:"mapping_id" db:"mapping_id"`
+	CompanyID         uuid.UUID  `json:"company_id" db:"company_id"`
+	UserID            uuid.UUID  `json:"user_id" db:"user_id"`
+	DeviceID          string     `json:"device_id" db:"device_id"`
+	SourceType        string     `json:"source_type" db:"source_type"`
+	DeviceUserCode    string     `json:"device_user_code" db:"device_user_code"`
+	IsActive          bool       `json:"is_active" db:"is_active"`
+	EnrollmentVersion int        `json:"enrollment_version" db:"enrollment_version"`
+	EnrolledAt        time.Time  `json:"enrolled_at" db:"enrolled_at"`
+	UnenrolledAt      *time.Time `json:"unenrolled_at,omitempty" db:"unenrolled_at"`
+	RevokedReason     *string    `json:"revoked_reason,omitempty" db:"revoked_reason"`
+	RevokedBy         *uuid.UUID // ✅ ADD
+	CreatedBy         *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
+}
+
+// DeviceEnrollmentRequest represents a request to enroll a user
+type DeviceEnrollmentRequest struct {
+	UserID         uuid.UUID `json:"user_id"`
+	DeviceUserCode string    `json:"device_user_code"`
+	SourceType     string    `json:"source_type"`
+}
+
+// DeviceEnrollmentRevokeRequest represents a request to revoke enrollment
+type DeviceEnrollmentRevokeRequest struct {
+	DeviceUserCode string `json:"device_user_code"`
+	SourceType     string `json:"source_type"` // ✅ REQUIRED
+	Reason         string `json:"reason"`
+}
+
+// DeviceEnrollmentResponse represents enrollment response
+type DeviceEnrollmentResponse struct {
+	MappingID      uuid.UUID `json:"mapping_id"`
+	UserID         uuid.UUID `json:"user_id"`
+	DeviceID       string    `json:"device_id"`
+	DeviceUserCode string    `json:"device_user_code"`
+	SourceType     string    `json:"source_type"`
+	EnrolledAt     time.Time `json:"enrolled_at"`
+	EnrolledBy     uuid.UUID `json:"enrolled_by"`
+}
+
+
+
+================================================================================
+FILE: ./models/attendance/offline_punch.go
+================================================================================
+
+package attendance
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type OfflinePunchEvent struct {
+	EventType      string    `json:"event_type"`
+	EventTime      time.Time `json:"event_time"`
+	DeviceUserCode string    `json:"device_user_code"`
+}
+
+type AttendancePunchBatch struct {
+	BatchID       uuid.UUID
+	CompanyID     uuid.UUID
+	DeviceID      string
+	BatchRef      string
+	TotalEvents   int
+	Status        string
+	FailureReason *string
+	ReceivedAt    time.Time
+	ProcessedAt   *time.Time
+}
+
+type AttendanceBatchIngestRequest struct {
+	CompanyID  uuid.UUID
+	DeviceID   string
+	SourceType string
+	BatchRef   string
+	Events     []OfflinePunchEvent
+}
+
+
+
+================================================================================
+FILE: ./models/attendance/device_token.go
+================================================================================
+
+package attendance
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type DeviceToken struct {
+	TokenID      uuid.UUID  `json:"token_id" db:"token_id"`
+	CompanyID    uuid.UUID  `json:"company_id" db:"company_id"`
+	DeviceID     string     `json:"device_id" db:"device_id"`
+	SourceType   string     `json:"source_type" db:"source_type"`
+	TokenHash    string     `json:"token_hash" db:"token_hash"`
+	TokenVersion int        `json:"token_version" db:"token_version"`
+	IsActive     bool       `json:"is_active" db:"is_active"`
+	IssuedAt     time.Time  `json:"issued_at" db:"issued_at"`
+	ExpiresAt    *time.Time `json:"expires_at,omitempty" db:"expires_at"`
+	RevokedAt    *time.Time `json:"revoked_at,omitempty" db:"revoked_at"`
+	IssuedBy     *uuid.UUID `json:"issued_by,omitempty" db:"issued_by"`
+	RevokedBy    *uuid.UUID `json:"revoked_by,omitempty" db:"revoked_by"`
+	RevokeReason *string    `json:"revoke_reason,omitempty" db:"revoke_reason"`
+	Metadata     JSONB      `json:"metadata,omitempty" db:"metadata"`
+	CreatedAt    time.Time  `json:"created_at" db:"created_at"`
+}
+
+type DeviceAuthContext struct {
+	CompanyID    uuid.UUID `json:"company_id"`
+	DeviceID     string    `json:"device_id"`
+	SourceType   string    `json:"source_type"`
+	TokenID      uuid.UUID `json:"token_id"`
+	IsTrusted    bool      `json:"is_trusted"`
+	WorkCenterID *string   `json:"work_center_id,omitempty"`
+}
+
+type IssueTokenRequest struct {
+	CompanyID  uuid.UUID  `json:"company_id"`
+	DeviceID   string     `json:"device_id"`
+	SourceType string     `json:"source_type"`
+	ExpiresIn  *int64     `json:"expires_in,omitempty"` // seconds
+	IssuedBy   *uuid.UUID `json:"issued_by,omitempty"`
+	Metadata   JSONB      `json:"metadata,omitempty"`
+}
+
+type ValidateTokenRequest struct {
+	RawToken  string    `json:"raw_token"`
+	CompanyID uuid.UUID `json:"company_id"`
+	DeviceID  string    `json:"device_id"`
+}
+
+type TokenValidationResult struct {
+	IsValid     bool               `json:"is_valid"`
+	Token       *DeviceToken       `json:"token,omitempty"`
+	AuthContext *DeviceAuthContext `json:"auth_context,omitempty"`
+	Error       string             `json:"error,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/attendance/device_heartbeat.go
+================================================================================
+
+package attendance
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type DeviceHeartbeat struct {
+	HeartbeatID     uuid.UUID
+	CompanyID       uuid.UUID
+	DeviceID        string
+	SourceType      string
+	DeviceTime      *time.Time
+	ServerTime      time.Time
+	FirmwareVersion *string
+	IPAddress       *string
+	Status          string
+	CreatedAt       time.Time
+}
+
+type DeviceHeartbeatRequest struct {
+	DeviceTime      *time.Time `json:"device_time"`
+	FirmwareVersion *string    `json:"firmware_version"`
+	IPAddress       *string    `json:"ip_address"`
+}
+
+
+
+================================================================================
+FILE: ./models/attendance/jsonb.go
+================================================================================
+
+package attendance
+
+// or package attendance IF you want it local (see note below)
+
+import (
+	"database/sql/driver"
+	"encoding/json"
+	"errors"
+)
+
+// JSONB represents a PostgreSQL JSONB column
+type JSONB map[string]interface{}
+
+// Value implements driver.Valuer (for INSERT/UPDATE)
+func (j JSONB) Value() (driver.Value, error) {
+	if j == nil {
+		return []byte("{}"), nil
+	}
+	return json.Marshal(j)
+}
+
+// Scan implements sql.Scanner (for SELECT)
+func (j *JSONB) Scan(value interface{}) error {
+	if value == nil {
+		*j = make(JSONB)
+		return nil
+	}
+
+	bytes, ok := value.([]byte)
+	if !ok {
+		return errors.New("invalid JSONB value")
+	}
+
+	return json.Unmarshal(bytes, j)
+}
+
+
+
+================================================================================
+FILE: ./models/scheduling/user_schedule_assignment.go
+================================================================================
+
+package scheduling
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type UserScheduleAssignment struct {
+	UserID             uuid.UUID  `json:"user_id" db:"user_id"`
+	ScheduleTemplateID uuid.UUID  `json:"schedule_template_id" db:"schedule_template_id"`
+	EffectiveFrom      time.Time  `json:"effective_from" db:"effective_from"`
+	EffectiveTo        *time.Time `json:"effective_to" db:"effective_to"`
+	AssignedBy         *uuid.UUID `json:"assigned_by" db:"assigned_by"`
+	CreatedAt          time.Time  `json:"created_at" db:"created_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/scheduling/schedule_template.go
+================================================================================
+
+package scheduling
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type ScheduleTemplate struct {
+	ScheduleTemplateID uuid.UUID     `json:"schedule_template_id" db:"schedule_template_id"`
+	CompanyID          uuid.UUID     `json:"company_id" db:"company_id"`
+	CalendarID         uuid.UUID     `json:"calendar_id" db:"calendar_id"`
+	TemplateType       string        `json:"template_type" db:"template_type"`
+	Name               string        `json:"name" db:"name"`
+	Rules              TemplateRules `json:"rules" db:"rules"`
+	IsActive           bool          `json:"is_active" db:"is_active"`
+	CreatedAt          time.Time     `json:"created_at" db:"created_at"`
+}
+
+type TemplateRules struct {
+	// Office rules
+	StartTime *string `json:"start_time,omitempty"`
+	EndTime   *string `json:"end_time,omitempty"`
+
+	// Shift rules
+	BreakMinutes *int `json:"break_minutes,omitempty"`
+
+	// Class rules
+	Periods []ClassPeriod `json:"periods,omitempty"`
+}
+
+type ClassPeriod struct {
+	Period int    `json:"period"`
+	Start  string `json:"start"`
+	End    string `json:"end"`
+}
+
+
+
+================================================================================
+FILE: ./models/scheduling/time_off.go
+================================================================================
+
+package scheduling
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// UserOffEntitlement represents a user's time off entitlement
+type UserOffEntitlement struct {
+	EntitlementID    uuid.UUID  `json:"entitlement_id" db:"entitlement_id"`
+	CompanyID        uuid.UUID  `json:"company_id" db:"company_id"`
+	UserID           uuid.UUID  `json:"user_id" db:"user_id"`
+	PeriodType       string     `json:"period_type" db:"period_type"` // weekly | monthly
+	OffCount         int        `json:"off_count" db:"off_count"`
+	RequiresApproval bool       `json:"requires_approval" db:"requires_approval"`
+	EffectiveFrom    time.Time  `json:"effective_from" db:"effective_from"`
+	EffectiveTo      *time.Time `json:"effective_to,omitempty" db:"effective_to"`
+	CreatedAt        time.Time  `json:"created_at" db:"created_at"`
+}
+
+// OffRequest represents a time off request
+type OffRequest struct {
+	OffRequestID uuid.UUID  `json:"off_request_id" db:"off_request_id"`
+	CompanyID    uuid.UUID  `json:"company_id" db:"company_id"`
+	UserID       uuid.UUID  `json:"user_id" db:"user_id"`
+	RequestDates []string   `json:"request_dates" db:"request_dates"` // Stored as JSON array
+	Status       string     `json:"status" db:"status"`               // pending | approved | rejected
+	RequestedBy  *uuid.UUID `json:"requested_by,omitempty" db:"requested_by"`
+	ApprovedBy   *uuid.UUID `json:"approved_by,omitempty" db:"approved_by"`
+	ApprovedAt   *time.Time `json:"approved_at,omitempty" db:"approved_at"`
+	CreatedAt    time.Time  `json:"created_at" db:"created_at"`
+}
+
+// ScheduleOverride represents a schedule override (off, force_work, holiday_override)
+type ScheduleOverride struct {
+	OverrideID   uuid.UUID  `json:"override_id" db:"override_id"`
+	CompanyID    uuid.UUID  `json:"company_id" db:"company_id"`
+	UserID       uuid.UUID  `json:"user_id" db:"user_id"`
+	OverrideDate time.Time  `json:"override_date" db:"override_date"`
+	OverrideType string     `json:"override_type" db:"override_type"` // off | force_work | holiday_override
+	Reason       *string    `json:"reason,omitempty" db:"reason"`
+	CreatedBy    *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
+	CreatedAt    time.Time  `json:"created_at" db:"created_at"`
+}
+
+// OffEntitlementCreate represents input for creating a new off entitlement
+type OffEntitlementCreate struct {
+	UserID           uuid.UUID  `json:"user_id"`
+	PeriodType       string     `json:"period_type"` // weekly | monthly
+	OffCount         int        `json:"off_count"`
+	RequiresApproval bool       `json:"requires_approval"`
+	EffectiveFrom    time.Time  `json:"effective_from"`
+	EffectiveTo      *time.Time `json:"effective_to,omitempty"`
+}
+
+// OffEntitlementUpdate represents input for updating an off entitlement
+type OffEntitlementUpdate struct {
+	PeriodType       *string    `json:"period_type,omitempty"`
+	OffCount         *int       `json:"off_count,omitempty"`
+	RequiresApproval *bool      `json:"requires_approval,omitempty"`
+	EffectiveFrom    *time.Time `json:"effective_from,omitempty"`
+	EffectiveTo      *time.Time `json:"effective_to,omitempty"`
+}
+
+// OffRequestCreate represents input for creating a new off request
+type OffRequestCreate struct {
+	UserID       uuid.UUID  `json:"user_id"`
+	RequestDates []string   `json:"request_dates"`
+	Status       *string    `json:"status,omitempty"`
+	RequestedBy  *uuid.UUID `json:"requested_by,omitempty"`
+}
+
+// OffRequestUpdate represents input for updating an off request
+type OffRequestUpdate struct {
+	RequestDates *[]string  `json:"request_dates,omitempty"`
+	Status       *string    `json:"status,omitempty"`
+	ApprovedBy   *uuid.UUID `json:"approved_by,omitempty"`
+	ApprovedAt   *time.Time `json:"approved_at,omitempty"`
+}
+
+// ScheduleOverrideCreate represents input for creating a schedule override
+type ScheduleOverrideCreate struct {
+	UserID       uuid.UUID  `json:"user_id"`
+	OverrideDate time.Time  `json:"override_date"`
+	OverrideType string     `json:"override_type"` // off | force_work | holiday_override
+	Reason       *string    `json:"reason,omitempty"`
+	CreatedBy    *uuid.UUID `json:"created_by,omitempty"`
+}
+
+// ScheduleOverrideUpdate represents input for updating a schedule override
+type ScheduleOverrideUpdate struct {
+	OverrideType *string `json:"override_type,omitempty"`
+	Reason       *string `json:"reason,omitempty"`
+}
+
+type UserWorkCenterAssignment struct {
+	AssignmentID   uuid.UUID  `db:"assignment_id" json:"assignment_id"`
+	CompanyID      uuid.UUID  `db:"company_id" json:"company_id"`
+	UserID         uuid.UUID  `db:"user_id" json:"user_id"`
+	WorkCenterCode string     `db:"work_center_code" json:"work_center_code"`
+	EffectiveFrom  time.Time  `db:"effective_from" json:"effective_from"`
+	EffectiveTo    *time.Time `db:"effective_to" json:"effective_to,omitempty"`
+	IsActive       bool       `db:"is_active" json:"is_active"`
+	CreatedAt      time.Time  `db:"created_at" json:"created_at"`
+}
+type WorkCenterShiftMapping struct {
+	MappingID      uuid.UUID  `db:"mapping_id" json:"mapping_id"`
+	CompanyID      uuid.UUID  `db:"company_id" json:"company_id"`
+	WorkCenterCode string     `db:"work_center_code" json:"work_center_code"`
+	ShiftID        uuid.UUID  `db:"shift_id" json:"shift_id"`
+	EffectiveFrom  time.Time  `db:"effective_from" json:"effective_from"`
+	EffectiveTo    *time.Time `db:"effective_to" json:"effective_to,omitempty"`
+	IsActive       bool       `db:"is_active" json:"is_active"`
+	CreatedAt      time.Time  `db:"created_at" json:"created_at"`
+}
+type WorkCenterShiftMappingUpdate struct {
+	ShiftID     *uuid.UUID `json:"shift_id,omitempty"`
+	EffectiveTo *time.Time `json:"effective_to,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/scheduling/schedule_instance.go
+================================================================================
+
+package scheduling
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// type ScheduleInstance struct {
+// 	ScheduleInstanceID uuid.UUID        `json:"schedule_instance_id" db:"schedule_instance_id"`
+// 	CompanyID          uuid.UUID        `json:"company_id" db:"company_id"`
+// 	UserID             uuid.UUID        `json:"user_id" db:"user_id"`
+// 	ScheduleDate       time.Time        `json:"schedule_date" db:"schedule_date"`
+// 	ScheduleTemplateID uuid.UUID        `json:"schedule_template_id" db:"schedule_template_id"`
+// 	ExpectedStart      *time.Time       `json:"expected_start" db:"expected_start"`
+// 	ExpectedEnd        *time.Time       `json:"expected_end" db:"expected_end"`
+// 	Timezone           string           `json:"timezone" db:"timezone"`
+// 	Metadata           InstanceMetadata `json:"metadata" db:"metadata"`
+// 	GeneratedAt        time.Time        `json:"generated_at" db:"generated_at"`
+
+// 	// ✅ ADD THESE
+// 	Status       string     `json:"status" db:"status"` // active | cancelled
+// 	CancelReason *string    `json:"cancel_reason,omitempty" db:"cancel_reason"`
+// 	CancelledAt  *time.Time `json:"cancelled_at,omitempty" db:"cancelled_at"`
+// }
+
+// type InstanceMetadata struct {
+// 	ShiftID *uuid.UUID `json:"shift_id,omitempty"`
+// 	ClassID *uuid.UUID `json:"class_id,omitempty"`
+// 	Periods *int       `json:"periods,omitempty"`
+// }
+
+// type ResolvedScheduleDay struct {
+// 	// Authoritative business date (normalized in schedule timezone)
+// 	Date time.Time
+
+// 	// Timezone used to resolve this day (VERY IMPORTANT)
+// 	Timezone string
+
+// 	// Calendar-level
+// 	IsWorkingDay  bool
+// 	IsHoliday     bool
+// 	IsPaidHoliday bool
+
+// 	// Overrides / leave
+// 	IsForceWork bool
+// 	IsOnLeave   bool
+
+// 	// Schedule expectations (in schedule timezone)
+// 	ExpectedStart *time.Time
+// 	ExpectedEnd   *time.Time
+// 	ShiftID       *uuid.UUID
+// }
+
+// ScheduleInstance represents a scheduled day for a user
+type ScheduleInstance struct {
+	ScheduleInstanceID uuid.UUID        `json:"schedule_instance_id" db:"schedule_instance_id"`
+	CompanyID          uuid.UUID        `json:"company_id" db:"company_id"`
+	UserID             uuid.UUID        `json:"user_id" db:"user_id"`
+	ScheduleDate       time.Time        `json:"schedule_date" db:"schedule_date"`
+	ScheduleTemplateID uuid.UUID        `json:"schedule_template_id" db:"schedule_template_id"`
+	ExpectedStart      *time.Time       `json:"expected_start" db:"expected_start"`
+	ExpectedEnd        *time.Time       `json:"expected_end" db:"expected_end"`
+	Timezone           string           `json:"timezone" db:"timezone"`
+	Metadata           InstanceMetadata `json:"metadata" db:"metadata"`
+	WorkCenterCode     *string          `json:"work_center_code,omitempty" db:"work_center_code"`
+	GeneratedAt        time.Time        `json:"generated_at" db:"generated_at"`
+	Status             string           `json:"status" db:"status"`
+	CancelReason       *string          `json:"cancel_reason,omitempty" db:"cancel_reason"`
+	CancelledAt        *time.Time       `json:"cancelled_at,omitempty" db:"cancelled_at"`
+}
+
+// InstanceMetadata contains non-queryable metadata for schedule instances
+// IMPORTANT: Do not store primary business keys here (like ShiftID)
+type InstanceMetadata struct {
+	ClassID *uuid.UUID `json:"class_id,omitempty"`
+	Periods *int       `json:"periods,omitempty"`
+}
+
+// ResolvedScheduleDay represents a resolved schedule day
+type ResolvedScheduleDay struct {
+	Date          time.Time  `json:"date"`
+	Timezone      string     `json:"timezone"`
+	IsWorkingDay  bool       `json:"is_working_day"`
+	IsHoliday     bool       `json:"is_holiday"`
+	IsPaidHoliday bool       `json:"is_paid_holiday"`
+	IsForceWork   bool       `json:"is_force_work"`
+	IsOnLeave     bool       `json:"is_on_leave"`
+	ExpectedStart *time.Time `json:"expected_start,omitempty"`
+	ExpectedEnd   *time.Time `json:"expected_end,omitempty"`
+	ShiftID       *uuid.UUID `json:"shift_id,omitempty"`
+}
+
+type Position struct {
+	PositionID         uuid.UUID `json:"position_id" db:"position_id"`
+	CompanyID          uuid.UUID `json:"company_id" db:"company_id"`
+	DepartmentID       uuid.UUID `json:"department_id" db:"department_id"`
+	Title              string    `json:"title" db:"title"`
+	IsSchedulable      bool      `json:"is_schedulable" db:"is_schedulable"`
+	AttendanceRequired bool      `json:"attendance_required" db:"attendance_required"`
+	OvertimeAllowed    bool      `json:"overtime_allowed" db:"overtime_allowed"`
+	WorkCenterCode     *string   `json:"work_center_code,omitempty" db:"work_center_code"`
+	IsOpen             bool      `json:"is_open" db:"is_open"`
+	CreatedAt          time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at" db:"updated_at"`
+}
+
+type CompanyEmployee struct {
+	CompanyID  uuid.UUID  `json:"company_id" db:"company_id"`
+	UserID     uuid.UUID  `json:"user_id" db:"user_id"`
+	EmployeeID string     `json:"employee_id" db:"employee_id"`
+	RoleID     uuid.UUID  `json:"role_id" db:"role_id"`
+	PositionID *uuid.UUID `json:"position_id,omitempty" db:"position_id"`
+	HireDate   time.Time  `json:"hire_date" db:"hire_date"`
+	IsActive   bool       `json:"is_active" db:"is_active"`
+	ReportsTo  *uuid.UUID `json:"reports_to,omitempty" db:"reports_to"`
+	CreatedAt  time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at" db:"updated_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/scheduling/work_calendar.go
+================================================================================
+
+package scheduling
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type WorkCalendar struct {
+	CalendarID  uuid.UUID `json:"calendar_id" db:"calendar_id"`
+	CompanyID   uuid.UUID `json:"company_id" db:"company_id"`
+	Year        int       `json:"year" db:"year"` // ✅ ADDED
+	Name        string    `json:"name" db:"name"`
+	Timezone    string    `json:"timezone" db:"timezone"`
+	WorkingDays []int     `json:"working_days" db:"working_days"`
+	Holidays    []Holiday `json:"holidays" db:"holidays"`
+	IsActive    bool      `json:"is_active" db:"is_active"`
+	CreatedAt   time.Time `json:"created_at" db:"created_at"`
+}
+
+type Holiday struct {
+	Date string `json:"date"`
+	Name string `json:"name"`
+}
+
+
+
+================================================================================
+FILE: ./models/orgunit/org_unit.go
+================================================================================
+
+package orgunit
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// OrgUnit represents an organizational unit (class/team/batch/project)
+type OrgUnit struct {
+	OrgUnitID    uuid.UUID  `json:"org_unit_id" db:"org_unit_id"`
+	CompanyID    uuid.UUID  `json:"company_id" db:"company_id"`
+	OrgUnitType  string     `json:"org_unit_type" db:"org_unit_type"` // class | team | batch | project
+	Name         string     `json:"name" db:"name"`
+	Description  *string    `json:"description,omitempty" db:"description"`
+	DepartmentID *uuid.UUID `json:"department_id,omitempty" db:"department_id"`
+	WorkCenterID *string    `json:"work_center_id,omitempty" db:"work_center_id"`
+	IsActive     bool       `json:"is_active" db:"is_active"`
+	CreatedAt    time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at" db:"updated_at"`
+}
+
+// OrgUnitMember represents membership of a user in an org unit
+type OrgUnitMember struct {
+	OrgUnitID     uuid.UUID  `json:"org_unit_id" db:"org_unit_id"`
+	UserID        uuid.UUID  `json:"user_id" db:"user_id"`
+	EffectiveFrom time.Time  `json:"effective_from" db:"effective_from"`
+	EffectiveTo   *time.Time `json:"effective_to,omitempty" db:"effective_to"`
+}
+
+// OrgUnitRole represents a role assignment within an org unit
+type OrgUnitRole struct {
+	OrgUnitID     uuid.UUID  `json:"org_unit_id" db:"org_unit_id"`
+	UserID        uuid.UUID  `json:"user_id" db:"user_id"`
+	Role          string     `json:"role" db:"role"` // teacher | supervisor | coordinator
+	PositionID    *uuid.UUID `json:"position_id,omitempty" db:"position_id"`
+	EffectiveFrom time.Time  `json:"effective_from" db:"effective_from"`
+	EffectiveTo   *time.Time `json:"effective_to,omitempty" db:"effective_to"`
+}
+
+// Request/Response DTOs
+type CreateOrgUnitRequest struct {
+	OrgUnitType  string     `json:"org_unit_type" validate:"required,oneof=class team batch project"`
+	Name         string     `json:"name" validate:"required,max=255"`
+	Description  *string    `json:"description,omitempty"`
+	DepartmentID *uuid.UUID `json:"department_id,omitempty"`
+	WorkCenterID *string    `json:"work_center_id,omitempty" validate:"omitempty,max=100"`
+	IsActive     bool       `json:"is_active"`
+}
+
+type UpdateOrgUnitRequest struct {
+	Name         *string    `json:"name,omitempty" validate:"omitempty,max=255"`
+	Description  *string    `json:"description,omitempty"`
+	DepartmentID *uuid.UUID `json:"department_id,omitempty"`
+	WorkCenterID *string    `json:"work_center_id,omitempty" validate:"omitempty,max=100"`
+	IsActive     *bool      `json:"is_active,omitempty"`
+}
+
+type AddMemberRequest struct {
+	UserID        uuid.UUID `json:"user_id" validate:"required"`
+	EffectiveFrom string    `json:"effective_from" validate:"required,datetime=2006-01-02"`
+	EffectiveTo   *string   `json:"effective_to,omitempty" validate:"omitempty,datetime=2006-01-02"`
+}
+
+type AssignRoleRequest struct {
+	UserID        uuid.UUID  `json:"user_id" validate:"required"`
+	Role          string     `json:"role" validate:"required,oneof=teacher supervisor coordinator"`
+	PositionID    *uuid.UUID `json:"position_id,omitempty"`
+	EffectiveFrom string     `json:"effective_from" validate:"required,datetime=2006-01-02"`
+	EffectiveTo   *string    `json:"effective_to,omitempty" validate:"omitempty,datetime=2006-01-02"`
+}
+
+type OrgUnitWithDetails struct {
+	OrgUnit
+	MemberCount   int             `json:"member_count"`
+	ActiveMembers []OrgUnitMember `json:"active_members,omitempty"`
+	Roles         []OrgUnitRole   `json:"roles,omitempty"`
+	Department    *string         `json:"department,omitempty"`
+	WorkCenter    *string         `json:"work_center,omitempty"`
+}
+
+type UserOrgUnitMembership struct {
+	OrgUnitID   uuid.UUID  `json:"org_unit_id"`
+	UserID      uuid.UUID  `json:"user_id"`
+	OrgUnitName string     `json:"org_unit_name"`
+	OrgUnitType string     `json:"org_unit_type"`
+	Role        *string    `json:"role,omitempty"`
+	PositionID  *uuid.UUID `json:"position_id,omitempty"`
+}
+
+type UpdateMemberRequest struct {
+	EffectiveFrom string  `json:"effective_from"`
+	EffectiveTo   *string `json:"effective_to,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/workcenter/work_center.go
+================================================================================
+
+package workcenter
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type WorkCenter struct {
+	WorkCenterCode string    `json:"work_center_code" db:"work_center_code"`
+	CompanyID      uuid.UUID `json:"company_id" db:"company_id"`
+	Name           string    `json:"name" db:"name"`
+	Description    *string   `json:"description" db:"description"`
+	Timezone       string    `json:"timezone" db:"timezone"`
+	IsActive       bool      `json:"is_active" db:"is_active"`
+	CreatedAt      time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at" db:"updated_at"`
+}
+
+type CreateWorkCenterRequest struct {
+	WorkCenterCode string  `json:"work_center_code" validate:"required,max=100"`
+	Name           string  `json:"name" validate:"required,max=255"`
+	Description    *string `json:"description,omitempty"`
+	Timezone       string  `json:"timezone" validate:"required"`
+	IsActive       bool    `json:"is_active"`
+}
+
+type UpdateWorkCenterRequest struct {
+	Name        *string `json:"name,omitempty" validate:"omitempty,max=255"`
+	Description *string `json:"description,omitempty"`
+	Timezone    *string `json:"timezone,omitempty" validate:"omitempty"`
+	IsActive    *bool   `json:"is_active,omitempty"`
+}
+
+type WorkCenterFilter struct {
+	Name     *string `json:"name,omitempty"`
+	IsActive *bool   `json:"is_active,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/employee/role_history.go
+================================================================================
+
+package employee
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type EmployeeRoleHistory struct {
+	ID        uuid.UUID  `json:"id" db:"id"`
+	UserID    uuid.UUID  `json:"user_id" db:"user_id"`
+	RoleID    uuid.UUID  `json:"role_id" db:"role_id"`
+	StartDate *time.Time `json:"start_date" db:"start_date"`
+	EndDate   *time.Time `json:"end_date" db:"end_date"`
+	Reason    *string    `json:"reason" db:"reason"`
+}
+
+
+
+================================================================================
+FILE: ./models/employee/documents.go
+================================================================================
+
+package employee
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type EmployeeDocument struct {
+	DocumentID        uuid.UUID  `json:"document_id" db:"document_id"`
+	UserID            uuid.UUID  `json:"user_id" db:"user_id"`
+	CompanyID         uuid.UUID  `json:"company_id" db:"company_id"`
+	DocumentType      *string    `json:"document_type" db:"document_type"`
+	DocumentName      *string    `json:"document_name" db:"document_name"`
+	DocumentObjectKey string     `json:"document_object_key" db:"document_object_key"`
+	MimeType          *string    `json:"mime_type" db:"mime_type"`
+	IsConfidential    bool       `json:"is_confidential" db:"is_confidential"`
+	UploadedBy        *uuid.UUID `json:"uploaded_by" db:"uploaded_by"`
+	UploadedAt        *time.Time `json:"uploaded_at,omitempty" db:"uploaded_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/employee/profile.go
+================================================================================
+
+package employee
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type EmployeeProfile struct {
+	EmployeeProfileID uuid.UUID `json:"employee_profile_id" db:"employee_profile_id"`
+	UserID            uuid.UUID `json:"user_id" db:"user_id"`
+	CompanyID         uuid.UUID `json:"company_id" db:"company_id"`
+
+	// Personal
+	DateOfBirth   *time.Time `json:"date_of_birth" db:"date_of_birth"`
+	Gender        *string    `json:"gender" db:"gender"`
+	MaritalStatus *string    `json:"marital_status" db:"marital_status"`
+	Nationality   *string    `json:"nationality" db:"nationality"`
+
+	// Employment
+	EmploymentType   *string    `json:"employment_type" db:"employment_type"`
+	EmploymentStatus *string    `json:"employment_status" db:"employment_status"`
+	ProbationEndDate *time.Time `json:"probation_end_date" db:"probation_end_date"`
+	ConfirmationDate *time.Time `json:"confirmation_date" db:"confirmation_date"`
+
+	// Job
+	JobTitle   *string `json:"job_title" db:"job_title"`
+	Grade      *string `json:"grade" db:"grade"`
+	CostCenter *string `json:"cost_center" db:"cost_center"`
+
+	// Legal
+	TaxID            *string `json:"tax_id" db:"tax_id"`
+	SocialSecurityID *string `json:"social_security_id" db:"social_security_id"`
+
+	// Contact
+	Email *string `json:"email" db:"email"` // <-- new field
+
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/employee/position.go
+================================================================================
+
+package employee
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type Position struct {
+	PositionID   uuid.UUID `json:"position_id" db:"position_id"`
+	CompanyID    uuid.UUID `json:"company_id" db:"company_id"`
+	DepartmentID uuid.UUID `json:"department_id" db:"department_id"`
+	Title        *string   `json:"title" db:"title"`
+	IsOpen       bool      `json:"is_open" db:"is_open"`
+	CreatedAt    time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at" db:"updated_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/employee/department_history.go
+================================================================================
+
+package employee
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type EmployeeDepartmentHistory struct {
+	ID           uuid.UUID  `json:"id" db:"id"`
+	UserID       uuid.UUID  `json:"user_id" db:"user_id"`
+	CompanyID    uuid.UUID  `json:"company_id" db:"company_id"`
+	DepartmentID uuid.UUID  `json:"department_id" db:"department_id"`
+	StartDate    time.Time  `json:"start_date" db:"start_date"`
+	EndDate      *time.Time `json:"end_date" db:"end_date"`
+	ChangeReason *string    `json:"change_reason" db:"change_reason"`
+	CreatedAt    time.Time  `json:"created_at" db:"created_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/employee/exit.go
+================================================================================
+
+package employee
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type EmployeeExit struct {
+	ExitID            uuid.UUID  `json:"exit_id" db:"exit_id"`
+	UserID            uuid.UUID  `json:"user_id" db:"user_id"`
+	CompanyID         uuid.UUID  `json:"company_id" db:"company_id"`
+	ExitDate          *time.Time `json:"exit_date" db:"exit_date"`
+	ExitReason        *string    `json:"exit_reason" db:"exit_reason"`
+	EligibleForRehire *bool      `json:"eligible_for_rehire" db:"eligible_for_rehire"`
+
+	ExitState string `json:"exit_state" db:"exit_state"` // scheduled | effective | rehired
+
+	EnforcedAt *time.Time `json:"enforced_at,omitempty" db:"enforced_at"`
+	EnforcedBy *uuid.UUID `json:"enforced_by,omitempty" db:"enforced_by"`
+
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/leave/type.go
+================================================================================
+
+package leave
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type LeaveType struct {
+	LeaveTypeID      uuid.UUID `json:"leave_type_id" db:"leave_type_id"`
+	CompanyID        uuid.UUID `json:"company_id" db:"company_id"`
+	LeaveCode        string    `json:"leave_code" db:"leave_code"`
+	Name             string    `json:"name" db:"name"`
+	Category         string    `json:"category" db:"category"`
+	IsStatutory      bool      `json:"is_statutory" db:"is_statutory"`
+	AffectsPay       bool      `json:"affects_pay" db:"affects_pay"`
+	RequiresApproval bool      `json:"requires_approval" db:"requires_approval"`
+	RequiresDocument bool      `json:"requires_document" db:"requires_document"`
+	AllowHalfDay     bool      `json:"allow_half_day" db:"allow_half_day"`
+	AllowHourly      bool      `json:"allow_hourly" db:"allow_hourly"`
+	IsActive         bool      `json:"is_active" db:"is_active"`
+	CreatedAt        time.Time `json:"created_at" db:"created_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/leave/request.go
+================================================================================
+
+package leave
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type LeaveRequest struct {
+	LeaveRequestID uuid.UUID `db:"leave_request_id"`
+	CompanyID      uuid.UUID `db:"company_id"`
+	UserID         uuid.UUID `db:"user_id"`
+	LeaveTypeID    uuid.UUID `db:"leave_type_id"`
+	StartDate      time.Time `db:"start_date"`
+	EndDate        time.Time `db:"end_date"`
+	Duration       float64   `db:"duration"`
+	Reason         *string   `db:"reason"`
+	Status         string    `db:"status"` // ENUM via constraint
+	RequestedAt    time.Time `db:"requested_at"`
+}
+
+type LeaveApproval struct {
+	ApprovalID     uuid.UUID `db:"approval_id"`
+	LeaveRequestID uuid.UUID `db:"leave_request_id"`
+	ApprovedBy     uuid.UUID `db:"approved_by"`
+	Decision       string    `db:"decision"` // approved / rejected
+	DecisionReason *string   `db:"decision_reason"`
+	ApprovalLevel  int       `db:"approval_level"`
+	DecidedAt      time.Time `db:"decided_at"`
+}
+
+const (
+	LeavePending   = "pending"
+	LeaveApproved  = "approved"
+	LeaveRejected  = "rejected"
+	LeaveCancelled = "cancelled"
+	LeaveWithdrawn = "withdrawn"
+)
+
+type LeaveTransaction struct {
+	TransactionID  uuid.UUID  `db:"transaction_id"`
+	CompanyID      uuid.UUID  `db:"company_id"`
+	UserID         uuid.UUID  `db:"user_id"`
+	LeaveTypeID    uuid.UUID  `db:"leave_type_id"`
+	LeaveRequestID *uuid.UUID `db:"leave_request_id"`
+	ChangeAmount   float64    `db:"change_amount"` // + or -
+	Reason         string     `db:"reason"`        // accrual | request | cancel | manual
+	CreatedAt      time.Time  `db:"created_at"`
+}
+
+const (
+	LeaveTxnAccrual = "accrual"
+	LeaveTxnRequest = "request"
+	LeaveTxnCancel  = "cancel"
+	LeaveTxnManual  = "manual"
+)
+
+
+
+================================================================================
+FILE: ./models/leave/policy.go
+================================================================================
+
+package leave
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type LeavePolicy struct {
+	LeavePolicyID uuid.UUID   `json:"leave_policy_id" db:"leave_policy_id"`
+	CompanyID     uuid.UUID   `json:"company_id" db:"company_id"`
+	DepartmentID  *uuid.UUID  `json:"department_id" db:"department_id"`
+	CountryCode   string      `json:"country_code" db:"country_code"`
+	PolicyCode    string      `json:"policy_code" db:"policy_code"`
+	Rules         PolicyRules `json:"rules" db:"rules"`
+	IsActive      bool        `json:"is_active" db:"is_active"`
+	CreatedAt     time.Time   `json:"created_at" db:"created_at"`
+}
+
+type PolicyRules struct {
+	LeaveType          string  `json:"leave_type"`
+	MaxPerYear         int     `json:"max_per_year"`
+	Accrual            string  `json:"accrual"`
+	AccrualRate        float64 `json:"accrual_rate"`
+	CarryForward       bool    `json:"carry_forward"`
+	CarryForwardLimit  int     `json:"carry_forward_limit"`
+	Encashable         bool    `json:"encashable"`
+	MinGapDays         int     `json:"min_gap_days"`
+	MaxConsecutiveDays int     `json:"max_consecutive_days"`
+	GenderRestricted   bool    `json:"gender_restricted"`
+}
+
+type UserLeavePolicy struct {
+	UserID        uuid.UUID  `json:"user_id" db:"user_id"`
+	LeavePolicyID uuid.UUID  `json:"leave_policy_id" db:"leave_policy_id"`
+	EffectiveFrom time.Time  `json:"effective_from" db:"effective_from"`
+	EffectiveTo   *time.Time `json:"effective_to" db:"effective_to"`
+	AssignedBy    *uuid.UUID `json:"assigned_by" db:"assigned_by"`
+	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/leave/balance.go
+================================================================================
+
+package leave
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type LeaveBalance struct {
+	CompanyID   uuid.UUID `json:"company_id" db:"company_id"`
+	UserID      uuid.UUID `json:"user_id" db:"user_id"`
+	LeaveTypeID uuid.UUID `json:"leave_type_id" db:"leave_type_id"`
+	Balance     float64   `json:"balance" db:"balance"`
+	AsOf        time.Time `json:"as_of" db:"as_of"`
+	GeneratedAt time.Time `json:"generated_at" db:"generated_at"`
+}
+
+

@@ -522,19 +522,16 @@ func (r *statutoryRepository) CreateStatutoryRuleSet(ctx context.Context, ruleSe
 	return r.WithTx(ctx, func(txRepo StatutoryRepository) error {
 		repo := txRepo.(*statutoryRepository)
 		const deactivateQuery = `
-			UPDATE payroll.statutory_rule_set
-			SET is_active = false,
-			    effective_to = $1,
-			    deactivated_at = NOW(),
-			    deactivated_by = $2
-			WHERE company_id = $3
-			  AND country_code = $4
-			  AND is_active = true
-		`
+            UPDATE payroll.statutory_rule_set
+            SET is_active = false,
+                effective_to = $1
+            WHERE company_id = $2
+              AND country_code = $3
+              AND is_active = true
+        `
 		_, err := repo.db.Exec(ctx,
 			deactivateQuery,
 			ruleSet.EffectiveFrom.AddDate(0, 0, -1),
-			ruleSet.CreatedBy,
 			ruleSet.CompanyID,
 			ruleSet.CountryCode,
 		)
@@ -542,12 +539,12 @@ func (r *statutoryRepository) CreateStatutoryRuleSet(ctx context.Context, ruleSe
 			return fmt.Errorf("failed to deactivate old rule sets: %w", err)
 		}
 		const insertQuery = `
-			INSERT INTO payroll.statutory_rule_set (
-				rule_set_id, company_id, country_code, version_label,
-				effective_from, effective_to, is_active,
-				created_at, created_by
-			) VALUES ($1,$2,$3,$4,$5,$6,true,$7,$8)
-		`
+            INSERT INTO payroll.statutory_rule_set (
+                rule_set_id, company_id, country_code, version_label,
+                effective_from, effective_to, is_active,
+                created_at, created_by
+            ) VALUES ($1,$2,$3,$4,$5,$6,true,$7,$8)
+        `
 		if ruleSet.RuleSetID == uuid.Nil {
 			ruleSet.RuleSetID = uuid.New()
 		}
@@ -601,28 +598,19 @@ func (r *statutoryRepository) UpdateStatutoryRuleSet(ctx context.Context, ruleSe
 	}
 	return nil
 }
-
 func (r *statutoryRepository) DeactivateStatutoryRuleSet(ctx context.Context, ruleSetID uuid.UUID, deactivatedBy uuid.UUID) error {
-	var companyID uuid.UUID
-	err := r.db.QueryRow(ctx, `SELECT company_id FROM payroll.statutory_rule_set WHERE rule_set_id = $1`, ruleSetID).Scan(&companyID)
-	if err != nil {
-		return fmt.Errorf("failed to retrieve company_id for deactivation: %w", err)
-	}
 	const query = `
-		UPDATE payroll.statutory_rule_set
-		SET is_active = false,
-		    deactivated_at = NOW(),
-		    deactivated_by = $1
-		WHERE rule_set_id = $2
-		  AND company_id = $3
-		  AND is_active = true
-	`
-	result, err := r.db.Exec(ctx, query, deactivatedBy, ruleSetID, companyID)
+        UPDATE payroll.statutory_rule_set
+        SET is_active = false,
+            effective_to = NOW()
+        WHERE rule_set_id = $1
+          AND is_active = true
+    `
+	result, err := r.db.Exec(ctx, query, ruleSetID)
 	if err != nil {
 		r.logger.Error("Failed to deactivate statutory rule set",
-			util.String("rule_set_id", ruleSetID.String()),
-			util.String("deactivated_by", deactivatedBy.String()),
-			util.ErrorField(err),
+			zap.String("rule_set_id", ruleSetID.String()),
+			zap.Error(err),
 		)
 		return fmt.Errorf("failed to deactivate statutory rule set: %w", err)
 	}
@@ -711,27 +699,24 @@ func (r *statutoryRepository) GetRuleSetByID(ctx context.Context, ruleSetID uuid
 
 func (r *statutoryRepository) DeactivateActiveRuleSetsByCountry(ctx context.Context, companyID uuid.UUID, countryCode string, actorID uuid.UUID) error {
 	const query = `
-		UPDATE payroll.statutory_rule_set
-		SET is_active = false,
-		    deactivated_at = NOW(),
-		    deactivated_by = $1
-		WHERE company_id = $2
-		  AND country_code = $3
-		  AND is_active = true
-	`
-	_, err := r.db.Exec(ctx, query, actorID, companyID, countryCode)
+        UPDATE payroll.statutory_rule_set
+        SET is_active = false,
+            effective_to = NOW()
+        WHERE company_id = $1
+          AND country_code = $2
+          AND is_active = true
+    `
+	_, err := r.db.Exec(ctx, query, companyID, countryCode)
 	return err
 }
 
 func (r *statutoryRepository) ActivateRuleSet(ctx context.Context, ruleSetID uuid.UUID, actorID uuid.UUID) error {
 	const query = `
-		UPDATE payroll.statutory_rule_set
-		SET is_active = true,
-		    effective_to = NULL,
-		    deactivated_at = NULL,
-		    deactivated_by = NULL
-		WHERE rule_set_id = $1
-	`
+        UPDATE payroll.statutory_rule_set
+        SET is_active = true,
+            effective_to = NULL
+        WHERE rule_set_id = $1
+    `
 	_, err := r.db.Exec(ctx, query, ruleSetID)
 	return err
 }

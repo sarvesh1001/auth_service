@@ -245,6 +245,8 @@ type PayrollItemDetail struct {
 type PayrollLedger struct {
 	LedgerID      uuid.UUID `json:"ledger_id" db:"ledger_id"`
 	PayrollItemID uuid.UUID `json:"payroll_item_id" db:"payroll_item_id"`
+	CompanyID     uuid.UUID `json:"company_id"` // new field
+
 	ComponentCode string    `json:"component_code" db:"component_code"`
 	Amount        float64   `json:"amount" db:"amount"`
 	CreatedAt     time.Time `json:"created_at" db:"created_at"`

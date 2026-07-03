@@ -135,19 +135,28 @@ func (s *leavePolicyService) AssignEntitlementToUser(
 	if req.EffectiveFrom.IsZero() {
 		return nil, fmt.Errorf("effective from date is required")
 	}
-
 	if req.EffectiveTo != nil && req.EffectiveTo.Before(req.EffectiveFrom) {
 		return nil, fmt.Errorf("effective to date must be after effective from date")
 	}
-
 	if req.TotalDays <= 0 {
 		return nil, fmt.Errorf("total days must be greater than 0")
 	}
 
+	// 🔥 NEW: Fetch user's current position context
+	positionID, workCenterCode, err := s.repo.GetUserPositionContext(ctx, req.CompanyID, req.UserID)
+	if err != nil {
+		// Log warning but do not fail; entitlement will be created without position (global)
+		s.logger.Warn("Failed to get user position context, leaving position_id and work_center_code NULL",
+			zap.String("user_id", req.UserID.String()),
+			zap.Error(err))
+	}
+	// If positionID is nil, it means no active position; that's fine.
+
+	// Check for overlapping entitlements – now also consider position
 	existingEntitlements, err := s.repo.GetLeaveEntitlementsByUser(
 		ctx,
 		req.UserID,
-		nil, // manual entitlement (not position-bound)
+		positionID, // pass the resolved position so overlapping check is position-aware
 	)
 	if err != nil {
 		s.logger.Error("Failed to get existing entitlements",
@@ -170,14 +179,17 @@ func (s *leavePolicyService) AssignEntitlementToUser(
 	}
 
 	entitlement := &models.LeaveEntitlement{
-		EntitlementID: uuid.New(),
-		CompanyID:     req.CompanyID,
-		UserID:        req.UserID,
-		LeaveTypeID:   req.LeaveTypeID,
-		TotalDays:     req.TotalDays,
-		EffectiveFrom: req.EffectiveFrom,
-		EffectiveTo:   req.EffectiveTo,
-		CreatedAt:     time.Now().UTC(),
+		EntitlementID:  uuid.New(),
+		CompanyID:      req.CompanyID,
+		UserID:         req.UserID,
+		LeaveTypeID:    req.LeaveTypeID,
+		TotalDays:      req.TotalDays,
+		EffectiveFrom:  req.EffectiveFrom,
+		EffectiveTo:    req.EffectiveTo,
+		PositionID:     positionID,     // ✅ now set
+		WorkCenterCode: workCenterCode, // ✅ now set
+		Source:         "manual",
+		CreatedAt:      time.Now().UTC(),
 	}
 
 	if err := s.repo.CreateLeaveEntitlement(ctx, entitlement); err != nil {
@@ -190,7 +202,6 @@ func (s *leavePolicyService) AssignEntitlementToUser(
 
 	return entitlement, nil
 }
-
 func (s *leavePolicyService) GetLeaveTypesByCompany(
 	ctx context.Context,
 	companyID uuid.UUID,

@@ -4,6 +4,7 @@ import (
 	"auth-service/internal/hr/service"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -113,4 +114,33 @@ func (h *AttendanceOMHandler) respondError(w http.ResponseWriter, status int, ms
 		"success": false,
 		"error":   msg,
 	})
+}
+func getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
+	// Try modern key first
+	if v := ctx.Value("current_user_id"); v != nil {
+		if id, ok := v.(uuid.UUID); ok {
+			return id, nil
+		}
+	}
+	// Fallback to old key
+	if v := ctx.Value("user_id"); v != nil {
+		switch raw := v.(type) {
+		case uuid.UUID:
+			return raw, nil
+		case string:
+			return uuid.Parse(raw)
+		default:
+			return uuid.Nil, errors.New("invalid user_id type")
+		}
+	}
+	return uuid.Nil, errors.New("user not authenticated")
+}
+func getCompanyIDFromContext(ctx context.Context) (uuid.UUID, error) {
+	if v := ctx.Value("company_id"); v != nil {
+		if id, ok := v.(uuid.UUID); ok {
+			return id, nil
+		}
+		return uuid.Nil, errors.New("invalid company_id type")
+	}
+	return uuid.Nil, errors.New("company_id not found in context")
 }

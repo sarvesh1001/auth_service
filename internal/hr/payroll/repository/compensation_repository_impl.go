@@ -826,18 +826,20 @@ func (r *compensationRepository) AddStructureComponent(
 		return fmt.Errorf("component %s does not exist or is inactive for company", component.ComponentCode)
 	}
 
+	// ✅ CRITICAL FIX: include company_id column and value
 	query := `
-		INSERT INTO payroll.salary_structure_component (
-			mapping_id,
-			salary_structure_id,
-			component_code,
-			calculation_type,
-			value,
-			based_on_component,
-			sequence_order,
-			created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-	`
+        INSERT INTO payroll.salary_structure_component (
+            mapping_id,
+            salary_structure_id,
+            company_id,
+            component_code,
+            calculation_type,
+            value,
+            based_on_component,
+            sequence_order,
+            created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    `
 	if component.MappingID == uuid.Nil {
 		component.MappingID = uuid.New()
 	}
@@ -848,6 +850,7 @@ func (r *compensationRepository) AddStructureComponent(
 	_, err = r.client.Exec(ctx, query,
 		component.MappingID,
 		component.SalaryStructureID,
+		component.CompanyID, // ✅ now provided
 		component.ComponentCode,
 		component.CalculationType,
 		component.Value,
@@ -865,7 +868,6 @@ func (r *compensationRepository) AddStructureComponent(
 	}
 	return nil
 }
-
 func (r *compensationRepository) UpdateStructureComponent(
 	ctx context.Context,
 	component *models.SalaryStructureComponent,

@@ -111,9 +111,11 @@ type PayrollRepository interface {
 	DeletePayrollAdjustment(ctx context.Context, adjustmentID uuid.UUID) error
 	GetPayrollAdjustmentByID(ctx context.Context, adjustmentID uuid.UUID) (*models.PayrollAdjustment, error)
 	ListPayrollAdjustments(ctx context.Context, filter models.PayrollAdjustmentFilter) ([]*models.PayrollAdjustment, int64, error)
+	FinalizeAttendanceForPeriod(ctx context.Context, companyID, userID uuid.UUID, startDate, endDate time.Time) error
 
 	// Statutory YTD context
 	BuildStatutoryYTDContext(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, financialYearStart time.Time) (*models.StatutoryYTDContext, error)
+	GetEmployeeIDsByRun(ctx context.Context, runID uuid.UUID) ([]uuid.UUID, error)
 
 	// Payroll run by period
 	GetPayrollRunByPeriod(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) (*models.PayrollRun, error)

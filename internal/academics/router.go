@@ -3,20 +3,19 @@ package academics
 import (
 	"auth-service/internal/academics/handler"
 	authMiddleware "auth-service/internal/middleware"
-	"auth-service/internal/service"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 )
 
-// RegisterAcademicRoutes registers all academic-related routes with their permission middleware.
+// RegisterAcademicRoutes registers all academic‑domain routes (excluding attendance,
+// which is handled by the generic attendance module).
 func RegisterAcademicRoutes(
 	r chi.Router,
 	academicYearHandler *handler.AcademicYearHandler,
 	admissionHandler *handler.AdmissionHandler,
 	analyticsHandler *handler.AnalyticsHandler,
 	assignmentHandler *handler.AssignmentHandler,
-	attendanceHandler *handler.AttendanceHandler,
 	courseHandler *handler.CourseHandler,
 	curriculumHandler *handler.CurriculumHandler,
 	enrollmentHandler *handler.EnrollmentHandler,
@@ -28,8 +27,6 @@ func RegisterAcademicRoutes(
 	notificationHandler *handler.NotificationHandler,
 	roomHandler *handler.RoomHandler,
 	sectionHandler *handler.SectionHandler,
-	logger *zap.Logger,
-	jwtService *service.JWTService,
 	studentHandler *handler.StudentHandler,
 	subjectHandler *handler.SubjectHandler,
 	submissionHandler *handler.SubmissionHandler,
@@ -38,7 +35,7 @@ func RegisterAcademicRoutes(
 	timetableHandler *handler.TimetableHandler,
 	transportHandler *handler.TransportHandler,
 	sessionGenerationHandler *handler.SessionGenerationHandler,
-	studentBiometricSyncHandler *handler.StudentBiometricSyncHandler, // <-- NEW
+	logger *zap.Logger,
 ) {
 	r.Route("/academics", func(r chi.Router) {
 		// ========== Academic Years ==========
@@ -290,72 +287,6 @@ func RegisterAcademicRoutes(
 					Get("/list", analyticsHandler.ListBiometricUsageMetrics)
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.write", logger)).
 					Post("/refresh", analyticsHandler.RefreshBiometricUsageMetrics)
-			})
-		})
-
-		// ========== Attendance ==========
-		r.Route("/attendance", func(r chi.Router) {
-			// Full‑day attendance
-			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.mark", logger)).
-				Post("/", attendanceHandler.MarkAttendance)
-			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.bulk_mark", logger)).
-				Post("/bulk", attendanceHandler.BulkMarkAttendance)
-			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
-				Get("/{attendanceID}", attendanceHandler.GetByID)
-			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
-				Get("/", attendanceHandler.List)
-			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.delete", logger)).
-				Delete("/{attendanceID}", attendanceHandler.Delete)
-
-			r.Route("/students/{studentID}/academic-years/{academicYearID}", func(r chi.Router) {
-				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
-					Get("/summary", attendanceHandler.GetSummary)
-				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.recalculate", logger)).
-					Post("/recalculate", attendanceHandler.RecalculateSummary)
-			})
-			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.recalculate", logger)).
-				Post("/recalculate/bulk", attendanceHandler.BulkRecalcSummaries)
-
-			// Exemptions
-			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.manage_exemptions", logger)).
-				Post("/exemptions", attendanceHandler.CreateExemption)
-			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.manage_exemptions", logger)).
-				Put("/exemptions/{exemptionID}", attendanceHandler.UpdateExemption)
-			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.manage_exemptions", logger)).
-				Delete("/exemptions/{exemptionID}", attendanceHandler.DeleteExemption)
-			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
-				Get("/exemptions", attendanceHandler.ListExemptions)
-
-			// Period attendance
-			r.Route("/period", func(r chi.Router) {
-				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.mark", logger)).
-					Post("/", attendanceHandler.MarkPeriodAttendance)
-				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.bulk_mark", logger)).
-					Post("/sessions/{sessionID}/bulk", attendanceHandler.BulkMarkPeriodAttendance)
-				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
-					Get("/sessions/{sessionID}", attendanceHandler.GetSessionAttendance)
-				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
-					Get("/sessions/{sessionID}/students/{enrollmentID}", attendanceHandler.GetStudentPeriodAttendance)
-				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
-					Get("/teachers/{teacherID}/sessions", attendanceHandler.GetTeacherSessions)
-				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
-					Get("/sections/{sectionID}/sessions", attendanceHandler.GetSectionSessions)
-			})
-
-			// Biometric
-			r.Route("/biometric", func(r chi.Router) {
-				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.manage_exemptions", logger)).
-					Post("/mappings", attendanceHandler.CreateBiometricMapping)
-				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
-					Get("/mappings/{mappingID}", attendanceHandler.GetBiometricMappingByID)
-				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
-					Get("/mappings", attendanceHandler.ListBiometricMappings)
-				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.manage_exemptions", logger)).
-					Put("/mappings/{mappingID}", attendanceHandler.UpdateBiometricMapping)
-				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.manage_exemptions", logger)).
-					Delete("/mappings/{mappingID}", attendanceHandler.DeleteBiometricMapping)
-				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.manage_exemptions", logger)).
-					Post("/students/{studentID}/deactivate", attendanceHandler.DeactivateStudentBiometricMappings)
 			})
 		})
 
@@ -1092,45 +1023,13 @@ func RegisterAcademicRoutes(
 		})
 
 		// ========== Session Generation ==========
+		// Fail-fast check: ensure the handler is not nil before registering the route.
+		if sessionGenerationHandler == nil {
+			logger.Fatal("❌ sessionGenerationHandler is nil – cannot register /sessions/generate. Check factory initialisation and argument order.")
+		}
 		r.Route("/sessions", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.recalculate", logger)).
-				Post("/generate", sessionGenerationHandler.GenerateSessions)
-		})
-
-		// ========== Student Face Embeddings (CRUD) ==========
-		// These endpoints are for admin/staff to manage student face embeddings.
-		// They are protected by user JWT (outer middleware) and require specific permissions.
-		// ========== Student Face Embeddings (CRUD) ==========
-		// These endpoints are for admin/staff to manage student face embeddings.
-		// They are protected by user JWT (outer middleware) and require existing permissions.
-		r.Route("/face-embeddings", func(r chi.Router) {
-			// Create a new face embedding
-			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.manage_exemptions", logger)).
-				Post("/", studentBiometricSyncHandler.CreateStudentFaceEmbedding)
-
-			// Update an existing face embedding
-			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.manage_exemptions", logger)).
-				Put("/{embeddingID}", studentBiometricSyncHandler.UpdateStudentFaceEmbedding)
-
-			// Soft‑delete a face embedding
-			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.manage_exemptions", logger)).
-				Delete("/{embeddingID}", studentBiometricSyncHandler.DeleteStudentFaceEmbedding)
-
-			// Get a face embedding by ID
-			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
-				Get("/{embeddingID}", studentBiometricSyncHandler.GetStudentFaceEmbedding)
-
-			// List face embeddings with filters & pagination
-			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
-				Get("/", studentBiometricSyncHandler.ListStudentFaceEmbeddings)
-
-			// Deactivate all embeddings for a student (e.g., when re‑enrolling)
-			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.manage_exemptions", logger)).
-				Post("/students/{studentID}/deactivate", studentBiometricSyncHandler.DeactivateEmbeddingsForStudent)
-
-			// Get active embedding for a student
-			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
-				Get("/students/{studentID}/active", studentBiometricSyncHandler.GetActiveStudentFaceEmbeddingByStudent)
+				Post("/generate", sessionGenerationHandler.GenerateSession)
 		})
 	})
 }

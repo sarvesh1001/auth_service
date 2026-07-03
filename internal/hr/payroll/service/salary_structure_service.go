@@ -241,10 +241,24 @@ func (s *salaryStructureService) PublishStructure(
 		return fmt.Errorf("already active")
 	}
 
+	// Check that the structure has at least one component.
+	comps, err := s.repo.GetStructureComponents(ctx, structureID, companyID)
+	if err != nil {
+		return fmt.Errorf("failed to check structure components: %w", err)
+	}
+	if len(comps) == 0 {
+		return fmt.Errorf("cannot publish structure without components")
+	}
+
+	// No "in use" check – we allow activation even if assigned to employees.
+	// This is a deliberate change for payroll compatibility: an inactive structure
+	// that is already assigned to employees should still be publishable.
+
 	beforeState, _ := json.Marshal(structure)
 
 	structure.IsActive = true
 	structure.UpdatedBy = &actorID
+	structure.UpdatedAt = time.Now().UTC()
 
 	if err := s.repo.UpdateSalaryStructure(ctx, structure); err != nil {
 		return err
@@ -253,7 +267,7 @@ func (s *salaryStructureService) PublishStructure(
 	afterState, _ := json.Marshal(structure)
 	_ = s.audit.LogAction(
 		ctx,
-		nil, // ✅ added transaction argument
+		nil,
 		&structure.CompanyID,
 		"payroll",
 		"salary_structure_published",

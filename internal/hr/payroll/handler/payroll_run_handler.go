@@ -10,6 +10,7 @@ import (
 	"auth-service/internal/hr/payroll/models"
 	"auth-service/internal/hr/payroll/repository"
 	"auth-service/internal/hr/payroll/service"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -321,6 +322,9 @@ func (h *PayrollRunHandler) MarkRunAsPaid(w http.ResponseWriter, r *http.Request
 }
 
 // CancelRun handles POST /companies/{companyID}/payroll/runs/{runID}/cancel
+
+// hr/payroll/handler/payroll_run_handler.go
+
 func (h *PayrollRunHandler) CancelRun(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -348,9 +352,18 @@ func (h *PayrollRunHandler) CancelRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.engineService.CancelRun(ctx, runID, actorID); err != nil {
+	err = h.engineService.CancelRun(ctx, runID, actorID)
+	if err != nil {
 		h.logger.Error("failed to cancel payroll run", zap.String("run_id", runID.String()), zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+
+		// Handle specific errors with appropriate status codes
+		if strings.Contains(err.Error(), "already in terminal state") {
+			h.respondWithError(w, http.StatusConflict, err.Error())
+		} else if strings.Contains(err.Error(), "run not found") {
+			h.respondWithError(w, http.StatusNotFound, err.Error())
+		} else {
+			h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		}
 		return
 	}
 

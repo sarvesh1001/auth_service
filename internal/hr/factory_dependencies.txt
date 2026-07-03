@@ -1,0 +1,1476 @@
+====================================================================================================
+./handler/attendance_class_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAttendanceClassHandler(
+	classService service.ClassAttendanceService,
+	logger *zap.Logger,
+) *AttendanceClassHandler {
+	return &AttendanceClassHandler{
+		classService: classService,
+		logger:       logger,
+	}
+}
+
+====================================================================================================
+./handler/attendance_om_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAttendanceOMHandler(
+	omService service.AttendanceOMService,
+	logger *zap.Logger,
+) *AttendanceOMHandler {
+	return &AttendanceOMHandler{
+		omService: omService,
+		logger:    logger,
+	}
+}
+
+====================================================================================================
+./handler/employee_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewEmployeeHandler(
+	employeeService *service.EmployeeService,
+	employeeQueryService *service.EmployeeQueryService,
+	auditService *a.AuditService,
+	logger *zap.Logger,
+	maxDocumentSizeMB int,
+) *EmployeeHandler {
+	if maxDocumentSizeMB <= 0 {
+		maxDocumentSizeMB = 50
+	}
+
+	return &EmployeeHandler{
+		employeeService:      employeeService,
+		employeeQueryService: employeeQueryService,
+		auditService:         auditService,
+		logger:               logger,
+		maxDocumentSizeMB:    maxDocumentSizeMB,
+	}
+}
+
+====================================================================================================
+./handler/org_unit_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewOrgUnitHandler(
+	orgUnitService *service.OrgUnitService,
+	orgUnitQueryService *service.OrgUnitQueryService,
+	auditService *a.AuditService,
+	logger *zap.Logger,
+) *OrgUnitHandler {
+	return &OrgUnitHandler{
+		orgUnitService:      orgUnitService,
+		orgUnitQueryService: orgUnitQueryService,
+		auditService:        auditService,
+		logger:              logger,
+	}
+}
+
+====================================================================================================
+./repository/employee_repository_postgres.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewEmployeeRepository(postgresClient *client.PostgresClient, logger *zap.Logger) EmployeeRepository {
+	repo := &EmployeeRepositoryImpl{
+		client:    postgresClient,
+		logger:    logger,
+		stmtCache: make(map[string]*sql.Stmt),
+	}
+
+	go repo.initializePreparedStatements(context.Background())
+	return repo
+}
+
+====================================================================================================
+./repository/identity_repository.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAttendanceIdentityRepository(
+	postgresClient *client.PostgresClient,
+	logger *zap.Logger,
+) AttendanceIdentityRepository {
+	return &attendanceIdentityRepository{
+		client: postgresClient,
+		logger: logger,
+	}
+}
+
+====================================================================================================
+./repository/org_unit_repository_impl.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewOrgUnitRepository(
+	postgresClient *client.PostgresClient,
+	logger *zap.Logger,
+) OrgUnitRepository {
+	repo := &OrgUnitRepositoryImpl{
+		client:    postgresClient,
+		logger:    logger,
+		stmtCache: make(map[string]*sql.Stmt),
+	}
+
+	repo.initializePreparedStatements(context.Background())
+
+	return repo
+}
+
+====================================================================================================
+./service/attendance_bulk_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAttendanceBulkService(
+	correctionSvc admin.CorrectionService,
+	resolutionSvc resolution.ResolutionService,
+	omService AttendanceOMService,
+	logger *zap.Logger,
+) AttendanceBulkService {
+	return &attendanceBulkService{
+		correctionSvc: correctionSvc,
+		resolutionSvc: resolutionSvc,
+		omService:     omService,
+		logger:        logger,
+	}
+}
+
+====================================================================================================
+./service/attendance_class_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewClassAttendanceService(
+	orgUnitRepo repository.OrgUnitRepository,
+	bulkService AttendanceBulkService,
+	logger *zap.Logger,
+) ClassAttendanceService {
+	return &classAttendanceService{
+		orgUnitRepo: orgUnitRepo,
+		bulkService: bulkService,
+		logger:      logger,
+	}
+}
+
+====================================================================================================
+./service/attendance_om_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAttendanceOMService(
+	orgUnitRepo repository.OrgUnitRepository,
+	auditService *a.AuditService,
+	logger *zap.Logger,
+) AttendanceOMService {
+	return &attendanceOMService{
+		orgUnitRepo:  orgUnitRepo,
+		auditService: auditService,
+		logger:       logger,
+	}
+}
+
+====================================================================================================
+./service/attendance_payroll_bridge.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAttendancePayrollBridge(
+	summaryRepo repository.SummaryRepository,
+	eventRepo repository.EventRepository,
+	logger *zap.Logger,
+) AttendancePayrollBridge {
+	return &attendancePayrollBridge{
+		summaryRepo: summaryRepo,
+		eventRepo:   eventRepo,
+		logger:      logger,
+	}
+}
+
+====================================================================================================
+./service/document_storage.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewLocalDocumentStorage(basePath string, maxFileSizeMB int, logger *zap.Logger) (*LocalDocumentStorage, error) {
+	if basePath == "" {
+		basePath = "/tmp/employee_documents"
+	}
+
+	if maxFileSizeMB <= 0 {
+		maxFileSizeMB = 50
+	}
+
+	if err := os.MkdirAll(basePath, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create base directory: %w", err)
+	}
+
+	allowed := map[string]struct{}{
+		"application/pdf":    {},
+		"image/jpeg":         {},
+		"image/png":          {},
+		"image/gif":          {},
+		"text/plain":         {},
+		"application/zip":    {},
+		"application/msword": {},
+		"application/vnd.openxmlformats-officedocument.wordprocessingml.document": {},
+		"application/vnd.ms-excel": {},
+		"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {},
+	}
+
+	return &LocalDocumentStorage{
+		basePath:     basePath,
+		maxFileSize:  int64(maxFileSizeMB) * 1024 * 1024,
+		allowedTypes: allowed,
+		logger:       logger,
+	}, nil
+}
+
+====================================================================================================
+./service/employee_query_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewEmployeeQueryService(
+	employeeRepo repository.EmployeeRepository,
+	documentStorage DocumentStorage,
+	logger *zap.Logger,
+) *EmployeeQueryService {
+
+	if documentStorage == nil {
+		panic("documentStorage is required for EmployeeQueryService")
+	}
+
+	return &EmployeeQueryService{
+		employeeRepo:    employeeRepo,
+		documentStorage: documentStorage,
+		logger:          logger,
+	}
+}
+
+====================================================================================================
+./service/employee_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewEmployeeService(
+	employeeRepo repository.EmployeeRepository,
+	auditService *a.AuditService,
+	config EmployeeServiceConfig,
+	logger *zap.Logger,
+) *EmployeeService {
+
+	if auditService == nil {
+		panic("auditService is required for EmployeeService")
+	}
+	if config.DocumentStorage == nil {
+		panic("documentStorage is required for EmployeeService")
+	}
+
+	if config.MaxDocumentSizeMB <= 0 {
+		config.MaxDocumentSizeMB = 50
+	}
+
+	return &EmployeeService{
+		employeeRepo:      employeeRepo,
+		auditService:      auditService,
+		documentStorage:   config.DocumentStorage,
+		logger:            logger,
+		maxDocumentSizeMB: config.MaxDocumentSizeMB,
+	}
+}
+
+====================================================================================================
+./service/org_unit_query_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewOrgUnitQueryService(
+	orgUnitRepo repository.OrgUnitRepository,
+	logger *zap.Logger,
+) *OrgUnitQueryService {
+	return &OrgUnitQueryService{
+		orgUnitRepo: orgUnitRepo,
+		logger:      logger,
+	}
+}
+
+====================================================================================================
+./service/org_unit_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewOrgUnitService(
+	orgUnitRepo repository.OrgUnitRepository,
+	auditService *a.AuditService,
+	logger *zap.Logger,
+) *OrgUnitService {
+	return &OrgUnitService{
+		orgUnitRepo:  orgUnitRepo,
+		auditService: auditService,
+		logger:       logger,
+	}
+}
+
+====================================================================================================
+./service/schedule_resolver_impl.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewEmployeeScheduleResolver(
+	employeeRepo hrRepo.EmployeeRepository,
+	workCenterRepo attRepo.WorkCenterRepository,
+	leaveQuery leaveSvc.LeaveQueryService,
+	logger *zap.Logger,
+) resolver.ScheduleSubjectResolver {
+	return &EmployeeScheduleResolver{
+		employeeRepo:   employeeRepo,
+		workCenterRepo: workCenterRepo,
+		leaveQuery:     leaveQuery,
+		logger:         logger,
+	}
+}
+
+====================================================================================================
+./payroll/handler/attendance_rule_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAttendanceRuleHandler(ruleService service.AttendanceRuleService, logger *zap.Logger) *AttendanceRuleHandler {
+	return &AttendanceRuleHandler{
+		ruleService: ruleService,
+		logger:      logger,
+		validate:    validator.New(),
+	}
+}
+
+====================================================================================================
+./payroll/handler/bank_export_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewBankExportHandler(
+	bankService service.BankExportService,
+	logger *zap.Logger,
+) *BankExportHandler {
+	return &BankExportHandler{
+		bankService: bankService,
+		logger:      logger.Named("bank_export_handler"),
+	}
+}
+
+====================================================================================================
+./payroll/handler/compensation_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewCompensationHandler(compensationSvc service.CompensationService, logger *zap.Logger) *CompensationHandler {
+	return &CompensationHandler{
+		compensationSvc: compensationSvc,
+		logger:          logger.Named("compensation_handler"),
+	}
+}
+
+====================================================================================================
+./payroll/handler/component_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewComponentHandler(componentService service.ComponentService, logger *zap.Logger) *ComponentHandler {
+	return &ComponentHandler{
+		componentService: componentService,
+		logger:           logger.Named("component_handler"),
+	}
+}
+
+====================================================================================================
+./payroll/handler/employee_fine_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewEmployeeFineHandler(fineService service.EmployeeFineService, logger *zap.Logger) *EmployeeFineHandler {
+	return &EmployeeFineHandler{
+		fineService: fineService,
+		logger:      logger,
+	}
+}
+
+====================================================================================================
+./payroll/handler/loan_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewLoanHandler(loanService service.LoanService, logger *zap.Logger) *LoanHandler {
+	return &LoanHandler{
+		loanService: loanService,
+		logger:      logger.Named("loan_handler"),
+	}
+}
+
+====================================================================================================
+./payroll/handler/payroll_adjustment_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewPayrollAdjustmentHandler(
+	adjustmentService service.PayrollAdjustmentService,
+	logger *zap.Logger,
+) *PayrollAdjustmentHandler {
+	return &PayrollAdjustmentHandler{
+		adjustmentService: adjustmentService,
+		logger:            logger,
+	}
+}
+
+====================================================================================================
+./payroll/handler/payroll_command_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewPayrollCommandHandler(
+	engine service.PayrollEngineService,
+	logger *zap.Logger,
+) *PayrollCommandHandler {
+	return &PayrollCommandHandler{
+		engine: engine,
+		logger: logger.Named("payroll_command_handler"),
+	}
+}
+
+====================================================================================================
+./payroll/handler/payroll_lock_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewPayrollLockHandler(
+	lockService service.PayrollLockService,
+	logger *zap.Logger,
+) *PayrollLockHandler {
+	return &PayrollLockHandler{
+		lockService: lockService,
+		logger:      logger,
+	}
+}
+
+====================================================================================================
+./payroll/handler/payroll_query_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewPayrollQueryHandler(
+	queryService service.PayrollQueryService,
+	logger *zap.Logger,
+) *PayrollQueryHandler {
+	return &PayrollQueryHandler{
+		queryService: queryService,
+		logger:       logger,
+	}
+}
+
+====================================================================================================
+./payroll/handler/payroll_run_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewPayrollRunHandler(
+	engineService service.PayrollEngineService,
+	queryService service.PayrollQueryService,
+	jobRepo repository.PayrollJobRepository,
+	logger *zap.Logger,
+) *PayrollRunHandler {
+	return &PayrollRunHandler{
+		engineService: engineService,
+		queryService:  queryService,
+		jobRepo:       jobRepo,
+		logger:        logger.Named("payroll_run_handler"),
+	}
+}
+
+====================================================================================================
+./payroll/handler/payslip_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewPayslipHandler(payslipService service.PayslipService, logger *zap.Logger) *PayslipHandler {
+	return &PayslipHandler{
+		payslipService: payslipService,
+		logger:         logger.Named("payslip_handler"),
+	}
+}
+
+====================================================================================================
+./payroll/handler/reporting_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewReportingHandler(reportingService service.ReportingService, logger *zap.Logger) *ReportingHandler {
+	return &ReportingHandler{
+		reportingService: reportingService,
+		logger:           logger.Named("reporting_handler"),
+	}
+}
+
+====================================================================================================
+./payroll/handler/salary_structure_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewSalaryStructureHandler(
+	structService service.SalaryStructureService,
+	logger *zap.Logger,
+) *SalaryStructureHandler {
+	return &SalaryStructureHandler{
+		structService: structService,
+		logger:        logger,
+	}
+}
+
+====================================================================================================
+./payroll/handler/statutory_profile_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewStatutoryProfileHandler(
+	profileService service.StatutoryProfileService,
+	engine service.StatutoryEngine,
+	logger *zap.Logger,
+) *StatutoryProfileHandler {
+	return &StatutoryProfileHandler{
+		profileService: profileService,
+		engine:         engine,
+		logger:         logger,
+	}
+}
+
+====================================================================================================
+./payroll/handler/tax_declaration_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewTaxDeclarationHandler(taxService service.TaxDeclarationService, logger *zap.Logger) *TaxDeclarationHandler {
+	return &TaxDeclarationHandler{
+		taxService: taxService,
+		logger:     logger.Named("tax_declaration_handler"),
+	}
+}
+
+====================================================================================================
+./payroll/repository/arrears_repository.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewArrearsRepository(postgresClient *client.PostgresClient, logger *zap.Logger) ArrearsRepository {
+	return &arrearsRepository{
+		client: postgresClient,
+		logger: logger.Named("arrears_repo"),
+	}
+}
+
+====================================================================================================
+./payroll/repository/attendance_rule_repository_postgres.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAttendanceRuleRepository(
+	postgresClient *client.PostgresClient,
+	logger *zap.Logger,
+) AttendanceRuleRepository {
+	return &attendanceRuleRepository{
+		client: postgresClient,
+		logger: logger,
+	}
+}
+
+====================================================================================================
+./payroll/repository/bank_details_repo.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewBankDetailsRepository(
+	postgresClient *client.PostgresClient,
+	encryptionManager *encryption.EncryptionManager,
+	logger *zap.Logger,
+) BankDetailsRepository {
+	return &bankDetailsRepository{
+		client:     postgresClient,
+		encryption: encryptionManager,
+		logger:     logger.Named("bank_details_repo"),
+	}
+}
+
+====================================================================================================
+./payroll/repository/company_settings_repository_impl.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewCompanySettingsRepository(
+	postgresClient *client.PostgresClient,
+	logger *zap.Logger,
+) CompanySettingsRepository {
+	return &companySettingsRepository{
+		client: postgresClient,
+		logger: logger.Named("company_settings_repo"),
+	}
+}
+
+====================================================================================================
+./payroll/repository/compensation_repository_impl.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewCompensationRepository(
+	postgresClient *client.PostgresClient,
+	logger *zap.Logger,
+) CompensationRepository {
+	return &compensationRepository{
+		client: postgresClient,
+		logger: logger,
+	}
+}
+
+====================================================================================================
+./payroll/repository/component_repository_impl.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewComponentRepository(
+	postgresClient *client.PostgresClient,
+	logger *zap.Logger,
+) ComponentRepository {
+	return &componentRepository{
+		client: postgresClient,
+		logger: logger.Named("component_repo"),
+	}
+}
+
+====================================================================================================
+./payroll/repository/employee_fine_repository_postgres.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewEmployeeFineRepository(
+	postgresClient *client.PostgresClient,
+	logger *zap.Logger,
+) EmployeeFineRepository {
+	return &employeeFineRepository{
+		client: postgresClient,
+		logger: logger,
+	}
+}
+
+====================================================================================================
+./payroll/repository/loan_repository.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewLoanRepository(postgresClient *client.PostgresClient, logger *zap.Logger) LoanRepository {
+	return &loanRepository{
+		client: postgresClient,
+		logger: logger,
+	}
+}
+
+====================================================================================================
+./payroll/repository/payroll_job_repository.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewPayrollJobRepository(pg *client.PostgresClient, logger *zap.Logger) PayrollJobRepository {
+	return &payrollJobRepository{
+		client: pg,
+		logger: logger,
+	}
+}
+
+====================================================================================================
+./payroll/repository/payroll_repository_postgres.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewPayrollRepository(
+	postgresClient *client.PostgresClient,
+	logger *zap.Logger,
+) PayrollRepository {
+	return &payrollRepository{
+		client: postgresClient,
+		logger: logger,
+	}
+}
+
+====================================================================================================
+./payroll/repository/payslip_repository.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewPayslipRepository(db *client.PostgresClient, logger *zap.Logger) PayslipRepository {
+	return &payslipRepository{
+		db:     db,
+		logger: logger.Named("payslip_repo"),
+	}
+}
+
+====================================================================================================
+./payroll/repository/salary_structure_repository.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewSalaryStructureRepository(pg *client.PostgresClient, logger *zap.Logger) SalaryStructureRepository {
+	return &salaryStructureRepository{
+		client: pg,
+		logger: logger.Named("salary_structure_repo"),
+	}
+}
+
+====================================================================================================
+./payroll/repository/statutory_profiler_repository.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewStatutoryProfileRepository(postgresClient *client.PostgresClient, logger *zap.Logger) StatutoryProfileRepository {
+	return &statutoryProfileRepository{
+		db:     postgresClient,
+		logger: logger.Named("statutory_profile_repo"),
+	}
+}
+
+====================================================================================================
+./payroll/repository/statutory_repository_impl.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewStatutoryRepository(postgresClient *client.PostgresClient, logger *zap.Logger) StatutoryRepository {
+	return &statutoryRepository{
+		db:     postgresClient,
+		logger: logger,
+	}
+}
+
+func NewStatutoryRepositoryFromTx(tx *sql.Tx, logger *zap.Logger) StatutoryRepository {
+	return &statutoryRepository{
+		db:     &txQuerier{tx: tx},
+		logger: logger,
+	}
+}
+
+====================================================================================================
+./payroll/repository/tax_declaration_repository.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewTaxDeclarationRepository(postgresClient *client.PostgresClient, logger *zap.Logger) TaxDeclarationRepository {
+	return &taxDeclarationRepository{
+		client: postgresClient,
+		logger: logger.Named("tax_declaration_repo"),
+	}
+}
+
+====================================================================================================
+./payroll/service/attendance_rule_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewAttendanceRuleService(
+	ruleRepo repository.AttendanceRuleRepository,
+	compRepo repository.ComponentRepository,
+	logger *zap.Logger,
+) AttendanceRuleService {
+	return &attendanceRuleService{
+		ruleRepo: ruleRepo,
+		compRepo: compRepo,
+		logger:   logger,
+	}
+}
+
+====================================================================================================
+./payroll/service/bank_export_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewBankExportService(
+	payrollRepo repository.PayrollRepository,
+	bankRepo repository.BankDetailsRepository,
+	logger *zap.Logger,
+) BankExportService {
+	return &bankExportService{
+		payrollRepo: payrollRepo,
+		bankRepo:    bankRepo,
+		logger:      logger.Named("bank_export_service"),
+	}
+}
+
+====================================================================================================
+./payroll/service/compensation_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewCompensationService(
+	compRepo repository.CompensationRepository,
+	payrollRepo repository.PayrollRepository,
+	audit *a.AuditService,
+	logger *zap.Logger,
+) CompensationService {
+	return &compensationService{
+		compRepo:    compRepo,
+		payrollRepo: payrollRepo,
+		audit:       audit,
+		logger:      logger.Named("compensation_service"),
+	}
+}
+
+====================================================================================================
+./payroll/service/component_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewComponentService(
+	compRepo ComponentRepository,
+	settingsRepo CompanySettingsRepository,
+	logger *zap.Logger,
+) ComponentService {
+	return &componentService{
+		compRepo:     compRepo,
+		settingsRepo: settingsRepo,
+		logger:       logger.Named("component_service"),
+		cache:        make(map[uuid.UUID]map[string]*models.PayrollComponent),
+	}
+}
+
+====================================================================================================
+./payroll/service/employee_fine_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewEmployeeFineService(
+	fineRepo repository.EmployeeFineRepository,
+	payrollRepo repository.PayrollRepository,
+	componentRepo repository.ComponentRepository,
+	settingsRepo repository.CompanySettingsRepository,
+	audit *a.AuditService,
+	logger *zap.Logger,
+) EmployeeFineService {
+	return &employeeFineService{
+		fineRepo:      fineRepo,
+		payrollRepo:   payrollRepo,
+		componentRepo: componentRepo,
+		settingsRepo:  settingsRepo,
+		audit:         audit,
+		logger:        logger,
+	}
+}
+
+====================================================================================================
+./payroll/service/loan_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewLoanService(
+	repo repository.LoanRepository,
+	componentRepo repository.ComponentRepository,
+	settingsRepo repository.CompanySettingsRepository,
+	compensationSvc CompensationService,
+	audit *a.AuditService,
+	logger *zap.Logger,
+) LoanService {
+	return &loanService{
+		repo:            repo,
+		componentRepo:   componentRepo,
+		settingsRepo:    settingsRepo,
+		compensationSvc: compensationSvc,
+		audit:           audit,
+		logger:          logger.Named("loan_service"),
+	}
+}
+
+====================================================================================================
+./payroll/service/payroll_adjustment_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewPayrollAdjustmentService(
+	repo repository.PayrollRepository,
+	audit *a.AuditService,
+	logger *zap.Logger,
+) PayrollAdjustmentService {
+	return &payrollAdjustmentService{
+		repo:   repo,
+		audit:  audit,
+		logger: logger,
+	}
+}
+
+====================================================================================================
+./payroll/service/payroll_engine.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewPayrollEngineService(
+	payrollRepo repository.PayrollRepository,
+	jobRepo repository.PayrollJobRepository,
+	compensationSvc CompensationService,
+	statutoryEngine StatutoryEngine,
+	attendanceBridge hrservice.AttendancePayrollBridge,
+	audit *a.AuditService,
+	attendanceRuleRepo repository.AttendanceRuleRepository,
+	employeeFineRepo repository.EmployeeFineRepository,
+	arrearsRepo repository.ArrearsRepository,
+	loanRepo repository.LoanRepository,
+	componentRepo repository.ComponentRepository,
+	settingsRepo repository.CompanySettingsRepository,
+	logger *zap.Logger,
+) PayrollEngineService {
+	return &payrollEngineService{
+		payrollRepo:        payrollRepo,
+		jobRepo:            jobRepo,
+		compensationSvc:    compensationSvc,
+		statutoryEngine:    statutoryEngine,
+		attendanceBridge:   attendanceBridge,
+		audit:              audit,
+		attendanceRuleRepo: attendanceRuleRepo,
+		employeeFineRepo:   employeeFineRepo,
+		arrearsRepo:        arrearsRepo,
+		loanRepo:           loanRepo,
+		componentRepo:      componentRepo,
+		settingsRepo:       settingsRepo,
+		logger:             logger,
+	}
+}
+
+====================================================================================================
+./payroll/service/payroll_lock_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewPayrollLockService(
+	repo repository.PayrollRepository,
+	audit *a.AuditService,
+	logger *zap.Logger,
+) PayrollLockService {
+	return &payrollLockService{
+		repo:   repo,
+		audit:  audit,
+		logger: logger.Named("payroll_lock_service"),
+	}
+}
+
+====================================================================================================
+./payroll/service/payroll_query_service_impl.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewPayrollQueryService(
+	payrollRepo repository.PayrollRepository,
+	bankRepo repository.BankDetailsRepository,
+	payslipRepo repository.PayslipRepository,
+	pdfGen PDFGenerator,
+	audit *a.AuditService,
+	logger *zap.Logger,
+) PayrollQueryService {
+	return &payrollQueryService{
+		payrollRepo:  payrollRepo,
+		bankRepo:     bankRepo,
+		payslipRepo:  payslipRepo,
+		pdfGenerator: pdfGen,
+		audit:        audit,
+		logger:       logger.Named("payroll_query_service"),
+	}
+}
+
+====================================================================================================
+./payroll/service/payroll_worker.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewPayrollWorker(
+	jobRepo repository.PayrollJobRepository,
+	engine PayrollEngineService,
+	logger *zap.Logger,
+	workerID string,
+	maxConcurrentPerCompany int,
+) *PayrollWorker {
+	return &PayrollWorker{
+		jobRepo:                 jobRepo,
+		engine:                  engine,
+		logger:                  logger,
+		workerID:                workerID,
+		pollDelay:               5 * time.Second,
+		maxConcurrentPerCompany: maxConcurrentPerCompany,
+	}
+}
+
+====================================================================================================
+./payroll/service/payslip_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewPayslipService(
+	payslipRepo repository.PayslipRepository,
+	emailSender email.Sender,
+	logger *zap.Logger,
+) PayslipService {
+	return &payslipService{
+		payslipRepo: payslipRepo,
+		emailSender: emailSender,
+		logger:      logger.Named("payslip_service"),
+	}
+}
+
+====================================================================================================
+./payroll/service/reporting_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewReportingService(
+	payrollRepo repository.PayrollRepository,
+	logger *zap.Logger,
+) ReportingService {
+	return &reportingService{
+		payrollRepo: payrollRepo,
+		logger:      logger.Named("reporting_service"),
+	}
+}
+
+====================================================================================================
+./payroll/service/salary_structure_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewSalaryStructureService(
+	repo repository.CompensationRepository,
+	lockService PayrollLockService,
+	compensationSvc CompensationService,
+	arrearsSvc ArrearsService,
+	audit *a.AuditService,
+	logger *zap.Logger,
+) SalaryStructureService {
+	return &salaryStructureService{
+		repo:            repo,
+		lockService:     lockService,
+		compensationSvc: compensationSvc,
+		arrearsSvc:      arrearsSvc,
+		audit:           audit,
+		logger:          logger.Named("salary_structure_service"),
+	}
+}
+
+====================================================================================================
+./payroll/service/statutory_engine.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewStatutoryEngine(
+	repo repository.StatutoryRepository,
+	audit *a.AuditService,
+	logger *zap.Logger,
+) StatutoryEngine {
+	return &statutoryEngine{
+		repo:   repo,
+		audit:  audit,
+		logger: logger,
+	}
+}
+
+====================================================================================================
+./payroll/service/statutory_profile_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewStatutoryProfileService(
+	repo repository.StatutoryProfileRepository,
+	audit *a.AuditService,
+	logger *zap.Logger,
+) StatutoryProfileService {
+	return &statutoryProfileService{
+		repo:   repo,
+		audit:  audit,
+		logger: logger.Named("statutory_profile_service"),
+	}
+}
+
+====================================================================================================
+./payroll/service/tax_declaration_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewTaxDeclarationService(
+	repo repository.TaxDeclarationRepository,
+	audit *a.AuditService,
+	logger *zap.Logger,
+) TaxDeclarationService {
+	return &taxDeclarationService{
+		repo:   repo,
+		audit:  audit,
+		logger: logger.Named("tax_declaration_service"),
+	}
+}
+
+====================================================================================================
+./payroll/service/pdf/generator.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewGenerator() *Generator {
+	return &Generator{}
+}
+
+====================================================================================================
+./payroll/events/payroll_events.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewPayrollEventPublisher(logger *zap.Logger) PayrollEventPublisher {
+	return &payrollEventPublisher{
+		logger: logger,
+	}
+}
+
+====================================================================================================
+./leave/handler/leave_admin_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewLeaveAdminHandler(
+	policyService service.LeavePolicyService,
+	policyConfigService service.LeavePolicyConfigService, // ✅ ADD
+	accrualService service.LeaveAccrualService,
+	logger *zap.Logger,
+) *LeaveAdminHandler {
+	return &LeaveAdminHandler{
+		policyService:       policyService,
+		policyConfigService: policyConfigService,
+		accrualService:      accrualService,
+		logger:              logger,
+	}
+}
+
+====================================================================================================
+./leave/handler/leave_policy_resolution_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewLeavePolicyResolutionHandler(
+	policyResolutionService service.LeavePolicyResolutionService,
+	logger *zap.Logger,
+) *LeavePolicyResolutionHandler {
+	return &LeavePolicyResolutionHandler{
+		policyResolutionService: policyResolutionService,
+		logger:                  logger.Named("leave_policy_resolution_handler"),
+	}
+}
+
+====================================================================================================
+./leave/handler/leave_query_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewLeaveQueryHandler(
+	queryService service.LeaveQueryService,
+	logger *zap.Logger,
+) *LeaveQueryHandler {
+	return &LeaveQueryHandler{
+		queryService: queryService,
+		logger:       logger.Named("leave_query_handler"),
+	}
+}
+
+====================================================================================================
+./leave/handler/leave_request_handler.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewLeaveRequestHandler(
+	requestService service.LeaveRequestService,
+	queryService service.LeaveQueryService,
+	schedulingService scheduling.SchedulingService,
+	logger *zap.Logger,
+) *LeaveRequestHandler {
+	return &LeaveRequestHandler{
+		requestService:    requestService,
+		queryService:      queryService,
+		schedulingService: schedulingService,
+		logger:            logger,
+	}
+}
+
+====================================================================================================
+./leave/repository/leave_repository_postgres.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewLeaveRepository(
+	postgresClient *client.PostgresClient,
+	logger *zap.Logger,
+) LeaveRepository {
+	return &leaveRepository{
+		client: postgresClient,
+		logger: logger,
+	}
+}
+
+====================================================================================================
+./leave/service/leave_accrual_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewLeaveAccrualService(repo repository.LeaveRepository, logger *zap.Logger) LeaveAccrualService {
+	return &leaveAccrualService{
+		repo:   repo,
+		logger: logger,
+	}
+}
+
+====================================================================================================
+./leave/service/leave_balance_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewLeaveBalanceService(
+	repo repository.LeaveRepository,
+	logger *zap.Logger,
+) LeaveBalanceService {
+	return &leaveBalanceService{
+		repo:   repo,
+		logger: logger.Named("leave_balance_service"),
+	}
+}
+
+====================================================================================================
+./leave/service/leave_policy_config_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewLeavePolicyConfigService(
+	repo repository.LeaveRepository,
+	logger *zap.Logger,
+) LeavePolicyConfigService {
+	return &leavePolicyConfigService{
+		repo:   repo,
+		logger: logger.Named("leave_policy_config_service"),
+	}
+}
+
+====================================================================================================
+./leave/service/leave_policy_resolution_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewLeavePolicyResolutionService(
+	repo repository.LeaveRepository,
+	logger *zap.Logger,
+) LeavePolicyResolutionService {
+	return &leavePolicyResolutionService{
+		repo:   repo,
+		logger: logger.Named("leave_policy_resolution_service"),
+	}
+}
+
+====================================================================================================
+./leave/service/leave_policy_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewLeavePolicyService(
+	repo repository.LeaveRepository,
+	logger *zap.Logger,
+) LeavePolicyService {
+	return &leavePolicyService{
+		repo:   repo,
+		logger: logger,
+	}
+}
+
+====================================================================================================
+./leave/service/leave_query_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewLeaveQueryService(
+	repo repository.LeaveRepository,
+	logger *zap.Logger,
+) LeaveQueryService {
+	return &leaveQueryService{
+		repo:   repo,
+		logger: logger.Named("leave_query_service"),
+	}
+}
+
+====================================================================================================
+./leave/service/leave_request_service.go
+====================================================================================================
+
+CONSTRUCTORS
+------------------------------------------------------------
+
+func NewLeaveRequestService(
+	repo repository.LeaveRepository,
+	balanceService LeaveBalanceService,
+	logger *zap.Logger,
+) LeaveRequestService {
+	return &leaveRequestService{
+		repo:           repo,
+		balanceService: balanceService,
+		logger:         logger,
+	}
+}
+

@@ -83,4 +83,10 @@ type EmployeeRepository interface {
 	) error
 	// Health check
 	HealthCheck(ctx context.Context) error
+	// GetActiveUsersByPosition returns all active user IDs for a given position.
+	GetActiveUsersByPosition(ctx context.Context, positionID uuid.UUID) ([]uuid.UUID, error)
+
+	// GetActiveEmployeesByCompany returns all active employee user IDs for a company.
+	GetActiveEmployeesByCompany(ctx context.Context, companyID uuid.UUID) ([]uuid.UUID, error)
+	GetCompanyEmployeeByUserID(ctx context.Context, userID uuid.UUID) (*employee.CompanyEmployee, error)
 }

@@ -63,6 +63,23 @@ func (s *sessionGenerationService) GenerateSessions(ctx context.Context, startDa
 		zap.String("job_id", jobID),
 	)
 
+	// ============================================================
+	// 🔥 FIX: Defensive nil checks – prevents panic
+	// ============================================================
+	if s.pgClient == nil {
+		return 0, fmt.Errorf("pgClient is not initialized")
+	}
+	if s.idempotencyStore == nil {
+		return 0, fmt.Errorf("idempotencyStore is not initialized")
+	}
+	if s.outboxRepo == nil {
+		return 0, fmt.Errorf("outboxRepo is not initialized")
+	}
+	if s.timetableSvc == nil {
+		return 0, fmt.Errorf("timetableSvc is not initialized")
+	}
+	// ============================================================
+
 	// Validate inputs
 	if startDate.After(endDate) {
 		return 0, fmt.Errorf("%w: start_date must be before end_date", ErrInvalidInput)
@@ -114,21 +131,21 @@ func (s *sessionGenerationService) GenerateSessions(ctx context.Context, startDa
 		// Not fatal, but log error
 	}
 
-	// Audit log – adjust to correct signature
+	// Audit log
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(
 			ctx,
-			tx,                  // *sql.Tx
-			nil,                 // companyID *uuid.UUID
-			"academics",         // module
-			"generate",          // action
-			"academic_sessions", // entityType
-			nil,                 // entityID *uuid.UUID
-			"system",            // userType
-			nil,                 // userID *uuid.UUID
-			nil,                 // oldData []byte
-			nil,                 // newData []byte
-			map[string]interface{}{ // metadata
+			tx,
+			nil,
+			"academics",
+			"generate",
+			"academic_sessions",
+			nil,
+			"system",
+			nil,
+			nil,
+			nil,
+			map[string]interface{}{
 				"job_id":     jobID,
 				"start_date": startDate,
 				"end_date":   endDate,
@@ -137,7 +154,7 @@ func (s *sessionGenerationService) GenerateSessions(ctx context.Context, startDa
 		)
 	}
 
-	// Publish outbox event – aggregate_id is the jobID (a valid UUID string)
+	// Publish outbox event
 	payload, _ := json.Marshal(map[string]interface{}{
 		"job_id":     jobID,
 		"start_date": startDate,
@@ -147,7 +164,7 @@ func (s *sessionGenerationService) GenerateSessions(ctx context.Context, startDa
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
 		AggregateType: "academic_sessions",
-		AggregateID:   jobID, // jobID is a UUID string, matches database column type
+		AggregateID:   jobID,
 		EventType:     string(EventSessionsGenerated),
 		Topic:         TopicStudent,
 		Payload:       payload,

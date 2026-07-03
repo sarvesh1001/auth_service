@@ -412,13 +412,62 @@ func (s *payrollEngineService) CancelRun(ctx context.Context, runID uuid.UUID, a
 	if err != nil || run == nil {
 		return fmt.Errorf("run not found")
 	}
-	if run.Status != "draft" {
-		return fmt.Errorf("only draft runs can be cancelled")
+
+	// If already terminal, reject.
+	if run.Status == "approved" || run.Status == "paid" || run.Status == "cancelled" {
+		return fmt.Errorf("run already in terminal state: %s", run.Status)
 	}
-	if err := s.payrollRepo.DeletePayrollRun(ctx, runID); err != nil {
+
+	// Draft: just delete.
+	if run.Status == "draft" {
+		if err := s.payrollRepo.DeletePayrollRun(ctx, runID); err != nil {
+			return err
+		}
+		s.auditRunStateChange(ctx, run.CompanyID, runID, "draft_deleted", actorID, nil)
+		return nil
+	}
+
+	// For processing/executing/failed/calculated: cancel and clean up.
+	tx, err := s.payrollRepo.BeginTx(ctx, nil)
+	if err != nil {
 		return err
 	}
-	s.auditRunStateChange(ctx, run.CompanyID, runID, "draft_deleted", actorID, nil)
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// Cancel pending employee jobs.
+	if err := s.jobRepo.CancelEmployeeJobsForRunTx(ctx, tx, runID); err != nil {
+		return fmt.Errorf("failed to cancel employee jobs: %w", err)
+	}
+
+	// Reset all payroll data (items, ledgers, snapshots).
+	if err := s.payrollRepo.ResetPayrollRunDataTx(ctx, tx, runID); err != nil {
+		return fmt.Errorf("failed to reset run data: %w", err)
+	}
+
+	// If run is failed, we may also want to cleanup failed run state.
+	if run.Status == "failed" {
+		if err := s.payrollRepo.CleanupFailedRunTx(ctx, tx, runID); err != nil {
+			return fmt.Errorf("failed to cleanup failed run: %w", err)
+		}
+	}
+
+	// Update status to cancelled.
+	if err := s.payrollRepo.UpdatePayrollRunStatusTx(ctx, tx, runID, "cancelled"); err != nil {
+		return fmt.Errorf("failed to update run status: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit cancellation: %w", err)
+	}
+
+	s.auditRunStateChange(ctx, run.CompanyID, runID, "cancelled", actorID, map[string]interface{}{
+		"previous_status": run.Status,
+	})
+
 	return nil
 }
 
@@ -531,11 +580,7 @@ func (s *payrollEngineService) ProcessEmployee(
 }
 
 // processEmployeeCore handles all non‑statutory calculations and commits them in a single transaction.
-// Returns:
-//   - payroll_item_id
-//   - earnings slice (for statutory input)
-//   - companyID, periodStart, periodEnd (to avoid extra query in Phase 2)
-//   - error
+// It automatically finalizes attendance for the employee before processing.
 func (s *payrollEngineService) processEmployeeCore(
 	ctx context.Context,
 	runID uuid.UUID,
@@ -546,6 +591,46 @@ func (s *payrollEngineService) processEmployeeCore(
 	settings *models.CompanyPayrollSettings,
 ) (uuid.UUID, []*models.PayrollLedgerItem, uuid.UUID, time.Time, time.Time, error) {
 
+	// -----------------------------------------------------------------
+	// 0️⃣ Ensure attendance is finalized for this employee before processing
+	// -----------------------------------------------------------------
+	// First, fetch the run details (we need companyID and period)
+	run, err := s.payrollRepo.GetPayrollRunByID(ctx, runID)
+	if err != nil || run == nil {
+		return uuid.Nil, nil, uuid.Nil, time.Time{}, time.Time{}, fmt.Errorf("run not found")
+	}
+
+	s.logger.Info("Processing employee: attendance finalization check",
+		zap.String("user_id", userID.String()),
+		zap.String("run_id", runID.String()),
+		zap.Time("period_start", run.PeriodStart),
+		zap.Time("period_end", run.PeriodEnd),
+	)
+
+	// Finalize attendance for this employee for the run period
+	finalizeErr := s.payrollRepo.FinalizeAttendanceForPeriod(
+		ctx,
+		run.CompanyID,
+		userID,
+		run.PeriodStart,
+		run.PeriodEnd,
+	)
+	if finalizeErr != nil {
+		s.logger.Warn("Failed to finalize attendance for employee before processing (will attempt summary anyway)",
+			zap.String("user_id", userID.String()),
+			zap.String("run_id", runID.String()),
+			zap.Error(finalizeErr),
+		)
+		// Do not fail; proceed to fetch summary – maybe it's already finalized.
+	} else {
+		s.logger.Info("Attendance finalized for employee before processing",
+			zap.String("user_id", userID.String()),
+		)
+	}
+
+	// -----------------------------------------------------------------
+	// Start main transaction
+	// -----------------------------------------------------------------
 	tx, err := s.payrollRepo.BeginTx(ctx, nil)
 	if err != nil {
 		return uuid.Nil, nil, uuid.Nil, time.Time{}, time.Time{}, err
@@ -556,12 +641,12 @@ func (s *payrollEngineService) processEmployeeCore(
 	}
 
 	// Lock Run
-	run, err := s.payrollRepo.GetPayrollRunTx(ctx, tx, runID)
+	run, err = s.payrollRepo.GetPayrollRunTx(ctx, tx, runID)
 	if err != nil || run == nil {
 		return rollback(fmt.Errorf("run not found"))
 	}
 
-	// Attendance Summary
+	// Attendance Summary – now attendance should be finalized (or we tried to finalize)
 	summary, err := s.attendanceBridge.GetPayrollAttendanceSummary(
 		ctx,
 		run.CompanyID,
@@ -584,6 +669,15 @@ func (s *payrollEngineService) processEmployeeCore(
 			TotalOvertimeMinutes: 0,
 			TotalLossMinutes:     0,
 		}
+	} else {
+		// Log attendance details for debugging
+		s.logger.Info("Attendance summary retrieved",
+			zap.String("user_id", userID.String()),
+			zap.Int("total_days", summary.TotalDays),
+			zap.Float64("payable_days", float64(summary.PayableDays)),
+			zap.Int("overtime_minutes", summary.TotalOvertimeMinutes),
+			zap.Int("loss_minutes", summary.TotalLossMinutes),
+		)
 	}
 
 	// Salary Assignments
@@ -778,6 +872,7 @@ func (s *payrollEngineService) processEmployeeCore(
 		ledgerEntries = append(ledgerEntries, &models.PayrollLedger{
 			LedgerID:      uuid.New(),
 			PayrollItemID: item.PayrollItemID,
+			CompanyID:     run.CompanyID, // <-- ADDED: CompanyID
 			ComponentCode: li.ComponentCode,
 			Amount:        li.Amount,
 			CreatedAt:     time.Now().UTC(),
@@ -870,6 +965,7 @@ func (s *payrollEngineService) processEmployeeStatutory(
 		ledgerEntries = append(ledgerEntries, &models.PayrollLedger{
 			LedgerID:      uuid.New(),
 			PayrollItemID: payrollItemID,
+			CompanyID:     companyID, // <-- ADDED: CompanyID
 			ComponentCode: li.ComponentCode,
 			Amount:        li.Amount,
 			CreatedAt:     time.Now().UTC(),
@@ -1336,25 +1432,73 @@ func (s *payrollEngineService) CountRemainingEmployeeJobs(ctx context.Context, r
 // NEW: Finalize run (move from executing to calculated)
 // ---------------------------------------------------------------------
 
+// FinalizeRun transitions the run from executing to calculated and finalizes attendance for all employees.
 func (s *payrollEngineService) FinalizeRun(ctx context.Context, runID uuid.UUID, actorID uuid.UUID) error {
+	// 1. Fetch the run
 	run, err := s.payrollRepo.GetPayrollRunByID(ctx, runID)
 	if err != nil || run == nil {
 		return fmt.Errorf("run not found")
 	}
 
-	err = s.payrollRepo.UpdatePayrollRunStatusIfCurrent(
+	s.logger.Info("Finalizing payroll run",
+		zap.String("run_id", runID.String()),
+		zap.String("company_id", run.CompanyID.String()),
+		zap.Time("period_start", run.PeriodStart),
+		zap.Time("period_end", run.PeriodEnd),
+	)
+
+	// 2. Fetch all employee IDs that were processed in this run
+	employeeIDs, err := s.payrollRepo.GetEmployeeIDsByRun(ctx, runID)
+	if err != nil {
+		s.logger.Error("Failed to fetch employee IDs for attendance finalization",
+			zap.String("run_id", runID.String()),
+			zap.Error(err),
+		)
+		// Continue to mark run as calculated even if finalization fails
+	} else {
+		s.logger.Info("Finalizing attendance for employees",
+			zap.String("run_id", runID.String()),
+			zap.Int("employee_count", len(employeeIDs)),
+		)
+
+		for _, userID := range employeeIDs {
+			if err := s.payrollRepo.FinalizeAttendanceForPeriod(
+				ctx,
+				run.CompanyID,
+				userID,
+				run.PeriodStart,
+				run.PeriodEnd,
+			); err != nil {
+				s.logger.Error("Failed to finalize attendance for employee",
+					zap.String("run_id", runID.String()),
+					zap.String("user_id", userID.String()),
+					zap.Error(err),
+				)
+			} else {
+				s.logger.Info("Attendance finalized for employee",
+					zap.String("run_id", runID.String()),
+					zap.String("user_id", userID.String()),
+				)
+			}
+		}
+	}
+
+	// 3. Update run status from "executing" to "calculated"
+	if err := s.payrollRepo.UpdatePayrollRunStatusIfCurrent(
 		ctx,
 		runID,
 		"executing",
 		"calculated",
-	)
-	if err != nil {
-		return err
+	); err != nil {
+		return fmt.Errorf("failed to update run status to calculated: %w", err)
 	}
 
+	// 4. Audit the state change
 	s.auditRunStateChange(ctx, run.CompanyID, runID, "calculated", actorID, nil)
-	s.logger.Info("Payroll run finalized (all employees processed)",
+
+	s.logger.Info("Payroll run finalized successfully",
 		zap.String("run_id", runID.String()),
+		zap.Int("employees_finalized", len(employeeIDs)),
 	)
 
 	return nil
@@ -1404,6 +1548,29 @@ func (s *payrollEngineService) CreateRun(
 	if periodEnd.Before(periodStart) {
 		return nil, fmt.Errorf("invalid period range")
 	}
+
+	// Check for existing runs for this period
+	existing, err := s.payrollRepo.GetPayrollRunByPeriod(ctx, companyID, periodStart, periodEnd)
+	if err != nil {
+		return nil, err
+	}
+
+	if existing != nil {
+		// If existing is cancelled, delete it and allow creation
+		if existing.Status == "cancelled" {
+			s.logger.Info("Deleting cancelled run before creating new one",
+				zap.String("run_id", existing.PayrollRunID.String()),
+				zap.String("period", existing.PeriodStart.Format("2006-01-02")+" to "+existing.PeriodEnd.Format("2006-01-02")),
+			)
+			if err := s.payrollRepo.DeletePayrollRun(ctx, existing.PayrollRunID); err != nil {
+				return nil, fmt.Errorf("failed to delete cancelled run: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("payroll run already exists for this period")
+		}
+	}
+
+	// Lock check (only after we've dealt with existing runs)
 	locked, err := s.payrollRepo.IsPayrollPeriodLockedRange(ctx, companyID, periodStart, periodEnd)
 	if err != nil {
 		return nil, err
@@ -1411,13 +1578,7 @@ func (s *payrollEngineService) CreateRun(
 	if locked {
 		return nil, fmt.Errorf("payroll period already locked")
 	}
-	existing, err := s.payrollRepo.GetPayrollRunByPeriod(ctx, companyID, periodStart, periodEnd)
-	if err != nil {
-		return nil, err
-	}
-	if existing != nil {
-		return nil, fmt.Errorf("payroll run already exists for this period")
-	}
+
 	run := &models.PayrollRun{
 		PayrollRunID: uuid.New(),
 		CompanyID:    companyID,
@@ -1427,9 +1588,11 @@ func (s *payrollEngineService) CreateRun(
 		CreatedAt:    time.Now().UTC(),
 		CreatedBy:    &createdBy,
 	}
+
 	if err := s.payrollRepo.CreatePayrollRun(ctx, run); err != nil {
 		return nil, err
 	}
+
 	_ = s.audit.LogAction(
 		ctx,
 		nil,
@@ -1447,6 +1610,7 @@ func (s *payrollEngineService) CreateRun(
 			"period_end":   periodEnd,
 		},
 	)
+
 	return run, nil
 }
 

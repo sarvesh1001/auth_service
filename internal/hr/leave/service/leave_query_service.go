@@ -35,6 +35,14 @@ type LeaveQueryService interface {
 		date time.Time,
 	) (bool, *models.LeaveRequest, error)
 
+	// GetApprovedLeaveForDate returns the approved leave request for a user on a specific date, if any.
+	GetApprovedLeaveForDate(
+		ctx context.Context,
+		companyID uuid.UUID,
+		userID uuid.UUID,
+		date time.Time,
+	) (*models.LeaveRequest, error)
+
 	GetUserLeaveHistory(
 		ctx context.Context,
 		userID uuid.UUID,
@@ -46,11 +54,13 @@ type LeaveQueryService interface {
 		userID uuid.UUID,
 		startDate, endDate time.Time,
 	) ([]*models.LeaveTransaction, error)
+
 	GetLeaveTypeByID(
 		ctx context.Context,
 		companyID uuid.UUID,
 		leaveTypeID uuid.UUID,
 	) (*models.LeaveType, error)
+
 	GetLeaveForecast(
 		ctx context.Context,
 		userID uuid.UUID,
@@ -63,7 +73,6 @@ type LeaveQueryService interface {
 		startDate, endDate time.Time,
 	) ([]*models.LeaveBalance, error)
 
-	// 🔥 FIXED: return float64 instead of int
 	CheckLeaveAvailability(
 		ctx context.Context,
 		companyID uuid.UUID,
@@ -186,6 +195,35 @@ func (s *leaveQueryService) IsUserOnLeave(
 	return false, nil, nil
 }
 
+// GetApprovedLeaveForDate returns the approved leave request for a user on a specific date, if any.
+func (s *leaveQueryService) GetApprovedLeaveForDate(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+	date time.Time,
+) (*models.LeaveRequest, error) {
+	// Query requests for the exact day (or range that includes the date)
+	start := date.Truncate(24 * time.Hour)
+	end := start.Add(24 * time.Hour).Add(-time.Second)
+
+	requests, err := s.repo.GetLeaveRequestsByUser(ctx, userID, start, end)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get leave requests: %w", err)
+	}
+
+	for _, r := range requests {
+		if r.Status == "approved" &&
+			!date.Before(r.StartDate) &&
+			!date.After(r.EndDate) {
+			// Ensure it belongs to the company (optional check)
+			if r.CompanyID == companyID {
+				return r, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
 func (s *leaveQueryService) GetUserLeaveHistory(
 	ctx context.Context,
 	userID uuid.UUID,
@@ -253,6 +291,7 @@ func (s *leaveQueryService) CheckLeaveAvailability(
 		positionID,
 	)
 }
+
 func (s *leaveQueryService) GetLeaveTypeByID(
 	ctx context.Context,
 	companyID uuid.UUID,

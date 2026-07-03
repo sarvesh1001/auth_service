@@ -27,6 +27,7 @@ type PayrollJobRepository interface {
 	MarkFailed(ctx context.Context, jobID uuid.UUID, errorMessage string) error
 	GetByID(ctx context.Context, jobID uuid.UUID) (*models.PayrollJob, error)
 	ReleaseStaleLocks(ctx context.Context, staleThreshold time.Duration) (int64, error)
+	CancelEmployeeJobsForRunTx(ctx context.Context, tx *sql.Tx, runID uuid.UUID) error
 
 	// Employee Job Queue
 	CreateEmployeeJobsForRun(
@@ -638,4 +639,23 @@ func (r *payrollJobRepository) CountIncompleteEmployeeJobs(ctx context.Context, 
 		return 0, fmt.Errorf("failed to count incomplete employee jobs: %w", err)
 	}
 	return count, nil
+}
+func (r *payrollJobRepository) CancelEmployeeJobsForRunTx(ctx context.Context, tx *sql.Tx, runID uuid.UUID) error {
+	query := `
+        UPDATE payroll.payroll_employee_job
+        SET status = 'cancelled',
+            updated_at = NOW()
+        WHERE payroll_run_id = $1
+          AND status IN ('pending', 'processing')
+    `
+	result, err := tx.ExecContext(ctx, query, runID)
+	if err != nil {
+		return fmt.Errorf("failed to cancel employee jobs: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	r.logger.Info("Cancelled employee jobs for run",
+		zap.String("run_id", runID.String()),
+		zap.Int64("rows_cancelled", rows),
+	)
+	return nil
 }

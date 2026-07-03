@@ -768,8 +768,8 @@ func (r *EmployeeRepositoryImpl) CreatePosition(ctx context.Context, position *e
 	query := `
 		INSERT INTO positions (
 			position_id, company_id, department_id, title, is_open, 
-			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7)`
+			created_at, updated_at, work_center_code
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
 
 	_, err := r.client.Exec(ctx, query,
 		position.PositionID,
@@ -779,6 +779,7 @@ func (r *EmployeeRepositoryImpl) CreatePosition(ctx context.Context, position *e
 		position.IsOpen,
 		position.CreatedAt,
 		position.UpdatedAt,
+		position.WorkCenterCode,
 	)
 
 	if err != nil {
@@ -810,7 +811,7 @@ func (r *EmployeeRepositoryImpl) GetPositionByID(ctx context.Context, positionID
 func (r *EmployeeRepositoryImpl) GetPositionsByDepartment(ctx context.Context, companyID, departmentID uuid.UUID) ([]*employee.Position, error) {
 	query := `
 		SELECT position_id, company_id, department_id, title, is_open, 
-		       created_at, updated_at
+		       created_at, updated_at, work_center_code
 		FROM positions 
 		WHERE company_id = $1 AND department_id = $2
 		ORDER BY created_at DESC`
@@ -873,13 +874,14 @@ func (r *EmployeeRepositoryImpl) UpdatePosition(ctx context.Context, position *e
 
 	query := `
 		UPDATE positions SET
-			title = $1, is_open = $2, updated_at = $3
-		WHERE position_id = $4`
+			title = $1, is_open = $2, updated_at = $3, work_center_code = $4
+		WHERE position_id = $5`
 
 	result, err := r.client.Exec(ctx, query,
 		position.Title,
 		position.IsOpen,
 		position.UpdatedAt,
+		position.WorkCenterCode,
 		position.PositionID,
 	)
 
@@ -1555,6 +1557,7 @@ func (r *EmployeeRepositoryImpl) scanEmployeeExit(rows *sql.Rows) (*employee.Emp
 func (r *EmployeeRepositoryImpl) scanPosition(rows *sql.Rows) (*employee.Position, error) {
 	var position employee.Position
 	var title sql.NullString
+	var workCenterCode sql.NullString
 
 	err := rows.Scan(
 		&position.PositionID,
@@ -1564,6 +1567,7 @@ func (r *EmployeeRepositoryImpl) scanPosition(rows *sql.Rows) (*employee.Positio
 		&position.IsOpen,
 		&position.CreatedAt,
 		&position.UpdatedAt,
+		&workCenterCode,
 	)
 
 	if err != nil {
@@ -1572,6 +1576,9 @@ func (r *EmployeeRepositoryImpl) scanPosition(rows *sql.Rows) (*employee.Positio
 
 	if title.Valid {
 		position.Title = &title.String
+	}
+	if workCenterCode.Valid {
+		position.WorkCenterCode = &workCenterCode.String
 	}
 
 	return &position, nil
@@ -1644,12 +1651,12 @@ func (r *EmployeeRepositoryImpl) initializePreparedStatements(ctx context.Contex
 
 		"get_position_by_id": `
 			SELECT position_id, company_id, department_id, title, is_open, 
-			       created_at, updated_at
+			       created_at, updated_at, work_center_code
 			FROM positions WHERE position_id = $1`,
 
 		"get_open_positions": `
 			SELECT position_id, company_id, department_id, title, is_open, 
-			       created_at, updated_at
+			       created_at, updated_at, work_center_code
 			FROM positions WHERE company_id = $1 AND is_open = true
 			ORDER BY created_at DESC`,
 	}
@@ -1833,4 +1840,102 @@ func (r *EmployeeRepositoryImpl) RehireEmployee(
 	}
 
 	return tx.Commit()
+}
+
+func (r *EmployeeRepositoryImpl) GetActiveUsersByPosition(ctx context.Context, positionID uuid.UUID) ([]uuid.UUID, error) {
+	query := `
+		SELECT ce.user_id
+		FROM company_employees ce
+		WHERE ce.position_id = $1
+		  AND ce.is_active = true
+	`
+	rows, err := r.client.Query(ctx, query, positionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var userIDs []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		userIDs = append(userIDs, id)
+	}
+	return userIDs, nil
+}
+
+func (r *EmployeeRepositoryImpl) GetActiveEmployeesByCompany(ctx context.Context, companyID uuid.UUID) ([]uuid.UUID, error) {
+	query := `
+		SELECT ce.user_id
+		FROM company_employees ce
+		WHERE ce.company_id = $1
+		  AND ce.is_active = true
+	`
+	rows, err := r.client.Query(ctx, query, companyID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var userIDs []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		userIDs = append(userIDs, id)
+	}
+	return userIDs, nil
+}
+
+func (r *EmployeeRepositoryImpl) GetCompanyEmployeeByUserID(ctx context.Context, userID uuid.UUID) (*employee.CompanyEmployee, error) {
+	r.logger.Info("GetCompanyEmployeeByUserID called", zap.String("user_id", userID.String()))
+	query := `
+        SELECT company_id, user_id, employee_id, role_id, hire_date, is_active, reports_to, position_id, created_at, updated_at
+        FROM company_employees
+        WHERE user_id = $1
+    `
+	row := r.client.QueryRow(ctx, query, userID)
+	var ce employee.CompanyEmployee
+	var reportsTo *uuid.UUID
+	var positionID *uuid.UUID
+	err := row.Scan(
+		&ce.CompanyID,
+		&ce.UserID,
+		&ce.EmployeeID,
+		&ce.RoleID,
+		&ce.HireDate,
+		&ce.IsActive,
+		&reportsTo,
+		&positionID,
+		&ce.CreatedAt,
+		&ce.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			r.logger.Warn("No company employee found", zap.String("user_id", userID.String()))
+			return nil, nil
+		}
+		r.logger.Error("Failed to scan company employee", zap.Error(err))
+		return nil, err
+	}
+	if reportsTo != nil {
+		ce.ReportsTo = reportsTo
+	}
+	if positionID != nil {
+		ce.PositionID = positionID
+	}
+	r.logger.Info("Company employee retrieved",
+		zap.String("user_id", ce.UserID.String()),
+		zap.String("company_id", ce.CompanyID.String()),
+		zap.String("employee_id", ce.EmployeeID),
+		zap.String("position_id", func() string {
+			if ce.PositionID != nil {
+				return ce.PositionID.String()
+			}
+			return "<nil>"
+		}()),
+		zap.Bool("is_active", ce.IsActive),
+	)
+	return &ce, nil
 }

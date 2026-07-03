@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"auth-service/internal/academics"
@@ -109,7 +110,6 @@ type AcademicsInfraFactory struct {
 	admissionRepo            repository.AdmissionRepository
 	analyticsRepo            repository.AnalyticsRepository
 	assignmentRepo           repository.AssignmentRepository
-	attendanceRepo           repository.AttendanceRepository
 	courseRepo               repository.CourseRepository
 	enrollmentRepo           repository.EnrollmentRepository
 	examRepo                 repository.ExamRepository
@@ -130,19 +130,9 @@ type AcademicsInfraFactory struct {
 	timetableRepo            repository.TimetableRepository
 	transportRepo            repository.TransportRepository
 
-	// New repositories for period attendance & biometric
-	academicSessionRepo   repository.AcademicSessionRepository
-	studentSessionAttRepo repository.StudentSessionAttendanceRepository
-	attendanceSessionRepo repository.AttendanceSessionRepository
-	biometricMappingRepo  repository.StudentBiometricMappingRepository
-
-	// New repositories for student sync
-	studentFaceEmbeddingRepo repository.StudentFaceEmbeddingRepository
-	deviceEmbeddingSyncRepo  repository.DeviceEmbeddingSyncRepository
-
 	// Idempotency & Outbox
 	idempotencyStore idempotency.Store
-	outboxRepo       outbox.Repository // shared outbox repository (no local processor)
+	outboxRepo       outbox.Repository
 
 	// Services
 	notificationService academicsvc.NotificationService
@@ -166,18 +156,8 @@ type AcademicsInfraFactory struct {
 	termService         academicsvc.TermService
 	analyticsService    academicsvc.AnalyticsService
 	admissionService    academicsvc.AdmissionService
-	attendanceService   academicsvc.AttendanceService
 	assignmentService   academicsvc.AssignmentService
 	feeService          academicsvc.FeeService
-
-	// New services for period attendance, biometric, session generation
-	periodAttendanceService  academicsvc.PeriodAttendanceService
-	biometricService         academicsvc.BiometricService
-	studentBiometricService  academicsvc.StudentBiometricService
-	sessionGenerationService academicsvc.SessionGenerationService
-
-	// New service for student biometric sync
-	studentBiometricSyncService academicsvc.StudentBiometricSyncService
 
 	// Handlers
 	academicYearHandler      *handler.AcademicYearHandler
@@ -198,22 +178,20 @@ type AcademicsInfraFactory struct {
 	subjectHandler           *handler.SubjectHandler
 	feeHandler               *handler.FeeHandler
 	assignmentHandler        *handler.AssignmentHandler
-	attendanceHandler        *handler.AttendanceHandler
 	admissionHandler         *handler.AdmissionHandler
 	termHandler              *handler.TermHandler
 	analyticsHandler         *handler.AnalyticsHandler
 	curriculumHandler        *handler.CurriculumHandler
+	academicSessionRepo      repository.AcademicSessionRepository
+	sessionGenerationService academicsvc.SessionGenerationService
 	sessionGenerationHandler *handler.SessionGenerationHandler
-
-	// New handler for student biometric sync
-	studentBiometricSyncHandler *handler.StudentBiometricSyncHandler
 }
 
-// NewAcademicsInfraFactory constructor – now receives shared outbox repository
+// NewAcademicsInfraFactory constructor
 func NewAcademicsInfraFactory(
 	postgresClient *client.PostgresClient,
 	redisClient *client.RedisClient,
-	sharedOutboxRepo outbox.Repository, // ✅ shared outbox repository
+	sharedOutboxRepo outbox.Repository,
 	encryptionManager *encryption.EncryptionManager,
 	eventPublisher EventPublisher,
 	auditService *audit.AuditService,
@@ -221,56 +199,83 @@ func NewAcademicsInfraFactory(
 	sessionService *mainservice.SessionService,
 	logger *zap.Logger,
 ) (*AcademicsInfraFactory, error) {
+	log := logger.Named("academics_infra")
+	log.Info("🏭 AcademicsInfraFactory construction started")
+
 	af := &AcademicsInfraFactory{
-		log:            logger.Named("academics_infra"),
+		log:            log,
 		postgresClient: postgresClient,
 		eventPublisher: eventPublisher,
 		auditService:   auditService,
 		emailSender:    emailSender,
 		sessionService: sessionService,
-		outboxRepo:     sharedOutboxRepo, // ✅ use shared repo
+		outboxRepo:     sharedOutboxRepo,
 	}
 
 	// Idempotency store
+	log.Info("Initialising idempotency store")
 	pgStore := idempotency.NewPostgresStore(postgresClient.DB)
 	redisCache := idempotency.NewRedisCache(redisClient, 24*time.Hour)
 	af.idempotencyStore = idempotency.NewHybridStore(pgStore, redisCache)
 
-	// Repositories
+	// Repositories – log each creation
 	af.academicEventRepo = repository.NewAcademicEventRepository(af.log)
+	log.Info("Repository initialised", zap.String("repo", "AcademicEvent"))
 	af.academicYearRepo = repository.NewAcademicYearRepository(af.log)
+	log.Info("Repository initialised", zap.String("repo", "AcademicYear"))
 	af.admissionRepo = repository.NewAdmissionRepository(af.log)
+	log.Info("Repository initialised", zap.String("repo", "Admission"))
 	af.analyticsRepo = repository.NewAnalyticsRepository(af.log)
+	log.Info("Repository initialised", zap.String("repo", "Analytics"))
 	af.assignmentRepo = repository.NewAssignmentRepository(af.log)
-	af.attendanceRepo = repository.NewAttendanceRepository(af.log)
+	log.Info("Repository initialised", zap.String("repo", "Assignment"))
 	af.courseRepo = repository.NewCourseRepository(af.log)
+	log.Info("Repository initialised", zap.String("repo", "Course"))
 	af.enrollmentRepo = repository.NewEnrollmentRepository(af.log)
+	log.Info("Repository initialised", zap.String("repo", "Enrollment"))
 	af.examRepo = repository.NewExamRepository(af.log)
+	log.Info("Repository initialised", zap.String("repo", "Exam"))
 	af.feeRepo = repository.NewFeeRepository(af.log)
+	log.Info("Repository initialised", zap.String("repo", "Fee"))
 	af.gradingRepo = repository.NewGradingRepository(af.log)
+	log.Info("Repository initialised", zap.String("repo", "Grading"))
 	af.guardianRepo = repository.NewGuardianRepository(af.log, encryptionManager)
+	log.Info("Repository initialised", zap.String("repo", "Guardian"))
 	af.libraryRepo = repository.NewLibraryRepository(af.log)
+	log.Info("Repository initialised", zap.String("repo", "Library"))
 	af.notificationRepo = repository.NewNotificationRepository(af.log)
+	log.Info("Repository initialised", zap.String("repo", "Notification"))
 	af.roomRepo = repository.NewRoomRepository(af.log)
+	log.Info("Repository initialised", zap.String("repo", "Room"))
 	af.sectionRepo = repository.NewSectionRepository(af.log)
+	log.Info("Repository initialised", zap.String("repo", "Section"))
 	af.studentAuthRepo = repository.NewStudentAuthRepository(af.log, encryptionManager)
+	log.Info("Repository initialised", zap.String("repo", "StudentAuth"))
 	af.studentRepo = repository.NewStudentRepository(af.log, encryptionManager)
+	log.Info("Repository initialised", zap.String("repo", "Student"))
 	af.subjectCourseMappingRepo = repository.NewSubjectCourseMappingRepository(af.log)
+	log.Info("Repository initialised", zap.String("repo", "SubjectCourseMapping"))
 	af.subjectRepo = repository.NewSubjectRepository(af.log)
+	log.Info("Repository initialised", zap.String("repo", "Subject"))
 	af.submissionRepo = repository.NewSubmissionRepository(af.log)
+	log.Info("Repository initialised", zap.String("repo", "Submission"))
 	af.teacherRepo = repository.NewTeacherRepository(af.log)
+	log.Info("Repository initialised", zap.String("repo", "Teacher"))
 	af.termRepo = repository.NewTermRepository(af.log)
+	log.Info("Repository initialised", zap.String("repo", "Term"))
 	af.timetableRepo = repository.NewTimetableRepository(af.log)
+	log.Info("Repository initialised", zap.String("repo", "Timetable"))
 	af.transportRepo = repository.NewTransportRepository(af.log)
+	log.Info("Repository initialised", zap.String("repo", "Transport"))
 
-	// New repositories
+	// AcademicSessionRepo – the critical one
 	af.academicSessionRepo = repository.NewAcademicSessionRepository(af.log)
-	af.studentSessionAttRepo = repository.NewStudentSessionAttendanceRepository(af.log)
-	af.attendanceSessionRepo = repository.NewAttendanceSessionRepository(af.log)
-	af.biometricMappingRepo = repository.NewStudentBiometricMappingRepository(af.log)
+	log.Info("✅ AcademicSessionRepository initialised",
+		zap.Bool("is_nil", af.academicSessionRepo == nil),
+		zap.String("type", fmt.Sprintf("%T", af.academicSessionRepo)),
+	)
 
-	// ❌ Outbox creation and local processor removed – the shared processor is used
-
+	log.Info("🏭 AcademicsInfraFactory construction completed")
 	return af, nil
 }
 
@@ -292,9 +297,6 @@ func (af *AcademicsInfraFactory) AnalyticsRepo() repository.AnalyticsRepository 
 }
 func (af *AcademicsInfraFactory) AssignmentRepo() repository.AssignmentRepository {
 	return af.assignmentRepo
-}
-func (af *AcademicsInfraFactory) AttendanceRepo() repository.AttendanceRepository {
-	return af.attendanceRepo
 }
 func (af *AcademicsInfraFactory) CourseRepo() repository.CourseRepository {
 	return af.courseRepo
@@ -359,40 +361,14 @@ func (af *AcademicsInfraFactory) IdempotencyStore() idempotency.Store {
 func (af *AcademicsInfraFactory) OutboxRepository() outbox.Repository {
 	return af.outboxRepo
 }
-func (af *AcademicsInfraFactory) AcademicSessionRepo() repository.AcademicSessionRepository {
-	return af.academicSessionRepo
-}
-func (af *AcademicsInfraFactory) StudentSessionAttRepo() repository.StudentSessionAttendanceRepository {
-	return af.studentSessionAttRepo
-}
-func (af *AcademicsInfraFactory) AttendanceSessionRepo() repository.AttendanceSessionRepository {
-	return af.attendanceSessionRepo
-}
-func (af *AcademicsInfraFactory) BiometricMappingRepo() repository.StudentBiometricMappingRepository {
-	return af.biometricMappingRepo
-}
-
-// New repository getters for student sync
-func (af *AcademicsInfraFactory) StudentFaceEmbeddingRepository() repository.StudentFaceEmbeddingRepository {
-	if af.studentFaceEmbeddingRepo == nil {
-		af.studentFaceEmbeddingRepo = repository.NewStudentFaceEmbeddingRepository(af.postgresClient, af.log)
-	}
-	return af.studentFaceEmbeddingRepo
-}
-
-func (af *AcademicsInfraFactory) DeviceEmbeddingSyncRepository() repository.DeviceEmbeddingSyncRepository {
-	if af.deviceEmbeddingSyncRepo == nil {
-		af.deviceEmbeddingSyncRepo = repository.NewDeviceEmbeddingSyncRepository(af.postgresClient, af.log)
-	}
-	return af.deviceEmbeddingSyncRepo
-}
 
 // ================================
-// Service Getters (all corrected)
+// Service Getters – with logging
 // ================================
 
 func (af *AcademicsInfraFactory) NotificationService() academicsvc.NotificationService {
 	if af.notificationService == nil {
+		af.log.Info("🔄 Creating NotificationService")
 		af.notificationService = academicsvc.NewNotificationService(
 			af.NotificationRepo(),
 			af.postgresClient,
@@ -401,12 +377,14 @@ func (af *AcademicsInfraFactory) NotificationService() academicsvc.NotificationS
 			af.auditService,
 			af.outboxRepo,
 		)
+		af.log.Info("✅ NotificationService created", zap.Bool("is_nil", af.notificationService == nil))
 	}
 	return af.notificationService
 }
 
 func (af *AcademicsInfraFactory) ExamService() academicsvc.ExamService {
 	if af.examService == nil {
+		af.log.Info("🔄 Creating ExamService")
 		af.examService = academicsvc.NewExamService(
 			af.ExamRepo(),
 			af.TermRepo(),
@@ -420,12 +398,14 @@ func (af *AcademicsInfraFactory) ExamService() academicsvc.ExamService {
 			af.auditService,
 			af.NotificationService(),
 		)
+		af.log.Info("✅ ExamService created", zap.Bool("is_nil", af.examService == nil))
 	}
 	return af.examService
 }
 
 func (af *AcademicsInfraFactory) StudentAuthService() academicsvc.StudentAuthService {
 	if af.studentAuthService == nil {
+		af.log.Info("🔄 Creating StudentAuthService")
 		af.studentAuthService = academicsvc.NewStudentAuthService(
 			af.StudentRepo(),
 			af.StudentAuthRepo(),
@@ -433,12 +413,14 @@ func (af *AcademicsInfraFactory) StudentAuthService() academicsvc.StudentAuthSer
 			af.log,
 			af.NotificationService(),
 		)
+		af.log.Info("✅ StudentAuthService created", zap.Bool("is_nil", af.studentAuthService == nil))
 	}
 	return af.studentAuthService
 }
 
 func (af *AcademicsInfraFactory) GuardianService() academicsvc.GuardianService {
 	if af.guardianService == nil {
+		af.log.Info("🔄 Creating GuardianService")
 		af.guardianService = academicsvc.NewGuardianService(
 			af.GuardianRepo(),
 			af.StudentRepo(),
@@ -449,12 +431,14 @@ func (af *AcademicsInfraFactory) GuardianService() academicsvc.GuardianService {
 			af.auditService,
 			af.NotificationService(),
 		)
+		af.log.Info("✅ GuardianService created", zap.Bool("is_nil", af.guardianService == nil))
 	}
 	return af.guardianService
 }
 
 func (af *AcademicsInfraFactory) EnrollmentService() academicsvc.EnrollmentService {
 	if af.enrollmentService == nil {
+		af.log.Info("🔄 Creating EnrollmentService")
 		af.enrollmentService = academicsvc.NewEnrollmentService(
 			af.EnrollmentRepo(),
 			af.StudentRepo(),
@@ -468,14 +452,16 @@ func (af *AcademicsInfraFactory) EnrollmentService() academicsvc.EnrollmentServi
 			af.idempotencyStore,
 			af.auditService,
 			af.outboxRepo,
-			&eventPublisherAdapter{pub: af.eventPublisher}, // EventPublisher
+			&eventPublisherAdapter{pub: af.eventPublisher},
 		)
+		af.log.Info("✅ EnrollmentService created", zap.Bool("is_nil", af.enrollmentService == nil))
 	}
 	return af.enrollmentService
 }
 
 func (af *AcademicsInfraFactory) SectionService() academicsvc.SectionService {
 	if af.sectionService == nil {
+		af.log.Info("🔄 Creating SectionService")
 		af.sectionService = academicsvc.NewSectionService(
 			af.SectionRepo(),
 			af.CourseRepo(),
@@ -487,12 +473,14 @@ func (af *AcademicsInfraFactory) SectionService() academicsvc.SectionService {
 			af.postgresClient,
 			af.log,
 		)
+		af.log.Info("✅ SectionService created", zap.Bool("is_nil", af.sectionService == nil))
 	}
 	return af.sectionService
 }
 
 func (af *AcademicsInfraFactory) AcademicYearService() academicsvc.AcademicYearService {
 	if af.academicYearService == nil {
+		af.log.Info("🔄 Creating AcademicYearService")
 		af.academicYearService = academicsvc.NewAcademicYearService(
 			af.AcademicYearRepo(),
 			af.postgresClient,
@@ -502,12 +490,14 @@ func (af *AcademicsInfraFactory) AcademicYearService() academicsvc.AcademicYearS
 			af.auditService,
 			af.NotificationService(),
 		)
+		af.log.Info("✅ AcademicYearService created", zap.Bool("is_nil", af.academicYearService == nil))
 	}
 	return af.academicYearService
 }
 
 func (af *AcademicsInfraFactory) GradingService() academicsvc.GradingService {
 	if af.gradingService == nil {
+		af.log.Info("🔄 Creating GradingService")
 		af.gradingService = academicsvc.NewGradingService(
 			af.GradingRepo(),
 			af.postgresClient,
@@ -518,12 +508,14 @@ func (af *AcademicsInfraFactory) GradingService() academicsvc.GradingService {
 			&eventPublisherAdapter{pub: af.eventPublisher},
 			af.NotificationService(),
 		)
+		af.log.Info("✅ GradingService created", zap.Bool("is_nil", af.gradingService == nil))
 	}
 	return af.gradingService
 }
 
 func (af *AcademicsInfraFactory) TransportService() academicsvc.TransportService {
 	if af.transportService == nil {
+		af.log.Info("🔄 Creating TransportService")
 		af.transportService = academicsvc.NewTransportService(
 			af.TransportRepo(),
 			af.idempotencyStore,
@@ -533,12 +525,14 @@ func (af *AcademicsInfraFactory) TransportService() academicsvc.TransportService
 			af.log,
 			af.NotificationService(),
 		)
+		af.log.Info("✅ TransportService created", zap.Bool("is_nil", af.transportService == nil))
 	}
 	return af.transportService
 }
 
 func (af *AcademicsInfraFactory) TeacherService() academicsvc.TeacherService {
 	if af.teacherService == nil {
+		af.log.Info("🔄 Creating TeacherService")
 		af.teacherService = academicsvc.NewTeacherService(
 			af.TeacherRepo(),
 			af.postgresClient,
@@ -548,12 +542,14 @@ func (af *AcademicsInfraFactory) TeacherService() academicsvc.TeacherService {
 			af.auditService,
 			af.outboxRepo,
 		)
+		af.log.Info("✅ TeacherService created", zap.Bool("is_nil", af.teacherService == nil))
 	}
 	return af.teacherService
 }
 
 func (af *AcademicsInfraFactory) SubmissionService() academicsvc.SubmissionService {
 	if af.submissionService == nil {
+		af.log.Info("🔄 Creating SubmissionService")
 		af.submissionService = academicsvc.NewSubmissionService(
 			af.SubmissionRepo(),
 			af.AssignmentRepo(),
@@ -566,12 +562,14 @@ func (af *AcademicsInfraFactory) SubmissionService() academicsvc.SubmissionServi
 			af.auditService,
 			af.outboxRepo,
 		)
+		af.log.Info("✅ SubmissionService created", zap.Bool("is_nil", af.submissionService == nil))
 	}
 	return af.submissionService
 }
 
 func (af *AcademicsInfraFactory) CurriculumService() academicsvc.CurriculumService {
 	if af.curriculumService == nil {
+		af.log.Info("🔄 Creating CurriculumService")
 		af.curriculumService = academicsvc.NewCurriculumService(
 			af.SubjectCourseMappingRepo(),
 			af.CourseRepo(),
@@ -583,12 +581,14 @@ func (af *AcademicsInfraFactory) CurriculumService() academicsvc.CurriculumServi
 			af.auditService,
 			af.outboxRepo,
 		)
+		af.log.Info("✅ CurriculumService created", zap.Bool("is_nil", af.curriculumService == nil))
 	}
 	return af.curriculumService
 }
 
 func (af *AcademicsInfraFactory) SubjectService() academicsvc.SubjectService {
 	if af.subjectService == nil {
+		af.log.Info("🔄 Creating SubjectService")
 		af.subjectService = academicsvc.NewSubjectService(
 			af.SubjectRepo(),
 			af.postgresClient,
@@ -597,12 +597,14 @@ func (af *AcademicsInfraFactory) SubjectService() academicsvc.SubjectService {
 			af.auditService,
 			af.outboxRepo,
 		)
+		af.log.Info("✅ SubjectService created", zap.Bool("is_nil", af.subjectService == nil))
 	}
 	return af.subjectService
 }
 
 func (af *AcademicsInfraFactory) StudentService() academicsvc.StudentService {
 	if af.studentService == nil {
+		af.log.Info("🔄 Creating StudentService")
 		af.studentService = academicsvc.NewStudentService(
 			af.StudentRepo(),
 			af.EnrollmentRepo(),
@@ -617,12 +619,14 @@ func (af *AcademicsInfraFactory) StudentService() academicsvc.StudentService {
 			af.idempotencyStore,
 			af.auditService,
 		)
+		af.log.Info("✅ StudentService created", zap.Bool("is_nil", af.studentService == nil))
 	}
 	return af.studentService
 }
 
 func (af *AcademicsInfraFactory) LibraryService() academicsvc.LibraryService {
 	if af.libraryService == nil {
+		af.log.Info("🔄 Creating LibraryService")
 		af.libraryService = academicsvc.NewLibraryService(
 			af.LibraryRepo(),
 			af.postgresClient,
@@ -633,12 +637,14 @@ func (af *AcademicsInfraFactory) LibraryService() academicsvc.LibraryService {
 			af.NotificationService(),
 			af.StudentService(),
 		)
+		af.log.Info("✅ LibraryService created", zap.Bool("is_nil", af.libraryService == nil))
 	}
 	return af.libraryService
 }
 
 func (af *AcademicsInfraFactory) RoomService() academicsvc.RoomService {
 	if af.roomService == nil {
+		af.log.Info("🔄 Creating RoomService")
 		af.roomService = academicsvc.NewRoomService(
 			af.RoomRepo(),
 			af.postgresClient,
@@ -648,12 +654,15 @@ func (af *AcademicsInfraFactory) RoomService() academicsvc.RoomService {
 			af.auditService,
 			af.outboxRepo,
 		)
+		af.log.Info("✅ RoomService created", zap.Bool("is_nil", af.roomService == nil))
 	}
 	return af.roomService
 }
 
+// TimetableService – now with extra logging
 func (af *AcademicsInfraFactory) TimetableService() academicsvc.TimetableService {
 	if af.timetableService == nil {
+		af.log.Info("🔄 Creating TimetableService")
 		af.timetableService = academicsvc.NewTimetableService(
 			af.TimetableRepo(),
 			af.SectionRepo(),
@@ -667,7 +676,11 @@ func (af *AcademicsInfraFactory) TimetableService() academicsvc.TimetableService
 			af.postgresClient,
 			af.log,
 			af.NotificationService(),
-			af.AcademicSessionRepo(), // ✅ added missing argument
+			af.academicSessionRepo, // ✅ non-nil now
+		)
+		af.log.Info("✅ TimetableService created",
+			zap.Bool("is_nil", af.timetableService == nil),
+			zap.Bool("academicSessionRepo_nil", af.academicSessionRepo == nil),
 		)
 	}
 	return af.timetableService
@@ -675,6 +688,7 @@ func (af *AcademicsInfraFactory) TimetableService() academicsvc.TimetableService
 
 func (af *AcademicsInfraFactory) CourseService() academicsvc.CourseService {
 	if af.courseService == nil {
+		af.log.Info("🔄 Creating CourseService")
 		af.courseService = academicsvc.NewCourseService(
 			af.CourseRepo(),
 			af.SectionRepo(),
@@ -685,12 +699,14 @@ func (af *AcademicsInfraFactory) CourseService() academicsvc.CourseService {
 			af.auditService,
 			af.NotificationService(),
 		)
+		af.log.Info("✅ CourseService created", zap.Bool("is_nil", af.courseService == nil))
 	}
 	return af.courseService
 }
 
 func (af *AcademicsInfraFactory) TermService() academicsvc.TermService {
 	if af.termService == nil {
+		af.log.Info("🔄 Creating TermService")
 		af.termService = academicsvc.NewTermService(
 			af.TermRepo(),
 			af.AcademicYearRepo(),
@@ -702,12 +718,14 @@ func (af *AcademicsInfraFactory) TermService() academicsvc.TermService {
 			af.auditService,
 			af.NotificationService(),
 		)
+		af.log.Info("✅ TermService created", zap.Bool("is_nil", af.termService == nil))
 	}
 	return af.termService
 }
 
 func (af *AcademicsInfraFactory) AnalyticsService() academicsvc.AnalyticsService {
 	if af.analyticsService == nil {
+		af.log.Info("🔄 Creating AnalyticsService")
 		af.analyticsService = academicsvc.NewAnalyticsService(
 			af.AnalyticsRepo(),
 			af.postgresClient,
@@ -715,12 +733,14 @@ func (af *AcademicsInfraFactory) AnalyticsService() academicsvc.AnalyticsService
 			af.idempotencyStore,
 			af.auditService,
 		)
+		af.log.Info("✅ AnalyticsService created", zap.Bool("is_nil", af.analyticsService == nil))
 	}
 	return af.analyticsService
 }
 
 func (af *AcademicsInfraFactory) AdmissionService() academicsvc.AdmissionService {
 	if af.admissionService == nil {
+		af.log.Info("🔄 Creating AdmissionService")
 		af.admissionService = academicsvc.NewAdmissionService(
 			af.AdmissionRepo(),
 			af.postgresClient,
@@ -730,33 +750,14 @@ func (af *AcademicsInfraFactory) AdmissionService() academicsvc.AdmissionService
 			af.auditService,
 			af.NotificationService(),
 		)
+		af.log.Info("✅ AdmissionService created", zap.Bool("is_nil", af.admissionService == nil))
 	}
 	return af.admissionService
 }
 
-func (af *AcademicsInfraFactory) AttendanceService() academicsvc.AttendanceService {
-	if af.attendanceService == nil {
-		af.attendanceService = academicsvc.NewAttendanceService(
-			af.AttendanceRepo(),
-			af.EnrollmentRepo(),
-			af.StudentRepo(),
-			af.postgresClient,
-			af.log,
-			af.NotificationService(),
-			af.idempotencyStore,
-			af.auditService,
-			af.outboxRepo,
-			af.AcademicSessionRepo(),
-			af.StudentSessionAttRepo(),
-			af.AttendanceSessionRepo(),
-			af.BiometricMappingRepo(),
-		)
-	}
-	return af.attendanceService
-}
-
 func (af *AcademicsInfraFactory) AssignmentService() academicsvc.AssignmentService {
 	if af.assignmentService == nil {
+		af.log.Info("🔄 Creating AssignmentService")
 		af.assignmentService = academicsvc.NewAssignmentService(
 			af.AssignmentRepo(),
 			af.TeacherRepo(),
@@ -771,12 +772,14 @@ func (af *AcademicsInfraFactory) AssignmentService() academicsvc.AssignmentServi
 			af.auditService,
 			af.outboxRepo,
 		)
+		af.log.Info("✅ AssignmentService created", zap.Bool("is_nil", af.assignmentService == nil))
 	}
 	return af.assignmentService
 }
 
 func (af *AcademicsInfraFactory) FeeService() academicsvc.FeeService {
 	if af.feeService == nil {
+		af.log.Info("🔄 Creating FeeService")
 		af.feeService = academicsvc.NewFeeService(
 			af.FeeRepo(),
 			af.StudentRepo(),
@@ -789,291 +792,265 @@ func (af *AcademicsInfraFactory) FeeService() academicsvc.FeeService {
 			af.auditService,
 			af.NotificationService(),
 		)
+		af.log.Info("✅ FeeService created", zap.Bool("is_nil", af.feeService == nil))
 	}
 	return af.feeService
 }
 
 // ================================
-// New Service Getters (period attendance, biometric, session generation)
-// ================================
-
-func (af *AcademicsInfraFactory) PeriodAttendanceService() academicsvc.PeriodAttendanceService {
-	if af.periodAttendanceService == nil {
-		af.periodAttendanceService = academicsvc.NewPeriodAttendanceService(
-			af.AcademicSessionRepo(),
-			af.StudentSessionAttRepo(),
-			af.AttendanceSessionRepo(),
-			af.EnrollmentRepo(),
-			af.SectionRepo(),
-			af.TeacherRepo(),
-			af.idempotencyStore,
-			af.auditService,
-			af.outboxRepo,
-			af.postgresClient,
-			af.log,
-		)
-	}
-	return af.periodAttendanceService
-}
-
-func (af *AcademicsInfraFactory) BiometricService() academicsvc.BiometricService {
-	if af.biometricService == nil {
-		af.biometricService = academicsvc.NewBiometricService(
-			af.BiometricMappingRepo(),
-			af.AcademicSessionRepo(),
-			af.EnrollmentRepo(),
-			af.PeriodAttendanceService(),
-			af.AttendanceService(), // ✅ added – full‑day attendance service
-			af.idempotencyStore,
-			af.auditService,
-			af.outboxRepo,
-			af.postgresClient,
-			af.log,
-		)
-	}
-	return af.biometricService
-}
-
-func (af *AcademicsInfraFactory) StudentBiometricService() academicsvc.StudentBiometricService {
-	if af.studentBiometricService == nil {
-		af.studentBiometricService = academicsvc.NewStudentBiometricService(
-			af.BiometricMappingRepo(),
-			af.idempotencyStore,
-			af.auditService,
-			af.outboxRepo,
-			af.postgresClient,
-			af.log,
-		)
-	}
-	return af.studentBiometricService
-}
-
-func (af *AcademicsInfraFactory) SessionGenerationService() academicsvc.SessionGenerationService {
-	if af.sessionGenerationService == nil {
-		af.sessionGenerationService = academicsvc.NewSessionGenerationService(
-			af.TimetableService(),
-			af.idempotencyStore,
-			af.auditService,
-			af.outboxRepo,
-			af.postgresClient,
-			af.log,
-		)
-	}
-	return af.sessionGenerationService
-}
-
-// New service getter for student biometric sync
-func (af *AcademicsInfraFactory) StudentBiometricSyncService() academicsvc.StudentBiometricSyncService {
-	if af.studentBiometricSyncService == nil {
-		af.studentBiometricSyncService = academicsvc.NewStudentBiometricSyncService(
-			af.StudentFaceEmbeddingRepository(),
-			af.DeviceEmbeddingSyncRepository(),
-			af.postgresClient,
-			af.log,
-			af.idempotencyStore,
-			af.outboxRepo,
-			af.auditService,
-			af.NotificationService(), // or a dedicated device notification service
-		)
-	}
-	return af.studentBiometricSyncService
-}
-
-// ================================
-// Handler Getters
+// Handler Getters – with logging
 // ================================
 
 func (af *AcademicsInfraFactory) AcademicYearHandler() *handler.AcademicYearHandler {
 	if af.academicYearHandler == nil {
+		af.log.Info("🔄 Creating AcademicYearHandler")
 		af.academicYearHandler = handler.NewAcademicYearHandler(af.AcademicYearService(), af.log)
+		af.log.Info("✅ AcademicYearHandler created", zap.Bool("is_nil", af.academicYearHandler == nil))
 	}
 	return af.academicYearHandler
 }
 
 func (af *AcademicsInfraFactory) SectionHandler() *handler.SectionHandler {
 	if af.sectionHandler == nil {
+		af.log.Info("🔄 Creating SectionHandler")
 		af.sectionHandler = handler.NewSectionHandler(af.SectionService(), af.log)
+		af.log.Info("✅ SectionHandler created", zap.Bool("is_nil", af.sectionHandler == nil))
 	}
 	return af.sectionHandler
 }
 
 func (af *AcademicsInfraFactory) EnrollmentHandler() *handler.EnrollmentHandler {
 	if af.enrollmentHandler == nil {
+		af.log.Info("🔄 Creating EnrollmentHandler")
 		af.enrollmentHandler = handler.NewEnrollmentHandler(af.EnrollmentService(), af.log)
+		af.log.Info("✅ EnrollmentHandler created", zap.Bool("is_nil", af.enrollmentHandler == nil))
 	}
 	return af.enrollmentHandler
 }
 
 func (af *AcademicsInfraFactory) GuardianHandler() *handler.GuardianHandler {
 	if af.guardianHandler == nil {
+		af.log.Info("🔄 Creating GuardianHandler")
 		af.guardianHandler = handler.NewGuardianHandler(af.GuardianService(), af.log)
+		af.log.Info("✅ GuardianHandler created", zap.Bool("is_nil", af.guardianHandler == nil))
 	}
 	return af.guardianHandler
 }
 
 func (af *AcademicsInfraFactory) ExamHandler() *handler.ExamHandler {
 	if af.examHandler == nil {
+		af.log.Info("🔄 Creating ExamHandler")
 		af.examHandler = handler.NewExamHandler(af.ExamService(), af.log)
+		af.log.Info("✅ ExamHandler created", zap.Bool("is_nil", af.examHandler == nil))
 	}
 	return af.examHandler
 }
 
 func (af *AcademicsInfraFactory) NotificationHandler() *handler.NotificationHandler {
 	if af.notificationHandler == nil {
+		af.log.Info("🔄 Creating NotificationHandler")
 		af.notificationHandler = handler.NewNotificationHandler(af.NotificationService(), af.log)
+		af.log.Info("✅ NotificationHandler created", zap.Bool("is_nil", af.notificationHandler == nil))
 	}
 	return af.notificationHandler
 }
 
 func (af *AcademicsInfraFactory) SubmissionHandler() *handler.SubmissionHandler {
 	if af.submissionHandler == nil {
+		af.log.Info("🔄 Creating SubmissionHandler")
 		af.submissionHandler = handler.NewSubmissionHandler(af.SubmissionService(), af.log)
+		af.log.Info("✅ SubmissionHandler created", zap.Bool("is_nil", af.submissionHandler == nil))
 	}
 	return af.submissionHandler
 }
 
 func (af *AcademicsInfraFactory) TeacherHandler() *handler.TeacherHandler {
 	if af.teacherHandler == nil {
+		af.log.Info("🔄 Creating TeacherHandler")
 		af.teacherHandler = handler.NewTeacherHandler(af.TeacherService(), af.log)
+		af.log.Info("✅ TeacherHandler created", zap.Bool("is_nil", af.teacherHandler == nil))
 	}
 	return af.teacherHandler
 }
 
 func (af *AcademicsInfraFactory) TransportHandler() *handler.TransportHandler {
 	if af.transportHandler == nil {
+		af.log.Info("🔄 Creating TransportHandler")
 		af.transportHandler = handler.NewTransportHandler(af.TransportService(), af.log)
+		af.log.Info("✅ TransportHandler created", zap.Bool("is_nil", af.transportHandler == nil))
 	}
 	return af.transportHandler
 }
 
 func (af *AcademicsInfraFactory) GradingHandler() *handler.GradingHandler {
 	if af.gradingHandler == nil {
+		af.log.Info("🔄 Creating GradingHandler")
 		af.gradingHandler = handler.NewGradingHandler(af.GradingService(), af.log)
+		af.log.Info("✅ GradingHandler created", zap.Bool("is_nil", af.gradingHandler == nil))
 	}
 	return af.gradingHandler
 }
 
 func (af *AcademicsInfraFactory) CourseHandler() *handler.CourseHandler {
 	if af.courseHandler == nil {
+		af.log.Info("🔄 Creating CourseHandler")
 		af.courseHandler = handler.NewCourseHandler(af.CourseService(), af.log)
+		af.log.Info("✅ CourseHandler created", zap.Bool("is_nil", af.courseHandler == nil))
 	}
 	return af.courseHandler
 }
 
 func (af *AcademicsInfraFactory) TimetableHandler() *handler.TimetableHandler {
 	if af.timetableHandler == nil {
+		af.log.Info("🔄 Creating TimetableHandler")
 		af.timetableHandler = handler.NewTimetableHandler(af.TimetableService(), af.log)
+		af.log.Info("✅ TimetableHandler created", zap.Bool("is_nil", af.timetableHandler == nil))
 	}
 	return af.timetableHandler
 }
 
 func (af *AcademicsInfraFactory) LibraryHandler() *handler.LibraryHandler {
 	if af.libraryHandler == nil {
+		af.log.Info("🔄 Creating LibraryHandler")
 		af.libraryHandler = handler.NewLibraryHandler(af.LibraryService(), af.log)
+		af.log.Info("✅ LibraryHandler created", zap.Bool("is_nil", af.libraryHandler == nil))
 	}
 	return af.libraryHandler
 }
 
 func (af *AcademicsInfraFactory) StudentHandler() *handler.StudentHandler {
 	if af.studentHandler == nil {
+		af.log.Info("🔄 Creating StudentHandler")
 		af.studentHandler = handler.NewStudentHandler(
 			af.StudentService(),
 			af.StudentAuthService(),
 			af.sessionService,
 			af.log,
 		)
+		af.log.Info("✅ StudentHandler created", zap.Bool("is_nil", af.studentHandler == nil))
 	}
 	return af.studentHandler
 }
 
+// ================================
+// Session Generation – with extensive logging
+// ================================
+
+func (af *AcademicsInfraFactory) SessionGenerationService() academicsvc.SessionGenerationService {
+	if af.sessionGenerationService == nil {
+		af.log.Info("🔄 Creating SessionGenerationService")
+		timetableSvc := af.TimetableService()
+		if timetableSvc == nil {
+			af.log.Error("❌ TimetableService is nil – cannot create SessionGenerationService")
+			panic("TimetableService is nil – check academicSessionRepo initialisation")
+		}
+		af.sessionGenerationService = academicsvc.NewSessionGenerationService(
+			timetableSvc,
+			af.idempotencyStore,
+			af.auditService,
+			af.outboxRepo,
+			af.postgresClient,
+			af.log,
+		)
+		af.log.Info("✅ SessionGenerationService created",
+			zap.Bool("is_nil", af.sessionGenerationService == nil),
+			zap.String("type", fmt.Sprintf("%T", af.sessionGenerationService)),
+		)
+	}
+	return af.sessionGenerationService
+}
+
+func (af *AcademicsInfraFactory) SessionGenerationHandler() *handler.SessionGenerationHandler {
+	if af.sessionGenerationHandler == nil {
+		af.log.Info("🔄 Creating SessionGenerationHandler")
+		svc := af.SessionGenerationService()
+		if svc == nil {
+			af.log.Error("❌ SessionGenerationService returned nil – handler cannot be created")
+			panic("SessionGenerationService is nil – check all dependencies")
+		}
+		af.sessionGenerationHandler = handler.NewSessionGenerationHandler(svc, af.log)
+		af.log.Info("✅ SessionGenerationHandler created",
+			zap.Bool("is_nil", af.sessionGenerationHandler == nil),
+			zap.String("address", fmt.Sprintf("%p", af.sessionGenerationHandler)),
+		)
+	}
+	return af.sessionGenerationHandler
+}
+
+// ================================
+// Other Handlers
+// ================================
+
 func (af *AcademicsInfraFactory) RoomHandler() *handler.RoomHandler {
 	if af.roomHandler == nil {
+		af.log.Info("🔄 Creating RoomHandler")
 		af.roomHandler = handler.NewRoomHandler(af.RoomService(), af.log)
+		af.log.Info("✅ RoomHandler created", zap.Bool("is_nil", af.roomHandler == nil))
 	}
 	return af.roomHandler
 }
 
 func (af *AcademicsInfraFactory) SubjectHandler() *handler.SubjectHandler {
 	if af.subjectHandler == nil {
+		af.log.Info("🔄 Creating SubjectHandler")
 		af.subjectHandler = handler.NewSubjectHandler(af.SubjectService(), af.log)
+		af.log.Info("✅ SubjectHandler created", zap.Bool("is_nil", af.subjectHandler == nil))
 	}
 	return af.subjectHandler
 }
 
 func (af *AcademicsInfraFactory) FeeHandler() *handler.FeeHandler {
 	if af.feeHandler == nil {
+		af.log.Info("🔄 Creating FeeHandler")
 		af.feeHandler = handler.NewFeeHandler(af.FeeService(), af.log)
+		af.log.Info("✅ FeeHandler created", zap.Bool("is_nil", af.feeHandler == nil))
 	}
 	return af.feeHandler
 }
 
 func (af *AcademicsInfraFactory) AssignmentHandler() *handler.AssignmentHandler {
 	if af.assignmentHandler == nil {
+		af.log.Info("🔄 Creating AssignmentHandler")
 		af.assignmentHandler = handler.NewAssignmentHandler(af.AssignmentService(), af.log)
+		af.log.Info("✅ AssignmentHandler created", zap.Bool("is_nil", af.assignmentHandler == nil))
 	}
 	return af.assignmentHandler
 }
 
-func (af *AcademicsInfraFactory) AttendanceHandler() *handler.AttendanceHandler {
-	if af.attendanceHandler == nil {
-		af.attendanceHandler = handler.NewAttendanceHandler(
-			af.AttendanceService(),
-			af.PeriodAttendanceService(),
-			af.BiometricService(),
-			af.StudentBiometricService(),
-			af.log,
-		)
-	}
-	return af.attendanceHandler
-}
-
 func (af *AcademicsInfraFactory) AdmissionHandler() *handler.AdmissionHandler {
 	if af.admissionHandler == nil {
+		af.log.Info("🔄 Creating AdmissionHandler")
 		af.admissionHandler = handler.NewAdmissionHandler(af.AdmissionService(), af.log)
+		af.log.Info("✅ AdmissionHandler created", zap.Bool("is_nil", af.admissionHandler == nil))
 	}
 	return af.admissionHandler
 }
 
 func (af *AcademicsInfraFactory) TermHandler() *handler.TermHandler {
 	if af.termHandler == nil {
+		af.log.Info("🔄 Creating TermHandler")
 		af.termHandler = handler.NewTermHandler(af.TermService(), af.log)
+		af.log.Info("✅ TermHandler created", zap.Bool("is_nil", af.termHandler == nil))
 	}
 	return af.termHandler
 }
 
 func (af *AcademicsInfraFactory) AnalyticsHandler() *handler.AnalyticsHandler {
 	if af.analyticsHandler == nil {
+		af.log.Info("🔄 Creating AnalyticsHandler")
 		af.analyticsHandler = handler.NewAnalyticsHandler(af.AnalyticsService(), af.log)
+		af.log.Info("✅ AnalyticsHandler created", zap.Bool("is_nil", af.analyticsHandler == nil))
 	}
 	return af.analyticsHandler
 }
 
 func (af *AcademicsInfraFactory) CurriculumHandler() *handler.CurriculumHandler {
 	if af.curriculumHandler == nil {
+		af.log.Info("🔄 Creating CurriculumHandler")
 		af.curriculumHandler = handler.NewCurriculumHandler(af.CurriculumService(), af.log)
+		af.log.Info("✅ CurriculumHandler created", zap.Bool("is_nil", af.curriculumHandler == nil))
 	}
 	return af.curriculumHandler
-}
-
-func (af *AcademicsInfraFactory) SessionGenerationHandler() *handler.SessionGenerationHandler {
-	if af.sessionGenerationHandler == nil {
-		af.sessionGenerationHandler = handler.NewSessionGenerationHandler(
-			af.SessionGenerationService(),
-			af.log,
-		)
-	}
-	return af.sessionGenerationHandler
-}
-
-// New handler getter for student biometric sync
-func (af *AcademicsInfraFactory) StudentBiometricSyncHandler() *handler.StudentBiometricSyncHandler {
-	if af.studentBiometricSyncHandler == nil {
-		af.studentBiometricSyncHandler = handler.NewStudentBiometricSyncHandler(
-			af.StudentBiometricSyncService(),
-			af.log,
-		)
-	}
-	return af.studentBiometricSyncHandler
 }
 
 // ================================
@@ -1081,13 +1058,21 @@ func (af *AcademicsInfraFactory) StudentBiometricSyncHandler() *handler.StudentB
 // ================================
 
 func (af *AcademicsInfraFactory) RegisterRoutes(r chi.Router, jwtService *mainservice.JWTService, logger *zap.Logger) {
+	af.log.Info("📌 Registering academic routes")
+
+	// Get the session generation handler specifically for logging
+	sessGenHandler := af.SessionGenerationHandler()
+	af.log.Info("🔍 SessionGenerationHandler before registration",
+		zap.Bool("is_nil", sessGenHandler == nil),
+		zap.String("address", fmt.Sprintf("%p", sessGenHandler)),
+	)
+
 	academics.RegisterAcademicRoutes(
 		r,
 		af.AcademicYearHandler(),
 		af.AdmissionHandler(),
 		af.AnalyticsHandler(),
 		af.AssignmentHandler(),
-		af.AttendanceHandler(),
 		af.CourseHandler(),
 		af.CurriculumHandler(),
 		af.EnrollmentHandler(),
@@ -1099,8 +1084,6 @@ func (af *AcademicsInfraFactory) RegisterRoutes(r chi.Router, jwtService *mainse
 		af.NotificationHandler(),
 		af.RoomHandler(),
 		af.SectionHandler(),
-		logger,
-		jwtService,
 		af.StudentHandler(),
 		af.SubjectHandler(),
 		af.SubmissionHandler(),
@@ -1108,10 +1091,10 @@ func (af *AcademicsInfraFactory) RegisterRoutes(r chi.Router, jwtService *mainse
 		af.TermHandler(),
 		af.TimetableHandler(),
 		af.TransportHandler(),
-		af.SessionGenerationHandler(),
-		af.StudentBiometricSyncHandler(), // <-- ADD THIS LINE
-		// ✅ added
+		sessGenHandler,
+		logger,
 	)
+	af.log.Info("✅ Academic routes registered")
 }
 
 // Close is a no‑op because the outbox processor is managed centrally

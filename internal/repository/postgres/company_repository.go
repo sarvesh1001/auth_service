@@ -6986,21 +6986,20 @@ func (r *CompanyRepositoryImpl) CreatePosition(ctx context.Context, position *mo
 }
 
 // Updated GetPosition function
+
 func (r *CompanyRepositoryImpl) GetPosition(ctx context.Context, positionID uuid.UUID) (*models.Position, error) {
 	query := `
-        SELECT 
+        SELECT
             p.position_id, p.company_id, p.department_id, p.title,
             p.is_open, p.is_schedulable, p.attendance_required,
             p.overtime_allowed, p.work_center_code, wc.name as work_center_name,
             p.created_at, p.updated_at
         FROM positions p
-        LEFT JOIN work_centers wc ON p.company_id = wc.company_id AND p.work_center_code = wc.work_center_code
+        LEFT JOIN attendance.work_centers wc ON p.company_id = wc.company_id AND p.work_center_code = wc.work_center_code
         WHERE p.position_id = $1`
-
 	var position models.Position
 	var workCenterCode sql.NullString
 	var workCenterName sql.NullString
-
 	err := r.client.QueryRow(ctx, query, positionID).Scan(
 		&position.PositionID, &position.CompanyID, &position.DepartmentID,
 		&position.Title, &position.IsOpen, &position.IsSchedulable,
@@ -7008,7 +7007,6 @@ func (r *CompanyRepositoryImpl) GetPosition(ctx context.Context, positionID uuid
 		&workCenterCode, &workCenterName,
 		&position.CreatedAt, &position.UpdatedAt,
 	)
-
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("position not found: %s", positionID)
@@ -7016,14 +7014,12 @@ func (r *CompanyRepositoryImpl) GetPosition(ctx context.Context, positionID uuid
 		r.recordError()
 		return nil, fmt.Errorf("failed to get position: %w", err)
 	}
-
 	if workCenterCode.Valid {
 		position.WorkCenterCode = &workCenterCode.String
 	}
 	if workCenterName.Valid {
 		position.WorkCenterName = &workCenterName.String
 	}
-
 	r.recordQuery()
 	return &position, nil
 }
@@ -7076,6 +7072,7 @@ func (r *CompanyRepositoryImpl) UpdatePosition(ctx context.Context, position *mo
 }
 
 // Updated GetPositionsByDepartment function
+
 func (r *CompanyRepositoryImpl) GetPositionsByDepartment(
 	ctx context.Context,
 	departmentID uuid.UUID,
@@ -7094,7 +7091,6 @@ func (r *CompanyRepositoryImpl) GetPositionsByDepartment(
 	if onlyOpen {
 		countQuery += ` AND is_open = true`
 	}
-
 	err := r.client.QueryRow(ctx, countQuery, departmentID).Scan(&totalCount)
 	if err != nil {
 		r.recordError()
@@ -7102,20 +7098,18 @@ func (r *CompanyRepositoryImpl) GetPositionsByDepartment(
 	}
 
 	query := `
-        SELECT 
+        SELECT
             p.position_id, p.company_id, p.title, p.is_open,
             p.is_schedulable, p.attendance_required, p.overtime_allowed,
             p.work_center_code, wc.name as work_center_name,
             p.created_at, p.updated_at, d.department_name
         FROM positions p
         INNER JOIN departments d ON p.department_id = d.department_id
-        LEFT JOIN work_centers wc ON p.company_id = wc.company_id AND p.work_center_code = wc.work_center_code
+        LEFT JOIN attendance.work_centers wc ON p.company_id = wc.company_id AND p.work_center_code = wc.work_center_code
         WHERE p.department_id = $1`
-
 	if onlyOpen {
 		query += ` AND p.is_open = true`
 	}
-
 	query += ` ORDER BY p.created_at DESC LIMIT $2 OFFSET $3`
 
 	rows, err := r.client.Query(ctx, query, departmentID, limit, offset)
@@ -7131,7 +7125,6 @@ func (r *CompanyRepositoryImpl) GetPositionsByDepartment(
 		var departmentName string
 		var workCenterCode sql.NullString
 		var workCenterName sql.NullString
-
 		err := rows.Scan(
 			&position.PositionID, &position.CompanyID, &position.Title,
 			&position.IsOpen, &position.IsSchedulable, &position.AttendanceRequired,
@@ -7142,7 +7135,6 @@ func (r *CompanyRepositoryImpl) GetPositionsByDepartment(
 			r.logger.Warn("Failed to scan department position row", util.ErrorField(err))
 			continue
 		}
-
 		position.DepartmentID = departmentID
 		position.DepartmentName = departmentName
 		if workCenterCode.Valid {
@@ -7151,19 +7143,17 @@ func (r *CompanyRepositoryImpl) GetPositionsByDepartment(
 		if workCenterName.Valid {
 			position.WorkCenterName = &workCenterName.String
 		}
-
 		positions = append(positions, &position)
 	}
-
 	if err := rows.Err(); err != nil {
 		return nil, 0, fmt.Errorf("error iterating department position rows: %w", err)
 	}
-
 	r.recordQuery()
 	return positions, totalCount, nil
 }
 
 // Updated GetPositionsByCompany function
+
 func (r *CompanyRepositoryImpl) GetPositionsByCompany(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -7182,7 +7172,6 @@ func (r *CompanyRepositoryImpl) GetPositionsByCompany(
 	if onlyOpen {
 		countQuery += ` AND is_open = true`
 	}
-
 	err := r.client.QueryRow(ctx, countQuery, companyID).Scan(&totalCount)
 	if err != nil {
 		r.recordError()
@@ -7190,19 +7179,17 @@ func (r *CompanyRepositoryImpl) GetPositionsByCompany(
 	}
 
 	query := `
-        SELECT 
+        SELECT
             p.position_id, p.department_id, p.title, p.is_open,
             p.is_schedulable, p.attendance_required, p.overtime_allowed,
             p.work_center_code, wc.name as work_center_name,
             p.created_at, p.updated_at
         FROM positions p
-        LEFT JOIN work_centers wc ON p.company_id = wc.company_id AND p.work_center_code = wc.work_center_code
+        LEFT JOIN attendance.work_centers wc ON p.company_id = wc.company_id AND p.work_center_code = wc.work_center_code
         WHERE p.company_id = $1`
-
 	if onlyOpen {
 		query += ` AND p.is_open = true`
 	}
-
 	query += ` ORDER BY p.created_at DESC LIMIT $2 OFFSET $3`
 
 	rows, err := r.client.Query(ctx, query, companyID, limit, offset)
@@ -7217,7 +7204,6 @@ func (r *CompanyRepositoryImpl) GetPositionsByCompany(
 		var position models.Position
 		var workCenterCode sql.NullString
 		var workCenterName sql.NullString
-
 		err := rows.Scan(
 			&position.PositionID, &position.DepartmentID, &position.Title,
 			&position.IsOpen, &position.IsSchedulable, &position.AttendanceRequired,
@@ -7228,7 +7214,6 @@ func (r *CompanyRepositoryImpl) GetPositionsByCompany(
 			r.logger.Warn("Failed to scan position row", util.ErrorField(err))
 			continue
 		}
-
 		position.CompanyID = companyID
 		if workCenterCode.Valid {
 			position.WorkCenterCode = &workCenterCode.String
@@ -7236,19 +7221,17 @@ func (r *CompanyRepositoryImpl) GetPositionsByCompany(
 		if workCenterName.Valid {
 			position.WorkCenterName = &workCenterName.String
 		}
-
 		positions = append(positions, &position)
 	}
-
 	if err := rows.Err(); err != nil {
 		return nil, 0, fmt.Errorf("error iterating position rows: %w", err)
 	}
-
 	r.recordQuery()
 	return positions, totalCount, nil
 }
 
 // Updated GetOpenPositions function
+
 func (r *CompanyRepositoryImpl) GetOpenPositions(ctx context.Context, companyID uuid.UUID, isOpen *bool, limit, offset int) ([]*models.Position, int, error) {
 	start := time.Now()
 	if limit <= 0 {
@@ -7261,14 +7244,12 @@ func (r *CompanyRepositoryImpl) GetOpenPositions(ctx context.Context, companyID 
 	var countQuery string
 	var countArgs []interface{}
 	countArgs = append(countArgs, companyID)
-
 	if isOpen != nil {
 		countQuery = `SELECT COUNT(*) FROM positions WHERE company_id = $1 AND is_open = $2`
 		countArgs = append(countArgs, *isOpen)
 	} else {
 		countQuery = `SELECT COUNT(*) FROM positions WHERE company_id = $1`
 	}
-
 	var totalCount int
 	err := r.client.QueryRow(ctx, countQuery, countArgs...).Scan(&totalCount)
 	if err != nil {
@@ -7292,20 +7273,17 @@ func (r *CompanyRepositoryImpl) GetOpenPositions(ctx context.Context, companyID 
 			p.updated_at
 		FROM positions p
 		INNER JOIN departments d ON p.department_id = d.department_id
-		LEFT JOIN work_centers wc ON p.company_id = wc.company_id AND p.work_center_code = wc.work_center_code
+		LEFT JOIN attendance.work_centers wc ON p.company_id = wc.company_id AND p.work_center_code = wc.work_center_code
 		WHERE p.company_id = $1 AND d.is_active = true
 	`
-
 	var queryArgs []interface{}
 	queryArgs = append(queryArgs, companyID)
 	argCounter := 2
-
 	if isOpen != nil {
 		query += fmt.Sprintf(" AND p.is_open = $%d", argCounter)
 		queryArgs = append(queryArgs, *isOpen)
 		argCounter++
 	}
-
 	query += fmt.Sprintf(" ORDER BY p.created_at DESC LIMIT $%d OFFSET $%d", argCounter, argCounter+1)
 	queryArgs = append(queryArgs, limit, offset)
 
@@ -7321,7 +7299,6 @@ func (r *CompanyRepositoryImpl) GetOpenPositions(ctx context.Context, companyID 
 		var position models.Position
 		var workCenterCode sql.NullString
 		var workCenterName sql.NullString
-
 		err := rows.Scan(
 			&position.PositionID,
 			&position.CompanyID,
@@ -7340,21 +7317,17 @@ func (r *CompanyRepositoryImpl) GetOpenPositions(ctx context.Context, companyID 
 			r.logger.Warn("Failed to scan position row", util.ErrorField(err))
 			continue
 		}
-
 		if workCenterCode.Valid {
 			position.WorkCenterCode = &workCenterCode.String
 		}
 		if workCenterName.Valid {
 			position.WorkCenterName = &workCenterName.String
 		}
-
 		positions = append(positions, &position)
 	}
-
 	if err := rows.Err(); err != nil {
 		return nil, 0, fmt.Errorf("error iterating position rows: %w", err)
 	}
-
 	r.recordQuery()
 	r.logger.Debug("GetOpenPositions completed",
 		util.String("company_id", companyID.String()),
@@ -7362,13 +7335,12 @@ func (r *CompanyRepositoryImpl) GetOpenPositions(ctx context.Context, companyID 
 		util.Int("returned", len(positions)),
 		util.Duration("duration", time.Since(start)),
 	)
-
 	return positions, totalCount, nil
 }
 
 // New: Check if work center exists
 func (r *CompanyRepositoryImpl) WorkCenterExists(ctx context.Context, companyID uuid.UUID, workCenterCode string) (bool, error) {
-	query := `SELECT EXISTS(SELECT 1 FROM work_centers WHERE company_id = $1 AND work_center_code = $2)`
+	query := `SELECT EXISTS(SELECT 1 FROM attendance.work_centers WHERE company_id = $1 AND work_center_code = $2)`
 	var exists bool
 	err := r.client.QueryRow(ctx, query, companyID, workCenterCode).Scan(&exists)
 	if err != nil {
@@ -7377,6 +7349,7 @@ func (r *CompanyRepositoryImpl) WorkCenterExists(ctx context.Context, companyID 
 	}
 	return exists, nil
 }
+
 func (r *CompanyRepositoryImpl) CreateCompany(
 	ctx context.Context,
 	company *models.Company,
@@ -7391,7 +7364,6 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 	}
 	defer tx.Rollback()
 
-	// 1. Create the company – ✅ UPDATED QUERY with financial_year_start_month
 	companyQuery := `
         INSERT INTO companies (
             company_id, company_name, owner_user_id, subscription_tier,
@@ -7414,7 +7386,7 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 		company.UpdatedAt,
 		company.SubscriptionStartDate,
 		company.SubscriptionEndDate,
-		company.FinancialYearStartMonth, // ✅ NEW
+		company.FinancialYearStartMonth,
 	)
 	if err != nil {
 		if strings.Contains(err.Error(), "idx_companies_name_owner_unique") {
@@ -7423,12 +7395,11 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 		return fmt.Errorf("failed to create company: %w", err)
 	}
 
-	// 2. Create work center if provided
 	if workCenterDetails != nil && workCenterDetails.WorkCenterCode != "" {
 		workCenterQuery := `
-            INSERT INTO work_centers (
-                work_center_code, company_id, name, 
-                description, timezone, is_active, 
+            INSERT INTO attendance.work_centers (
+                work_center_code, company_id, name,
+                description, timezone, is_active,
                 created_at, updated_at
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (company_id, work_center_code) DO NOTHING
@@ -7448,7 +7419,7 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 		}
 	}
 
-	// 3. Create owner role (system role)
+	// Create owner role
 	ownerRoleID := uuid.New()
 	_, err = tx.ExecContext(ctx, `
         INSERT INTO roles (
@@ -7469,19 +7440,19 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 		return fmt.Errorf("failed to create owner role: %w", err)
 	}
 
-	// 4. Get system department ID for Administration
+	// Get administration system department
 	var adminSystemDeptID uuid.UUID
 	err = tx.QueryRowContext(ctx, `
-        SELECT system_department_id 
-        FROM system_departments 
-        WHERE module_code = 'administration' 
+        SELECT system_department_id
+        FROM system_departments
+        WHERE module_code = 'administration'
         LIMIT 1
     `).Scan(&adminSystemDeptID)
 	if err != nil {
 		return fmt.Errorf("failed to get administration system department: %w", err)
 	}
 
-	// 5. Create Administration department (main department for owner)
+	// Create administration department
 	adminDeptID := uuid.New()
 	departmentName := "Administration"
 	_, err = tx.ExecContext(ctx, `
@@ -7502,7 +7473,7 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 		return fmt.Errorf("failed to create administration department: %w", err)
 	}
 
-	// 6. Create owner position in Administration department
+	// Create owner position
 	ownerPositionID := uuid.New()
 	positionQuery := `
         INSERT INTO positions (
@@ -7529,7 +7500,7 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 		return fmt.Errorf("failed to create owner position: %w", err)
 	}
 
-	// 7. Create additional departments if any
+	// Create additional departments
 	remainingSlots := company.MaxDepartments - 1
 	if remainingSlots < 0 {
 		remainingSlots = 0
@@ -7545,9 +7516,9 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 		deptID := uuid.New()
 		var systemDeptID uuid.UUID
 		err = tx.QueryRowContext(ctx, `
-            SELECT system_department_id 
-            FROM system_departments 
-            WHERE module_code = $1 
+            SELECT system_department_id
+            FROM system_departments
+            WHERE module_code = $1
             LIMIT 1
         `, strings.ToLower(strings.TrimSpace(deptName))).Scan(&systemDeptID)
 		if err != nil {
@@ -7574,7 +7545,6 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 				util.ErrorField(err))
 			continue
 		}
-
 		ownerAccessDeptIDs = append(ownerAccessDeptIDs, deptID)
 		if systemDeptID == adminSystemDeptID {
 			ownerAccessModules = append(ownerAccessModules, "administration")
@@ -7583,7 +7553,7 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 		}
 	}
 
-	// 8. Link owner role to all departments
+	// Map owner role to all departments
 	for _, deptID := range ownerAccessDeptIDs {
 		_, _ = tx.ExecContext(ctx,
 			`INSERT INTO role_departments (role_id, department_id) VALUES ($1,$2)`,
@@ -7592,7 +7562,7 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 		)
 	}
 
-	// 9. Grant all permissions for the modules the owner has access to
+	// Grant permissions for all modules the owner has access to
 	_, err = tx.ExecContext(ctx, `
         INSERT INTO role_permissions (role_id, permission_id, granted_by, granted_at)
         SELECT $1, p.permission_id, $2, $3
@@ -7608,7 +7578,7 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 		return fmt.Errorf("failed to grant permissions: %w", err)
 	}
 
-	// 10. Create owner employee record
+	// Insert owner as employee
 	_, err = tx.ExecContext(ctx, `
         INSERT INTO company_employees (
             company_id, user_id, employee_id,
@@ -7643,6 +7613,7 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 	)
 	return nil
 }
+
 func (r *CompanyRepositoryImpl) AddRoleDepartments(ctx context.Context, roleID uuid.UUID, departmentIDs []uuid.UUID) error {
 	query := `
         INSERT INTO role_departments (role_id, department_id, created_at)

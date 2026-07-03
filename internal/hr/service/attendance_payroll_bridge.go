@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"time"
 
-	"auth-service/internal/hr/repository"
-
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+
+	"auth-service/internal/attendance/repository"
 )
 
 // ============================================================
@@ -58,17 +58,20 @@ type PayrollAttendanceSummary struct {
 // ============================================================
 
 type attendancePayrollBridge struct {
-	attendanceRepo repository.AttendanceRepository
-	logger         *zap.Logger
+	summaryRepo repository.SummaryRepository
+	eventRepo   repository.EventRepository // for transactions
+	logger      *zap.Logger
 }
 
 func NewAttendancePayrollBridge(
-	attendanceRepo repository.AttendanceRepository,
+	summaryRepo repository.SummaryRepository,
+	eventRepo repository.EventRepository,
 	logger *zap.Logger,
 ) AttendancePayrollBridge {
 	return &attendancePayrollBridge{
-		attendanceRepo: attendanceRepo,
-		logger:         logger,
+		summaryRepo: summaryRepo,
+		eventRepo:   eventRepo,
+		logger:      logger,
 	}
 }
 
@@ -89,34 +92,25 @@ func (b *attendancePayrollBridge) ValidateAttendanceForPayroll(
 
 	expectedDays := int(endDate.Sub(startDate).Hours()/24) + 1
 
-	count, err := b.attendanceRepo.CountAttendanceSummariesInRange(
+	// Fetch summaries for the period
+	summaries, err := b.summaryRepo.GetBySubjectRange(
 		ctx,
 		companyID,
 		userID,
+		"employee", // HR subjects are employees
 		startDate,
 		endDate,
 	)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to fetch summaries: %w", err)
 	}
 
-	if count != expectedDays {
+	if len(summaries) != expectedDays {
 		return fmt.Errorf(
 			"attendance incomplete: expected %d days but found %d summaries",
 			expectedDays,
-			count,
+			len(summaries),
 		)
-	}
-
-	summaries, err := b.attendanceRepo.GetAttendanceSummariesInRange(
-		ctx,
-		companyID,
-		userID,
-		startDate,
-		endDate,
-	)
-	if err != nil {
-		return err
 	}
 
 	for _, s := range summaries {
@@ -154,10 +148,11 @@ func (b *attendancePayrollBridge) GetPayrollAttendanceSummary(
 		return nil, err
 	}
 
-	summaries, err := b.attendanceRepo.GetAttendanceSummariesInRange(
+	summaries, err := b.summaryRepo.GetBySubjectRange(
 		ctx,
 		companyID,
 		userID,
+		"employee",
 		startDate,
 		endDate,
 	)
@@ -232,10 +227,11 @@ func (b *attendancePayrollBridge) LockAttendanceForPayroll(
 	}
 
 	// 2. Explicitly check for existing locks
-	summaries, err := b.attendanceRepo.GetAttendanceSummariesInRange(
+	summaries, err := b.summaryRepo.GetBySubjectRange(
 		ctx,
 		companyID,
 		userID,
+		"employee",
 		startDate,
 		endDate,
 	)
@@ -252,16 +248,28 @@ func (b *attendancePayrollBridge) LockAttendanceForPayroll(
 		}
 	}
 
-	// 3. Perform the lock
-	err = b.attendanceRepo.LockAttendanceSummariesInRange(
+	// 3. Perform the lock within a transaction
+	tx, err := b.eventRepo.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to start transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	err = b.summaryRepo.LockBySubjectDateRange(
 		ctx,
+		tx,
 		companyID,
 		userID,
+		"employee",
 		startDate,
 		endDate,
 	)
 	if err != nil {
 		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit lock transaction: %w", err)
 	}
 
 	b.logger.Info(

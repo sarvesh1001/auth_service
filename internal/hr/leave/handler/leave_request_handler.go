@@ -1,9 +1,6 @@
 package handler
 
 import (
-	"auth-service/internal/hr/leave/models"
-	"auth-service/internal/hr/leave/service"
-	a "auth-service/internal/hr/service"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -13,19 +10,23 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+
+	"auth-service/internal/attendance/service/scheduling" // ✅ Unified scheduling service
+	"auth-service/internal/hr/leave/models"
+	"auth-service/internal/hr/leave/service"
 )
 
 type LeaveRequestHandler struct {
 	requestService    service.LeaveRequestService
 	queryService      service.LeaveQueryService
-	schedulingService a.SchedulingService // ✅ ADD
+	schedulingService scheduling.SchedulingService
 	logger            *zap.Logger
 }
 
 func NewLeaveRequestHandler(
 	requestService service.LeaveRequestService,
 	queryService service.LeaveQueryService,
-	schedulingService a.SchedulingService,
+	schedulingService scheduling.SchedulingService,
 	logger *zap.Logger,
 ) *LeaveRequestHandler {
 	return &LeaveRequestHandler{
@@ -36,6 +37,8 @@ func NewLeaveRequestHandler(
 	}
 }
 
+// ---- DTOs ----
+
 type CreateLeaveRequest struct {
 	UserID      uuid.UUID `json:"user_id"`
 	LeaveTypeID uuid.UUID `json:"leave_type_id"`
@@ -44,15 +47,12 @@ type CreateLeaveRequest struct {
 	TotalDays   int       `json:"total_days"`
 }
 
-type UpdateLeaveRequest struct {
-	Status     *string    `json:"status,omitempty"`
-	ApprovedBy *uuid.UUID `json:"approved_by,omitempty"`
-}
-
 type ApproveRejectRequest struct {
 	ApprovedBy uuid.UUID `json:"approved_by"`
 	Reason     string    `json:"reason,omitempty"`
 }
+
+// ---- Handlers ----
 
 func (h *LeaveRequestHandler) RequestLeave(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -63,7 +63,6 @@ func (h *LeaveRequestHandler) RequestLeave(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Get user ID from context (assuming it's set by authentication middleware)
 	requestedBy, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -85,27 +84,18 @@ func (h *LeaveRequestHandler) RequestLeave(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusBadRequest, "user ID is required")
 		return
 	}
-
 	if req.LeaveTypeID == uuid.Nil {
 		h.respondWithError(w, http.StatusBadRequest, "leave type ID is required")
 		return
 	}
-
-	if req.StartDate.IsZero() {
-		h.respondWithError(w, http.StatusBadRequest, "start date is required")
+	if req.StartDate.IsZero() || req.EndDate.IsZero() {
+		h.respondWithError(w, http.StatusBadRequest, "start and end dates are required")
 		return
 	}
-
-	if req.EndDate.IsZero() {
-		h.respondWithError(w, http.StatusBadRequest, "end date is required")
-		return
-	}
-
 	if req.EndDate.Before(req.StartDate) {
 		h.respondWithError(w, http.StatusBadRequest, "end date must be after start date")
 		return
 	}
-
 	if req.TotalDays <= 0 {
 		h.respondWithError(w, http.StatusBadRequest, "total days must be greater than 0")
 		return
@@ -154,18 +144,15 @@ func (h *LeaveRequestHandler) GetLeaveRequest(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Note: You'll need to add this method to your repository/service
-	// For now, we'll use the query service to get user's requests and filter
-	userID, _ := getUserIDFromContext(ctx)
-	if userID == uuid.Nil {
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
 
-	// Get user's leave history and find the specific request
 	requests, err := h.queryService.GetUserLeaveHistory(ctx, userID,
-		time.Now().AddDate(-1, 0, 0), // Last year
-		time.Now().AddDate(1, 0, 0))  // Next year
+		time.Now().AddDate(-1, 0, 0),
+		time.Now().AddDate(1, 0, 0))
 	if err != nil {
 		h.logger.Error("Failed to get leave requests",
 			zap.String("user_id", userID.String()),
@@ -208,7 +195,6 @@ func (h *LeaveRequestHandler) ListLeaveRequests(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Parse query parameters
 	startDateStr := r.URL.Query().Get("start_date")
 	endDateStr := r.URL.Query().Get("end_date")
 	status := r.URL.Query().Get("status")
@@ -222,9 +208,8 @@ func (h *LeaveRequestHandler) ListLeaveRequests(w http.ResponseWriter, r *http.R
 			return
 		}
 	} else {
-		startDate = time.Now().AddDate(-1, 0, 0) // Default: last year
+		startDate = time.Now().AddDate(-1, 0, 0)
 	}
-
 	if endDateStr != "" {
 		endDate, err = time.Parse("2006-01-02", endDateStr)
 		if err != nil {
@@ -232,10 +217,9 @@ func (h *LeaveRequestHandler) ListLeaveRequests(w http.ResponseWriter, r *http.R
 			return
 		}
 	} else {
-		endDate = time.Now().AddDate(1, 0, 0) // Default: next year
+		endDate = time.Now().AddDate(1, 0, 0)
 	}
 
-	// Get user's leave history
 	requests, err := h.queryService.GetUserLeaveHistory(ctx, userID, startDate, endDate)
 	if err != nil {
 		h.logger.Error("Failed to list leave requests",
@@ -245,24 +229,20 @@ func (h *LeaveRequestHandler) ListLeaveRequests(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Apply filters
 	filteredRequests := make([]*models.LeaveRequest, 0)
 	for _, req := range requests {
 		if req.CompanyID != companyID {
 			continue
 		}
-
 		if status != "" && req.Status != status {
 			continue
 		}
-
 		if leaveTypeIDStr != "" {
-			leaveTypeID, err := uuid.Parse(leaveTypeIDStr)
-			if err == nil && req.LeaveTypeID != leaveTypeID {
+			ltID, err := uuid.Parse(leaveTypeIDStr)
+			if err == nil && req.LeaveTypeID != ltID {
 				continue
 			}
 		}
-
 		filteredRequests = append(filteredRequests, req)
 	}
 
@@ -320,13 +300,15 @@ func (h *LeaveRequestHandler) ApproveLeave(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// ✅ THIS IS THE MISSING LINK
-	if err := h.schedulingService.ApplyApprovedLeave(
-		ctx,
-		leaveRequest,
-		"user",
-		approvedBy,
-	); err != nil {
+	// ✅ Apply scheduling overrides for approved leave
+	leaveData := &scheduling.LeaveScheduleData{
+		LeaveRequestID: leaveRequest.LeaveRequestID,
+		UserID:         leaveRequest.UserID,
+		CompanyID:      leaveRequest.CompanyID,
+		StartDate:      leaveRequest.StartDate,
+		EndDate:        leaveRequest.EndDate,
+	}
+	if err := h.schedulingService.ApplyApprovedLeave(ctx, leaveData, "user", approvedBy); err != nil {
 		h.logger.Warn(
 			"Leave approved but scheduling override failed",
 			zap.String("leave_request_id", leaveRequest.LeaveRequestID.String()),
@@ -374,36 +356,29 @@ func (h *LeaveRequestHandler) RejectLeave(w http.ResponseWriter, r *http.Request
 		rejectedBy = req.ApprovedBy
 	}
 
-	leaveRequest, err := h.requestService.RejectLeave(
-		ctx,
-		requestID,
-		rejectedBy,
-		req.Reason,
-	)
+	leaveRequest, err := h.requestService.RejectLeave(ctx, requestID, rejectedBy, req.Reason)
 	if err != nil {
-		h.logger.Error(
-			"Failed to reject leave request",
+		h.logger.Error("Failed to reject leave request",
 			zap.String("leave_request_id", requestID.String()),
-			zap.Error(err),
-		)
+			zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to reject leave request")
 		return
 	}
 
-	// 🔁 ROLLBACK scheduling overrides (NON-BLOCKING)
-	if h.schedulingService != nil {
-		if err := h.schedulingService.RollbackCancelledLeave(
-			ctx,
-			leaveRequest,
-			"user",
-			rejectedBy,
-		); err != nil {
-			h.logger.Warn(
-				"Leave rejected but scheduling rollback failed",
-				zap.String("leave_request_id", leaveRequest.LeaveRequestID.String()),
-				zap.Error(err),
-			)
-		}
+	// 🔁 Rollback scheduling overrides
+	leaveData := &scheduling.LeaveScheduleData{
+		LeaveRequestID: leaveRequest.LeaveRequestID,
+		UserID:         leaveRequest.UserID,
+		CompanyID:      leaveRequest.CompanyID,
+		StartDate:      leaveRequest.StartDate,
+		EndDate:        leaveRequest.EndDate,
+	}
+	if err := h.schedulingService.RollbackCancelledLeave(ctx, leaveData, "user", rejectedBy); err != nil {
+		h.logger.Warn(
+			"Leave rejected but scheduling rollback failed",
+			zap.String("leave_request_id", leaveRequest.LeaveRequestID.String()),
+			zap.Error(err),
+		)
 	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
@@ -438,29 +413,27 @@ func (h *LeaveRequestHandler) CancelLeave(w http.ResponseWriter, r *http.Request
 
 	leaveRequest, err := h.requestService.CancelLeave(ctx, requestID, cancelledBy)
 	if err != nil {
-		h.logger.Error(
-			"Failed to cancel leave request",
+		h.logger.Error("Failed to cancel leave request",
 			zap.String("leave_request_id", requestID.String()),
-			zap.Error(err),
-		)
+			zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to cancel leave request")
 		return
 	}
 
-	// 🔁 ROLLBACK scheduling overrides (NON-BLOCKING)
-	if h.schedulingService != nil {
-		if err := h.schedulingService.RollbackCancelledLeave(
-			ctx,
-			leaveRequest,
-			"user",
-			cancelledBy,
-		); err != nil {
-			h.logger.Warn(
-				"Leave cancelled but scheduling rollback failed",
-				zap.String("leave_request_id", leaveRequest.LeaveRequestID.String()),
-				zap.Error(err),
-			)
-		}
+	// 🔁 Rollback scheduling overrides
+	leaveData := &scheduling.LeaveScheduleData{
+		LeaveRequestID: leaveRequest.LeaveRequestID,
+		UserID:         leaveRequest.UserID,
+		CompanyID:      leaveRequest.CompanyID,
+		StartDate:      leaveRequest.StartDate,
+		EndDate:        leaveRequest.EndDate,
+	}
+	if err := h.schedulingService.RollbackCancelledLeave(ctx, leaveData, "user", cancelledBy); err != nil {
+		h.logger.Warn(
+			"Leave cancelled but scheduling rollback failed",
+			zap.String("leave_request_id", leaveRequest.LeaveRequestID.String()),
+			zap.Error(err),
+		)
 	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
@@ -511,7 +484,8 @@ func (h *LeaveRequestHandler) GetPendingRequests(w http.ResponseWriter, r *http.
 	})
 }
 
-// Helper methods
+// ---- Helper methods ----
+
 func (h *LeaveRequestHandler) hasPermission(ctx interface{}, companyID uuid.UUID, permission string) bool {
 	// TODO: Implement actual permission checking
 	return true
@@ -520,7 +494,7 @@ func (h *LeaveRequestHandler) hasPermission(ctx interface{}, companyID uuid.UUID
 func (h *LeaveRequestHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
+	_ = json.NewEncoder(w).Encode(data)
 }
 
 func (h *LeaveRequestHandler) respondWithError(w http.ResponseWriter, status int, message string) {
@@ -529,16 +503,11 @@ func (h *LeaveRequestHandler) respondWithError(w http.ResponseWriter, status int
 		"error":   message,
 	})
 }
+
 func getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
 	userIDStr, ok := ctx.Value("user_id").(string)
 	if !ok {
 		return uuid.Nil, fmt.Errorf("user ID not found in context")
 	}
-
-	userID, err := uuid.Parse(userIDStr)
-	if err != nil {
-		return uuid.Nil, fmt.Errorf("invalid user ID in context: %v", err)
-	}
-
-	return userID, nil
+	return uuid.Parse(userIDStr)
 }

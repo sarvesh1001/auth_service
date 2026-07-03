@@ -7,35 +7,18 @@ done
 echo "✅ PostgreSQL is ready!"
 echo "🏗️ Creating database schema..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'EOSQL'
-
--- =====================================================
--- 1. EXTENSIONS
--- =====================================================
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pg_trgm";
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 CREATE EXTENSION IF NOT EXISTS "btree_gist";
-
--- =====================================================
--- 2. SCHEMAS
--- =====================================================
 CREATE SCHEMA IF NOT EXISTS leave;
 CREATE SCHEMA IF NOT EXISTS payroll;
 CREATE SCHEMA IF NOT EXISTS audit;
 CREATE SCHEMA IF NOT EXISTS attendance;
-CREATE SCHEMA IF NOT EXISTS biometric;   
+CREATE SCHEMA IF NOT EXISTS biometric;
 CREATE SCHEMA IF NOT EXISTS outbox;
 CREATE SCHEMA IF NOT EXISTS sales;
 CREATE SCHEMA IF NOT EXISTS sales_analytics;
-
-
--- =====================================================
--- 3. CORE TABLES (all columns and constraints integrated)
--- =====================================================
-
--- -----------------------------------------------------
--- permissions
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS permissions (
     permission_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     permission_name VARCHAR(100) NOT NULL UNIQUE,
@@ -47,10 +30,6 @@ CREATE TABLE IF NOT EXISTS permissions (
     bit_index       INTEGER UNIQUE,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
--- -----------------------------------------------------
--- system_departments
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS system_departments (
     system_department_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name                 VARCHAR(255) UNIQUE NOT NULL,
@@ -58,10 +37,6 @@ CREATE TABLE IF NOT EXISTS system_departments (
     description          TEXT,
     bitmask              BIGINT NOT NULL
 );
-
--- -----------------------------------------------------
--- admin_roles
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS admin_roles (
     admin_role_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     role_name       VARCHAR(100) NOT NULL,
@@ -75,10 +50,6 @@ CREATE TABLE IF NOT EXISTS admin_roles (
     CONSTRAINT check_role_type CHECK (role_type IN (1, 2, 4)),
     CONSTRAINT unique_super_admin_role EXCLUDE USING btree (role_type WITH =) WHERE (role_type = 4)
 );
-
--- -----------------------------------------------------
--- admin_role_permissions
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS admin_role_permissions (
     admin_role_id  UUID NOT NULL,
     permission_id  UUID NOT NULL,
@@ -88,10 +59,6 @@ CREATE TABLE IF NOT EXISTS admin_role_permissions (
     CONSTRAINT fk_admin_role_perms_role FOREIGN KEY (admin_role_id) REFERENCES admin_roles(admin_role_id) ON DELETE CASCADE,
     CONSTRAINT fk_admin_role_perms_permission FOREIGN KEY (permission_id) REFERENCES permissions(permission_id) ON DELETE CASCADE
 );
-
--- -----------------------------------------------------
--- admin_role_departments
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS admin_role_departments (
     admin_role_id        UUID NOT NULL,
     system_department_id UUID NOT NULL,
@@ -100,10 +67,6 @@ CREATE TABLE IF NOT EXISTS admin_role_departments (
     CONSTRAINT fk_admin_role_departments_role FOREIGN KEY (admin_role_id) REFERENCES admin_roles(admin_role_id) ON DELETE CASCADE,
     CONSTRAINT fk_admin_role_departments_department FOREIGN KEY (system_department_id) REFERENCES system_departments(system_department_id) ON DELETE CASCADE
 );
-
--- -----------------------------------------------------
--- admin_users
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS admin_users (
     admin_id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     phone_hash            VARCHAR(128) NOT NULL,
@@ -131,10 +94,6 @@ CREATE TABLE IF NOT EXISTS admin_users (
     CONSTRAINT check_admin_role_type CHECK (role_type IN (1, 2, 4)),
     CONSTRAINT unique_super_admin_user EXCLUDE USING btree (role_type WITH =) WHERE (role_type = 4)
 );
-
--- -----------------------------------------------------
--- users (partitioned)
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS users (
     user_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     username         VARCHAR(100) NOT NULL,
@@ -160,7 +119,6 @@ CREATE TABLE IF NOT EXISTS users (
     last_login       TIMESTAMPTZ,
     CONSTRAINT unique_username UNIQUE (user_id, username)
 ) PARTITION BY HASH (user_id);
-
 CREATE TABLE IF NOT EXISTS users_p0 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 0);
 CREATE TABLE IF NOT EXISTS users_p1 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 1);
 CREATE TABLE IF NOT EXISTS users_p2 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 2);
@@ -169,10 +127,6 @@ CREATE TABLE IF NOT EXISTS users_p4 PARTITION OF users FOR VALUES WITH (MODULUS 
 CREATE TABLE IF NOT EXISTS users_p5 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 5);
 CREATE TABLE IF NOT EXISTS users_p6 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 6);
 CREATE TABLE IF NOT EXISTS users_p7 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 7);
-
--- -----------------------------------------------------
--- companies (financial_year_start_month added)
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS companies (
     company_id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_name            VARCHAR(255) NOT NULL,
@@ -194,10 +148,6 @@ CREATE TABLE IF NOT EXISTS companies (
     CONSTRAINT fk_companies_owner FOREIGN KEY (owner_user_id) REFERENCES users(user_id),
     CONSTRAINT check_max_departments CHECK (max_departments > 0 AND max_departments <= 1000)
 );
-
--- -----------------------------------------------------
--- roles
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS roles (
     role_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     role_name       VARCHAR(100) NOT NULL,
@@ -210,10 +160,6 @@ CREATE TABLE IF NOT EXISTS roles (
     UNIQUE(company_id, role_name),
     CONSTRAINT fk_roles_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE
 );
-
--- -----------------------------------------------------
--- role_permissions
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS role_permissions (
     role_id       UUID NOT NULL,
     permission_id UUID NOT NULL,
@@ -223,10 +169,6 @@ CREATE TABLE IF NOT EXISTS role_permissions (
     CONSTRAINT fk_role_perms_role FOREIGN KEY (role_id) REFERENCES roles(role_id) ON DELETE CASCADE,
     CONSTRAINT fk_role_perms_permission FOREIGN KEY (permission_id) REFERENCES permissions(permission_id) ON DELETE CASCADE
 );
-
--- -----------------------------------------------------
--- departments
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS departments (
     department_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id           UUID NOT NULL,
@@ -240,10 +182,6 @@ CREATE TABLE IF NOT EXISTS departments (
     CONSTRAINT fk_departments_system FOREIGN KEY (system_department_id) REFERENCES system_departments(system_department_id),
     CONSTRAINT fk_departments_parent FOREIGN KEY (parent_department_id) REFERENCES departments(department_id)
 );
-
--- -----------------------------------------------------
--- role_departments
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS role_departments (
     role_id       UUID NOT NULL,
     department_id UUID NOT NULL,
@@ -252,10 +190,6 @@ CREATE TABLE IF NOT EXISTS role_departments (
     CONSTRAINT fk_role_departments_role FOREIGN KEY (role_id) REFERENCES roles(role_id) ON DELETE CASCADE,
     CONSTRAINT fk_role_departments_department FOREIGN KEY (department_id) REFERENCES departments(department_id)
 );
-
--- -----------------------------------------------------
--- company_employees
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS company_employees (
     company_id  UUID NOT NULL,
     user_id     UUID NOT NULL,
@@ -272,69 +206,6 @@ CREATE TABLE IF NOT EXISTS company_employees (
     CONSTRAINT fk_employees_user FOREIGN KEY (user_id) REFERENCES users(user_id),
     CONSTRAINT fk_employees_role FOREIGN KEY (role_id) REFERENCES roles(role_id)
 );
-
-CREATE TABLE IF NOT EXISTS biometric.embedding_audit_log (
-    audit_id UUID DEFAULT gen_random_uuid() NOT NULL,
-    company_id UUID NOT NULL,
-    user_id UUID NOT NULL,
-    action VARCHAR(30) NOT NULL,
-    model_version VARCHAR(50),
-    acted_by UUID,
-    created_at TIMESTAMPTZ DEFAULT now(),
-    metadata JSONB,
-
-    CONSTRAINT embedding_audit_log_pkey PRIMARY KEY (audit_id),
-
-    CONSTRAINT fk_embedding_audit_employee
-        FOREIGN KEY (company_id, user_id)
-        REFERENCES public.company_employees(company_id, user_id)
-        ON DELETE CASCADE
-);
-
-
-CREATE TABLE IF NOT EXISTS biometric.face_embeddings (
-    embedding_id UUID DEFAULT gen_random_uuid() NOT NULL,
-    company_id UUID NOT NULL,
-    user_id UUID NOT NULL,
-    embedding_vector DOUBLE PRECISION[] NOT NULL,
-    model_version VARCHAR(50) NOT NULL,
-    embedding_dim INTEGER NOT NULL,
-    is_active BOOLEAN DEFAULT true NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
-    created_by UUID NOT NULL,
-    updated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
-
-    CONSTRAINT face_embeddings_pkey PRIMARY KEY (embedding_id),
-
-    CONSTRAINT unique_company_user UNIQUE (company_id, user_id),
-
-    CONSTRAINT face_embeddings_embedding_dim_check
-        CHECK (embedding_dim IN (128,512)),
-
-    CONSTRAINT fk_face_embeddings_employee
-        FOREIGN KEY (company_id, user_id)
-        REFERENCES public.company_employees(company_id, user_id)
-        ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_face_embeddings_active
-ON biometric.face_embeddings(company_id, is_active)
-WHERE is_active = true;
-
-CREATE INDEX IF NOT EXISTS idx_face_embeddings_company
-ON biometric.face_embeddings(company_id);
-
-CREATE INDEX IF NOT EXISTS idx_face_embeddings_sync_lookup
-ON biometric.face_embeddings(company_id, model_version, updated_at);
-
-CREATE INDEX IF NOT EXISTS idx_face_embeddings_updated
-ON biometric.face_embeddings(company_id, model_version, updated_at);
-
-
-
--- -----------------------------------------------------
--- user_devices
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS user_devices (
     device_id    VARCHAR(256) PRIMARY KEY,
     user_id      UUID NOT NULL,
@@ -348,10 +219,6 @@ CREATE TABLE IF NOT EXISTS user_devices (
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT fk_user_devices_user FOREIGN KEY (user_id) REFERENCES users(user_id)
 );
-
--- -----------------------------------------------------
--- login_attempts
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS login_attempts (
     attempt_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id       UUID NOT NULL,
@@ -364,10 +231,6 @@ CREATE TABLE IF NOT EXISTS login_attempts (
     CONSTRAINT fk_login_attempts_user FOREIGN KEY (user_id) REFERENCES users(user_id),
     CONSTRAINT fk_login_attempts_device FOREIGN KEY (device_id) REFERENCES user_devices(device_id)
 );
-
--- -----------------------------------------------------
--- employee_profiles
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS employee_profiles (
     employee_profile_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id             UUID NOT NULL,
@@ -385,7 +248,7 @@ CREATE TABLE IF NOT EXISTS employee_profiles (
     cost_center         VARCHAR(50),
     tax_id              VARCHAR(50),
     social_security_id  VARCHAR(50),
-    email               VARCHAR(255),                     -- new column
+    email               VARCHAR(255),
     created_at          TIMESTAMPTZ DEFAULT NOW(),
     updated_at          TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE (company_id, user_id),
@@ -395,10 +258,6 @@ CREATE TABLE IF NOT EXISTS employee_profiles (
     FOREIGN KEY (user_id) REFERENCES users(user_id),
     FOREIGN KEY (company_id) REFERENCES companies(company_id)
 );
-
--- -----------------------------------------------------
--- employee_department_history
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS employee_department_history (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id       UUID NOT NULL,
@@ -411,10 +270,6 @@ CREATE TABLE IF NOT EXISTS employee_department_history (
     FOREIGN KEY (user_id) REFERENCES users(user_id),
     FOREIGN KEY (department_id) REFERENCES departments(department_id)
 );
-
--- -----------------------------------------------------
--- employee_documents
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS employee_documents (
     document_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id             UUID NOT NULL,
@@ -429,26 +284,6 @@ CREATE TABLE IF NOT EXISTS employee_documents (
     FOREIGN KEY (user_id) REFERENCES users(user_id),
     FOREIGN KEY (company_id) REFERENCES companies(company_id)
 );
-
--- -----------------------------------------------------
--- work_centers
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS work_centers (
-    work_center_code VARCHAR(100) NOT NULL,
-    company_id       UUID NOT NULL,
-    name             VARCHAR(255) NOT NULL,
-    description      TEXT,
-    timezone         VARCHAR(50) NOT NULL DEFAULT 'UTC',
-    is_active        BOOLEAN NOT NULL DEFAULT true,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT fk_work_centers_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
-    PRIMARY KEY (company_id, work_center_code)
-);
-
--- -----------------------------------------------------
--- positions
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS positions (
     position_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id           UUID NOT NULL,
@@ -462,14 +297,8 @@ CREATE TABLE IF NOT EXISTS positions (
     overtime_allowed     BOOLEAN NOT NULL DEFAULT false,
     work_center_code     VARCHAR(100),
     CONSTRAINT uniq_position_title_per_dept UNIQUE (company_id, department_id, title),
-    FOREIGN KEY (department_id) REFERENCES departments(department_id),
-    CONSTRAINT fk_positions_work_center FOREIGN KEY (company_id, work_center_code)
-        REFERENCES work_centers(company_id, work_center_code)
+    FOREIGN KEY (department_id) REFERENCES departments(department_id)
 );
-
--- -----------------------------------------------------
--- employee_role_history
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS employee_role_history (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id    UUID NOT NULL,
@@ -480,10 +309,6 @@ CREATE TABLE IF NOT EXISTS employee_role_history (
     FOREIGN KEY (user_id) REFERENCES users(user_id),
     FOREIGN KEY (role_id) REFERENCES roles(role_id)
 );
-
--- -----------------------------------------------------
--- employee_exit
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS employee_exit (
     exit_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id          UUID NOT NULL,
@@ -501,438 +326,6 @@ CREATE TABLE IF NOT EXISTS employee_exit (
     FOREIGN KEY (user_id) REFERENCES users(user_id),
     FOREIGN KEY (company_id) REFERENCES companies(company_id)
 );
-
--- -----------------------------------------------------
--- work_calendars
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS work_calendars (
-    calendar_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id   UUID NOT NULL,
-    year         INTEGER NOT NULL,
-    name         VARCHAR(100) NOT NULL,
-    timezone     VARCHAR(50) NOT NULL DEFAULT 'UTC',
-    working_days INTEGER[] NOT NULL,
-    holidays     JSONB,
-    is_active    BOOLEAN DEFAULT true,
-    created_at   TIMESTAMPTZ DEFAULT NOW(),
-    CONSTRAINT fk_calendar_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
-    CONSTRAINT uq_work_calendar_company_year UNIQUE (company_id, year)
-);
-
--- -----------------------------------------------------
--- schedule_templates
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS schedule_templates (
-    schedule_template_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id           UUID NOT NULL,
-    calendar_id          UUID NOT NULL,
-    template_type        VARCHAR(30) NOT NULL,
-    name                 VARCHAR(100) NOT NULL,
-    rules                JSONB NOT NULL,
-    is_active            BOOLEAN DEFAULT true,
-    created_at           TIMESTAMPTZ DEFAULT NOW(),
-    CONSTRAINT chk_template_type CHECK (template_type IN ('office', 'shift', 'class')),
-    CONSTRAINT fk_schedule_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
-    CONSTRAINT fk_schedule_calendar FOREIGN KEY (calendar_id) REFERENCES work_calendars(calendar_id)
-);
-
--- -----------------------------------------------------
--- user_schedule_assignments
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS user_schedule_assignments (
-    user_id              UUID NOT NULL,
-    schedule_template_id UUID NOT NULL,
-    effective_from       DATE NOT NULL,
-    effective_to         DATE,
-    assigned_by          UUID,
-    created_at           TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (user_id, schedule_template_id, effective_from),
-    CONSTRAINT no_overlapping_schedules EXCLUDE USING gist (
-        user_id WITH =,
-        daterange(effective_from, COALESCE(effective_to, 'infinity'), '[]') WITH &&
-    ),
-    CONSTRAINT fk_usa_user FOREIGN KEY (user_id) REFERENCES users(user_id),
-    CONSTRAINT fk_usa_template FOREIGN KEY (schedule_template_id) REFERENCES schedule_templates(schedule_template_id)
-);
-
--- -----------------------------------------------------
--- schedule_instances
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS schedule_instances (
-    schedule_instance_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id           UUID NOT NULL,
-    user_id              UUID NOT NULL,
-    schedule_date        DATE NOT NULL,
-    schedule_template_id UUID NOT NULL,
-    expected_start       TIMESTAMPTZ,
-    expected_end         TIMESTAMPTZ,
-    timezone             VARCHAR(50) NOT NULL DEFAULT 'UTC',
-    metadata             JSONB,
-    generated_at         TIMESTAMPTZ DEFAULT NOW(),
-    status               VARCHAR(20) NOT NULL DEFAULT 'active',
-    cancel_reason        VARCHAR(50),
-    cancelled_at         TIMESTAMPTZ,
-    work_center_code     VARCHAR(100),
-    device_user_code     VARCHAR(100),
-    raw_event_payload    JSONB,
-    CONSTRAINT fk_si_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
-    CONSTRAINT fk_si_user FOREIGN KEY (user_id) REFERENCES users(user_id),
-    CONSTRAINT fk_si_template FOREIGN KEY (schedule_template_id) REFERENCES schedule_templates(schedule_template_id),
-    CONSTRAINT fk_schedule_instances_work_center FOREIGN KEY (company_id, work_center_code)
-        REFERENCES work_centers(company_id, work_center_code)
-);
-
--- -----------------------------------------------------
--- attendance_source_types
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS attendance_source_types (
-    source_type        VARCHAR(30) PRIMARY KEY,
-    description        TEXT NOT NULL,
-    category           VARCHAR(30) NOT NULL,
-    requires_device    BOOLEAN NOT NULL DEFAULT false,
-    is_system          BOOLEAN NOT NULL DEFAULT false,
-    allow_backdated    BOOLEAN NOT NULL DEFAULT false,
-    allow_future       BOOLEAN NOT NULL DEFAULT false,
-    trust_level        SMALLINT NOT NULL DEFAULT 1,
-    is_self_service    BOOLEAN NOT NULL DEFAULT true,
-    created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- -----------------------------------------------------
--- attendance_devices
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS attendance_devices (
-    device_id        VARCHAR(256) PRIMARY KEY,
-    company_id       UUID NOT NULL,
-    source_type      VARCHAR(30) NOT NULL,
-    device_code      VARCHAR(100) NOT NULL,
-    device_name      VARCHAR(100),
-    manufacturer     VARCHAR(100),
-    model            VARCHAR(100),
-    work_center_code VARCHAR(100),
-    location_id      UUID,
-    ip_address       INET,
-    mac_address      VARCHAR(50),
-    is_active        BOOLEAN NOT NULL DEFAULT true,
-    is_trusted       BOOLEAN NOT NULL DEFAULT true,
-    last_seen_at     TIMESTAMPTZ,
-    installed_at     TIMESTAMPTZ,
-    last_punch_at    TIMESTAMPTZ,
-    metadata         JSONB NOT NULL DEFAULT '{}',
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (company_id, device_code),
-    FOREIGN KEY (source_type) REFERENCES attendance_source_types(source_type)
-);
-
-
-CREATE TABLE IF NOT EXISTS biometric.device_embedding_sync (
-    sync_id UUID DEFAULT gen_random_uuid() NOT NULL,
-    company_id UUID NOT NULL,
-    device_id VARCHAR(256) NOT NULL,
-    model_version VARCHAR(50) NOT NULL,
-    last_synced_at TIMESTAMPTZ,
-    last_full_sync TIMESTAMPTZ,
-    created_at TIMESTAMPTZ DEFAULT now(),
-
-    CONSTRAINT device_embedding_sync_pkey PRIMARY KEY (sync_id),
-
-    CONSTRAINT unique_company_device
-        UNIQUE (company_id, device_id),
-
-    CONSTRAINT fk_device_sync_device
-        FOREIGN KEY (device_id)
-        REFERENCES public.attendance_devices(device_id)
-        ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_device_embedding_sync_company
-ON biometric.device_embedding_sync(company_id);
--- -----------------------------------------------------
--- attendance_device_tokens
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS attendance_device_tokens (
-    token_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id     UUID NOT NULL,
-    device_id      VARCHAR(64) NOT NULL,
-    source_type    VARCHAR(32) NOT NULL,
-    token_hash     TEXT NOT NULL,
-    token_version  INT NOT NULL DEFAULT 1,
-    is_active      BOOLEAN NOT NULL DEFAULT true,
-    issued_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    expires_at     TIMESTAMPTZ,
-    revoked_at     TIMESTAMPTZ,
-    issued_by      UUID,
-    revoked_by     UUID,
-    revoke_reason  TEXT,
-    metadata       JSONB,
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT fk_device_token_device FOREIGN KEY (device_id) REFERENCES attendance_devices(device_id) ON DELETE CASCADE
-);
-
--- -----------------------------------------------------
--- attendance_device_heartbeats
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS attendance_device_heartbeats (
-    heartbeat_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id       UUID NOT NULL,
-    device_id        VARCHAR(256) NOT NULL,
-    source_type      VARCHAR(30) NOT NULL,
-    device_time      TIMESTAMPTZ,
-    server_time      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    firmware_version TEXT,
-    ip_address       INET,
-    status           VARCHAR(20) NOT NULL DEFAULT 'online',
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT fk_heartbeat_device FOREIGN KEY (device_id) REFERENCES attendance_devices(device_id) ON DELETE CASCADE
-);
-
--- -----------------------------------------------------
--- attendance_device_punch_batches
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS attendance_device_punch_batches (
-    batch_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id     UUID NOT NULL,
-    device_id      VARCHAR(256) NOT NULL,
-    batch_ref      TEXT NOT NULL,
-    total_events   INT NOT NULL,
-    received_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    processed_at   TIMESTAMPTZ,
-    status         VARCHAR(30) NOT NULL DEFAULT 'pending',
-    failure_reason TEXT,
-    CONSTRAINT fk_batch_device FOREIGN KEY (device_id) REFERENCES attendance_devices(device_id) ON DELETE CASCADE
-);
-
--- -----------------------------------------------------
--- attendance_device_punch_failures
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS attendance_device_punch_failures (
-    failure_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    batch_id        UUID NOT NULL,
-    company_id      UUID NOT NULL,
-    device_id       VARCHAR(256) NOT NULL,
-    device_user_code VARCHAR(100),
-    event_type      VARCHAR(30),
-    event_time      TIMESTAMPTZ,
-    failure_reason  TEXT NOT NULL,
-    raw_event       JSONB,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT fk_failure_batch FOREIGN KEY (batch_id) REFERENCES attendance_device_punch_batches (batch_id) ON DELETE CASCADE
-);
-
--- -----------------------------------------------------
--- attendance_device_trust_history
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS attendance_device_trust_history (
-    trust_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    device_id  VARCHAR(256) NOT NULL,
-    company_id UUID NOT NULL,
-    action     VARCHAR(20) NOT NULL,
-    reason     TEXT,
-    acted_by   UUID,
-    acted_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    FOREIGN KEY (device_id) REFERENCES attendance_devices(device_id)
-);
-
--- -----------------------------------------------------
--- attendance_user_device_identifiers
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS attendance_user_device_identifiers (
-    mapping_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id         UUID NOT NULL,
-    user_id            UUID NOT NULL,
-    device_id          VARCHAR(256) NOT NULL,
-    source_type        VARCHAR(30) NOT NULL,
-    device_user_code   VARCHAR(100) NOT NULL,
-    is_active          BOOLEAN NOT NULL DEFAULT true,
-    enrolled_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    unenrolled_at      TIMESTAMPTZ,
-    created_by         UUID,
-    enrollment_version INT NOT NULL DEFAULT 1,
-    revoked_reason     TEXT,
-    revoked_by         UUID,
-    CONSTRAINT fk_attendance_enroll_employee FOREIGN KEY (company_id, user_id)
-        REFERENCES company_employees (company_id, user_id) ON DELETE CASCADE,
-    CONSTRAINT fk_attendance_enroll_created_by FOREIGN KEY (created_by) REFERENCES users(user_id),
-    CONSTRAINT chk_created_by_not_zero CHECK (created_by IS NULL OR created_by <> '00000000-0000-0000-0000-000000000000'),
-    FOREIGN KEY (device_id) REFERENCES attendance_devices(device_id),
-    FOREIGN KEY (source_type) REFERENCES attendance_source_types(source_type)
-);
-
--- -----------------------------------------------------
--- attendance_sources
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS attendance_sources (
-    source_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id     UUID NOT NULL,
-    source_type    VARCHAR(30) NOT NULL,
-    name           VARCHAR(100) NOT NULL,
-    reference_type VARCHAR(30),
-    reference_id   UUID,
-    is_active      BOOLEAN NOT NULL DEFAULT true,
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by     UUID,
-    CONSTRAINT fk_attendance_sources_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
-    CONSTRAINT fk_attendance_sources_type FOREIGN KEY (source_type) REFERENCES attendance_source_types(source_type)
-);
-
--- -----------------------------------------------------
--- attendance_event_types
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS attendance_event_types (
-    event_type          VARCHAR(30) PRIMARY KEY,
-    category            VARCHAR(30) NOT NULL,
-    description         TEXT,
-    is_user_triggered   BOOLEAN NOT NULL DEFAULT true,
-    is_system_generated BOOLEAN NOT NULL DEFAULT false,
-    is_active           BOOLEAN NOT NULL DEFAULT true
-);
-
--- -----------------------------------------------------
--- attendance_events
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS attendance_events (
-    attendance_event_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id          UUID NOT NULL,
-    user_id             UUID NOT NULL,
-    event_type          VARCHAR(30) NOT NULL,
-    event_time          TIMESTAMPTZ NOT NULL,
-    source_type         VARCHAR(30) NOT NULL,
-    source_id           UUID,
-    device_id           VARCHAR(256),
-    ip_address          VARCHAR(64),
-    metadata            JSONB,
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by          UUID,
-    event_date          DATE GENERATED ALWAYS AS ((event_time AT TIME ZONE 'UTC')::date) STORED,
-    context             JSONB,
-    device_user_code    VARCHAR(100),
-    raw_event_payload   JSONB,
-    CONSTRAINT fk_att_events_user FOREIGN KEY (user_id) REFERENCES users(user_id),
-    CONSTRAINT fk_att_events_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
-    CONSTRAINT fk_att_events_source_type FOREIGN KEY (source_type) REFERENCES attendance_source_types(source_type),
-    CONSTRAINT fk_att_events_source FOREIGN KEY (source_id) REFERENCES attendance_sources(source_id),
-    CONSTRAINT fk_attendance_events_event_type FOREIGN KEY (event_type) REFERENCES attendance_event_types(event_type)
-);
-
--- -----------------------------------------------------
--- attendance_policies
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS attendance_policies (
-    policy_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id       UUID NOT NULL,
-    work_center_code TEXT,
-    position_id      UUID,
-    policy_code      VARCHAR(50) NOT NULL,
-    policy_type      VARCHAR(30) NOT NULL,
-    rules            JSONB NOT NULL,
-    is_active        BOOLEAN NOT NULL DEFAULT true,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (company_id, policy_code),
-    CONSTRAINT fk_attendance_policies_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
-    CONSTRAINT fk_attendance_policies_position FOREIGN KEY (position_id) REFERENCES positions(position_id)
-);
-
--- -----------------------------------------------------
--- user_attendance_policies
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS user_attendance_policies (
-    user_id        UUID NOT NULL,
-    policy_id      UUID NOT NULL,
-    effective_from DATE NOT NULL,
-    effective_to   DATE,
-    assigned_by    UUID,
-    created_at     TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (user_id, policy_id, effective_from),
-    CONSTRAINT fk_uap_user FOREIGN KEY (user_id) REFERENCES users(user_id),
-    CONSTRAINT fk_uap_policy FOREIGN KEY (policy_id) REFERENCES attendance_policies(policy_id)
-);
-
--- -----------------------------------------------------
--- attendance_daily_summary
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS attendance_daily_summary (
-    attendance_summary_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id            UUID NOT NULL,
-    user_id               UUID NOT NULL,
-    attendance_date       DATE NOT NULL,
-    status                VARCHAR(30) NOT NULL,
-    worked_minutes        INTEGER,
-    overtime_minutes      INTEGER,
-    late_minutes          INTEGER,
-    metadata              JSONB,
-    generated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    generated_by          VARCHAR(30) DEFAULT 'system',
-    is_payroll_locked     BOOLEAN NOT NULL DEFAULT false,
-    is_finalized          BOOLEAN NOT NULL DEFAULT false,
-    is_payable            BOOLEAN NOT NULL DEFAULT false,
-    expected_minutes      INTEGER,
-    UNIQUE (company_id, user_id, attendance_date),
-    CONSTRAINT fk_att_summary_user FOREIGN KEY (user_id) REFERENCES users(user_id),
-    CONSTRAINT fk_att_summary_company FOREIGN KEY (company_id) REFERENCES companies(company_id)
-);
-
--- -----------------------------------------------------
--- attendance_locations
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS attendance_locations (
-    location_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id    UUID NOT NULL,
-    name          VARCHAR(100),
-    location_type VARCHAR(30),
-    geo_lat       NUMERIC,
-    geo_lng       NUMERIC,
-    location_code VARCHAR(50),
-    zone          VARCHAR(100),
-    is_active     BOOLEAN DEFAULT true,
-    CONSTRAINT fk_att_locations_company FOREIGN KEY (company_id) REFERENCES companies(company_id)
-);
-
--- -----------------------------------------------------
--- work_center_shifts
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS work_center_shifts (
-    mapping_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id        UUID NOT NULL,
-    work_center_code  VARCHAR(100) NOT NULL,
-    shift_id          UUID NOT NULL,
-    effective_from    DATE NOT NULL,
-    effective_to      DATE,
-    is_active         BOOLEAN DEFAULT true,
-    created_at        TIMESTAMPTZ DEFAULT NOW(),
-    updated_at        TIMESTAMPTZ DEFAULT NOW(),
-    CONSTRAINT fk_work_center_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
-    CONSTRAINT fk_work_center_shift FOREIGN KEY (shift_id) REFERENCES schedule_templates(schedule_template_id) ON DELETE CASCADE,
-    CONSTRAINT fk_wcs_work_center FOREIGN KEY (company_id, work_center_code) REFERENCES work_centers(company_id, work_center_code),
-    CONSTRAINT no_overlap_work_center_shifts EXCLUDE USING gist (
-        company_id WITH =,
-        work_center_code WITH =,
-        daterange(effective_from, COALESCE(effective_to, 'infinity')) WITH &&
-    )
-);
-
--- -----------------------------------------------------
--- user_work_center_assignments
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS user_work_center_assignments (
-    assignment_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id        UUID NOT NULL,
-    user_id           UUID NOT NULL,
-    work_center_code  VARCHAR(100) NOT NULL,
-    effective_from    DATE NOT NULL,
-    effective_to      DATE,
-    is_active         BOOLEAN DEFAULT true,
-    created_at        TIMESTAMPTZ DEFAULT NOW(),
-    updated_at        TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE (user_id, work_center_code, effective_from),
-    CONSTRAINT fk_user_work_center_user FOREIGN KEY (user_id) REFERENCES users(user_id),
-    CONSTRAINT fk_user_work_center_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
-    CONSTRAINT fk_uwca_work_center FOREIGN KEY (company_id, work_center_code) REFERENCES work_centers(company_id, work_center_code)
-);
-
--- -----------------------------------------------------
--- leave.leave_type
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS leave.leave_type (
     leave_type_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id          UUID NOT NULL,
@@ -946,10 +339,6 @@ CREATE TABLE IF NOT EXISTS leave.leave_type (
     CONSTRAINT fk_leave_type_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
     CONSTRAINT uq_leave_type_company_code UNIQUE (company_id, code)
 );
-
--- -----------------------------------------------------
--- leave.leave_policy
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS leave.leave_policy (
     policy_id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id                  UUID NOT NULL,
@@ -968,10 +357,6 @@ CREATE TABLE IF NOT EXISTS leave.leave_policy (
     CONSTRAINT fk_leave_policy_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
     CONSTRAINT fk_leave_policy_position FOREIGN KEY (applies_to_position_id) REFERENCES positions(position_id) ON DELETE CASCADE
 );
-
--- -----------------------------------------------------
--- leave.leave_policy_rule
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS leave.leave_policy_rule (
     policy_rule_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     policy_id            UUID NOT NULL,
@@ -986,10 +371,6 @@ CREATE TABLE IF NOT EXISTS leave.leave_policy_rule (
     CONSTRAINT chk_lpr_accrual_method CHECK (accrual_method IN ('monthly','quarterly','yearly','none')),
     UNIQUE (policy_id, leave_type_id)
 );
-
--- -----------------------------------------------------
--- leave.leave_entitlement
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS leave.leave_entitlement (
     entitlement_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id       UUID NOT NULL,
@@ -1009,12 +390,6 @@ CREATE TABLE IF NOT EXISTS leave.leave_entitlement (
     CONSTRAINT fk_leave_entitlement_type FOREIGN KEY (leave_type_id) REFERENCES leave.leave_type(leave_type_id),
     CONSTRAINT fk_leave_entitlement_policy FOREIGN KEY (policy_id) REFERENCES leave.leave_policy(policy_id) ON DELETE SET NULL
 );
-
-
-
--- -----------------------------------------------------
--- leave.leave_accrual
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS leave.leave_accrual (
     accrual_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     entitlement_id   UUID NOT NULL,
@@ -1026,10 +401,6 @@ CREATE TABLE IF NOT EXISTS leave.leave_accrual (
     CONSTRAINT fk_leave_accrual_entitlement FOREIGN KEY (entitlement_id) REFERENCES leave.leave_entitlement(entitlement_id) ON DELETE CASCADE,
     CONSTRAINT unique_entitlement_accrual_date UNIQUE (entitlement_id, accrual_date)
 );
-
--- -----------------------------------------------------
--- leave.leave_request
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS leave.leave_request (
     leave_request_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id       UUID NOT NULL,
@@ -1048,10 +419,6 @@ CREATE TABLE IF NOT EXISTS leave.leave_request (
     CONSTRAINT fk_leave_request_type FOREIGN KEY (leave_type_id) REFERENCES leave.leave_type(leave_type_id),
     CONSTRAINT check_status CHECK (status IN ('pending', 'approved', 'rejected', 'cancelled'))
 );
-
--- -----------------------------------------------------
--- leave.leave_ledger
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS leave.leave_ledger (
     ledger_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     entitlement_id   UUID NOT NULL,
@@ -1064,10 +431,6 @@ CREATE TABLE IF NOT EXISTS leave.leave_ledger (
     CONSTRAINT fk_leave_ledger_request FOREIGN KEY (leave_request_id) REFERENCES leave.leave_request(leave_request_id) ON DELETE SET NULL,
     CONSTRAINT check_entry_type CHECK (entry_type IN ('accrual', 'consumption', 'reversal'))
 );
-
--- -----------------------------------------------------
--- leave.leave_balance_snapshot
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS leave.leave_balance_snapshot (
     snapshot_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     entitlement_id UUID NOT NULL,
@@ -1076,10 +439,6 @@ CREATE TABLE IF NOT EXISTS leave.leave_balance_snapshot (
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT fk_lbs_entitlement FOREIGN KEY (entitlement_id) REFERENCES leave.leave_entitlement(entitlement_id) ON DELETE CASCADE
 );
-
--- -----------------------------------------------------
--- leave.leave_policy_resolution
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS leave.leave_policy_resolution (
     resolution_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id    UUID NOT NULL,
@@ -1090,39 +449,26 @@ CREATE TABLE IF NOT EXISTS leave.leave_policy_resolution (
     metadata      JSONB,
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
--- -----------------------------------------------------
--- payroll.payroll_component (composite PK with company_id)
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.payroll_component (
     company_id        UUID,
-
     component_code    VARCHAR(50) NOT NULL,
-    component_type    VARCHAR(40) NOT NULL 
+    component_type    VARCHAR(40) NOT NULL
         CHECK (component_type IN ('earning','deduction')),
-
     description       TEXT,
-
     is_taxable        BOOLEAN NOT NULL DEFAULT false,
     is_system         BOOLEAN NOT NULL DEFAULT false,
     is_active         BOOLEAN NOT NULL DEFAULT true,
-
     contribution_side VARCHAR(20) DEFAULT 'none'
         CHECK (contribution_side IN ('employee','employer','none')),
-
     CONSTRAINT payroll_component_component_code_unique
         UNIQUE (component_code)
 );
--- -----------------------------------------------------
--- payroll.payroll_tax_profile
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.payroll_tax_profile (
     profile_name   VARCHAR(100) NOT NULL,
     country_code   VARCHAR(10) NOT NULL,
     is_active      BOOLEAN NOT NULL DEFAULT true,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
 CREATE TABLE IF NOT EXISTS payroll.attendance_rule (
     rule_id UUID NOT NULL,
     company_id UUID NOT NULL,
@@ -1137,28 +483,22 @@ CREATE TABLE IF NOT EXISTS payroll.attendance_rule (
     updated_at TIMESTAMP WITHOUT TIME ZONE,
     updated_by UUID,
     component_code VARCHAR(50),
-
     CONSTRAINT attendance_rule_pkey
         PRIMARY KEY (rule_id),
-
     CONSTRAINT fk_attendance_rule_company
         FOREIGN KEY (company_id)
         REFERENCES public.companies(company_id)
         ON DELETE CASCADE,
-
     CONSTRAINT fk_attendance_rule_component
         FOREIGN KEY (component_code)
         REFERENCES payroll.payroll_component(component_code),
-
     CONSTRAINT fk_attendance_rule_created_by
         FOREIGN KEY (created_by)
         REFERENCES public.users(user_id),
-
     CONSTRAINT fk_attendance_rule_updated_by
         FOREIGN KEY (updated_by)
         REFERENCES public.users(user_id)
 );
-
 CREATE INDEX IF NOT EXISTS idx_attendance_rule_company
 ON payroll.attendance_rule(company_id, is_active);
 CREATE TABLE IF NOT EXISTS payroll.payroll_run (
@@ -1177,8 +517,6 @@ CREATE TABLE IF NOT EXISTS payroll.payroll_run (
     last_processed_at TIMESTAMPTZ,
     CONSTRAINT fk_payroll_run_company FOREIGN KEY (company_id) REFERENCES companies(company_id)
 );
-
-
 CREATE TABLE IF NOT EXISTS payroll.employee_fine (
     fine_id UUID NOT NULL,
     company_id UUID NOT NULL,
@@ -1191,35 +529,25 @@ CREATE TABLE IF NOT EXISTS payroll.employee_fine (
     created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now() NOT NULL,
     created_by UUID NOT NULL,
     component_code VARCHAR(50),
-
     CONSTRAINT employee_fine_pkey PRIMARY KEY (fine_id),
-
     CONSTRAINT fk_employee_fine_company
         FOREIGN KEY (company_id)
         REFERENCES public.companies(company_id),
-
     CONSTRAINT fk_employee_fine_user
         FOREIGN KEY (user_id)
         REFERENCES public.users(user_id),
-
     CONSTRAINT fk_employee_fine_created_by
         FOREIGN KEY (created_by)
         REFERENCES public.users(user_id),
-
     CONSTRAINT fk_employee_fine_payroll_run
         FOREIGN KEY (payroll_run_id)
         REFERENCES payroll.payroll_run(payroll_run_id),
-
     CONSTRAINT fk_employee_fine_component
         FOREIGN KEY (component_code)
         REFERENCES payroll.payroll_component(component_code)
 );
-
 CREATE INDEX IF NOT EXISTS idx_employee_fine_user
 ON payroll.employee_fine(company_id, user_id, is_processed);
--- -----------------------------------------------------
--- payroll.payroll_tax_rule
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.payroll_tax_rule (
     tax_rule_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     component_code   VARCHAR(50) NOT NULL,
@@ -1227,12 +555,7 @@ CREATE TABLE IF NOT EXISTS payroll.payroll_tax_rule (
     rule_definition  JSONB,
     is_active        BOOLEAN NOT NULL DEFAULT true,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    -- Note: FK to payroll_component would require company_id; this table may be extended later.
 );
-
--- -----------------------------------------------------
--- payroll.statutory_rule_set (with EXCLUDE)
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.statutory_rule_set (
     rule_set_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id      UUID NOT NULL,
@@ -1251,9 +574,6 @@ CREATE TABLE IF NOT EXISTS payroll.statutory_rule_set (
         daterange(effective_from, COALESCE(effective_to, 'infinity'), '[]') WITH &&
     )
 );
--- -----------------------------------------------------
--- payroll.statutory_component_definition (added columns)
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.statutory_component_definition (
     company_id       UUID NOT NULL,
     statutory_code   VARCHAR(50) NOT NULL,
@@ -1273,11 +593,6 @@ CREATE TABLE IF NOT EXISTS payroll.statutory_component_definition (
         REFERENCES companies(company_id)
         ON DELETE CASCADE
 );
-
-
--- -----------------------------------------------------
--- payroll.statutory_component_mapping
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.statutory_component_mapping (
     mapping_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id       UUID NOT NULL,
@@ -1292,30 +607,22 @@ CREATE TABLE IF NOT EXISTS payroll.statutory_component_mapping (
     deactivated_by   UUID,
     version          INT NOT NULL DEFAULT 1,
     rule_set_id      UUID,
-
     CONSTRAINT fk_scm_company
         FOREIGN KEY (company_id)
         REFERENCES public.companies(company_id),
-
     CONSTRAINT fk_scm_component
         FOREIGN KEY (component_code)
         REFERENCES payroll.payroll_component(component_code),
-
     CONSTRAINT fk_scm_ruleset
         FOREIGN KEY (rule_set_id)
         REFERENCES payroll.statutory_rule_set(rule_set_id)
         ON DELETE CASCADE,
-
     CONSTRAINT fk_scm_definition
         FOREIGN KEY (company_id, statutory_code)
         REFERENCES payroll.statutory_component_definition(company_id, statutory_code)
         ON DELETE CASCADE,
-
     UNIQUE (company_id, statutory_code, component_code, effective_from)
 );
--- -----------------------------------------------------
--- payroll.statutory_contribution_rule
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.statutory_contribution_rule (
     rule_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id    UUID NOT NULL,
@@ -1349,10 +656,6 @@ CREATE TABLE IF NOT EXISTS payroll.statutory_contribution_rule (
         REFERENCES payroll.statutory_component_definition(company_id, statutory_code)
         ON DELETE CASCADE
 );
-
--- -----------------------------------------------------
--- payroll.company_tax_slab (added columns)
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.company_tax_slab (
     slab_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id     UUID NOT NULL,
@@ -1386,10 +689,6 @@ CREATE TABLE IF NOT EXISTS payroll.company_tax_slab (
         REFERENCES payroll.statutory_component_definition(company_id, statutory_code)
         ON DELETE CASCADE
 );
-
--- -----------------------------------------------------
--- payroll.employee_statutory_profile (with EXCLUDE)
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.employee_statutory_profile (
     profile_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id       UUID NOT NULL,
@@ -1425,10 +724,6 @@ CREATE TABLE IF NOT EXISTS payroll.employee_statutory_profile (
         daterange(effective_from, COALESCE(effective_to, 'infinity'), '[]') WITH &&
     ) WHERE (is_active = true)
 );
-
--- -----------------------------------------------------
--- payroll.statutory_deduction_limit
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.statutory_deduction_limit (
     limit_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id  UUID NOT NULL,
@@ -1446,10 +741,6 @@ CREATE TABLE IF NOT EXISTS payroll.statutory_deduction_limit (
         REFERENCES payroll.statutory_rule_set(rule_set_id)
         ON DELETE CASCADE
 );
-
--- -----------------------------------------------------
--- payroll.company_statutory_profile
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.company_statutory_profile (
     profile_id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id                  UUID NOT NULL,
@@ -1460,10 +751,6 @@ CREATE TABLE IF NOT EXISTS payroll.company_statutory_profile (
     UNIQUE(company_id),
     CONSTRAINT fk_stat_profile_company FOREIGN KEY (company_id) REFERENCES companies(company_id)
 );
-
--- -----------------------------------------------------
--- payroll.salary_structure
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.salary_structure (
     salary_structure_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id          UUID NOT NULL,
@@ -1480,42 +767,30 @@ CREATE TABLE IF NOT EXISTS payroll.salary_structure (
     CONSTRAINT fk_salary_structure_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
     UNIQUE(company_id, structure_name)
 );
-
--- -----------------------------------------------------
--- payroll.salary_structure_component
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.salary_structure_component (
     mapping_id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     salary_structure_id  UUID NOT NULL,
     company_id           UUID NOT NULL,
     component_code       VARCHAR(50) NOT NULL,
-    calculation_type     VARCHAR(20) NOT NULL 
+    calculation_type     VARCHAR(20) NOT NULL
         CHECK (calculation_type IN ('fixed','percentage')),
     value                NUMERIC(12,4) NOT NULL,
     based_on_component   VARCHAR(50),
     sequence_order       INTEGER DEFAULT 1,
     created_at           TIMESTAMPTZ DEFAULT NOW(),
-
     CONSTRAINT uq_structure_component
         UNIQUE (salary_structure_id, component_code),
-
     CONSTRAINT fk_ssc_structure
         FOREIGN KEY (salary_structure_id)
         REFERENCES payroll.salary_structure(salary_structure_id)
         ON DELETE CASCADE,
-
     CONSTRAINT fk_ssc_component
         FOREIGN KEY (component_code)
         REFERENCES payroll.payroll_component(component_code),
-
     CONSTRAINT fk_ssc_based_on_component
         FOREIGN KEY (based_on_component)
         REFERENCES payroll.payroll_component(component_code)
 );
-
--- -----------------------------------------------------
--- payroll.employee_salary (added pay_type)
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.employee_salary (
     employee_salary_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id           UUID NOT NULL,
@@ -1536,10 +811,6 @@ CREATE TABLE IF NOT EXISTS payroll.employee_salary (
     CONSTRAINT fk_emp_salary_user FOREIGN KEY (user_id) REFERENCES users(user_id),
     CONSTRAINT fk_emp_salary_structure FOREIGN KEY (salary_structure_id) REFERENCES payroll.salary_structure(salary_structure_id)
 );
-
--- -----------------------------------------------------
--- payroll.company_statutory_config
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.company_statutory_config (
     company_statutory_config_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id                  UUID NOT NULL,
@@ -1552,14 +823,6 @@ CREATE TABLE IF NOT EXISTS payroll.company_statutory_config (
     version                     INT NOT NULL DEFAULT 1,
     CONSTRAINT fk_csc_company FOREIGN KEY (company_id) REFERENCES companies(company_id)
 );
-
--- -----------------------------------------------------
--- payroll.payroll_run
--- -----------------------------------------------------
-
--- -----------------------------------------------------
--- payroll.payroll_item (added versioning)
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.payroll_item (
     payroll_item_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     payroll_run_id  UUID NOT NULL,
@@ -1579,10 +842,6 @@ CREATE TABLE IF NOT EXISTS payroll.payroll_item (
     CONSTRAINT fk_payroll_item_run FOREIGN KEY (payroll_run_id) REFERENCES payroll.payroll_run(payroll_run_id) ON DELETE CASCADE,
     CONSTRAINT fk_payroll_item_user FOREIGN KEY (user_id) REFERENCES users(user_id)
 );
-
--- -----------------------------------------------------
--- payroll.payroll_ledger (added company_id)
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.payroll_ledger (
     ledger_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     payroll_item_id UUID NOT NULL,
@@ -1590,23 +849,16 @@ CREATE TABLE IF NOT EXISTS payroll.payroll_ledger (
     component_code  VARCHAR(50) NOT NULL,
     amount          NUMERIC(12,2) NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
     CONSTRAINT fk_ledger_item
         FOREIGN KEY (payroll_item_id)
         REFERENCES payroll.payroll_item(payroll_item_id)
         ON DELETE CASCADE,
-
     CONSTRAINT fk_ledger_component
         FOREIGN KEY (component_code)
         REFERENCES payroll.payroll_component(component_code),
-
     CONSTRAINT uq_payroll_ledger_item_component
         UNIQUE (payroll_item_id, component_code)
 );
-
--- -----------------------------------------------------
--- payroll.payroll_snapshot
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.payroll_snapshot (
     snapshot_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     payroll_run_id UUID NOT NULL,
@@ -1619,10 +871,6 @@ CREATE TABLE IF NOT EXISTS payroll.payroll_snapshot (
     rule_hash      TEXT,
     CONSTRAINT fk_snapshot_run FOREIGN KEY (payroll_run_id) REFERENCES payroll.payroll_run(payroll_run_id) ON DELETE CASCADE
 );
-
--- -----------------------------------------------------
--- payroll.payroll_period_lock (with EXCLUDE)
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.payroll_period_lock (
     lock_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id    UUID NOT NULL,
@@ -1638,10 +886,6 @@ CREATE TABLE IF NOT EXISTS payroll.payroll_period_lock (
         daterange(period_start, period_end, '[]') WITH &&
     )
 );
-
--- -----------------------------------------------------
--- payroll.payroll_adjustment (added company_id)
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.payroll_adjustment (
     adjustment_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id      UUID NOT NULL,
@@ -1654,19 +898,13 @@ CREATE TABLE IF NOT EXISTS payroll.payroll_adjustment (
     applicable_month DATE NOT NULL,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     created_by      UUID,
-
     CONSTRAINT fk_adjust_company
         FOREIGN KEY (company_id)
         REFERENCES public.companies(company_id),
-
     CONSTRAINT fk_adjust_component
         FOREIGN KEY (component_code)
         REFERENCES payroll.payroll_component(component_code)
 );
-
--- -----------------------------------------------------
--- payroll.payslip_template
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.payslip_template (
     template_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id          UUID NOT NULL,
@@ -1676,10 +914,6 @@ CREATE TABLE IF NOT EXISTS payroll.payslip_template (
     created_at          TIMESTAMPTZ DEFAULT NOW(),
     CONSTRAINT fk_template_company FOREIGN KEY (company_id) REFERENCES companies(company_id)
 );
-
--- -----------------------------------------------------
--- payroll.employee_statutory_contribution
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.employee_statutory_contribution (
     contribution_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id       UUID NOT NULL,
@@ -1691,17 +925,13 @@ CREATE TABLE IF NOT EXISTS payroll.employee_statutory_contribution (
     employer_amount  NUMERIC(12,2) NOT NULL,
     total_amount     NUMERIC(12,2) NOT NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
     CONSTRAINT fk_esc_definition
         FOREIGN KEY (company_id, statutory_code)
         REFERENCES payroll.statutory_component_definition(company_id, statutory_code)
         ON DELETE CASCADE,
-
     CONSTRAINT fk_esc_user
         FOREIGN KEY (user_id)
         REFERENCES users(user_id),
-
-    -- 🔒 Prevent duplicate statutory rows
     CONSTRAINT uniq_employee_statutory_period
         UNIQUE (
             company_id,
@@ -1711,10 +941,6 @@ CREATE TABLE IF NOT EXISTS payroll.employee_statutory_contribution (
             period_end
         )
 );
-
--- -----------------------------------------------------
--- user_avatars
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS user_avatars (
     avatar_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id           UUID NOT NULL,
@@ -1729,10 +955,6 @@ CREATE TABLE IF NOT EXISTS user_avatars (
     CONSTRAINT fk_user_avatars_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
     CONSTRAINT uq_user_primary_avatar UNIQUE (user_id, is_primary)
 );
-
--- -----------------------------------------------------
--- admin_avatars
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS admin_avatars (
     avatar_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     admin_id          UUID NOT NULL,
@@ -1747,10 +969,6 @@ CREATE TABLE IF NOT EXISTS admin_avatars (
     CONSTRAINT fk_admin_avatars_admin FOREIGN KEY (admin_id) REFERENCES admin_users(admin_id) ON DELETE CASCADE,
     CONSTRAINT uq_admin_primary_avatar UNIQUE (admin_id, is_primary)
 );
-
--- -----------------------------------------------------
--- audit.audit_logs
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS audit.audit_logs (
     audit_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id   UUID,
@@ -1765,10 +983,6 @@ CREATE TABLE IF NOT EXISTS audit.audit_logs (
     metadata     JSONB,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
--- -----------------------------------------------------
--- audit.audit_logs_outbox
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS audit.audit_logs_outbox (
     outbox_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     audit_id     UUID NOT NULL,
@@ -1778,115 +992,12 @@ CREATE TABLE IF NOT EXISTS audit.audit_logs_outbox (
     processed_at TIMESTAMPTZ,
     error_message TEXT
 );
-
--- -----------------------------------------------------
--- audit.outbox_debounce
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS audit.outbox_debounce (
     debounce_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     last_processed_id  UUID,
     last_processed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     batch_size         INTEGER DEFAULT 0
 );
-
--- -----------------------------------------------------
--- company_attendance_rules
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS company_attendance_rules (
-    company_id              UUID PRIMARY KEY,
-    allowed_source_types    VARCHAR(30)[] NOT NULL,
-    allow_multiple_checkins BOOLEAN NOT NULL DEFAULT false,
-    timezone                VARCHAR(50) NOT NULL DEFAULT 'UTC',
-    created_at              TIMESTAMPTZ DEFAULT NOW(),
-    CONSTRAINT fk_company_attendance_rules_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE
-);
-
--- -----------------------------------------------------
--- department_attendance_rules
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS department_attendance_rules (
-    rule_id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id              UUID NOT NULL,
-    department_id           UUID NOT NULL,
-    allowed_source_types    VARCHAR(30)[] NOT NULL,
-    allowed_event_types     VARCHAR(30)[] NOT NULL,
-    require_location        BOOLEAN NOT NULL DEFAULT false,
-    require_device          BOOLEAN NOT NULL DEFAULT false,
-    created_at              TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE (company_id, department_id),
-    CONSTRAINT fk_dept_att_rules_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
-    CONSTRAINT fk_dept_att_rules_department FOREIGN KEY (department_id) REFERENCES departments(department_id) ON DELETE CASCADE
-);
-
--- -----------------------------------------------------
--- user_attendance_profiles
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS user_attendance_profiles (
-    user_id                 UUID PRIMARY KEY,
-    company_id              UUID NOT NULL,
-    override_source_types   VARCHAR(30)[],
-    override_event_types    VARCHAR(30)[],
-    created_at              TIMESTAMPTZ DEFAULT NOW(),
-    CONSTRAINT fk_user_att_profile_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
-    CONSTRAINT fk_user_att_profile_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE
-);
-
--- -----------------------------------------------------
--- user_off_entitlements
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS user_off_entitlements (
-    entitlement_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id       UUID NOT NULL,
-    user_id          UUID NOT NULL,
-    period_type      VARCHAR(20) NOT NULL,
-    off_count        INTEGER NOT NULL,
-    requires_approval BOOLEAN DEFAULT true,
-    effective_from   DATE NOT NULL,
-    effective_to     DATE,
-    created_at       TIMESTAMPTZ DEFAULT NOW(),
-    CONSTRAINT fk_ent_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
-    CONSTRAINT fk_ent_user FOREIGN KEY (user_id) REFERENCES users(user_id),
-    CONSTRAINT chk_period_type CHECK (period_type IN ('weekly','monthly'))
-);
-
--- -----------------------------------------------------
--- off_requests
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS off_requests (
-    off_request_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id     UUID NOT NULL,
-    user_id        UUID NOT NULL,
-    request_dates  DATE[] NOT NULL,
-    status         VARCHAR(20) DEFAULT 'pending',
-    requested_by   UUID,
-    approved_by    UUID,
-    approved_at    TIMESTAMPTZ,
-    created_at     TIMESTAMPTZ DEFAULT NOW(),
-    CONSTRAINT fk_or_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
-    CONSTRAINT fk_or_user FOREIGN KEY (user_id) REFERENCES users(user_id)
-);
-
--- -----------------------------------------------------
--- schedule_overrides
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS schedule_overrides (
-    override_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id     UUID NOT NULL,
-    user_id        UUID NOT NULL,
-    override_date  DATE NOT NULL,
-    override_type  VARCHAR(20) NOT NULL,
-    reason         TEXT,
-    created_by     UUID,
-    created_at     TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE (user_id, override_date),
-    CONSTRAINT fk_so_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
-    CONSTRAINT fk_so_user FOREIGN KEY (user_id) REFERENCES users(user_id),
-    CONSTRAINT chk_override_type CHECK (override_type IN ('off','force_work','holiday_override'))
-);
-
--- -----------------------------------------------------
--- org_units
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS org_units (
     org_unit_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id     UUID NOT NULL,
@@ -1900,10 +1011,6 @@ CREATE TABLE IF NOT EXISTS org_units (
     CONSTRAINT fk_org_units_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
     CONSTRAINT fk_org_units_department FOREIGN KEY (department_id) REFERENCES departments(department_id)
 );
-
--- -----------------------------------------------------
--- org_unit_members
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS org_unit_members (
     org_unit_id    UUID NOT NULL,
     user_id        UUID NOT NULL,
@@ -1913,10 +1020,6 @@ CREATE TABLE IF NOT EXISTS org_unit_members (
     CONSTRAINT fk_oum_org_unit FOREIGN KEY (org_unit_id) REFERENCES org_units(org_unit_id) ON DELETE CASCADE,
     CONSTRAINT fk_oum_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
 );
-
--- -----------------------------------------------------
--- org_unit_roles
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS org_unit_roles (
     org_unit_id    UUID NOT NULL,
     user_id        UUID NOT NULL,
@@ -1929,70 +1032,27 @@ CREATE TABLE IF NOT EXISTS org_unit_roles (
     CONSTRAINT fk_our_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
     CONSTRAINT fk_our_position FOREIGN KEY (position_id) REFERENCES positions(position_id)
 );
-
--- -----------------------------------------------------
--- attendance.attendance_events_outbox
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS attendance.attendance_events_outbox (
-    outbox_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    event_type   VARCHAR(50) NOT NULL,
-    aggregate_id UUID NOT NULL,
-    payload      JSONB NOT NULL,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    processed_at TIMESTAMPTZ
-);
-
--- -----------------------------------------------------
--- attendance.attendance_batch_outbox
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS attendance.attendance_batch_outbox (
-    outbox_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    event_type    VARCHAR(50) NOT NULL,
-    aggregate_id  UUID NOT NULL,
-    payload       JSONB NOT NULL,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    processed_at  TIMESTAMPTZ,
-    error_message TEXT
-);
-
--- -----------------------------------------------------
--- payroll.employee_bank_details (new)
--- -----------------------------------------------------
 CREATE TABLE payroll.employee_bank_details (
     bank_detail_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-
     company_id       UUID NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
     user_id          UUID NOT NULL REFERENCES users(user_id),
-
     account_holder   VARCHAR(255) NOT NULL,
-
-    -- encrypted bank account
     account_number           TEXT NOT NULL,
     account_number_dek       TEXT NOT NULL,
     account_number_key_id    TEXT NOT NULL,
-
-    -- encrypted IFSC
     ifsc_code                TEXT NOT NULL,
     ifsc_code_dek            TEXT NOT NULL,
     ifsc_code_key_id         TEXT NOT NULL,
-
     bank_name        VARCHAR(255),
     branch           VARCHAR(255),
     account_type     VARCHAR(20),
-
     is_active        BOOLEAN NOT NULL DEFAULT true,
-
     effective_from   DATE NOT NULL,
     effective_to     DATE,
-
     created_at       TIMESTAMPTZ DEFAULT NOW(),
     updated_at       TIMESTAMPTZ DEFAULT NOW(),
-
     UNIQUE (company_id, user_id, effective_from)
 );
--- -----------------------------------------------------
--- payroll.payslip (new)
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.payslip (
     payslip_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     payroll_run_id   UUID NOT NULL REFERENCES payroll.payroll_run(payroll_run_id) ON DELETE CASCADE,
@@ -2002,10 +1062,6 @@ CREATE TABLE IF NOT EXISTS payroll.payslip (
     sent_at          TIMESTAMPTZ,
     CONSTRAINT uq_payslip_run_user UNIQUE (payroll_run_id, user_id)
 );
-
--- -----------------------------------------------------
--- payroll.employee_loan (new)
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.employee_loan (
     loan_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id       UUID NOT NULL REFERENCES companies(company_id),
@@ -2030,10 +1086,6 @@ CREATE TABLE IF NOT EXISTS payroll.employee_loan (
     allow_partial_payment BOOLEAN DEFAULT true,
     CONSTRAINT fk_employee_loan_component FOREIGN KEY (component_code) REFERENCES payroll.payroll_component(component_code)
 );
-
--- -----------------------------------------------------
--- payroll.emi_transaction (new)
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.emi_transaction (
     emi_id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     loan_id          UUID NOT NULL REFERENCES payroll.employee_loan(loan_id) ON DELETE CASCADE,
@@ -2047,10 +1099,6 @@ CREATE TABLE IF NOT EXISTS payroll.emi_transaction (
     remaining_amount NUMERIC(10,2),
     payment_status   VARCHAR(20) DEFAULT 'pending'
 );
-
--- -----------------------------------------------------
--- payroll.arrears (new)
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.arrears (
     arrears_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id       UUID NOT NULL,
@@ -2065,10 +1113,6 @@ CREATE TABLE IF NOT EXISTS payroll.arrears (
     component_code   VARCHAR(50),
     CONSTRAINT fk_arrears_component FOREIGN KEY (component_code) REFERENCES payroll.payroll_component(component_code)
 );
-
--- -----------------------------------------------------
--- payroll.tax_declaration_type (new)
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.tax_declaration_type (
     company_id       UUID NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
     type_code        VARCHAR(50) NOT NULL,
@@ -2079,10 +1123,6 @@ CREATE TABLE IF NOT EXISTS payroll.tax_declaration_type (
     updated_at       TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (company_id, type_code)
 );
-
--- -----------------------------------------------------
--- payroll.tax_declaration (new)
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.tax_declaration (
     declaration_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id       UUID NOT NULL REFERENCES companies(company_id),
@@ -2100,42 +1140,28 @@ CREATE TABLE IF NOT EXISTS payroll.tax_declaration (
     CONSTRAINT fk_tax_declaration_type FOREIGN KEY (company_id, declaration_type)
         REFERENCES payroll.tax_declaration_type(company_id, type_code)
 );
-
--- -----------------------------------------------------
--- payroll.company_payroll_settings (new)
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.company_payroll_settings (
-    company_id                UUID PRIMARY KEY 
+    company_id                UUID PRIMARY KEY
         REFERENCES companies(company_id) ON DELETE CASCADE,
-
     default_fine_component    VARCHAR(50),
     default_arrears_component VARCHAR(50),
     default_loan_component    VARCHAR(50),
     default_basic_component   VARCHAR(50),
-
     created_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
     CONSTRAINT fk_default_fine_component
         FOREIGN KEY (default_fine_component)
         REFERENCES payroll.payroll_component(component_code),
-
     CONSTRAINT fk_default_arrears_component
         FOREIGN KEY (default_arrears_component)
         REFERENCES payroll.payroll_component(component_code),
-
     CONSTRAINT fk_default_loan_component
         FOREIGN KEY (default_loan_component)
         REFERENCES payroll.payroll_component(component_code),
-
     CONSTRAINT fk_default_basic_component
         FOREIGN KEY (default_basic_component)
         REFERENCES payroll.payroll_component(component_code)
 );
-
--- -----------------------------------------------------
--- payroll.payroll_job (new)
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.payroll_job (
     job_id UUID PRIMARY KEY,
     company_id UUID NOT NULL,
@@ -2154,10 +1180,6 @@ CREATE TABLE IF NOT EXISTS payroll.payroll_job (
     locked_by TEXT,
     locked_at TIMESTAMP
 );
-
--- -----------------------------------------------------
--- payroll.loan_payment (new)
--- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.loan_payment (
     payment_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     loan_id           UUID NOT NULL REFERENCES payroll.employee_loan(loan_id) ON DELETE CASCADE,
@@ -2169,12 +1191,6 @@ CREATE TABLE IF NOT EXISTS payroll.loan_payment (
     payroll_run_id    UUID REFERENCES payroll.payroll_run(payroll_run_id) ON DELETE SET NULL,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
--- =====================================================
--- 4. INDEXES (all indexes consolidated)
--- =====================================================
-CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_attendance_policy_work_center ON attendance_policies (work_center_code) WHERE is_active = true;
-CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_attendance_policy_position ON attendance_policies (position_id) WHERE is_active = true;
 CREATE INDEX IF NOT EXISTS idx_admin_users_search_tsv ON admin_users USING GIN (user_search_tsv);
 CREATE INDEX IF NOT EXISTS idx_admin_users_username_trgm ON admin_users USING GIN (username gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_admin_users_fullname_trgm ON admin_users USING GIN (full_name gin_trgm_ops);
@@ -2259,50 +1275,6 @@ CREATE INDEX IF NOT EXISTS idx_employee_role_history_role ON employee_role_histo
 CREATE INDEX IF NOT EXISTS idx_employee_exit_user ON employee_exit (user_id);
 CREATE INDEX IF NOT EXISTS idx_employee_exit_company ON employee_exit (company_id);
 CREATE INDEX IF NOT EXISTS idx_employee_exit_date ON employee_exit (exit_date);
-CREATE INDEX IF NOT EXISTS idx_work_calendars_company ON work_calendars (company_id);
-CREATE INDEX IF NOT EXISTS idx_work_calendars_active ON work_calendars (is_active) WHERE is_active = true;
-CREATE INDEX IF NOT EXISTS idx_schedule_templates_company ON schedule_templates (company_id);
-CREATE INDEX IF NOT EXISTS idx_schedule_templates_calendar ON schedule_templates (calendar_id);
-CREATE INDEX IF NOT EXISTS idx_schedule_templates_active ON schedule_templates (is_active) WHERE is_active = true;
-CREATE INDEX IF NOT EXISTS idx_user_schedule_assignments_user ON user_schedule_assignments (user_id);
-CREATE INDEX IF NOT EXISTS idx_user_schedule_assignments_template ON user_schedule_assignments (schedule_template_id);
-CREATE INDEX IF NOT EXISTS idx_user_schedule_assignments_dates ON user_schedule_assignments (effective_from, effective_to);
-CREATE INDEX IF NOT EXISTS idx_schedule_instances_user_date ON schedule_instances (user_id, schedule_date);
-CREATE INDEX IF NOT EXISTS idx_schedule_instances_company ON schedule_instances (company_id);
-CREATE INDEX IF NOT EXISTS idx_schedule_instances_template ON schedule_instances (schedule_template_id);
-CREATE INDEX IF NOT EXISTS idx_schedule_instances_status ON schedule_instances (status) WHERE status = 'active';
-CREATE UNIQUE INDEX IF NOT EXISTS uq_schedule_instances_user_date_active ON schedule_instances (user_id, schedule_date) WHERE status = 'active';
-CREATE INDEX IF NOT EXISTS idx_attendance_sources_company ON attendance_sources (company_id);
-CREATE INDEX IF NOT EXISTS idx_attendance_sources_type ON attendance_sources (source_type);
-CREATE INDEX IF NOT EXISTS idx_attendance_sources_active ON attendance_sources (is_active) WHERE is_active = true;
-CREATE INDEX IF NOT EXISTS idx_attendance_events_user_time ON attendance_events (user_id, event_time DESC);
-CREATE INDEX IF NOT EXISTS idx_attendance_events_company ON attendance_events (company_id);
-CREATE INDEX IF NOT EXISTS idx_attendance_events_type ON attendance_events (event_type);
-CREATE INDEX IF NOT EXISTS idx_attendance_events_source ON attendance_events (source_type, source_id);
-CREATE INDEX IF NOT EXISTS idx_attendance_events_event_date ON attendance_events (event_date);
-CREATE INDEX IF NOT EXISTS idx_attendance_events_company_event_date ON attendance_events (company_id, event_date);
-CREATE INDEX IF NOT EXISTS idx_attendance_policies_company ON attendance_policies (company_id);
-CREATE INDEX IF NOT EXISTS idx_attendance_policies_position ON attendance_policies (position_id) WHERE position_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_attendance_policies_active ON attendance_policies (is_active) WHERE is_active = true;
-CREATE INDEX IF NOT EXISTS idx_user_attendance_policies_user ON user_attendance_policies (user_id);
-CREATE INDEX IF NOT EXISTS idx_user_attendance_policies_policy ON user_attendance_policies (policy_id);
-CREATE INDEX IF NOT EXISTS idx_user_attendance_policies_dates ON user_attendance_policies (effective_from, effective_to);
-CREATE INDEX IF NOT EXISTS idx_attendance_policies_effective ON user_attendance_policies (user_id, effective_from, effective_to);
-CREATE INDEX IF NOT EXISTS idx_attendance_daily_summary_user_date ON attendance_daily_summary (user_id, attendance_date DESC);
-CREATE INDEX IF NOT EXISTS idx_attendance_daily_summary_company ON attendance_daily_summary (company_id);
-CREATE INDEX IF NOT EXISTS idx_attendance_daily_summary_status ON attendance_daily_summary (status);
-CREATE INDEX IF NOT EXISTS idx_attendance_daily_summary_date_status ON attendance_daily_summary (attendance_date, status);
-CREATE INDEX IF NOT EXISTS idx_attendance_locations_company ON attendance_locations (company_id);
-CREATE INDEX IF NOT EXISTS idx_attendance_locations_active ON attendance_locations (is_active) WHERE is_active = true;
-CREATE INDEX IF NOT EXISTS idx_attendance_locations_code ON attendance_locations (company_id, location_code) WHERE location_code IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_attendance_locations_zone ON attendance_locations (company_id, zone) WHERE zone IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_work_center_shifts_code ON work_center_shifts (work_center_code);
-CREATE INDEX IF NOT EXISTS idx_work_center_shifts_company ON work_center_shifts (company_id);
-CREATE INDEX IF NOT EXISTS idx_work_center_shifts_active ON work_center_shifts (is_active) WHERE is_active = true;
-CREATE INDEX IF NOT EXISTS idx_work_center_shifts_dates ON work_center_shifts (effective_from, effective_to);
-CREATE INDEX IF NOT EXISTS idx_user_work_center_user ON user_work_center_assignments (user_id, is_active, effective_from DESC);
-CREATE INDEX IF NOT EXISTS idx_user_work_center_company ON user_work_center_assignments (company_id, work_center_code, is_active);
-CREATE INDEX IF NOT EXISTS idx_work_centers_company ON work_centers (company_id, is_active);
 CREATE INDEX IF NOT EXISTS idx_leave_type_company ON leave.leave_type (company_id);
 CREATE INDEX IF NOT EXISTS idx_leave_type_code ON leave.leave_type (code);
 CREATE INDEX IF NOT EXISTS idx_leave_type_accrual_method ON leave.leave_type (accrual_method);
@@ -2348,12 +1320,6 @@ CREATE INDEX IF NOT EXISTS idx_payroll_tax_profile_active ON payroll.payroll_tax
 CREATE INDEX IF NOT EXISTS idx_payroll_tax_profile_created_at ON payroll.payroll_tax_profile (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_payroll_tax_rule_component ON payroll.payroll_tax_rule (component_code);
 CREATE INDEX IF NOT EXISTS idx_payroll_tax_rule_type ON payroll.payroll_tax_rule (calculation_type);
-CREATE INDEX IF NOT EXISTS idx_company_attendance_rules_company ON company_attendance_rules (company_id);
-CREATE INDEX IF NOT EXISTS idx_department_attendance_rules_dept ON department_attendance_rules (department_id);
-CREATE INDEX IF NOT EXISTS idx_user_attendance_profiles_user ON user_attendance_profiles (user_id);
-CREATE INDEX IF NOT EXISTS idx_user_off_entitlements_user ON user_off_entitlements (user_id, company_id);
-CREATE INDEX IF NOT EXISTS idx_off_requests_user ON off_requests (user_id, company_id);
-CREATE INDEX IF NOT EXISTS idx_schedule_overrides_user_date ON schedule_overrides (user_id, override_date);
 CREATE INDEX IF NOT EXISTS idx_org_units_company ON org_units (company_id, org_unit_type) WHERE is_active = true;
 CREATE INDEX IF NOT EXISTS idx_oum_user_active ON org_unit_members (user_id) WHERE effective_to IS NULL;
 CREATE INDEX IF NOT EXISTS idx_our_user_active ON org_unit_roles (user_id) WHERE effective_to IS NULL;
@@ -2361,29 +1327,13 @@ CREATE INDEX IF NOT EXISTS idx_audit_logs_company_time ON audit.audit_logs (comp
 CREATE INDEX IF NOT EXISTS idx_audit_logs_module_action ON audit.audit_logs (module, action);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit.audit_logs (entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_outbox_unprocessed ON audit.audit_logs_outbox (created_at) WHERE processed_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_attendance_outbox_unprocessed ON attendance.attendance_events_outbox (processed_at) WHERE processed_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_employee_active_department ON employee_department_history (user_id) WHERE end_date IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_employee_role_active ON employee_role_history (user_id) WHERE end_date IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_employee_exit_active ON employee_exit (company_id, user_id) WHERE exit_state IN ('scheduled','effective');
-CREATE UNIQUE INDEX IF NOT EXISTS idx_user_attendance_policies_active ON user_attendance_policies (user_id) WHERE effective_to IS NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS uniq_correction_event ON attendance_events (company_id, user_id, event_type, event_time) WHERE source_type = 'correction';
-CREATE INDEX IF NOT EXISTS idx_attendance_events_user_type_time ON attendance_events (company_id, user_id, event_type, event_time DESC) WHERE source_type != 'correction';
-CREATE INDEX IF NOT EXISTS idx_attendance_events_device_time ON attendance_events (company_id, user_id, device_id, event_type, event_time DESC) WHERE device_id IS NOT NULL AND source_type != 'correction';
 CREATE INDEX IF NOT EXISTS idx_user_avatars_user_active ON user_avatars (user_id) WHERE is_active = true AND is_primary = true;
 CREATE INDEX IF NOT EXISTS idx_user_avatars_hash ON user_avatars (avatar_hash);
 CREATE INDEX IF NOT EXISTS idx_admin_avatars_admin_active ON admin_avatars (admin_id) WHERE is_active = true AND is_primary = true;
 CREATE INDEX IF NOT EXISTS idx_admin_avatars_hash ON admin_avatars (avatar_hash);
-CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_user_device_source ON attendance_user_device_identifiers (company_id, device_id, user_id, source_type) WHERE is_active = true;
-CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_device_code ON attendance_user_device_identifiers (company_id, device_id, device_user_code) WHERE is_active = true;
-CREATE UNIQUE INDEX IF NOT EXISTS uniq_enrollment_version ON attendance_user_device_identifiers (company_id, device_id, user_id, source_type, enrollment_version);
-CREATE INDEX IF NOT EXISTS idx_active_enrollment_lookup ON attendance_user_device_identifiers (company_id, device_id, device_user_code) WHERE is_active = true;
-CREATE INDEX IF NOT EXISTS idx_batch_failures_batch ON attendance_device_punch_failures (batch_id);
-CREATE INDEX IF NOT EXISTS idx_batch_failures_company ON attendance_device_punch_failures (company_id, created_at DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_device_batch_ref ON attendance_device_punch_batches (company_id, device_id, batch_ref);
-CREATE INDEX IF NOT EXISTS idx_device_tokens_device ON attendance_device_tokens (company_id, device_id);
-CREATE INDEX IF NOT EXISTS idx_device_tokens_active ON attendance_device_tokens (company_id, device_id, is_active);
-CREATE INDEX IF NOT EXISTS idx_device_heartbeats_latest ON attendance_device_heartbeats (company_id, device_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_attendance_batch_outbox_unprocessed ON attendance.attendance_batch_outbox (created_at) WHERE processed_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_active_entitlement_per_leave ON leave.leave_entitlement (company_id, user_id, leave_type_id, source) WHERE effective_to IS NULL;
 CREATE INDEX IF NOT EXISTS idx_leave_policy_scope_priority ON leave.leave_policy (company_id, applies_to_type, priority, is_active);
 CREATE INDEX IF NOT EXISTS idx_payroll_snapshot_run ON payroll.payroll_snapshot(payroll_run_id);
@@ -2421,10 +1371,6 @@ CREATE INDEX IF NOT EXISTS idx_payroll_item_run_active ON payroll.payroll_item(p
 CREATE INDEX IF NOT EXISTS idx_payroll_ledger_item ON payroll.payroll_ledger(payroll_item_id);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_statutory_contribution_rule_active ON payroll.statutory_contribution_rule (company_id, statutory_code, contribution_side, effective_from, rule_set_id) WHERE is_active = true;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_company_tax_slab_active ON payroll.company_tax_slab (company_id, statutory_code, min_income, max_income, effective_from, rule_set_id) WHERE is_active = true;
-
--- =====================================================
--- 5. FUNCTIONS
--- =====================================================
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -2438,7 +1384,6 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION update_admin_user_search_tsv()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -2449,7 +1394,6 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION update_user_search_tsv()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -2460,7 +1404,6 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION update_company_name_tsv()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -2470,7 +1413,6 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION audit.audit_logs_outbox_trigger()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -2496,7 +1438,6 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION enforce_department_limit()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -2522,7 +1463,6 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION deactivate_child_departments(p_dept_id UUID)
 RETURNS VOID AS $$
 DECLARE
@@ -2534,7 +1474,6 @@ BEGIN
     END LOOP;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION cascade_department_soft_delete()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -2544,7 +1483,6 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION prevent_child_on_inactive_parent()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -2565,7 +1503,6 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION enforce_unique_active_department_name()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -2581,14 +1518,12 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION prevent_department_delete()
 RETURNS TRIGGER AS $$
 BEGIN
     RAISE EXCEPTION 'Hard delete of departments is not allowed';
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION enforce_employee_limit()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -2605,7 +1540,6 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION get_active_employee_count(p_company_id UUID)
 RETURNS INTEGER AS $$
 DECLARE total INTEGER;
@@ -2614,7 +1548,6 @@ BEGIN
     RETURN total;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION prevent_position_in_inactive_department()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -2627,7 +1560,6 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION close_positions_on_department_deactivate()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -2637,7 +1569,6 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION sync_employee_department_on_position()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -2655,7 +1586,6 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION sync_employee_role_history()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -2666,7 +1596,6 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION enforce_scheduled_employee_exits(
     p_effective_date DATE DEFAULT CURRENT_DATE,
     p_enforced_by UUID DEFAULT NULL
@@ -2684,7 +1613,6 @@ BEGIN
     RETURN affected_count;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION mark_employee_rehired(
     p_company_id UUID,
     p_user_id UUID
@@ -2695,7 +1623,6 @@ BEGIN
     UPDATE company_employees SET is_active = true WHERE company_id = p_company_id AND user_id = p_user_id;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION prevent_exit_for_inactive_employee()
 RETURNS TRIGGER AS $$
 DECLARE active_status BOOLEAN;
@@ -2707,72 +1634,6 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
-CREATE OR REPLACE FUNCTION check_recent_attendance_duplicate(
-    p_company_id UUID,
-    p_user_id UUID,
-    p_event_type VARCHAR(30),
-    p_event_time TIMESTAMPTZ,
-    p_time_window_minutes INTEGER DEFAULT 5
-) RETURNS BOOLEAN AS $$
-DECLARE duplicate_count INTEGER;
-BEGIN
-    SELECT COUNT(*) INTO duplicate_count
-    FROM attendance_events
-    WHERE company_id = p_company_id AND user_id = p_user_id
-      AND event_type = p_event_type AND source_type != 'correction'
-      AND ABS(EXTRACT(EPOCH FROM (event_time - p_event_time))) <= p_time_window_minutes * 60;
-    RETURN duplicate_count > 0;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE OR REPLACE FUNCTION find_existing_correction(
-    p_company_id UUID,
-    p_user_id UUID,
-    p_event_type VARCHAR(30),
-    p_event_time TIMESTAMPTZ
-) RETURNS TABLE (
-    attendance_event_id UUID, company_id UUID, user_id UUID, event_type VARCHAR(30), event_time TIMESTAMPTZ,
-    source_type VARCHAR(30), source_id UUID, device_id VARCHAR(256), ip_address VARCHAR(64),
-    metadata JSONB, created_at TIMESTAMPTZ, created_by UUID
-) AS $$
-BEGIN
-    RETURN QUERY SELECT ae.attendance_event_id, ae.company_id, ae.user_id, ae.event_type, ae.event_time,
-                        ae.source_type, ae.source_id, ae.device_id, ae.ip_address,
-                        ae.metadata, ae.created_at, ae.created_by
-                 FROM attendance_events ae
-                 WHERE ae.company_id = p_company_id AND ae.user_id = p_user_id
-                   AND ae.event_type = p_event_type AND ae.event_time = p_event_time
-                   AND ae.source_type = 'correction' LIMIT 1;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE OR REPLACE FUNCTION prevent_past_schedule_update()
-RETURNS TRIGGER AS $$
-BEGIN
-    IF OLD.schedule_date <= CURRENT_DATE THEN
-        RAISE EXCEPTION 'Past or current schedules are immutable';
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE OR REPLACE FUNCTION enforce_schedule_cancellation()
-RETURNS TRIGGER AS $$
-BEGIN
-    IF OLD.status = 'active' AND NEW.status = 'cancelled' AND OLD.schedule_date > CURRENT_DATE THEN
-        RETURN NEW;
-    END IF;
-    IF OLD.status = 'active' AND NEW.status = 'active' THEN
-        RAISE EXCEPTION 'Direct modification not allowed. Cancel and regenerate.';
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
--- -------------------------------
--- Admin search functions
--- -------------------------------
 CREATE OR REPLACE FUNCTION search_admin_users(
     search_query_param TEXT DEFAULT NULL,
     role_type_filter_param INTEGER DEFAULT NULL,
@@ -2864,7 +1725,6 @@ BEGIN
     RETURN;
 END;
 $$ LANGUAGE plpgsql STABLE;
-
 CREATE OR REPLACE FUNCTION search_admin_users_by_role_type(
     role_type_param INTEGER,
     search_query TEXT DEFAULT NULL,
@@ -2899,7 +1759,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION search_admin_employees(
     search_query TEXT DEFAULT NULL,
     search_type TEXT DEFAULT 'autocomplete',
@@ -2933,7 +1792,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION search_admin_managers(
     search_query TEXT DEFAULT NULL,
     search_type TEXT DEFAULT 'autocomplete',
@@ -2967,7 +1825,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION search_super_admins(
     search_query TEXT DEFAULT NULL,
     search_type TEXT DEFAULT 'autocomplete',
@@ -3001,7 +1858,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION get_admin_with_permissions(
     admin_id_param UUID
 ) RETURNS TABLE(
@@ -3075,7 +1931,6 @@ BEGIN
     WHERE au.admin_id = admin_id_param;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION admin_has_permission(
     admin_id_param UUID,
     permission_name_param VARCHAR(100)
@@ -3092,7 +1947,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION admin_has_department_access(
     admin_id_param UUID,
     department_bitmask BIGINT
@@ -3109,7 +1963,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION get_admin_suggestions(
     prefix VARCHAR(100),
     role_type_filter INTEGER DEFAULT NULL,
@@ -3151,7 +2004,6 @@ BEGIN
     LIMIT limit_suggestions;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION get_admin_role_permissions(
     role_id_param UUID
 ) RETURNS TABLE(
@@ -3179,7 +2031,6 @@ BEGIN
     ORDER BY p.module, p.bit_index;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION get_admin_role_departments(
     role_id_param UUID
 ) RETURNS TABLE(
@@ -3203,7 +2054,6 @@ BEGIN
     ORDER BY sd.bitmask;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION search_admin_users_with_departments(
     search_query TEXT DEFAULT NULL,
     role_type_filter INTEGER DEFAULT NULL,
@@ -3293,10 +2143,6 @@ BEGIN
     RETURN QUERY EXECUTE base_query USING query_params;
 END;
 $$ LANGUAGE plpgsql;
-
--- -------------------------------
--- User search functions
--- -------------------------------
 CREATE OR REPLACE FUNCTION user_search(
     search_query TEXT,
     search_type TEXT DEFAULT 'fulltext',
@@ -3419,7 +2265,6 @@ EXCEPTION
         RAISE;
 END;
 $$ LANGUAGE plpgsql STABLE;
-
 CREATE OR REPLACE FUNCTION company_search(
     search_query TEXT,
     search_type TEXT DEFAULT 'fulltext',
@@ -3525,7 +2370,6 @@ BEGIN
     RETURN QUERY EXECUTE base_query USING query_params;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION company_employee_search(
     search_query TEXT,
     company_id_param UUID,
@@ -3671,7 +2515,6 @@ BEGIN
     RETURN QUERY EXECUTE base_query USING query_params;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION get_company_employee_suggestions(
     company_id_param UUID,
     prefix VARCHAR(100),
@@ -3710,7 +2553,6 @@ BEGIN
     LIMIT limit_suggestions;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION find_company_employee_by_username(
     company_id_search UUID,
     username_search VARCHAR(100)
@@ -3751,7 +2593,6 @@ BEGIN
     LIMIT 1;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION find_user_by_username(username_search VARCHAR(100))
 RETURNS TABLE(
     user_id UUID,
@@ -3775,7 +2616,6 @@ BEGIN
     LIMIT 1;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION find_companies_by_owner(
     owner_id UUID,
     name_filter VARCHAR(255) DEFAULT NULL
@@ -3802,7 +2642,6 @@ BEGIN
     ORDER BY c.created_at DESC;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION get_user_suggestions(
     prefix VARCHAR(100),
     limit_suggestions INTEGER DEFAULT 10
@@ -3830,7 +2669,6 @@ BEGIN
     LIMIT limit_suggestions;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION get_company_suggestions(
     prefix VARCHAR(255),
     limit_suggestions INTEGER DEFAULT 10
@@ -3849,10 +2687,6 @@ BEGIN
     LIMIT limit_suggestions;
 END;
 $$ LANGUAGE plpgsql;
-
--- -------------------------------
--- Leave functions
--- -------------------------------
 CREATE OR REPLACE FUNCTION leave.update_updated_at_column()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -3860,7 +2694,6 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION leave.calculate_fractional_accrual(
     p_total_days INTEGER,
     p_accrual_method TEXT,
@@ -3882,7 +2715,6 @@ BEGIN
     RETURN ROUND(v_result, 4);
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;
-
 CREATE OR REPLACE FUNCTION leave.get_user_effective_policy(
     p_company_id UUID,
     p_user_id UUID,
@@ -3968,7 +2800,6 @@ BEGIN
         ap.effective_from DESC;
 END;
 $$ LANGUAGE plpgsql STABLE;
-
 CREATE OR REPLACE FUNCTION leave.close_active_entitlements(
     p_company_id UUID,
     p_user_id UUID,
@@ -3986,24 +2817,6 @@ BEGIN
     RETURN ROW_COUNT;
 END;
 $$ LANGUAGE plpgsql;
-
--- -------------------------------
--- Other functions
--- -------------------------------
-CREATE OR REPLACE FUNCTION revoke_enrollment_on_exit()
-RETURNS TRIGGER AS $$
-BEGIN
-    UPDATE attendance_user_device_identifiers
-    SET is_active = false,
-        unenrolled_at = NOW(),
-        revoked_reason = 'employee_exit'
-    WHERE company_id = NEW.company_id
-      AND user_id = NEW.user_id
-      AND is_active = true;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION prevent_structure_update_if_used()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -4017,233 +2830,90 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
-CREATE OR REPLACE FUNCTION prevent_attendance_update_if_locked()
-RETURNS TRIGGER AS $$
-BEGIN
-    IF OLD.is_payroll_locked = true THEN
-        RAISE EXCEPTION 'Attendance is payroll locked';
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
--- =====================================================
--- 6. TRIGGERS
--- =====================================================
 CREATE TRIGGER audit_logs_outbox_trigger
     AFTER INSERT ON audit.audit_logs FOR EACH ROW
     EXECUTE FUNCTION audit.audit_logs_outbox_trigger();
-
 CREATE TRIGGER update_admin_user_search_tsv
     BEFORE UPDATE OF username, full_name ON admin_users FOR EACH ROW
     EXECUTE FUNCTION update_admin_user_search_tsv();
-
 CREATE TRIGGER update_user_search_tsv
     BEFORE UPDATE OF username, full_name ON users FOR EACH ROW
     EXECUTE FUNCTION update_user_search_tsv();
-
 CREATE TRIGGER update_company_name_tsv
     BEFORE UPDATE OF company_name ON companies FOR EACH ROW
     EXECUTE FUNCTION update_company_name_tsv();
-
 CREATE TRIGGER update_admin_users_updated_at
     BEFORE UPDATE ON admin_users FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
-
 CREATE TRIGGER update_users_updated_at
     BEFORE UPDATE ON users FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
-
 CREATE TRIGGER update_companies_updated_at
     BEFORE UPDATE ON companies FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
-
 CREATE TRIGGER update_roles_updated_at
     BEFORE UPDATE ON roles FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
-
 CREATE TRIGGER update_departments_updated_at
     BEFORE UPDATE ON departments FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
-
 CREATE TRIGGER update_company_employees_updated_at
     BEFORE UPDATE ON company_employees FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
-
 CREATE TRIGGER update_user_devices_updated_at
     BEFORE UPDATE ON user_devices FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
-
 CREATE TRIGGER update_admin_roles_updated_at
     BEFORE UPDATE ON admin_roles FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
-
 CREATE TRIGGER update_employee_profiles_updated_at
     BEFORE UPDATE ON employee_profiles FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
-
-CREATE TRIGGER update_attendance_policies_updated_at
-    BEFORE UPDATE ON attendance_policies FOR EACH ROW
-    EXECUTE FUNCTION update_updated_at_column();
-
-CREATE TRIGGER update_work_center_shifts_updated_at
-    BEFORE UPDATE ON work_center_shifts FOR EACH ROW
-    EXECUTE FUNCTION update_updated_at_column();
-
-CREATE TRIGGER update_user_work_center_assignments_updated_at
-    BEFORE UPDATE ON user_work_center_assignments FOR EACH ROW
-    EXECUTE FUNCTION update_updated_at_column();
-
-CREATE TRIGGER update_work_centers_updated_at
-    BEFORE UPDATE ON work_centers FOR EACH ROW
-    EXECUTE FUNCTION update_updated_at_column();
-
-CREATE TRIGGER update_org_units_updated_at
-    BEFORE UPDATE ON org_units FOR EACH ROW
-    EXECUTE FUNCTION update_updated_at_column();
-
 CREATE TRIGGER update_leave_entitlement_updated_at
     BEFORE UPDATE ON leave.leave_entitlement FOR EACH ROW
     EXECUTE FUNCTION leave.update_updated_at_column();
-
 CREATE TRIGGER update_leave_policy_updated_at
     BEFORE UPDATE ON leave.leave_policy FOR EACH ROW
     EXECUTE FUNCTION leave.update_updated_at_column();
-
 CREATE TRIGGER update_leave_policy_rule_updated_at
     BEFORE UPDATE ON leave.leave_policy_rule FOR EACH ROW
     EXECUTE FUNCTION leave.update_updated_at_column();
-
 CREATE TRIGGER trg_enforce_department_limit
     BEFORE INSERT OR UPDATE OF is_active ON departments FOR EACH ROW
     EXECUTE FUNCTION enforce_department_limit();
-
 CREATE TRIGGER trg_no_department_delete
     BEFORE DELETE ON departments FOR EACH ROW
     EXECUTE FUNCTION prevent_department_delete();
-
 CREATE TRIGGER trg_cascade_department_soft_delete
     BEFORE UPDATE OF is_active ON departments FOR EACH ROW
     EXECUTE FUNCTION cascade_department_soft_delete();
-
 CREATE TRIGGER trg_prevent_child_on_inactive_parent
     BEFORE INSERT OR UPDATE OF parent_department_id ON departments FOR EACH ROW
     EXECUTE FUNCTION prevent_child_on_inactive_parent();
-
 CREATE TRIGGER trg_unique_active_department_name
     BEFORE INSERT OR UPDATE OF department_name, is_active ON departments FOR EACH ROW
     EXECUTE FUNCTION enforce_unique_active_department_name();
-
 CREATE TRIGGER trg_close_positions_on_department_deactivate
     BEFORE UPDATE OF is_active ON departments FOR EACH ROW
     EXECUTE FUNCTION close_positions_on_department_deactivate();
-
 CREATE TRIGGER trg_prevent_position_in_inactive_department
     BEFORE INSERT OR UPDATE ON positions FOR EACH ROW
     EXECUTE FUNCTION prevent_position_in_inactive_department();
-
 CREATE TRIGGER trg_enforce_employee_limit
     BEFORE INSERT OR UPDATE OF is_active ON company_employees FOR EACH ROW
     EXECUTE FUNCTION enforce_employee_limit();
-
 CREATE TRIGGER trg_sync_department_on_position
     AFTER INSERT OR UPDATE OF position_id ON company_employees FOR EACH ROW
     EXECUTE FUNCTION sync_employee_department_on_position();
-
 CREATE TRIGGER trg_sync_role_history
     AFTER INSERT OR UPDATE OF role_id ON company_employees FOR EACH ROW
     EXECUTE FUNCTION sync_employee_role_history();
-
 CREATE TRIGGER trg_prevent_exit_for_inactive_employee
     BEFORE INSERT ON employee_exit FOR EACH ROW
     EXECUTE FUNCTION prevent_exit_for_inactive_employee();
-
-CREATE TRIGGER trg_prevent_past_schedule_update
-    BEFORE UPDATE OR DELETE ON schedule_instances FOR EACH ROW
-    EXECUTE FUNCTION prevent_past_schedule_update();
-
-CREATE TRIGGER trg_enforce_schedule_cancel
-    BEFORE UPDATE ON schedule_instances FOR EACH ROW
-    EXECUTE FUNCTION enforce_schedule_cancellation();
-
-CREATE TRIGGER trg_revoke_device_on_employee_exit
-    AFTER UPDATE OF exit_state ON employee_exit FOR EACH ROW
-    WHEN (NEW.exit_state = 'effective')
-    EXECUTE FUNCTION revoke_enrollment_on_exit();
-
 CREATE TRIGGER trg_prevent_structure_update
     BEFORE UPDATE ON payroll.salary_structure FOR EACH ROW
     EXECUTE FUNCTION prevent_structure_update_if_used();
-
-CREATE TRIGGER trg_prevent_attendance_update_if_locked
-    BEFORE UPDATE OR DELETE ON attendance_daily_summary FOR EACH ROW
-    EXECUTE FUNCTION prevent_attendance_update_if_locked();
-
--- =====================================================
--- 7. DEFAULT DATA INSERTS
--- =====================================================
-
--- Attendance source types
-INSERT INTO attendance_source_types
-    (source_type, description, category, requires_device, is_system,
-     allow_backdated, allow_future, trust_level, is_self_service)
-VALUES
-    ('mobile', 'Mobile App Punch', 'mobile', false, false, false, false, 2, true),
-    ('web', 'Web Portal Punch', 'web', false, false, false, false, 2, true),
-    ('biometric', 'Biometric Attendance Device', 'biometric', true, false, false, false, 5, false),
-    ('kiosk', 'Shared Kiosk / Tablet', 'machine', true, false, false, false, 4, true),
-    ('manual', 'Manual Attendance Entry', 'manual', false, false, true, false, 1, false),
-    ('correction', 'Attendance Correction', 'manual', false, false, true, false, 1, false),
-    ('system', 'System Generated Attendance', 'system', false, true, false, false, 5, false),
-    ('import', 'Bulk Attendance Import', 'system', false, true, true, false, 4, false),
-    ('api', 'External Attendance API', 'system', false, true, false, false, 3, false),
-    ('factory', 'Factory Machine Sync', 'machine', true, true, false, false, 5, true),
-    ('classroom', 'Classroom / Lab Attendance', 'machine', true, false, false, false, 3, true),
-    ('geo', 'Geo-fenced Mobile Attendance', 'mobile', false, false, false, false, 3, true)
-ON CONFLICT DO NOTHING;
-
--- Attendance event types
-INSERT INTO attendance_event_types
-    (event_type, category, description, is_user_triggered, is_system_generated)
-VALUES
-    ('check_in', 'core', 'User check-in', true, false),
-    ('check_out', 'core', 'User check-out', true, false),
-    ('break_start', 'core', 'Break started', true, false),
-    ('break_end', 'core', 'Break ended', true, false),
-    ('shift_start', 'shift', 'Shift started', true, false),
-    ('shift_end', 'shift', 'Shift ended', true, false),
-    ('overtime_start', 'shift', 'Overtime started', true, false),
-    ('overtime_end', 'shift', 'Overtime ended', true, false),
-    ('early_exit', 'shift', 'Left early', false, true),
-    ('late_entry', 'shift', 'Late arrival', false, true),
-    ('gate_entry', 'location', 'Gate entry', true, false),
-    ('gate_exit', 'location', 'Gate exit', true, false),
-    ('zone_entry', 'location', 'Zone entry', true, false),
-    ('zone_exit', 'location', 'Zone exit', true, false),
-    ('class_start', 'class', 'Class started', true, false),
-    ('class_end', 'class', 'Class ended', true, false),
-    ('session_join', 'class', 'Joined session', true, false),
-    ('session_leave', 'class', 'Left session', true, false),
-    ('leave_start', 'leave', 'Leave started', false, true),
-    ('leave_end', 'leave', 'Leave ended', false, true),
-    ('absent_marked', 'leave', 'Absent marked', false, true),
-    ('holiday_marked', 'leave', 'Holiday', false, true),
-    ('weekly_off', 'leave', 'Weekly off', false, true),
-    ('manual_check_in', 'manual', 'Manual check-in', false, false),
-    ('manual_check_out', 'manual', 'Manual check-out', false, false),
-    ('manual_override', 'manual', 'Manual override', false, false),
-    ('attendance_adjustment', 'manual', 'Attendance adjustment', false, false),
-    ('biometric_sync', 'system', 'Biometric sync', false, true),
-    ('system_generated', 'system', 'System generated event', false, true),
-    ('imported_event', 'system', 'Imported attendance', false, true),
-    ('missing_punch', 'exception', 'Missing punch', false, true),
-    ('duplicate_punch', 'exception', 'Duplicate punch', false, true),
-    ('invalid_punch', 'exception', 'Invalid punch', false, true),
-    ('policy_violation', 'exception', 'Attendance policy violation', false, true)
-ON CONFLICT DO NOTHING;
-
--- Payroll components (with company_id)
 INSERT INTO payroll.payroll_component (
     company_id,
     component_code,
@@ -4254,11 +2924,6 @@ INSERT INTO payroll.payroll_component (
     is_active,
     contribution_side
 ) VALUES
-
--- ========================
--- Earnings
--- ========================
-
 (NULL,'BASIC','earning','Basic Salary',true,true,true,'employee'),
 (NULL,'HRA','earning','House Rent Allowance',true,false,true,'employee'),
 (NULL,'CONVEYANCE','earning','Conveyance Allowance',true,false,true,'employee'),
@@ -4272,38 +2937,24 @@ INSERT INTO payroll.payroll_component (
 (NULL,'SHIFT_ALLOWANCE','earning','Shift Allowance',true,false,true,'employee'),
 (NULL,'FOOD_ALLOWANCE','earning','Meal / Food Allowance',true,false,true,'employee'),
 (NULL,'OVERTIME_PAY','earning','Overtime Pay',true,true,true,'employee'),
-
--- ========================
--- Employee Deductions
--- ========================
-
 (NULL,'LOAN_EMI','deduction','Loan EMI',false,false,true,'employee'),
 (NULL,'ABSENT_DEDUCTION','deduction','Absent Deduction',false,true,true,'employee'),
 (NULL,'MANUAL_FINE','deduction','Manual Fine',false,false,true,'employee'),
-
 (NULL,'PF','deduction','Provident Fund (Employee)',false,false,true,'employee'),
 (NULL,'ESI','deduction','Employee State Insurance',false,false,true,'employee'),
 (NULL,'PT','deduction','Professional Tax',false,false,true,'employee'),
 (NULL,'TDS','deduction','Income Tax (TDS)',false,false,true,'employee'),
 (NULL,'LOP','deduction','Loss of Pay',false,true,true,'employee'),
-
 (NULL,'ADVANCE','deduction','Salary Advance Recovery',false,false,true,'employee'),
 (NULL,'LOAN_DEDUCTION','deduction','Loan Repayment Deduction',false,false,true,'employee'),
 (NULL,'INSURANCE','deduction','Insurance Deduction',false,false,true,'employee'),
 (NULL,'OTHER_DEDUCTION','deduction','Other Deduction',false,false,true,'employee'),
 (NULL,'LATE_DEDUCTION','deduction','Late Attendance Deduction',false,true,true,'employee'),
-
--- ========================
--- Employer Contributions
--- ========================
-
 (NULL,'PF_EMPLOYER','deduction','Employer Provident Fund',false,true,true,'employer'),
 (NULL,'ESI_EMPLOYER','deduction','Employer ESI Contribution',false,true,true,'employer'),
 (NULL,'GRATUITY','deduction','Gratuity Provision',false,true,true,'employer'),
 (NULL,'BONUS_PROVISION','deduction','Bonus Provision',false,true,true,'employer')
-
 ON CONFLICT DO NOTHING;
--- System departments
 INSERT INTO system_departments (name, module_code, description, bitmask) VALUES
     ('HR', 'hr', 'Human resource management', 1 << 0),
     ('Finance', 'finance', 'Finance operations', 1 << 1),
@@ -4329,13 +2980,7 @@ INSERT INTO system_departments (name, module_code, description, bitmask) VALUES
     ('Payroll', 'payroll', 'Payroll management and processing', 1 << 21),
     ('Academics', 'academics', 'Academic management system', 1 << 22)
 ON CONFLICT (name) DO NOTHING;
-
-
--- =====================================================
--- FULL PERMISSIONS (including Academics)
--- =====================================================
 INSERT INTO permissions (permission_name, description, category, module, scope, requires_tier, bit_index) VALUES
-    -- hr & employee
     ('hr.employee.create', 'Create employees', 'employee', 'hr', 'user', 'basic', 0),
     ('hr.employee.update', 'Update employees', 'employee', 'hr', 'user', 'basic', 1),
     ('hr.employee.delete', 'Delete employees', 'employee', 'hr', 'user', 'basic', 2),
@@ -4356,8 +3001,6 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('hr.leave.view', 'View leave', 'leave', 'hr', 'user', 'basic', 17),
     ('hr.attendance.view', 'View attendance', 'attendance', 'hr', 'user', 'basic', 18),
     ('hr.attendance.update', 'Update attendance', 'attendance', 'hr', 'user', 'basic', 19),
-
-    -- finance
     ('finance.invoice.create', 'Create invoices', 'invoice', 'finance', 'user', 'basic', 20),
     ('finance.invoice.update', 'Update invoices', 'invoice', 'finance', 'user', 'basic', 21),
     ('finance.invoice.delete', 'Delete invoices', 'invoice', 'finance', 'user', 'basic', 22),
@@ -4377,8 +3020,6 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('finance.budget.update', 'Update budgets', 'budget', 'finance', 'user', 'basic', 36),
     ('finance.budget.delete', 'Delete budgets', 'budget', 'finance', 'user', 'basic', 37),
     ('finance.budget.view', 'View budgets', 'budget', 'finance', 'user', 'basic', 38),
-
-    -- accounting
     ('accounting.ledger.view', 'View ledger', 'ledger', 'accounting', 'user', 'basic', 39),
     ('accounting.journal.create', 'Create journal entries', 'journal', 'accounting', 'user', 'basic', 40),
     ('accounting.journal.update', 'Update journal entries', 'journal', 'accounting', 'user', 'basic', 41),
@@ -4389,8 +3030,6 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('accounting.cashflow.view', 'View cash flow', 'cashflow', 'accounting', 'user', 'basic', 46),
     ('accounting.reconcile', 'Reconcile accounts', 'reconcile', 'accounting', 'user', 'basic', 47),
     ('accounting.report.export', 'Export reports', 'report', 'accounting', 'user', 'basic', 48),
-
-    -- procurement
     ('procurement.po.create', 'Create purchase orders', 'po', 'procurement', 'user', 'basic', 49),
     ('procurement.po.update', 'Update purchase orders', 'po', 'procurement', 'user', 'basic', 50),
     ('procurement.po.approve', 'Approve purchase orders', 'po', 'procurement', 'user', 'basic', 51),
@@ -4406,8 +3045,6 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('procurement.request.update', 'Update procurement requests', 'request', 'procurement', 'user', 'basic', 61),
     ('procurement.request.delete', 'Delete procurement requests', 'request', 'procurement', 'user', 'basic', 62),
     ('procurement.request.view', 'View procurement requests', 'request', 'procurement', 'user', 'basic', 63),
-
-    -- inventory
     ('inventory.item.create', 'Create items', 'item', 'inventory', 'user', 'basic', 64),
     ('inventory.item.update', 'Update items', 'item', 'inventory', 'user', 'basic', 65),
     ('inventory.item.delete', 'Delete items', 'item', 'inventory', 'user', 'basic', 66),
@@ -4426,8 +3063,6 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('inventory.warehouse.update', 'Update warehouses', 'warehouse', 'inventory', 'user', 'basic', 79),
     ('inventory.warehouse.delete', 'Delete warehouses', 'warehouse', 'inventory', 'user', 'basic', 80),
     ('inventory.warehouse.view', 'View warehouses', 'warehouse', 'inventory', 'user', 'basic', 81),
-
-    -- logistics
     ('logistics.shipment.create', 'Create shipments', 'shipment', 'logistics', 'user', 'basic', 82),
     ('logistics.shipment.update', 'Update shipments', 'shipment', 'logistics', 'user', 'basic', 83),
     ('logistics.shipment.delete', 'Delete shipments', 'shipment', 'logistics', 'user', 'basic', 84),
@@ -4440,8 +3075,6 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('logistics.vehicle.assign', 'Assign vehicles', 'vehicle', 'logistics', 'user', 'basic', 91),
     ('logistics.vehicle.update', 'Update vehicles', 'vehicle', 'logistics', 'user', 'basic', 92),
     ('logistics.vehicle.view', 'View vehicles', 'vehicle', 'logistics', 'user', 'basic', 93),
-
-    -- sales
     ('sales.lead.create', 'Create sales leads', 'lead', 'sales', 'user', 'basic', 94),
     ('sales.lead.update', 'Update sales leads', 'lead', 'sales', 'user', 'basic', 95),
     ('sales.lead.delete', 'Delete sales leads', 'lead', 'sales', 'user', 'basic', 96),
@@ -4458,8 +3091,6 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('sales.target.create', 'Create sales targets', 'target', 'sales', 'user', 'basic', 107),
     ('sales.target.update', 'Update sales targets', 'target', 'sales', 'user', 'basic', 108),
     ('sales.target.view', 'View sales targets', 'target', 'sales', 'user', 'basic', 109),
-
-    -- marketing
     ('marketing.campaign.create', 'Create campaigns', 'campaign', 'marketing', 'user', 'basic', 110),
     ('marketing.campaign.update', 'Update campaigns', 'campaign', 'marketing', 'user', 'basic', 111),
     ('marketing.campaign.delete', 'Delete campaigns', 'campaign', 'marketing', 'user', 'basic', 112),
@@ -4472,8 +3103,6 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('marketing.budget.create', 'Create marketing budgets', 'budget', 'marketing', 'user', 'basic', 119),
     ('marketing.budget.update', 'Update marketing budgets', 'budget', 'marketing', 'user', 'basic', 120),
     ('marketing.budget.view', 'View marketing budgets', 'budget', 'marketing', 'user', 'basic', 121),
-
-    -- support
     ('support.ticket.create', 'Create support tickets', 'ticket', 'support', 'user', 'basic', 122),
     ('support.ticket.update', 'Update support tickets', 'ticket', 'support', 'user', 'basic', 123),
     ('support.ticket.assign', 'Assign support tickets', 'ticket', 'support', 'user', 'basic', 124),
@@ -4485,8 +3114,6 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('support.faq.delete', 'Delete FAQs', 'faq', 'support', 'user', 'basic', 130),
     ('support.faq.view', 'View FAQs', 'faq', 'support', 'user', 'basic', 131),
     ('support.report.view', 'View support reports', 'report', 'support', 'user', 'basic', 132),
-
-    -- operations
     ('operations.task.create', 'Create tasks', 'task', 'operations', 'user', 'basic', 133),
     ('operations.task.update', 'Update tasks', 'task', 'operations', 'user', 'basic', 134),
     ('operations.task.delete', 'Delete tasks', 'task', 'operations', 'user', 'basic', 135),
@@ -4501,8 +3128,6 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('operations.workflow.update', 'Update workflows', 'workflow', 'operations', 'user', 'basic', 144),
     ('operations.workflow.delete', 'Delete workflows', 'workflow', 'operations', 'user', 'basic', 145),
     ('operations.workflow.view', 'View workflows', 'workflow', 'operations', 'user', 'basic', 146),
-
-    -- IT
     ('it.asset.create', 'Create IT assets', 'asset', 'it', 'user', 'basic', 147),
     ('it.asset.update', 'Update IT assets', 'asset', 'it', 'user', 'basic', 148),
     ('it.asset.delete', 'Delete IT assets', 'asset', 'it', 'user', 'basic', 149),
@@ -4517,8 +3142,6 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('it.access.revoke', 'Revoke access', 'access', 'it', 'user', 'basic', 158),
     ('it.system.config.update', 'Update system config', 'system', 'it', 'user', 'basic', 159),
     ('it.system.config.view', 'View system config', 'system', 'it', 'user', 'basic', 160),
-
-    -- production
     ('production.order.create', 'Create production orders', 'order', 'production', 'user', 'basic', 161),
     ('production.order.update', 'Update production orders', 'order', 'production', 'user', 'basic', 162),
     ('production.order.start', 'Start production orders', 'order', 'production', 'user', 'basic', 163),
@@ -4535,8 +3158,6 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('production.route.update', 'Update routes', 'route', 'production', 'user', 'basic', 174),
     ('production.route.view', 'View routes', 'route', 'production', 'user', 'basic', 175),
     ('production.route.delete', 'Delete routes', 'route', 'production', 'user', 'basic', 176),
-
-    -- quality control
     ('qc.inspection.create', 'Create inspections', 'inspection', 'qc', 'user', 'basic', 177),
     ('qc.inspection.update', 'Update inspections', 'inspection', 'qc', 'user', 'basic', 178),
     ('qc.inspection.approve', 'Approve inspections', 'inspection', 'qc', 'user', 'basic', 179),
@@ -4547,8 +3168,6 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('qc.batch.release', 'Release batches', 'batch', 'qc', 'user', 'basic', 184),
     ('qc.report.generate', 'Generate QC reports', 'report', 'qc', 'user', 'basic', 185),
     ('qc.report.view', 'View QC reports', 'report', 'qc', 'user', 'basic', 186),
-
-    -- quality assurance
     ('qa.test.create', 'Create tests', 'test', 'qa', 'user', 'basic', 187),
     ('qa.test.update', 'Update tests', 'test', 'qa', 'user', 'basic', 188),
     ('qa.test.delete', 'Delete tests', 'test', 'qa', 'user', 'basic', 189),
@@ -4559,8 +3178,6 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('qa.audit.view', 'View audits', 'audit', 'qa', 'user', 'basic', 194),
     ('qa.report.generate', 'Generate QA reports', 'report', 'qa', 'user', 'basic', 195),
     ('qa.report.view', 'View QA reports', 'report', 'qa', 'user', 'basic', 196),
-
-    -- R&D
     ('rnd.experiment.create', 'Create experiments', 'experiment', 'rnd', 'user', 'basic', 197),
     ('rnd.experiment.update', 'Update experiments', 'experiment', 'rnd', 'user', 'basic', 198),
     ('rnd.experiment.delete', 'Delete experiments', 'experiment', 'rnd', 'user', 'basic', 199),
@@ -4573,8 +3190,6 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('rnd.document.update', 'Update R&D documents', 'document', 'rnd', 'user', 'basic', 206),
     ('rnd.document.view', 'View R&D documents', 'document', 'rnd', 'user', 'basic', 207),
     ('rnd.document.delete', 'Delete R&D documents', 'document', 'rnd', 'user', 'basic', 208),
-
-    -- administration (note gap at 209)
     ('administration.company.view', 'View company administration settings', 'company', 'administration', 'user', 'basic', 210),
     ('administration.company.update', 'Update company administration settings', 'company', 'administration', 'user', 'basic', 211),
     ('administration.policy.create', 'Create company policies', 'policy', 'administration', 'user', 'basic', 212),
@@ -4588,14 +3203,10 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('administration.audit.view', 'View company audit logs', 'audit', 'administration', 'user', 'basic', 220),
     ('administration.security.view', 'View company security settings', 'security', 'administration', 'user', 'basic', 221),
     ('administration.security.update', 'Update company security settings', 'security', 'administration', 'user', 'basic', 222),
-
-    -- attendance (self service)
     ('attendance.self.punch', 'Allow user to punch their own attendance (check-in/check-out)', 'attendance', 'attendance', 'user', 'basic', 223),
     ('attendance.team.punch', 'Allow manager/lead to punch attendance for team members', 'attendance', 'attendance', 'user', 'basic', 224),
     ('attendance.correct', 'Allow correction or adjustment of attendance records', 'attendance', 'attendance', 'user', 'basic', 225),
     ('attendance.configure', 'Configure attendance rules, sources, and policies', 'attendance', 'attendance', 'user', 'basic', 226),
-
-    -- payroll
     ('payroll.run.create', 'Create payroll runs', 'payroll', 'payroll', 'user', 'basic', 227),
     ('payroll.run.update', 'Update payroll runs', 'payroll', 'payroll', 'user', 'basic', 228),
     ('payroll.run.view', 'View payroll runs', 'payroll', 'payroll', 'user', 'basic', 229),
@@ -4604,40 +3215,26 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('payroll.run.process', 'Process payroll runs', 'payroll', 'payroll', 'user', 'basic', 232),
     ('payroll.component.manage', 'Manage payroll components', 'payroll', 'payroll', 'user', 'basic', 233),
     ('payroll.tax.manage', 'Manage tax rules and profiles', 'payroll', 'payroll', 'user', 'basic', 234),
-
-    -- admin employees (admin scope)
     ('admin.employee.create', 'Create admin employees', 'employee', 'employee_management', 'admin', 'admin', 235),
     ('admin.employee.update', 'Update admin employees', 'employee', 'employee_management', 'admin', 'admin', 236),
     ('admin.employee.view', 'View admin employees', 'employee', 'employee_management', 'admin', 'admin', 237),
     ('admin.employee.delete', 'Delete admin employees', 'employee', 'employee_management', 'admin', 'admin', 238),
     ('admin.employee.assign', 'Assign admin employees to departments', 'employee', 'employee_management', 'admin', 'admin', 239),
-
-    -- admin managers
     ('admin.manager.create', 'Create admin managers', 'manager', 'manager_management', 'admin', 'admin', 240),
     ('admin.manager.update', 'Update admin managers', 'manager', 'manager_management', 'admin', 'admin', 241),
     ('admin.manager.view', 'View admin managers', 'manager', 'manager_management', 'admin', 'admin', 242),
     ('admin.manager.delete', 'Delete admin managers', 'manager', 'manager_management', 'admin', 'admin', 243),
     ('admin.manager.assign', 'Assign admin managers to departments', 'manager', 'manager_management', 'admin', 'admin', 244),
-
-    -- admin company management
     ('admin.company.create', 'Create companies', 'company', 'company_management', 'admin', 'admin', 245),
     ('admin.company.update', 'Update companies', 'company', 'company_management', 'admin', 'admin', 246),
     ('admin.company.view', 'View companies', 'company', 'company_management', 'admin', 'admin', 247),
     ('admin.company.delete', 'Delete companies', 'company', 'company_management', 'admin', 'admin', 248),
     ('admin.company.suspend', 'Suspend companies', 'company', 'company_management', 'admin', 'admin', 249),
-
-    -- super admin
     ('admin.super.manage_roles', 'Manage all admin roles', 'role', 'super_admin', 'admin', 'super_admin', 250),
     ('admin.super.manage_permissions', 'Manage all permissions', 'permission', 'super_admin', 'admin', 'super_admin', 251),
     ('admin.super.manage_departments', 'Manage all departments', 'department', 'super_admin', 'admin', 'super_admin', 252),
     ('admin.super.system_config', 'Configure system settings', 'system', 'super_admin', 'admin', 'super_admin', 253),
     ('admin.super.audit_logs', 'View audit logs', 'audit', 'super_admin', 'admin', 'super_admin', 254),
-
-    -- =====================================================
-    -- Academics Permissions (bit_index 255–467)
-    -- =====================================================
-
-    -- Academic Years
     ('academics.academic_year.read', 'View academic years', 'academics', 'academics', 'user', 'basic', 255),
     ('academics.academic_year.create', 'Create academic years', 'academics', 'academics', 'user', 'basic', 256),
     ('academics.academic_year.update', 'Update academic years', 'academics', 'academics', 'user', 'basic', 257),
@@ -4645,32 +3242,24 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('academics.academic_year.set_current', 'Set current academic year', 'academics', 'academics', 'user', 'basic', 259),
     ('academics.academic_year.bulk_create', 'Bulk create academic years', 'academics', 'academics', 'user', 'basic', 260),
     ('academics.academic_year.upsert', 'Upsert academic years', 'academics', 'academics', 'user', 'basic', 261),
-
-    -- Admissions
     ('academics.admission.read', 'View admissions', 'academics', 'academics', 'user', 'basic', 262),
     ('academics.admission.create', 'Create admissions', 'academics', 'academics', 'user', 'basic', 263),
     ('academics.admission.update', 'Update admissions', 'academics', 'academics', 'user', 'basic', 264),
     ('academics.admission.delete', 'Delete admissions', 'academics', 'academics', 'user', 'basic', 265),
     ('academics.admission.update_status', 'Update admission status', 'academics', 'academics', 'user', 'basic', 266),
     ('academics.admission.bulk_create', 'Bulk create admissions', 'academics', 'academics', 'user', 'basic', 267),
-
-    -- Assignments
     ('academics.assignment.read', 'View assignments', 'academics', 'academics', 'user', 'basic', 268),
     ('academics.assignment.create', 'Create assignments', 'academics', 'academics', 'user', 'basic', 269),
     ('academics.assignment.update', 'Update assignments', 'academics', 'academics', 'user', 'basic', 270),
     ('academics.assignment.delete', 'Delete assignments', 'academics', 'academics', 'user', 'basic', 271),
     ('academics.assignment.publish', 'Publish assignments', 'academics', 'academics', 'user', 'basic', 272),
     ('academics.assignment.bulk_create', 'Bulk create assignments', 'academics', 'academics', 'user', 'basic', 273),
-
-    -- Attendance (Academics)
     ('academics.attendance.mark', 'Mark student attendance', 'academics', 'academics', 'user', 'basic', 274),
     ('academics.attendance.bulk_mark', 'Bulk mark attendance', 'academics', 'academics', 'user', 'basic', 275),
     ('academics.attendance.read', 'View attendance records', 'academics', 'academics', 'user', 'basic', 276),
     ('academics.attendance.delete', 'Delete attendance record', 'academics', 'academics', 'user', 'basic', 277),
     ('academics.attendance.recalculate', 'Recalculate attendance summary', 'academics', 'academics', 'user', 'basic', 278),
     ('academics.attendance.manage_exemptions', 'Manage attendance exemptions', 'academics', 'academics', 'user', 'basic', 279),
-
-    -- Courses
     ('academics.course.read', 'View courses', 'academics', 'academics', 'user', 'basic', 280),
     ('academics.course.create', 'Create courses', 'academics', 'academics', 'user', 'basic', 281),
     ('academics.course.update', 'Update courses', 'academics', 'academics', 'user', 'basic', 282),
@@ -4678,16 +3267,12 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('academics.course.activate', 'Activate course', 'academics', 'academics', 'user', 'basic', 284),
     ('academics.course.deactivate', 'Deactivate course', 'academics', 'academics', 'user', 'basic', 285),
     ('academics.course.bulk_create', 'Bulk create courses', 'academics', 'academics', 'user', 'basic', 286),
-
-    -- Curriculum (Subject-Course mapping)
     ('academics.curriculum.assign', 'Assign subject to course', 'academics', 'academics', 'user', 'basic', 287),
     ('academics.curriculum.bulk_assign', 'Bulk assign subjects', 'academics', 'academics', 'user', 'basic', 288),
     ('academics.curriculum.read', 'View curriculum', 'academics', 'academics', 'user', 'basic', 289),
     ('academics.curriculum.remove', 'Remove subject mapping', 'academics', 'academics', 'user', 'basic', 290),
     ('academics.curriculum.remove_all', 'Remove all mappings for course', 'academics', 'academics', 'user', 'basic', 291),
     ('academics.curriculum.validate', 'Validate curriculum', 'academics', 'academics', 'user', 'basic', 292),
-
-    -- Enrollments
     ('academics.enrollment.read', 'View enrollments', 'academics', 'academics', 'user', 'basic', 293),
     ('academics.enrollment.create', 'Create enrollment', 'academics', 'academics', 'user', 'basic', 294),
     ('academics.enrollment.update', 'Update enrollment', 'academics', 'academics', 'user', 'basic', 295),
@@ -4706,8 +3291,6 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('academics.enrollment.bulk_assign_roll_numbers', 'Bulk assign roll numbers', 'academics', 'academics', 'user', 'basic', 308),
     ('academics.enrollment.search', 'Search enrollments', 'academics', 'academics', 'user', 'basic', 309),
     ('academics.enrollment.update_status', 'Update enrollment status', 'academics', 'academics', 'user', 'basic', 310),
-
-    -- Exams
     ('academics.exam.read', 'View exams', 'academics', 'academics', 'user', 'basic', 311),
     ('academics.exam.create', 'Create exam', 'academics', 'academics', 'user', 'basic', 312),
     ('academics.exam.update', 'Update exam', 'academics', 'academics', 'user', 'basic', 313),
@@ -4725,8 +3308,6 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('academics.exam.grade.read', 'View exam grades', 'academics', 'academics', 'user', 'basic', 325),
     ('academics.exam.grade.update', 'Update exam grade', 'academics', 'academics', 'user', 'basic', 326),
     ('academics.exam.grade.delete', 'Delete exam grade', 'academics', 'academics', 'user', 'basic', 327),
-
-    -- Fees
     ('academics.fee.structure.create', 'Create fee structure', 'academics', 'academics', 'user', 'basic', 328),
     ('academics.fee.structure.read', 'View fee structures', 'academics', 'academics', 'user', 'basic', 329),
     ('academics.fee.structure.update', 'Update fee structure', 'academics', 'academics', 'user', 'basic', 330),
@@ -4743,8 +3324,6 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('academics.fee.penalty.update', 'Update fee penalty', 'academics', 'academics', 'user', 'basic', 341),
     ('academics.fee.receipt.generate', 'Generate fee receipt', 'academics', 'academics', 'user', 'basic', 342),
     ('academics.fee.receipt.read', 'View fee receipt', 'academics', 'academics', 'user', 'basic', 343),
-
-    -- Grading
     ('academics.grading.policy.create', 'Create grading policy', 'academics', 'academics', 'user', 'basic', 344),
     ('academics.grading.policy.read', 'View grading policies', 'academics', 'academics', 'user', 'basic', 345),
     ('academics.grading.policy.update', 'Update grading policy', 'academics', 'academics', 'user', 'basic', 346),
@@ -4755,16 +3334,12 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('academics.grading.boundary.update', 'Update grade boundary', 'academics', 'academics', 'user', 'basic', 351),
     ('academics.grading.boundary.delete', 'Delete grade boundary', 'academics', 'academics', 'user', 'basic', 352),
     ('academics.grading.boundary.delete_all', 'Delete all grade boundaries for policy', 'academics', 'academics', 'user', 'basic', 353),
-
-    -- Guardians
     ('academics.guardian.create', 'Create guardian', 'academics', 'academics', 'user', 'basic', 354),
     ('academics.guardian.bulk_create', 'Bulk create guardians', 'academics', 'academics', 'user', 'basic', 355),
     ('academics.guardian.read', 'View guardians', 'academics', 'academics', 'user', 'basic', 356),
     ('academics.guardian.update', 'Update guardian', 'academics', 'academics', 'user', 'basic', 357),
     ('academics.guardian.delete', 'Delete guardian', 'academics', 'academics', 'user', 'basic', 358),
     ('academics.guardian.set_primary', 'Set primary guardian', 'academics', 'academics', 'user', 'basic', 359),
-
-    -- Library
     ('academics.library.category.create', 'Create library category', 'academics', 'academics', 'user', 'basic', 360),
     ('academics.library.category.read', 'View library categories', 'academics', 'academics', 'user', 'basic', 361),
     ('academics.library.category.update', 'Update library category', 'academics', 'academics', 'user', 'basic', 362),
@@ -4783,14 +3358,10 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('academics.library.fine.create', 'Create fine', 'academics', 'academics', 'user', 'basic', 375),
     ('academics.library.fine.update', 'Update fine payment', 'academics', 'academics', 'user', 'basic', 376),
     ('academics.library.fine.read', 'View fines', 'academics', 'academics', 'user', 'basic', 377),
-
-    -- Notifications
     ('academics.notification.create', 'Create notification', 'academics', 'academics', 'user', 'basic', 378),
     ('academics.notification.read', 'View notifications', 'academics', 'academics', 'user', 'basic', 379),
     ('academics.notification.update', 'Update notification', 'academics', 'academics', 'user', 'basic', 380),
     ('academics.notification.delete', 'Delete notification', 'academics', 'academics', 'user', 'basic', 381),
-
-    -- Rooms
     ('academics.room.create', 'Create room', 'academics', 'academics', 'user', 'basic', 382),
     ('academics.room.bulk_create', 'Bulk create rooms', 'academics', 'academics', 'user', 'basic', 383),
     ('academics.room.read', 'View rooms', 'academics', 'academics', 'user', 'basic', 384),
@@ -4798,16 +3369,12 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('academics.room.delete', 'Delete room', 'academics', 'academics', 'user', 'basic', 386),
     ('academics.room.activate', 'Activate room', 'academics', 'academics', 'user', 'basic', 387),
     ('academics.room.deactivate', 'Deactivate room', 'academics', 'academics', 'user', 'basic', 388),
-
-    -- Sections
     ('academics.section.create', 'Create section', 'academics', 'academics', 'user', 'basic', 389),
     ('academics.section.bulk_create', 'Bulk create sections', 'academics', 'academics', 'user', 'basic', 390),
     ('academics.section.upsert', 'Upsert section', 'academics', 'academics', 'user', 'basic', 391),
     ('academics.section.read', 'View sections', 'academics', 'academics', 'user', 'basic', 392),
     ('academics.section.update', 'Update section', 'academics', 'academics', 'user', 'basic', 393),
     ('academics.section.delete', 'Delete section', 'academics', 'academics', 'user', 'basic', 394),
-
-    -- Students
     ('student.create', 'Create student', 'academics', 'academics', 'user', 'basic', 395),
     ('student.bulk_create', 'Bulk create students', 'academics', 'academics', 'user', 'basic', 396),
     ('student.read', 'View student details', 'academics', 'academics', 'user', 'basic', 397),
@@ -4823,8 +3390,6 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('student.set_password', 'Set student password', 'academics', 'academics', 'user', 'basic', 407),
     ('student.reset_password', 'Reset student password', 'academics', 'academics', 'user', 'basic', 408),
     ('student.change_password', 'Change own password', 'academics', 'academics', 'user', 'basic', 409),
-
-    -- Subjects
     ('subject.create', 'Create subject', 'academics', 'academics', 'user', 'basic', 410),
     ('subject.bulk_create', 'Bulk create subjects', 'academics', 'academics', 'user', 'basic', 411),
     ('subject.read', 'View subjects', 'academics', 'academics', 'user', 'basic', 412),
@@ -4832,16 +3397,12 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('subject.delete', 'Delete subject', 'academics', 'academics', 'user', 'basic', 414),
     ('subject.activate', 'Activate subject', 'academics', 'academics', 'user', 'basic', 415),
     ('subject.deactivate', 'Deactivate subject', 'academics', 'academics', 'user', 'basic', 416),
-
-    -- Submissions
     ('submission.create', 'Create submission', 'academics', 'academics', 'user', 'basic', 417),
     ('submission.read', 'View submissions', 'academics', 'academics', 'user', 'basic', 418),
     ('submission.update', 'Update submission', 'academics', 'academics', 'user', 'basic', 419),
     ('submission.delete', 'Delete submission', 'academics', 'academics', 'user', 'basic', 420),
     ('submission.grade', 'Grade submission', 'academics', 'academics', 'user', 'basic', 421),
     ('submission.comment', 'Comment on submission', 'academics', 'academics', 'user', 'basic', 422),
-
-    -- Teachers
     ('teacher.create', 'Create teacher', 'academics', 'academics', 'user', 'basic', 423),
     ('teacher.bulk_create', 'Bulk create teachers', 'academics', 'academics', 'user', 'basic', 424),
     ('teacher.read', 'View teacher details', 'academics', 'academics', 'user', 'basic', 425),
@@ -4852,16 +3413,12 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('teacher.manage_subjects', 'Manage teacher subjects', 'academics', 'academics', 'user', 'basic', 430),
     ('teacher.manage_sections', 'Manage teacher sections', 'academics', 'academics', 'user', 'basic', 431),
     ('teacher.manage_preferences', 'Manage teacher schedule preferences', 'academics', 'academics', 'user', 'basic', 432),
-
-    -- Terms
     ('term.create', 'Create term', 'academics', 'academics', 'user', 'basic', 433),
     ('term.bulk_create', 'Bulk create terms', 'academics', 'academics', 'user', 'basic', 434),
     ('term.read', 'View terms', 'academics', 'academics', 'user', 'basic', 435),
     ('term.update', 'Update term', 'academics', 'academics', 'user', 'basic', 436),
     ('term.delete', 'Delete term', 'academics', 'academics', 'user', 'basic', 437),
     ('term.set_current', 'Set current term', 'academics', 'academics', 'user', 'basic', 438),
-
-    -- Timetable
     ('timetable.create', 'Create timetable', 'academics', 'academics', 'user', 'basic', 439),
     ('timetable.read', 'View timetables', 'academics', 'academics', 'user', 'basic', 440),
     ('timetable.update', 'Update timetable', 'academics', 'academics', 'user', 'basic', 441),
@@ -4869,8 +3426,6 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('timetable.manage_slots', 'Manage timetable slots', 'academics', 'academics', 'user', 'basic', 443),
     ('timetable.manage_entries', 'Manage timetable entries', 'academics', 'academics', 'user', 'basic', 444),
     ('timetable.manage_changes', 'Manage timetable changes', 'academics', 'academics', 'user', 'basic', 445),
-
-    -- Transport
     ('transport.route.create', 'Create transport route', 'academics', 'academics', 'user', 'basic', 446),
     ('transport.route.read', 'View transport routes', 'academics', 'academics', 'user', 'basic', 447),
     ('transport.route.update', 'Update transport route', 'academics', 'academics', 'user', 'basic', 448),
@@ -4891,19 +3446,11 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('transport.student_assignment.read', 'View student transport assignments', 'academics', 'academics', 'user', 'basic', 463),
     ('transport.student_assignment.update', 'Update student transport assignment', 'academics', 'academics', 'user', 'basic', 464),
     ('transport.student_assignment.delete', 'Delete student transport assignment', 'academics', 'academics', 'user', 'basic', 465),
-
-    -- Analytics
     ('academics.analytics.read', 'View academic analytics', 'academics', 'academics', 'user', 'basic', 466),
     ('academics.analytics.write', 'Refresh analytics metrics', 'academics', 'academics', 'user', 'basic', 467)
-
 ON CONFLICT (permission_name) DO NOTHING;
--- Outbox debounce
 INSERT INTO audit.outbox_debounce (last_processed_id, last_processed_at, batch_size)
 VALUES (NULL, NOW() - INTERVAL '1 hour', 0);
-
--- =====================================================
--- 8. VIEWS
--- =====================================================
 CREATE OR REPLACE VIEW leave.leave_balance_detailed_view AS
 WITH accrual_totals AS (
     SELECT
@@ -4937,7 +3484,6 @@ SELECT
     (ce.accrued_total - ce.consumed_total) as available_balance,
     GREATEST(0, ce.total_days - ce.accrued_total) as remaining_to_accrue
 FROM current_entitlements ce;
-
 CREATE OR REPLACE VIEW leave.leave_balance_view AS
 SELECT
     le.user_id,
@@ -4946,7 +3492,6 @@ SELECT
 FROM leave.leave_ledger ll
 JOIN leave.leave_entitlement le ON ll.entitlement_id = le.entitlement_id
 GROUP BY le.user_id, le.leave_type_id;
-
 CREATE OR REPLACE VIEW payroll.statutory_contribution_summary_view AS
 SELECT
     company_id,
@@ -4960,68 +3505,41 @@ SELECT
     NOW() AS generated_at
 FROM payroll.employee_statutory_contribution
 GROUP BY company_id, statutory_code, period_start, period_end;
-
--- =====================================================
--- 9. FINAL PERMISSIONS
--- =====================================================
 REVOKE UPDATE, DELETE ON audit.audit_logs FROM PUBLIC;
-
 CREATE UNIQUE INDEX idx_payroll_component_global
 ON payroll.payroll_component(component_code)
 WHERE company_id IS NULL;
-
 CREATE UNIQUE INDEX idx_payroll_component_company
 ON payroll.payroll_component(company_id, component_code)
 WHERE company_id IS NOT NULL;
-
--- ============================================================
--- Payroll Employee Jobs (distributed payroll processing)
--- ============================================================
-
 CREATE TABLE IF NOT EXISTS payroll.payroll_employee_job (
     job_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-
     payroll_run_id UUID NOT NULL,
     user_id UUID NOT NULL,
-
     status VARCHAR(20) NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending','processing','completed','failed')),
-
     attempts INT NOT NULL DEFAULT 0,
-
     locked_by TEXT,
     locked_at TIMESTAMPTZ,
-
     error TEXT,
-
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
     CONSTRAINT fk_employee_job_run
         FOREIGN KEY (payroll_run_id)
         REFERENCES payroll.payroll_run(payroll_run_id)
         ON DELETE CASCADE,
-
     CONSTRAINT uq_employee_job_run_user
         UNIQUE (payroll_run_id, user_id)
 );
-
--- Fast worker job fetching
 CREATE INDEX IF NOT EXISTS idx_payroll_employee_job_pending
 ON payroll.payroll_employee_job (payroll_run_id)
 WHERE status = 'pending';
-
 CREATE INDEX IF NOT EXISTS idx_payroll_employee_job_status
 ON payroll.payroll_employee_job (status);
-
 CREATE INDEX idx_employee_job_run_status
 ON payroll.payroll_employee_job(payroll_run_id, status);
 CREATE INDEX idx_employee_job_pending
 ON payroll.payroll_employee_job(status, created_at);
--- -----------------------------------------------------------------------------
--- Seed SYSTEM user for background jobs (payroll workers, schedulers, etc.)
--- -----------------------------------------------------------------------------
-
 INSERT INTO users (
     user_id,
     username,
@@ -5048,11 +3566,8 @@ ON CONFLICT (user_id) DO NOTHING;
 CREATE INDEX IF NOT EXISTS idx_employee_profiles_email
 ON employee_profiles (email)
 WHERE email IS NOT NULL;
-
 ALTER TABLE employee_profiles
 ADD CONSTRAINT uniq_employee_profiles_company_email UNIQUE (company_id, email);
-
--- Run this migration
 CREATE UNIQUE INDEX IF NOT EXISTS uq_employee_bank_details_active
     ON payroll.employee_bank_details (company_id, user_id)
     WHERE is_active = true;
