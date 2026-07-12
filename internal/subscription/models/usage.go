@@ -2,25 +2,19 @@ package models
 
 import (
 	"time"
-
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type Usage struct {
-	UsageID            uuid.UUID  `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	SubscriptionItemID uuid.UUID  `gorm:"type:uuid;not null;index"`
-	FeatureKey         string     `gorm:"size:100;not null"`
-	QuantityUsed       float64    `gorm:"type:numeric(14,4);not null"`
-	PeriodStart        time.Time  `gorm:"type:date;not null;index"`
-	PeriodEnd          time.Time  `gorm:"type:date;not null;index"`
-	RecordedAt         time.Time  `gorm:"not null;default:now()"`
-	SourceType         *string    `gorm:"size:50"`
-	SourceID           *uuid.UUID `gorm:"type:uuid"`
-	CreatedBy          *uuid.UUID `gorm:"type:uuid"`
-
-	SubscriptionItem SubscriptionItem `gorm:"foreignKey:SubscriptionItemID"`
-	Feature          FeatureRegistry  `gorm:"foreignKey:FeatureKey"`
-	Creator          *User            `gorm:"foreignKey:CreatedBy"`
+	UsageID             uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"usageId"`
+	SubscriptionItemID  uuid.UUID       `gorm:"type:uuid;not null;index" json:"subscriptionItemId"`
+	FeatureKey          string          `gorm:"type:varchar(100);not null" json:"featureKey"`
+	QuantityUsed        decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"quantityUsed"`
+	PeriodStart         time.Time       `gorm:"type:date;not null" json:"periodStart"`
+	PeriodEnd           time.Time       `gorm:"type:date;not null" json:"periodEnd"`
+	RecordedAt          time.Time       `gorm:"type:timestamptz;not null;default:now()" json:"recordedAt"`
+	SourceType          *string         `gorm:"type:varchar(50)" json:"sourceType,omitempty"`
+	SourceID            *uuid.UUID      `gorm:"type:uuid" json:"sourceId,omitempty"`
+	CreatedBy           *uuid.UUID      `gorm:"type:uuid" json:"createdBy,omitempty"`
 }
-
-func (Usage) TableName() string { return "usages" }

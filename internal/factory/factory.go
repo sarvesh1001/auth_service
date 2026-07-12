@@ -41,6 +41,7 @@ import (
 	"auth-service/internal/sales"
 	"auth-service/internal/service"
 	"auth-service/internal/sms"
+	"auth-service/internal/subscription"
 	"auth-service/internal/tls"
 	"auth-service/internal/util"
 )
@@ -189,15 +190,17 @@ type Factory struct {
 	inventoryConsumer            *consumer.InventoryConsumer
 	inventoryConsumerCancel      context.CancelFunc
 	salesInfra                   *SalesInfraFactory
+	subscriptionInfra            *SubscriptionInfraFactory
 	salesConsumer                *consumer.SalesConsumer
 	salesConsumerCancel          context.CancelFunc
+	subscriptionConsumer         *consumer.SubscriptionConsumer // new
+	subscriptionConsumerCancel   context.CancelFunc             // new
 	outboxRepo                   outbox.Repository
 	idempotencyStore             idempotency.Store
 	outboxProcessor              *outbox.Processor
 	outboxCancel                 context.CancelFunc
 	emailSender                  email.Sender
 
-	// New attendance factory
 	attendanceFactory *AttendanceFactory
 }
 
@@ -338,6 +341,9 @@ func NewFactory() (*Factory, error) {
 	}
 	f.inventoryInfra = inventoryInfra
 
+	// -------------------------------------------------------------
+	// SALES INFRA – initially with nil updater
+	// -------------------------------------------------------------
 	salesInfra := NewSalesInfraFactory(
 		f.PostgresClient(),
 		f.outboxRepo,
@@ -345,11 +351,36 @@ func NewFactory() (*Factory, error) {
 		f.GetAuditService(),
 		f.EncryptionManager(),
 		f.accountingInfra.TaxEngineService(),
+		nil, // placeholder – will be set after subscription infra is created
 		f.logger,
 	)
 	f.salesInfra = salesInfra
 
-	// Initialize attendance factory (single return value)
+	// -------------------------------------------------------------
+	// SUBSCRIPTION INFRA
+	// -------------------------------------------------------------
+	subscriptionInfra := NewSubscriptionInfraFactory(
+		f.PostgresClient(),
+		f.outboxRepo,
+		f.idempotencyStore,
+		f.GetAuditService(),
+		f.logger,
+		f.salesInfra.PricingService(),
+		f.salesInfra.CouponService(),
+		f.salesInfra.DiscountEngineService(),
+		f.salesInfra.TaxIntegrationService(),
+		f.salesInfra.InvoiceService(),
+	)
+	f.subscriptionInfra = subscriptionInfra
+
+	// -------------------------------------------------------------
+	// INJECT UPDATER INTO SALES INFRA
+	// -------------------------------------------------------------
+	f.salesInfra.SetPlanItemUpdater(f.subscriptionInfra.PlanItemService())
+
+	// -------------------------------------------------------------
+	// ATTENDANCE FACTORY
+	// -------------------------------------------------------------
 	attendanceFactory := NewAttendanceFactory(
 		f.PostgresClient(),
 		f.RedisClient(),
@@ -364,8 +395,7 @@ func NewFactory() (*Factory, error) {
 			DeviceTokenSecret:   f.config.HR.Attendance.DeviceTokenSecret,
 			DeviceTokenValidity: f.config.HR.Attendance.DeviceTokenValidity,
 		},
-		f.EncryptionManager(), // <-- ADD THIS
-
+		f.EncryptionManager(),
 	)
 	f.attendanceFactory = attendanceFactory
 
@@ -567,8 +597,38 @@ func NewFactory() (*Factory, error) {
 			}()
 			f.logger.Info("✅ Sales consumer started", zap.String("topic", salesTopic))
 		}
+
+		// -------------------------------------------------------------
+		// NEW: SUBSCRIPTION CONSUMER FOR PRODUCT SYNC
+		// -------------------------------------------------------------
+		subscriptionTopic := "subscription-events"
+		subscriptionKafkaConsumer, err := client.NewKafkaConsumer(
+			f.config,
+			subscriptionTopic,
+			"subscription-product-sync-group",
+			f.logger,
+		)
+		if err != nil {
+			f.logger.Error("Failed to create subscription Kafka consumer", zap.Error(err))
+		} else {
+			productSyncSvc := f.salesInfra.ProductSyncService() // implements SubscriptionAnalyticsService
+			f.subscriptionConsumer = consumer.NewSubscriptionConsumer(
+				productSyncSvc,
+				f.logger,
+				subscriptionKafkaConsumer,
+				subscriptionTopic,
+				f.config.Kafka.Brokers,
+			)
+			ctx, cancel := context.WithCancel(context.Background())
+			f.subscriptionConsumerCancel = cancel
+			go func() {
+				f.subscriptionConsumer.Start(ctx)
+				f.logger.Info("Subscription consumer stopped")
+			}()
+			f.logger.Info("✅ Subscription consumer started (product sync)", zap.String("topic", subscriptionTopic))
+		}
 	} else {
-		f.logger.Warn("Kafka not available – analytics, student, accounting, inventory, and sales consumers disabled")
+		f.logger.Warn("Kafka not available – analytics, student, accounting, inventory, sales, and subscription consumers disabled")
 	}
 
 	return f, nil
@@ -659,6 +719,16 @@ func (f *Factory) Close() error {
 				f.logger.Error("Failed to close sales consumer", zap.Error(err))
 			}
 		}
+		// NEW: Close subscription consumer
+		if f.subscriptionConsumerCancel != nil {
+			f.logger.Info("Stopping subscription consumer...")
+			f.subscriptionConsumerCancel()
+		}
+		if f.subscriptionConsumer != nil {
+			if err := f.subscriptionConsumer.Close(); err != nil {
+				f.logger.Error("Failed to close subscription consumer", zap.Error(err))
+			}
+		}
 		if f.outboxCancel != nil {
 			f.outboxCancel()
 			f.logger.Info("Central outbox processor stopped")
@@ -671,6 +741,10 @@ func (f *Factory) Close() error {
 		}
 		if f.salesInfra != nil {
 			f.salesInfra.Close()
+		}
+		if f.subscriptionInfra != nil {
+			f.subscriptionInfra.Close()
+			f.logger.Info("Subscription infra closed")
 		}
 		if f.postgresClient != nil {
 			f.postgresClient.Close()
@@ -701,6 +775,10 @@ func (f *Factory) Close() error {
 	})
 	return nil
 }
+
+// ----------------------------------------------------------------------------
+// All getters and helper methods (unchanged from the original)
+// ----------------------------------------------------------------------------
 
 func (f *Factory) PayrollJobRepository() payrollrepo.PayrollJobRepository {
 	if f.payrollJobRepo == nil {
@@ -2358,7 +2436,7 @@ func (f *Factory) InitializeHandlers() error {
 	reportingHandler := f.GetReportingHandler()
 	taxDeclarationHandler := f.GetTaxDeclarationHandler()
 
-	// Academic handlers (removed invalid fields)
+	// Academic handlers
 	academicHandlers := &handler.AcademicHandlers{
 		AcademicYearHandler:      f.academicsInfra.AcademicYearHandler(),
 		AdmissionHandler:         f.academicsInfra.AdmissionHandler(),
@@ -2382,8 +2460,7 @@ func (f *Factory) InitializeHandlers() error {
 		TermHandler:              f.academicsInfra.TermHandler(),
 		TimetableHandler:         f.academicsInfra.TimetableHandler(),
 		TransportHandler:         f.academicsInfra.TransportHandler(),
-		SessionGenerationHandler: f.academicsInfra.SessionGenerationHandler(), // add this
-
+		SessionGenerationHandler: f.academicsInfra.SessionGenerationHandler(),
 	}
 
 	// Accounting handlers
@@ -2425,7 +2502,18 @@ func (f *Factory) InitializeHandlers() error {
 		TaxHandler:         f.salesInfra.TaxHandler(),
 	}
 
-	// ----- Attendance handlers from attendance factory -----
+	// Subscription handlers
+	var subscriptionHandlers *subscription.SubscriptionHandlers
+	if f.subscriptionInfra != nil {
+		subscriptionHandlers = f.subscriptionInfra.SubscriptionHandlers()
+		if subscriptionHandlers == nil {
+			logger.Warn("Subscription handlers not available from infra")
+		}
+	} else {
+		logger.Warn("Subscription infra not available – subscription routes will not be registered")
+	}
+
+	// Attendance handlers
 	attendanceIngestHandler := f.attendanceFactory.IngestHandler()
 	attendanceAdminHandler := f.attendanceFactory.AdminHandler()
 	attendanceQueryHandler := f.attendanceFactory.QueryHandler()
@@ -2453,6 +2541,7 @@ func (f *Factory) InitializeHandlers() error {
 	leaveRequestHandler := f.LeaveRequestHandler()
 	leaveQueryHandler := f.LeaveQueryHandler()
 
+	// Build the router – now includes subscriptionHandlers
 	f.router = handler.NewRouter(
 		otpHandler,
 		adminHandler,
@@ -2491,6 +2580,7 @@ func (f *Factory) InitializeHandlers() error {
 		accountingHandlers,
 		inventoryHandlers,
 		salesHandlers,
+		subscriptionHandlers, // <-- NEW
 		attendanceIngestHandler,
 		attendanceQueryHandler,
 		attendanceExemptionHandler,
@@ -2508,11 +2598,11 @@ func (f *Factory) InitializeHandlers() error {
 		attendanceWorkCenterHandler,
 		attendanceSchedulingHandler,
 		attendanceAdminHandler,
-		f.academicsInfra.SessionGenerationHandler(), // new
+		f.academicsInfra.SessionGenerationHandler(),
 		deviceAuthMiddleware,
 	)
 
-	logger.Info("Handlers and router initialized with JWT, bitmask, QR web login, attendance, leave, payroll, biometric, accounting, and inventory systems")
+	logger.Info("Handlers and router initialized with JWT, bitmask, QR web login, attendance, leave, payroll, biometric, accounting, inventory, subscription, and sales systems")
 	return nil
 }
 

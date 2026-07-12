@@ -1,10 +1,13 @@
 package models
 
-type Status struct {
-	StatusID int16  `gorm:"primaryKey"`
-	Code     string `gorm:"size:30;not null"`
-	Category string `gorm:"size:30;not null"`
-	Name     string `gorm:"size:100;not null"`
-}
+import (
+	"time"
+)
 
-func (Status) TableName() string { return "statuses" }
+type Status struct {
+	StatusID  int16     `gorm:"primaryKey" json:"statusId"`
+	Code      string    `gorm:"type:varchar(30);not null" json:"code"`
+	Category  string    `gorm:"type:varchar(30);not null" json:"category"`
+	Name      string    `gorm:"type:varchar(100);not null" json:"name"`
+	CreatedAt time.Time `gorm:"default:now()" json:"createdAt"`
+}

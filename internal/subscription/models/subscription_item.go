@@ -2,34 +2,25 @@ package models
 
 import (
 	"time"
-
-	"gorm.io/datatypes"
-
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"auth-service/internal/subscription/models/enums"
 )
 
 type SubscriptionItem struct {
-	SubItemID      uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	SubscriptionID uuid.UUID      `gorm:"type:uuid;not null;index"`
-	PlanItemID     uuid.UUID      `gorm:"type:uuid;not null"`
-	AddonID        *uuid.UUID     `gorm:"type:uuid"`
-	Quantity       float64        `gorm:"type:numeric(14,4);not null;default:1"`
-	UnitPrice      float64        `gorm:"type:numeric(14,2);not null"`
-	TotalPrice     float64        `gorm:"type:numeric(14,2);generated:always as (quantity * unit_price) stored"`
-	Currency       string         `gorm:"size:3;not null;default:'USD'"`
-	StatusID       int16          `gorm:"not null;default:7;index"`
-	StartDate      time.Time      `gorm:"type:date;not null;default:now()"`
-	EndDate        *time.Time     `gorm:"type:date"`
-	Metadata       datatypes.JSON `gorm:"type:jsonb"`
-	CreatedAt      time.Time      `gorm:"not null;default:now()"`
-	UpdatedAt      time.Time      `gorm:"not null;default:now()"`
-
-	// relationships
-	Subscription Subscription `gorm:"foreignKey:SubscriptionID"`
-	PlanItem     PlanItem     `gorm:"foreignKey:PlanItemID"`
-	Addon        *Addon       `gorm:"foreignKey:AddonID"`
-	Status       Status       `gorm:"foreignKey:StatusID"`
-	Usages       []Usage      `gorm:"foreignKey:SubscriptionItemID"`
+	SubItemID      uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"subItemId"`
+	SubscriptionID uuid.UUID       `gorm:"type:uuid;not null;index" json:"subscriptionId"`
+	PlanItemID     uuid.UUID       `gorm:"type:uuid;not null" json:"planItemId"`
+	AddonID        *uuid.UUID      `gorm:"type:uuid" json:"addonId,omitempty"`
+	Quantity       decimal.Decimal `gorm:"type:numeric(14,4);not null;default:1" json:"quantity"`
+	UnitPrice      decimal.Decimal `gorm:"type:numeric(14,2);not null" json:"unitPrice"`
+	TotalPrice     decimal.Decimal `gorm:"->" json:"totalPrice"` // generated column (quantity * unit_price)
+	Currency       string          `gorm:"type:varchar(3);not null;default:'USD'" json:"currency"`
+	Status         enums.ItemStatus `gorm:"type:varchar(20);not null;default:'active'" json:"status"`
+	StartDate      time.Time       `gorm:"type:date;not null;default:CURRENT_DATE" json:"startDate"`
+	EndDate        *time.Time      `gorm:"type:date" json:"endDate,omitempty"`
+	Metadata       JSONB           `gorm:"type:jsonb" json:"metadata,omitempty"`
+	CreatedAt      time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt      time.Time       `gorm:"autoUpdateTime" json:"updatedAt"`
+	ProductID      *uuid.UUID      `gorm:"type:uuid" json:"productId,omitempty"` // reference to sales.products
 }
-
-func (SubscriptionItem) TableName() string { return "subscription_items" }

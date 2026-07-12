@@ -28,6 +28,7 @@ type SalesInfraFactory struct {
 	auditService        *audit.AuditService
 	encryptionMgr       *encryption.EncryptionManager
 	accountingTaxEngine accountingService.TaxEngineService
+	planItemUpdater     service.PlanItemUpdater // injected updater for product sync
 
 	// repositories (lazy)
 	analyticsRepo          repository.AnalyticsRepository
@@ -71,6 +72,7 @@ type SalesInfraFactory struct {
 	paymentTermService        service.PaymentTermService
 	pricingService            service.PricingService
 	productService            service.ProductService
+	productSyncService        *service.ProductSyncService
 	promotionService          service.PromotionService
 	quoteService              service.QuoteService
 	returnService             service.ReturnService
@@ -102,6 +104,7 @@ type SalesInfraFactory struct {
 }
 
 // NewSalesInfraFactory creates a new sales infrastructure factory.
+// If planItemUpdater is nil, you must call SetPlanItemUpdater before using ProductSyncService.
 func NewSalesInfraFactory(
 	pgClient *client.PostgresClient,
 	outboxRepo outbox.Repository,
@@ -109,6 +112,7 @@ func NewSalesInfraFactory(
 	auditService *audit.AuditService,
 	encryptionMgr *encryption.EncryptionManager,
 	accountingTaxEngine accountingService.TaxEngineService,
+	planItemUpdater service.PlanItemUpdater,
 	logger *zap.Logger,
 ) *SalesInfraFactory {
 	return &SalesInfraFactory{
@@ -119,6 +123,7 @@ func NewSalesInfraFactory(
 		auditService:        auditService,
 		encryptionMgr:       encryptionMgr,
 		accountingTaxEngine: accountingTaxEngine,
+		planItemUpdater:     planItemUpdater,
 	}
 }
 
@@ -431,30 +436,29 @@ func (f *SalesInfraFactory) InvoiceService() service.InvoiceService {
 			f.OrderRepo(),
 			f.ProductRepo(),
 			f.CustomerService(),
-			f.QuoteService(), // <-- add this
-
+			f.QuoteService(),
 			f.PricingRepo(),
 			f.DiscountEngineService(),
 			f.TaxSnapshotRepo(),
 			f.PaymentRepo(),
-			f.PaymentTermRepo(), // <-- ADDED (required)
+			f.PaymentTermRepo(),
 			f.outboxRepo,
 			f.idempotencyStore,
 			f.auditService,
 			f.pgClient,
 			f.logger,
-			f.TaxIntegrationService(), // NEW: pass tax service
-
+			f.TaxIntegrationService(),
 		)
 	}
 	return f.invoiceService
 }
+
 func (f *SalesInfraFactory) OrderService() service.OrderService {
 	if f.orderService == nil {
 		f.orderService = service.NewOrderService(
 			f.OrderRepo(),
 			f.ProductRepo(),
-			f.SalesRepRepo(), // <-- ADD THIS LINE
+			f.SalesRepRepo(),
 			f.CustomerService(),
 			f.PricingRepo(),
 			f.CouponRepo(),
@@ -467,8 +471,7 @@ func (f *SalesInfraFactory) OrderService() service.OrderService {
 			f.idempotencyStore,
 			f.auditService,
 			f.logger,
-			f.TaxIntegrationService(), // NEW: pass tax service
-
+			f.TaxIntegrationService(),
 		)
 	}
 	return f.orderService
@@ -515,7 +518,7 @@ func (f *SalesInfraFactory) PricingService() service.PricingService {
 			f.QuoteRepo(),
 			f.InvoiceRepo(),
 			f.CustomerService(),
-			f.pgClient, // <-- added here
+			f.pgClient,
 			f.logger,
 		)
 	}
@@ -534,6 +537,27 @@ func (f *SalesInfraFactory) ProductService() service.ProductService {
 		)
 	}
 	return f.productService
+}
+
+// ProductSyncService returns the product sync service.
+func (f *SalesInfraFactory) ProductSyncService() *service.ProductSyncService {
+	if f.productSyncService == nil {
+		f.productSyncService = service.NewProductSyncService(
+			f.ProductService(),
+			f.planItemUpdater,
+			f.logger,
+		)
+	}
+	return f.productSyncService
+}
+
+// SetPlanItemUpdater allows injecting the updater after factory creation.
+// It also updates an already‑created ProductSyncService if present.
+func (f *SalesInfraFactory) SetPlanItemUpdater(updater service.PlanItemUpdater) {
+	f.planItemUpdater = updater
+	if f.productSyncService != nil {
+		f.productSyncService.SetPlanItemUpdater(updater)
+	}
 }
 
 func (f *SalesInfraFactory) PromotionService() service.PromotionService {
@@ -572,8 +596,7 @@ func (f *SalesInfraFactory) QuoteService() service.QuoteService {
 			f.idempotencyStore,
 			f.auditService,
 			f.logger,
-			f.TaxIntegrationService(), // ✅ NEW: pass tax service
-
+			f.TaxIntegrationService(),
 		)
 	}
 	return f.quoteService
@@ -668,12 +691,13 @@ func (f *SalesInfraFactory) SalesRepService() service.SalesRepService {
 			f.outboxRepo,
 			f.idempotencyStore,
 			f.auditService,
-			f.encryptionMgr, // <-- ADDED
+			f.encryptionMgr,
 			f.logger,
 		)
 	}
 	return f.salesRepService
 }
+
 func (f *SalesInfraFactory) TaxIntegrationService() service.TaxIntegrationService {
 	if f.taxIntegrationService == nil {
 		f.taxIntegrationService = service.NewTaxIntegrationService(
@@ -800,6 +824,7 @@ func (f *SalesInfraFactory) QuoteHandler() *handler.QuoteHandler {
 	}
 	return f.quoteHandler
 }
+
 func (f *SalesInfraFactory) ReportHandler() *handler.ReportHandler {
 	if f.reportHandler == nil {
 		f.reportHandler = handler.NewReportHandler(f.SalesQueryService(), f.logger)

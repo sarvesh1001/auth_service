@@ -2,21 +2,16 @@ package models
 
 import (
 	"time"
-
 	"github.com/google/uuid"
-	"gorm.io/datatypes"
+	"auth-service/internal/subscription/models/enums"
 )
 
 type Benefit struct {
-	BenefitID          uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	PlanItemID         uuid.UUID      `gorm:"type:uuid;not null;index"`
-	BenefitType        string         `gorm:"size:50;not null;check:benefit_type IN ('discount','freebie','access','service','other')"`
-	BenefitDescription *string        `gorm:"type:text"`
-	Value              datatypes.JSON `gorm:"type:jsonb;not null"`
-	CreatedAt          time.Time      `gorm:"not null;default:now()"`
-	UpdatedAt          time.Time      `gorm:"not null;default:now()"`
-
-	PlanItem PlanItem `gorm:"foreignKey:PlanItemID"`
+	BenefitID          uuid.UUID          `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"benefitId"`
+	PlanItemID         uuid.UUID          `gorm:"type:uuid;not null;index" json:"planItemId"`
+	BenefitType        enums.BenefitType  `gorm:"type:varchar(50);not null" json:"benefitType"`
+	BenefitDescription *string            `gorm:"type:text" json:"benefitDescription,omitempty"`
+	Value              JSONB              `gorm:"type:jsonb;not null" json:"value"`
+	CreatedAt          time.Time          `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt          time.Time          `gorm:"autoUpdateTime" json:"updatedAt"`
 }
-
-func (Benefit) TableName() string { return "benefits" }

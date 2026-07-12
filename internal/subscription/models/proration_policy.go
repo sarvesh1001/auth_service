@@ -2,24 +2,18 @@ package models
 
 import (
 	"time"
-
 	"github.com/google/uuid"
-	"gorm.io/gorm"
+	"auth-service/internal/subscription/models/enums"
 )
 
 type ProrationPolicy struct {
-	ProrationPolicyID uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	CompanyID         uuid.UUID      `gorm:"type:uuid;not null;index"`
-	Name              string         `gorm:"size:100;not null"`
-	UpgradeType       string         `gorm:"size:20;not null;check:upgrade_type IN ('charge_difference','refund','credit_note')"`
-	DowngradeType     string         `gorm:"size:20;not null;check:downgrade_type IN ('credit_next','refund','none')"`
-	IsActive          bool           `gorm:"not null;default:true"`
-	CreatedAt         time.Time      `gorm:"not null;default:now()"`
-	UpdatedAt         time.Time      `gorm:"not null;default:now()"`
-	DeletedAt         gorm.DeletedAt `gorm:"index"`
-
-	// relationships
-	Company Company `gorm:"foreignKey:CompanyID"`
+	ProrationPolicyID uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"prorationPolicyId"`
+	CompanyID         uuid.UUID       `gorm:"type:uuid;not null;index" json:"companyId"`
+	Name              string          `gorm:"type:varchar(100);not null" json:"name"`
+	UpgradeType       enums.UpgradeType   `gorm:"type:varchar(20);not null" json:"upgradeType"`
+	DowngradeType     enums.DowngradeType `gorm:"type:varchar(20);not null" json:"downgradeType"`
+	IsActive          bool            `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt         time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt         time.Time       `gorm:"autoUpdateTime" json:"updatedAt"`
+	DeletedAt         *time.Time      `gorm:"index" json:"deletedAt,omitempty"`
 }
-
-func (ProrationPolicy) TableName() string { return "proration_policies" }

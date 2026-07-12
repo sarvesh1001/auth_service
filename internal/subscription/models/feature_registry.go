@@ -1,21 +1,23 @@
+// FILE: models/feature_registry.go
+
 package models
 
 import (
 	"time"
+
+	"github.com/shopspring/decimal"
 )
 
 type FeatureRegistry struct {
-	FeatureKey      string    `gorm:"primaryKey;size:100"`
-	Module          string    `gorm:"size:50;not null"`
-	FeatureGroup    *string   `gorm:"size:50"`
-	PermissionScope *string   `gorm:"size:50"`
-	Description     *string   `gorm:"type:text"`
-	DefaultLimit    *float64  `gorm:"type:numeric(14,4)"`
-	DependsOn       []string  `gorm:"type:varchar(100)[];not null;default:'{}'"` // changed
-	Version         int       `gorm:"not null;default:1"`
-	IsActive        bool      `gorm:"not null;default:true"`
-	CreatedAt       time.Time `gorm:"not null;default:now()"`
-	UpdatedAt       time.Time `gorm:"not null;default:now()"`
+	FeatureKey      string           `gorm:"type:varchar(100);primaryKey" json:"featureKey"`
+	Module          string           `gorm:"type:varchar(50);not null" json:"module"`
+	FeatureGroup    *string          `gorm:"type:varchar(50)" json:"featureGroup,omitempty"`
+	PermissionScope *string          `gorm:"type:varchar(50)" json:"permissionScope,omitempty"`
+	Description     *string          `gorm:"type:text" json:"description,omitempty"`
+	DefaultLimit    *decimal.Decimal `gorm:"type:numeric(14,4)" json:"defaultLimit,omitempty"`
+	DependsOn       []string         `gorm:"type:varchar(100)[]" json:"dependsOn,omitempty"` // PostgreSQL array
+	Version         int              `gorm:"not null;default:1" json:"version"`
+	IsActive        bool             `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt       time.Time        `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt       time.Time        `gorm:"autoUpdateTime" json:"updatedAt"`
 }
-
-func (FeatureRegistry) TableName() string { return "feature_registry" }

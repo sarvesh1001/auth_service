@@ -1,76 +1,72 @@
 
 ================================================================================
-FILE: ./models/provider.go
-================================================================================
-
-package models
-
-type Provider struct {
-	ProviderID int16  `gorm:"primaryKey"`
-	Code       string `gorm:"size:30;not null;unique"`
-	Name       string `gorm:"size:100;not null"`
-}
-
-func (Provider) TableName() string { return "providers" }
-
-
-
-================================================================================
 FILE: ./models/subscription.go
 ================================================================================
 
 package models
 
 import (
+	"auth-service/internal/subscription/models/enums"
 	"time"
 
 	"github.com/google/uuid"
-	"gorm.io/gorm"
 )
 
 type Subscription struct {
-	SubscriptionID    uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	CompanyID         uuid.UUID      `gorm:"type:uuid;not null;index"`
-	SubscriberTypeID  int16          `gorm:"not null"`
-	SubscriberID      uuid.UUID      `gorm:"type:uuid;not null;index"`
-	PlanID            uuid.UUID      `gorm:"type:uuid;not null"`
-	StatusID          int16          `gorm:"not null;default:1;index"`
-	StartDate         time.Time      `gorm:"type:date;not null;default:now()"`
-	EndDate           *time.Time     `gorm:"type:date"`
-	TrialEnd          *time.Time     `gorm:"type:date"`
-	BillingStart      time.Time      `gorm:"type:date;not null"`
-	AutoRenew         bool           `gorm:"not null;default:true"`
-	PauseReason       *string        `gorm:"type:text"`
-	CancellationReason *string       `gorm:"type:text"`
-	CancelledAt       *time.Time     `gorm:"type:timestamptz"`
-	ContractNumber    *string        `gorm:"size:100;unique"`
-	SignedAt          *time.Time     `gorm:"type:timestamptz"`
-	TermsVersion      *string        `gorm:"size:20"`
-	SignedDocumentKey *string        `gorm:"type:text"`
-	CurrentInvoiceID  *uuid.UUID     `gorm:"type:uuid"`
-	LastInvoiceID     *uuid.UUID     `gorm:"type:uuid"`
-	NextInvoiceID     *uuid.UUID     `gorm:"type:uuid"`
-	CouponID          *uuid.UUID     `gorm:"type:uuid"`
-	Version           int            `gorm:"not null;default:1"`
-	CreatedAt         time.Time      `gorm:"not null;default:now()"`
-	UpdatedAt         time.Time      `gorm:"not null;default:now()"`
-	DeletedAt         gorm.DeletedAt `gorm:"index"`
-
-	// relationships
-	Company         Company          `gorm:"foreignKey:CompanyID"`
-	SubscriberType  SubscriberType   `gorm:"foreignKey:SubscriberTypeID"`
-	Plan            Plan             `gorm:"foreignKey:PlanID"`
-	Status          Status           `gorm:"foreignKey:StatusID"`
-	Items           []SubscriptionItem `gorm:"foreignKey:SubscriptionID"`
-	Versions        []SubscriptionVersion `gorm:"foreignKey:SubscriptionID"`
-	Timeline        []SubscriptionTimeline `gorm:"foreignKey:SubscriptionID"`
-	ResourceAssignments []ResourceAssignment `gorm:"foreignKey:SubscriptionID"`
-	Schedules       []Schedule       `gorm:"foreignKey:SubscriptionID"`
-	Notifications   []NotificationPreference `gorm:"foreignKey:SubscriptionID"`
-	AuditLogs       []AuditLog       `gorm:"foreignKey:SubscriptionID"`
+	SubscriptionID     uuid.UUID                `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"subscriptionId"`
+	CompanyID          uuid.UUID                `gorm:"type:uuid;not null;index" json:"companyId"`
+	CustomerID         uuid.UUID                `gorm:"type:uuid;not null" json:"customerId"` // from sales.customers
+	PlanID             uuid.UUID                `gorm:"type:uuid;not null" json:"planId"`
+	Status             enums.SubscriptionStatus `gorm:"type:varchar(20);not null;default:'pending'" json:"status"`
+	StartDate          time.Time                `gorm:"type:date;not null;default:CURRENT_DATE" json:"startDate"`
+	EndDate            *time.Time               `gorm:"type:date" json:"endDate,omitempty"`
+	TrialEnd           *time.Time               `gorm:"type:date" json:"trialEnd,omitempty"`
+	BillingStart       time.Time                `gorm:"type:date;not null" json:"billingStart"`
+	AutoRenew          bool                     `gorm:"not null;default:true" json:"autoRenew"`
+	PauseReason        *string                  `gorm:"type:text" json:"pauseReason,omitempty"`
+	CancellationReason *string                  `gorm:"type:text" json:"cancellationReason,omitempty"`
+	CancelledAt        *time.Time               `gorm:"type:timestamptz" json:"cancelledAt,omitempty"`
+	ContractNumber     *string                  `gorm:"type:varchar(100);uniqueIndex" json:"contractNumber,omitempty"`
+	SignedAt           *time.Time               `gorm:"type:timestamptz" json:"signedAt,omitempty"`
+	TermsVersion       *string                  `gorm:"type:varchar(20)" json:"termsVersion,omitempty"`
+	SignedDocumentKey  *string                  `gorm:"type:text" json:"signedDocumentKey,omitempty"`
+	CurrentInvoiceID   *uuid.UUID               `gorm:"type:uuid" json:"currentInvoiceId,omitempty"` // sales.invoices
+	LastInvoiceID      *uuid.UUID               `gorm:"type:uuid" json:"lastInvoiceId,omitempty"`
+	NextInvoiceID      *uuid.UUID               `gorm:"type:uuid" json:"nextInvoiceId,omitempty"`
+	CouponID           *uuid.UUID               `gorm:"type:uuid" json:"couponId,omitempty"` // sales.coupons
+	Version            int                      `gorm:"not null;default:1" json:"version"`
+	CreatedAt          time.Time                `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt          time.Time                `gorm:"autoUpdateTime" json:"updatedAt"`
+	DeletedAt          *time.Time               `gorm:"index" json:"deletedAt,omitempty"`
+	SalesOrderID       *uuid.UUID               `gorm:"type:uuid" json:"salesOrderId,omitempty"`       // sales.orders
+	ScheduleID         *uuid.UUID               `gorm:"type:uuid" json:"scheduleId,omitempty"`         // external scheduling
+	WorkflowID         *uuid.UUID               `gorm:"type:uuid" json:"workflowId,omitempty"`         // external workflow
+	NotificationPrefID *uuid.UUID               `gorm:"type:uuid" json:"notificationPrefId,omitempty"` // external notifications
 }
 
-func (Subscription) TableName() string { return "subscriptions" }
+
+
+================================================================================
+FILE: ./models/usage_remaining.go
+================================================================================
+
+package models
+
+import (
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+// UsageRemaining is a view model, not persisted.
+type UsageRemaining struct {
+	SubItemID     uuid.UUID        `gorm:"column:sub_item_id" json:"subItemId"`
+	SubscriptionID uuid.UUID       `gorm:"column:subscription_id" json:"subscriptionId"`
+	PlanItemID    uuid.UUID        `gorm:"column:plan_item_id" json:"planItemId"`
+	FeatureKey    string           `gorm:"column:feature_key" json:"featureKey"`
+	TotalAllowed  *decimal.Decimal `gorm:"column:total_allowed" json:"totalAllowed,omitempty"`
+	Used          decimal.Decimal  `gorm:"column:used" json:"used"`
+	Remaining     decimal.Decimal  `gorm:"column:remaining" json:"remaining"`
+}
 
 
 
@@ -82,72 +78,17 @@ package models
 
 import (
 	"time"
-
 	"github.com/google/uuid"
-	"gorm.io/datatypes"
 )
 
 type SubscriptionVersion struct {
-	VersionID      uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	SubscriptionID uuid.UUID      `gorm:"type:uuid;not null;index"`
-	VersionNumber  int            `gorm:"not null"`
-	Snapshot       datatypes.JSON `gorm:"type:jsonb;not null"`
-	Reason         *string        `gorm:"type:text"`
-	CreatedAt      time.Time      `gorm:"not null;default:now()"`
-
-	Subscription Subscription `gorm:"foreignKey:SubscriptionID"`
+	VersionID      uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"versionId"`
+	SubscriptionID uuid.UUID  `gorm:"type:uuid;not null;index" json:"subscriptionId"`
+	VersionNumber  int        `gorm:"not null" json:"versionNumber"`
+	Snapshot       JSONB      `gorm:"type:jsonb;not null" json:"snapshot"`
+	Reason         *string    `gorm:"type:text" json:"reason,omitempty"`
+	CreatedAt      time.Time  `gorm:"not null;default:now()" json:"createdAt"`
 }
-
-func (SubscriptionVersion) TableName() string { return "subscription_versions" }
-
-
-
-================================================================================
-FILE: ./models/schedule_type.go
-================================================================================
-
-package models
-
-type ScheduleType struct {
-	ScheduleTypeID int16  `gorm:"primaryKey"`
-	Code           string `gorm:"size:30;not null;unique"`
-	Name           string `gorm:"size:100;not null"`
-}
-
-func (ScheduleType) TableName() string { return "schedule_types" }
-
-
-
-================================================================================
-FILE: ./models/audit.go
-================================================================================
-
-package models
-
-import (
-	"time"
-
-	"github.com/google/uuid"
-	"gorm.io/datatypes"
-	"net"
-)
-
-type AuditLog struct {
-	AuditID        uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	SubscriptionID uuid.UUID      `gorm:"type:uuid;not null;index"`
-	Action         string         `gorm:"size:50;not null"`
-	OldState       datatypes.JSON `gorm:"type:jsonb"`
-	NewState       datatypes.JSON `gorm:"type:jsonb"`
-	PerformedBy    *uuid.UUID     `gorm:"type:uuid"`
-	PerformedAt    time.Time      `gorm:"not null;default:now();index"`
-	IPAddress      *net.IP        `gorm:"type:inet"`
-	UserAgent      *string        `gorm:"type:text"`
-
-	Subscription Subscription `gorm:"foreignKey:SubscriptionID"`
-	Performer    *User        `gorm:"foreignKey:PerformedBy"`
-}
-
-func (AuditLog) TableName() string { return "audit_logs" }
 
 
 
@@ -159,27 +100,22 @@ package models
 
 import (
 	"time"
-
 	"github.com/google/uuid"
-	"gorm.io/datatypes"
+	"auth-service/internal/subscription/models/enums"
 )
 
 type Trial struct {
-	TrialID         uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	SubscriptionID  uuid.UUID      `gorm:"type:uuid;not null;index"`
-	StartedAt       time.Time      `gorm:"not null;default:now()"`
-	EndedAt         *time.Time     `gorm:"type:timestamptz"`
-	TrialDays       int            `gorm:"not null"`
-	FeaturesEnabled datatypes.JSON `gorm:"type:jsonb;not null;default:'{}'"`
-	UsageConsumed   datatypes.JSON `gorm:"type:jsonb;not null;default:'{}'"`
-	Status          string         `gorm:"size:20;not null;default:'active';check:status IN ('active','expired','converted','cancelled')"`
-	CreatedAt       time.Time      `gorm:"not null;default:now()"`
-	UpdatedAt       time.Time      `gorm:"not null;default:now()"`
-
-	Subscription Subscription `gorm:"foreignKey:SubscriptionID"`
+	TrialID        uuid.UUID          `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"trialId"`
+	SubscriptionID uuid.UUID          `gorm:"type:uuid;not null;index" json:"subscriptionId"`
+	StartedAt      time.Time          `gorm:"type:timestamptz;not null;default:now()" json:"startedAt"`
+	EndedAt        *time.Time         `gorm:"type:timestamptz" json:"endedAt,omitempty"`
+	TrialDays      int                `gorm:"not null" json:"trialDays"`
+	FeaturesEnabled JSONB              `gorm:"type:jsonb;not null;default:'{}'" json:"featuresEnabled"`
+	UsageConsumed  JSONB              `gorm:"type:jsonb;not null;default:'{}'" json:"usageConsumed"`
+	Status         enums.TrialStatus  `gorm:"type:varchar(20);not null;default:'active'" json:"status"`
+	CreatedAt      time.Time          `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt      time.Time          `gorm:"autoUpdateTime" json:"updatedAt"`
 }
-
-func (Trial) TableName() string { return "trials" }
 
 
 
@@ -191,42 +127,31 @@ package models
 
 import (
 	"time"
-
 	"github.com/google/uuid"
-	"gorm.io/gorm"
-	"gorm.io/datatypes"
+	"auth-service/internal/subscription/models/enums"
 )
 
 type Plan struct {
-	PlanID             uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	CompanyID          uuid.UUID      `gorm:"type:uuid;not null;index"`
-	Name               string         `gorm:"size:255;not null"`
-	BusinessModelID    int16          `gorm:"not null"`
-	Description        *string        `gorm:"type:text"`
-	BillingPolicyID    uuid.UUID      `gorm:"type:uuid;not null"`
-	RenewalPolicyID    uuid.UUID      `gorm:"type:uuid;not null"`
-	PausePolicyID      uuid.UUID      `gorm:"type:uuid;not null"`
-	ProrationPolicyID  uuid.UUID      `gorm:"type:uuid;not null"`
-	DurationDays       int            `gorm:"not null;default:365"`
-	CancellationPolicy *string        `gorm:"type:text"`
-	Metadata           datatypes.JSON `gorm:"type:jsonb"`
-	IsActive           bool           `gorm:"not null;default:true"`
-	CreatedAt          time.Time      `gorm:"not null;default:now()"`
-	UpdatedAt          time.Time      `gorm:"not null;default:now()"`
-	DeletedAt          gorm.DeletedAt `gorm:"index"`
-
-	// relationships
-	Company          Company           `gorm:"foreignKey:CompanyID"`
-	BusinessModel    BusinessModel     `gorm:"foreignKey:BusinessModelID"`
-	BillingPolicy    BillingPolicy     `gorm:"foreignKey:BillingPolicyID"`
-	RenewalPolicy    RenewalPolicy     `gorm:"foreignKey:RenewalPolicyID"`
-	PausePolicy      PausePolicy       `gorm:"foreignKey:PausePolicyID"`
-	ProrationPolicy  ProrationPolicy   `gorm:"foreignKey:ProrationPolicyID"`
-	PlanItems        []PlanItem        `gorm:"foreignKey:PlanID"`
-	Subscriptions    []Subscription    `gorm:"foreignKey:PlanID"`
+	PlanID            uuid.UUID          `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"planId"`
+	CompanyID         uuid.UUID          `gorm:"type:uuid;not null;index" json:"companyId"`
+	Name              string             `gorm:"type:varchar(255);not null" json:"name"`
+	PlanType          enums.PlanType     `gorm:"type:varchar(30);not null" json:"planType"`
+	Description       *string            `gorm:"type:text" json:"description,omitempty"`
+	BillingPolicyID   uuid.UUID          `gorm:"type:uuid;not null" json:"billingPolicyId"`
+	RenewalPolicyID   uuid.UUID          `gorm:"type:uuid;not null" json:"renewalPolicyId"`
+	PausePolicyID     uuid.UUID          `gorm:"type:uuid;not null" json:"pausePolicyId"`
+	ProrationPolicyID uuid.UUID          `gorm:"type:uuid;not null" json:"prorationPolicyId"`
+	DurationDays      int                `gorm:"not null;default:365" json:"durationDays"`
+	CancellationPolicy *string           `gorm:"type:text" json:"cancellationPolicy,omitempty"`
+	Metadata          JSONB              `gorm:"type:jsonb" json:"metadata,omitempty"`
+	IsActive          bool               `gorm:"not null;default:true" json:"isActive"`
+	Version           int                `gorm:"not null;default:1" json:"version"`
+	PublishedAt       *time.Time         `gorm:"type:timestamptz" json:"publishedAt,omitempty"`
+	PublishedBy       *uuid.UUID         `gorm:"type:uuid" json:"publishedBy,omitempty"`
+	CreatedAt         time.Time          `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt         time.Time          `gorm:"autoUpdateTime" json:"updatedAt"`
+	DeletedAt         *time.Time         `gorm:"index" json:"deletedAt,omitempty"`
 }
-
-func (Plan) TableName() string { return "plans" }
 
 
 
@@ -234,27 +159,29 @@ func (Plan) TableName() string { return "plans" }
 FILE: ./models/feature_registry.go
 ================================================================================
 
+// FILE: models/feature_registry.go
+
 package models
 
 import (
 	"time"
+
+	"github.com/shopspring/decimal"
 )
 
 type FeatureRegistry struct {
-	FeatureKey      string    `gorm:"primaryKey;size:100"`
-	Module          string    `gorm:"size:50;not null"`
-	FeatureGroup    *string   `gorm:"size:50"`
-	PermissionScope *string   `gorm:"size:50"`
-	Description     *string   `gorm:"type:text"`
-	DefaultLimit    *float64  `gorm:"type:numeric(14,4)"`
-	DependsOn       []string  `gorm:"type:varchar(100)[];not null;default:'{}'"` // changed
-	Version         int       `gorm:"not null;default:1"`
-	IsActive        bool      `gorm:"not null;default:true"`
-	CreatedAt       time.Time `gorm:"not null;default:now()"`
-	UpdatedAt       time.Time `gorm:"not null;default:now()"`
+	FeatureKey      string           `gorm:"type:varchar(100);primaryKey" json:"featureKey"`
+	Module          string           `gorm:"type:varchar(50);not null" json:"module"`
+	FeatureGroup    *string          `gorm:"type:varchar(50)" json:"featureGroup,omitempty"`
+	PermissionScope *string          `gorm:"type:varchar(50)" json:"permissionScope,omitempty"`
+	Description     *string          `gorm:"type:text" json:"description,omitempty"`
+	DefaultLimit    *decimal.Decimal `gorm:"type:numeric(14,4)" json:"defaultLimit,omitempty"`
+	DependsOn       []string         `gorm:"type:varchar(100)[]" json:"dependsOn,omitempty"` // PostgreSQL array
+	Version         int              `gorm:"not null;default:1" json:"version"`
+	IsActive        bool             `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt       time.Time        `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt       time.Time        `gorm:"autoUpdateTime" json:"updatedAt"`
 }
-
-func (FeatureRegistry) TableName() string { return "feature_registry" }
 
 
 
@@ -266,68 +193,29 @@ package models
 
 import (
 	"time"
-
 	"github.com/google/uuid"
-	"gorm.io/gorm"
+	"github.com/shopspring/decimal"
+	"auth-service/internal/subscription/models/enums"
 )
 
 type PlanItem struct {
-	PlanItemID      uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	PlanID          uuid.UUID      `gorm:"type:uuid;not null;index"`
-	ItemType        string         `gorm:"size:20;not null;check:item_type IN ('base','addon','benefit','discount','tax')"`
-	Name            string         `gorm:"size:255;not null"`
-	Description     *string        `gorm:"type:text"`
-	FeatureKey      *string        `gorm:"size:100"`
-	BillingPolicyID *uuid.UUID     `gorm:"type:uuid"`
-	Price           float64        `gorm:"type:numeric(14,2);not null;default:0"`
-	Currency        string         `gorm:"size:3;not null;default:'USD'"`
-	EffectiveFrom   time.Time      `gorm:"type:date;not null;default:now()"`
-	EffectiveTo     *time.Time     `gorm:"type:date"`
-	IsMandatory     bool           `gorm:"not null;default:false"`
-	IsActive        bool           `gorm:"not null;default:true"`
-	CreatedAt       time.Time      `gorm:"not null;default:now()"`
-	UpdatedAt       time.Time      `gorm:"not null;default:now()"`
-	DeletedAt       gorm.DeletedAt `gorm:"index"`
-
-	// relationships
-	Plan          Plan            `gorm:"foreignKey:PlanID"`
-	Feature       *FeatureRegistry `gorm:"foreignKey:FeatureKey"`
-	BillingPolicy *BillingPolicy  `gorm:"foreignKey:BillingPolicyID"`
-	Entitlements  []Entitlement   `gorm:"foreignKey:PlanItemID"`
-	Benefits      []Benefit       `gorm:"foreignKey:PlanItemID"`
+	PlanItemID      uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"planItemId"`
+	PlanID          uuid.UUID       `gorm:"type:uuid;not null;index" json:"planId"`
+	ItemType        enums.ItemType  `gorm:"type:varchar(20);not null" json:"itemType"`
+	Name            string          `gorm:"type:varchar(255);not null" json:"name"`
+	Description     *string         `gorm:"type:text" json:"description,omitempty"`
+	FeatureKey      *string         `gorm:"type:varchar(100)" json:"featureKey,omitempty"`
+	BillingPolicyID *uuid.UUID      `gorm:"type:uuid" json:"billingPolicyId,omitempty"`
+	Price           decimal.Decimal `gorm:"type:numeric(14,2);not null;default:0" json:"price"`
+	Currency        string          `gorm:"type:varchar(3);not null;default:'USD'" json:"currency"`
+	EffectiveFrom   time.Time       `gorm:"type:date;not null;default:CURRENT_DATE" json:"effectiveFrom"`
+	EffectiveTo     *time.Time      `gorm:"type:date" json:"effectiveTo,omitempty"`
+	IsMandatory     bool            `gorm:"not null;default:false" json:"isMandatory"`
+	IsActive        bool            `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt       time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt       time.Time       `gorm:"autoUpdateTime" json:"updatedAt"`
+	DeletedAt       *time.Time      `gorm:"index" json:"deletedAt,omitempty"`
 }
-
-func (PlanItem) TableName() string { return "plan_items" }
-
-
-
-================================================================================
-FILE: ./models/workflow_step.go
-================================================================================
-
-package models
-
-import (
-	"time"
-
-	"github.com/google/uuid"
-	"gorm.io/datatypes"
-)
-
-type WorkflowStep struct {
-	StepID        uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	WorkflowID    uuid.UUID      `gorm:"type:uuid;not null;index"`
-	StepOrder     int            `gorm:"not null"`
-	StepType      string         `gorm:"size:30;not null"`
-	Config        datatypes.JSON `gorm:"type:jsonb;not null"`
-	DependsOnStep *uuid.UUID     `gorm:"type:uuid"`
-	CreatedAt     time.Time      `gorm:"not null;default:now()"`
-
-	Workflow    Workflow       `gorm:"foreignKey:WorkflowID"`
-	Dependency  *WorkflowStep  `gorm:"foreignKey:DependsOnStep"`
-}
-
-func (WorkflowStep) TableName() string { return "workflow_steps" }
 
 
 
@@ -339,29 +227,23 @@ package models
 
 import (
 	"time"
-
 	"github.com/google/uuid"
-	"gorm.io/gorm"
+	"github.com/shopspring/decimal"
 )
 
 type Addon struct {
-	AddonID         uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	CompanyID       uuid.UUID      `gorm:"type:uuid;not null;index"`
-	Name            string         `gorm:"size:255;not null"`
-	Description     *string        `gorm:"type:text"`
-	BillingPolicyID uuid.UUID      `gorm:"type:uuid;not null"`
-	Price           float64        `gorm:"type:numeric(14,2);not null"`
-	Currency        string         `gorm:"size:3;not null;default:'USD'"`
-	IsActive        bool           `gorm:"not null;default:true"`
-	CreatedAt       time.Time      `gorm:"not null;default:now()"`
-	UpdatedAt       time.Time      `gorm:"not null;default:now()"`
-	DeletedAt       gorm.DeletedAt `gorm:"index"`
-
-	Company       Company       `gorm:"foreignKey:CompanyID"`
-	BillingPolicy BillingPolicy `gorm:"foreignKey:BillingPolicyID"`
+	AddonID         uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"addonId"`
+	CompanyID       uuid.UUID       `gorm:"type:uuid;not null;index" json:"companyId"`
+	Name            string          `gorm:"type:varchar(255);not null" json:"name"`
+	Description     *string         `gorm:"type:text" json:"description,omitempty"`
+	BillingPolicyID uuid.UUID       `gorm:"type:uuid;not null" json:"billingPolicyId"`
+	Price           decimal.Decimal `gorm:"type:numeric(14,2);not null" json:"price"`
+	Currency        string          `gorm:"type:varchar(3);not null;default:'USD'" json:"currency"`
+	IsActive        bool            `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt       time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt       time.Time       `gorm:"autoUpdateTime" json:"updatedAt"`
+	DeletedAt       *time.Time      `gorm:"index" json:"deletedAt,omitempty"`
 }
-
-func (Addon) TableName() string { return "addons" }
 
 
 
@@ -373,79 +255,21 @@ package models
 
 import (
 	"time"
-
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"auth-service/internal/subscription/models/enums"
 )
 
 type Entitlement struct {
-	EntitlementID uuid.UUID  `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	PlanItemID    uuid.UUID  `gorm:"type:uuid;not null;index"`
-	FeatureKey    string     `gorm:"size:100;not null"`
-	LimitValue    *float64   `gorm:"type:numeric(14,4)"`
-	LimitPeriod   *string    `gorm:"size:20;check:limit_period IN ('day','week','month','year','lifetime')"`
-	IsEnabled     bool       `gorm:"not null;default:true"`
-	CreatedAt     time.Time  `gorm:"not null;default:now()"`
-	UpdatedAt     time.Time  `gorm:"not null;default:now()"`
-
-	// relationships
-	PlanItem PlanItem        `gorm:"foreignKey:PlanItemID"`
-	Feature  FeatureRegistry `gorm:"foreignKey:FeatureKey"`
+	EntitlementID uuid.UUID          `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"entitlementId"`
+	PlanItemID    uuid.UUID          `gorm:"type:uuid;not null;index" json:"planItemId"`
+	FeatureKey    string             `gorm:"type:varchar(100);not null" json:"featureKey"`
+	LimitValue    *decimal.Decimal   `gorm:"type:numeric(14,4)" json:"limitValue,omitempty"`
+	LimitPeriod   enums.LimitPeriod  `gorm:"type:varchar(20);default:'month'" json:"limitPeriod,omitempty"`
+	IsEnabled     bool               `gorm:"not null;default:true" json:"isEnabled"`
+	CreatedAt     time.Time          `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt     time.Time          `gorm:"autoUpdateTime" json:"updatedAt"`
 }
-
-func (Entitlement) TableName() string { return "entitlements" }
-
-
-
-================================================================================
-FILE: ./models/billing_type.go
-================================================================================
-
-package models
-
-type BillingType struct {
-	BillingTypeID int16  `gorm:"primaryKey"`
-	Code          string `gorm:"size:30;not null;unique"`
-	Name          string `gorm:"size:100;not null"`
-}
-
-func (BillingType) TableName() string { return "billing_types" }
-
-
-
-================================================================================
-FILE: ./models/waitlist.go
-================================================================================
-
-package models
-
-import (
-	"time"
-
-	"github.com/google/uuid"
-)
-
-type Waitlist struct {
-	WaitlistID       uuid.UUID  `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	CompanyID        uuid.UUID  `gorm:"type:uuid;not null;index"`
-	ScheduleID       uuid.UUID  `gorm:"type:uuid;not null;index"`
-	SubscriberTypeID int16      `gorm:"not null"`
-	SubscriberID     uuid.UUID  `gorm:"type:uuid;not null;index"`
-	StatusID         int16      `gorm:"not null;default:1;index"`
-	RegisteredAt     time.Time  `gorm:"not null;default:now()"`
-	Position         *int       `gorm:"default:null"`
-	NotifiedAt       *time.Time `gorm:"type:timestamptz"`
-	ExpiresAt        *time.Time `gorm:"type:timestamptz"`
-	Notes            *string    `gorm:"type:text"`
-	CreatedAt        time.Time  `gorm:"not null;default:now()"`
-	UpdatedAt        time.Time  `gorm:"not null;default:now()"`
-
-	Company        Company        `gorm:"foreignKey:CompanyID"`
-	Schedule       Schedule       `gorm:"foreignKey:ScheduleID"`
-	SubscriberType SubscriberType `gorm:"foreignKey:SubscriberTypeID"`
-	Status         Status         `gorm:"foreignKey:StatusID"`
-}
-
-func (Waitlist) TableName() string { return "waitlists" }
 
 
 
@@ -459,52 +283,52 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"gorm.io/gorm"
 )
 
 type PausePolicy struct {
-	PausePolicyID  uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	CompanyID      uuid.UUID      `gorm:"type:uuid;not null;index"`
-	Name           string         `gorm:"size:100;not null"`
-	MaxPauseDays   int            `gorm:"not null;default:0"`
-	AllowedReasons []string       `gorm:"type:text[];not null;default:'{}'"` // changed
-	FreezeDays     int            `gorm:"not null;default:0"`
-	IsActive       bool           `gorm:"not null;default:true"`
-	CreatedAt      time.Time      `gorm:"not null;default:now()"`
-	UpdatedAt      time.Time      `gorm:"not null;default:now()"`
-	DeletedAt      gorm.DeletedAt `gorm:"index"`
-	Company        Company        `gorm:"foreignKey:CompanyID"`
+	PausePolicyID  uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"pausePolicyId"`
+	CompanyID      uuid.UUID  `gorm:"type:uuid;not null;index" json:"companyId"`
+	Name           string     `gorm:"type:varchar(100);not null" json:"name"`
+	MaxPauseDays   int        `gorm:"not null;default:0" json:"maxPauseDays"`
+	AllowedReasons []string   `gorm:"type:text[]" json:"allowedReasons"`
+	FreezeDays     int        `gorm:"not null;default:0" json:"freezeDays"`
+	IsActive       bool       `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt      time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt      time.Time  `gorm:"autoUpdateTime" json:"updatedAt"`
+	DeletedAt      *time.Time `gorm:"index" json:"deletedAt,omitempty"`
 }
-
-func (PausePolicy) TableName() string { return "pause_policies" }
 
 
 
 ================================================================================
-FILE: ./models/notification_preference.go
+FILE: ./models/types.go
 ================================================================================
 
 package models
 
 import (
-	"time"
-
-	"github.com/google/uuid"
+	"database/sql/driver"
+	"encoding/json"
+	"fmt"
 )
 
-type NotificationPreference struct {
-	PrefID         uuid.UUID `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	SubscriptionID uuid.UUID `gorm:"type:uuid;not null;index"`
-	Channel        string    `gorm:"size:20;not null;check:channel IN ('email','sms','whatsapp','push')"`
-	EventType      string    `gorm:"size:50;not null"`
-	IsEnabled      bool      `gorm:"not null;default:true"`
-	CreatedAt      time.Time `gorm:"not null;default:now()"`
-	UpdatedAt      time.Time `gorm:"not null;default:now()"`
+type JSONB map[string]interface{}
 
-	Subscription Subscription `gorm:"foreignKey:SubscriptionID"`
+func (j JSONB) Value() (driver.Value, error) {
+	return json.Marshal(j)
 }
 
-func (NotificationPreference) TableName() string { return "notification_preferences" }
+func (j *JSONB) Scan(value interface{}) error {
+	if value == nil {
+		*j = nil
+		return nil
+	}
+	bytes, ok := value.([]byte)
+	if !ok {
+		return fmt.Errorf("failed to unmarshal JSONB value: %v", value)
+	}
+	return json.Unmarshal(bytes, j)
+}
 
 
 
@@ -516,34 +340,47 @@ package models
 
 import (
 	"time"
-
 	"github.com/google/uuid"
-	"gorm.io/datatypes"
+	"auth-service/internal/subscription/models/enums"
 )
 
 type SubscriptionTimeline struct {
-	TimelineID   uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	SubscriptionID uuid.UUID    `gorm:"type:uuid;not null;index"`
-	EventType    string         `gorm:"size:50;not null;index"`
-	OldStatusID  *int16         `gorm:"default:null"`
-	NewStatusID  *int16         `gorm:"default:null"`
-	PerformedBy  *uuid.UUID     `gorm:"type:uuid"`
-	Metadata     datatypes.JSON `gorm:"type:jsonb"`
-	CreatedAt    time.Time      `gorm:"not null;default:now()"`
-
-	Subscription Subscription `gorm:"foreignKey:SubscriptionID"`
-	OldStatus    *Status      `gorm:"foreignKey:OldStatusID"`
-	NewStatus    *Status      `gorm:"foreignKey:NewStatusID"`
-	Performer    *User        `gorm:"foreignKey:PerformedBy"`
+	TimelineID   uuid.UUID          `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"timelineId"`
+	SubscriptionID uuid.UUID        `gorm:"type:uuid;not null;index" json:"subscriptionId"`
+	EventType    enums.TimelineEvent `gorm:"type:varchar(50);not null" json:"eventType"`
+	OldStatus    *enums.SubscriptionStatus `gorm:"type:varchar(20)" json:"oldStatus,omitempty"`
+	NewStatus    *enums.SubscriptionStatus `gorm:"type:varchar(20)" json:"newStatus,omitempty"`
+	PerformedBy  *uuid.UUID          `gorm:"type:uuid" json:"performedBy,omitempty"`
+	Metadata     JSONB               `gorm:"type:jsonb" json:"metadata,omitempty"`
+	CreatedAt    time.Time           `gorm:"not null;default:now()" json:"createdAt"`
 }
 
-func (SubscriptionTimeline) TableName() string { return "subscription_timeline" }
+
+
+================================================================================
+FILE: ./models/billing_frequency.go
+================================================================================
+
+package models
+
+import (
+	"time"
+)
+
+type BillingFrequency struct {
+	FrequencyID int16     `gorm:"primaryKey" json:"frequencyId"`
+	Code        string    `gorm:"type:varchar(20);not null;unique" json:"code"`
+	Name        string    `gorm:"type:varchar(50);not null" json:"name"`
+	CreatedAt   time.Time `gorm:"default:now()" json:"createdAt"`
+}
 
 
 
 ================================================================================
-FILE: ./models/resource_assignment.go
+FILE: ./models/plan_version.go
 ================================================================================
+
+// FILE: models/plan_version.go
 
 package models
 
@@ -553,39 +390,45 @@ import (
 	"github.com/google/uuid"
 )
 
-type ResourceAssignment struct {
-	AssignmentID       uuid.UUID  `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	SubscriptionID     uuid.UUID  `gorm:"type:uuid;not null;index"`
-	ResourceType       string     `gorm:"size:50;not null;index"`
-	ResourceID         uuid.UUID  `gorm:"type:uuid;not null;index"`
-	AllocationStrategy string     `gorm:"size:20;not null;default:'exclusive';check:allocation_strategy IN ('exclusive','shared','rotating','priority')"`
-	AssignedAt         time.Time  `gorm:"not null;default:now()"`
-	AssignedUntil      *time.Time `gorm:"type:timestamptz"`
-	StatusID           int16      `gorm:"not null;default:1;index"`
-	CreatedAt          time.Time  `gorm:"not null;default:now()"`
-	UpdatedAt          time.Time  `gorm:"not null;default:now()"`
+// PlanVersion stores historical snapshots of a plan configuration.
+// Each version is immutable once created.
+type PlanVersion struct {
+	VersionID     uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"versionId"`
+	CompanyID     uuid.UUID `gorm:"type:uuid;not null;index" json:"companyId"`
+	PlanID        uuid.UUID `gorm:"type:uuid;not null;index" json:"planId"`
+	VersionNumber int       `gorm:"not null" json:"versionNumber"`
+	Snapshot      JSONB     `gorm:"type:jsonb;not null" json:"snapshot"` // full plan configuration at that version
 
-	Subscription Subscription `gorm:"foreignKey:SubscriptionID"`
-	Status       Status       `gorm:"foreignKey:StatusID"`
+	IsPublished bool       `gorm:"not null;default:false" json:"isPublished"`
+	PublishedAt *time.Time `gorm:"type:timestamptz" json:"publishedAt,omitempty"`
+	PublishedBy *uuid.UUID `gorm:"type:uuid" json:"publishedBy,omitempty"`
+
+	CreatedAt time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt time.Time  `gorm:"autoUpdateTime" json:"updatedAt"`
+	DeletedAt *time.Time `gorm:"index" json:"deletedAt,omitempty"`
 }
-
-func (ResourceAssignment) TableName() string { return "resource_assignments" }
 
 
 
 ================================================================================
-FILE: ./models/business_model.go
+FILE: ./models/subscription_invoice_item_map.go
 ================================================================================
 
 package models
 
-type BusinessModel struct {
-	BusinessModelID int16  `gorm:"primaryKey"`
-	Code            string `gorm:"size:30;not null;unique"`
-	Name            string `gorm:"size:100;not null"`
-}
+import (
+	"time"
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
 
-func (BusinessModel) TableName() string { return "business_models" }
+type SubscriptionInvoiceItemMap struct {
+	MapID               uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"mapId"`
+	SubscriptionItemID  uuid.UUID       `gorm:"type:uuid;not null;index" json:"subscriptionItemId"`
+	InvoiceItemID       uuid.UUID       `gorm:"type:uuid;not null;index" json:"invoiceItemId"` // sales.invoice_items
+	AllocatedQuantity   decimal.Decimal `gorm:"type:numeric(14,4);not null;default:1" json:"allocatedQuantity"`
+	CreatedAt           time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+}
 
 
 
@@ -597,43 +440,79 @@ package models
 
 import (
 	"time"
-
 	"github.com/google/uuid"
-	"gorm.io/gorm"
+	"auth-service/internal/subscription/models/enums"
 )
 
 type ProrationPolicy struct {
-	ProrationPolicyID uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	CompanyID         uuid.UUID      `gorm:"type:uuid;not null;index"`
-	Name              string         `gorm:"size:100;not null"`
-	UpgradeType       string         `gorm:"size:20;not null;check:upgrade_type IN ('charge_difference','refund','credit_note')"`
-	DowngradeType     string         `gorm:"size:20;not null;check:downgrade_type IN ('credit_next','refund','none')"`
-	IsActive          bool           `gorm:"not null;default:true"`
-	CreatedAt         time.Time      `gorm:"not null;default:now()"`
-	UpdatedAt         time.Time      `gorm:"not null;default:now()"`
-	DeletedAt         gorm.DeletedAt `gorm:"index"`
-
-	// relationships
-	Company Company `gorm:"foreignKey:CompanyID"`
+	ProrationPolicyID uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"prorationPolicyId"`
+	CompanyID         uuid.UUID       `gorm:"type:uuid;not null;index" json:"companyId"`
+	Name              string          `gorm:"type:varchar(100);not null" json:"name"`
+	UpgradeType       enums.UpgradeType   `gorm:"type:varchar(20);not null" json:"upgradeType"`
+	DowngradeType     enums.DowngradeType `gorm:"type:varchar(20);not null" json:"downgradeType"`
+	IsActive          bool            `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt         time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt         time.Time       `gorm:"autoUpdateTime" json:"updatedAt"`
+	DeletedAt         *time.Time      `gorm:"index" json:"deletedAt,omitempty"`
 }
-
-func (ProrationPolicy) TableName() string { return "proration_policies" }
 
 
 
 ================================================================================
-FILE: ./models/subscriber_type.go
+FILE: ./models/usage_attendance_link.go
 ================================================================================
 
 package models
 
-type SubscriberType struct {
-	SubscriberTypeID int16  `gorm:"primaryKey"`
-	Code             string `gorm:"size:30;not null;unique"`
-	Name             string `gorm:"size:100;not null"`
+import (
+	"time"
+	"github.com/google/uuid"
+)
+
+type UsageAttendanceLink struct {
+	LinkID             uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"linkId"`
+	UsageID            uuid.UUID  `gorm:"type:uuid;not null;uniqueIndex" json:"usageId"`
+	AttendanceEventID  uuid.UUID  `gorm:"type:uuid;not null;uniqueIndex" json:"attendanceEventId"` // attendance.attendance_events
+	CreatedAt          time.Time  `gorm:"not null;default:now()" json:"createdAt"`
 }
 
-func (SubscriberType) TableName() string { return "subscriber_types" }
+
+
+================================================================================
+FILE: ./models/pricing_model.go
+================================================================================
+
+package models
+
+import (
+	"time"
+)
+
+type PricingModel struct {
+	ModelID   int16     `gorm:"primaryKey" json:"modelId"`
+	Code      string    `gorm:"type:varchar(30);not null;unique" json:"code"`
+	Name      string    `gorm:"type:varchar(100);not null" json:"name"`
+	CreatedAt time.Time `gorm:"default:now()" json:"createdAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/plan_type.go
+================================================================================
+
+package models
+
+import (
+	"time"
+)
+
+type PlanType struct {
+	PlanTypeID int16     `gorm:"primaryKey" json:"planTypeId"`
+	Code       string    `gorm:"type:varchar(30);not null;unique" json:"code"`
+	Name       string    `gorm:"type:varchar(100);not null" json:"name"`
+	CreatedAt  time.Time `gorm:"default:now()" json:"createdAt"`
+}
 
 
 
@@ -647,27 +526,42 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"gorm.io/gorm"
 )
 
 type BillingPolicy struct {
-	BillingPolicyID  uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	CompanyID        uuid.UUID      `gorm:"type:uuid;not null;index"`
-	Name             string         `gorm:"size:100;not null"`
-	BillingTypeID    int16          `gorm:"not null"`
-	BillingFrequency *int           `gorm:"default:null"`
-	AdvanceDays      int            `gorm:"not null;default:0"`
-	IsActive         bool           `gorm:"not null;default:true"`
-	CreatedAt        time.Time      `gorm:"not null;default:now()"`
-	UpdatedAt        time.Time      `gorm:"not null;default:now()"`
-	DeletedAt        gorm.DeletedAt `gorm:"index"`
-
-	// relationships
-	Company     Company      `gorm:"foreignKey:CompanyID"`
-	BillingType BillingType  `gorm:"foreignKey:BillingTypeID"`
+	BillingPolicyID uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"billingPolicyId"`
+	CompanyID       uuid.UUID  `gorm:"type:uuid;not null;index" json:"companyId"`
+	Name            string     `gorm:"type:varchar(100);not null" json:"name"`
+	FrequencyID     int16      `gorm:"type:smallint;not null" json:"frequencyId"` // references billing_frequency
+	BillingInterval int        `gorm:"not null;default:1" json:"billingInterval"`
+	ModelID         int16      `gorm:"type:smallint;not null" json:"modelId"` // references pricing_model
+	AdvanceDays     int        `gorm:"not null;default:0" json:"advanceDays"`
+	IsActive        bool       `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt       time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt       time.Time  `gorm:"autoUpdateTime" json:"updatedAt"`
+	DeletedAt       *time.Time `gorm:"index" json:"deletedAt,omitempty"`
 }
 
-func (BillingPolicy) TableName() string { return "billing_policies" }
+
+
+================================================================================
+FILE: ./models/subscription_session_map.go
+================================================================================
+
+package models
+
+import (
+	"time"
+	"github.com/google/uuid"
+)
+
+type SubscriptionSessionMap struct {
+	MapID          uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"mapId"`
+	SubscriptionID uuid.UUID  `gorm:"type:uuid;not null;index" json:"subscriptionId"`
+	SessionType    string     `gorm:"type:varchar(50);not null" json:"sessionType"`
+	SessionID      uuid.UUID  `gorm:"type:uuid;not null" json:"sessionId"`
+	CreatedAt      time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+}
 
 
 
@@ -677,14 +571,43 @@ FILE: ./models/status.go
 
 package models
 
+import (
+	"time"
+)
+
 type Status struct {
-	StatusID int16  `gorm:"primaryKey"`
-	Code     string `gorm:"size:30;not null"`
-	Category string `gorm:"size:30;not null"`
-	Name     string `gorm:"size:100;not null"`
+	StatusID  int16     `gorm:"primaryKey" json:"statusId"`
+	Code      string    `gorm:"type:varchar(30);not null" json:"code"`
+	Category  string    `gorm:"type:varchar(30);not null" json:"category"`
+	Name      string    `gorm:"type:varchar(100);not null" json:"name"`
+	CreatedAt time.Time `gorm:"default:now()" json:"createdAt"`
 }
 
-func (Status) TableName() string { return "statuses" }
+
+
+================================================================================
+FILE: ./models/audit_log.go
+================================================================================
+
+package models
+
+import (
+	"time"
+	"github.com/google/uuid"
+	"net"
+)
+
+type AuditLog struct {
+	AuditID        uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"auditId"`
+	SubscriptionID uuid.UUID  `gorm:"type:uuid;not null;index" json:"subscriptionId"`
+	Action         string     `gorm:"type:varchar(50);not null" json:"action"`
+	OldState       JSONB      `gorm:"type:jsonb" json:"oldState,omitempty"`
+	NewState       JSONB      `gorm:"type:jsonb" json:"newState,omitempty"`
+	PerformedBy    *uuid.UUID `gorm:"type:uuid" json:"performedBy,omitempty"`
+	PerformedAt    time.Time  `gorm:"type:timestamptz;not null;default:now()" json:"performedAt"`
+	IPAddress      *net.IP    `gorm:"type:inet" json:"ipAddress,omitempty"`
+	UserAgent      *string    `gorm:"type:text" json:"userAgent,omitempty"`
+}
 
 
 
@@ -696,28 +619,22 @@ package models
 
 import (
 	"time"
-
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type Usage struct {
-	UsageID            uuid.UUID  `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	SubscriptionItemID uuid.UUID  `gorm:"type:uuid;not null;index"`
-	FeatureKey         string     `gorm:"size:100;not null"`
-	QuantityUsed       float64    `gorm:"type:numeric(14,4);not null"`
-	PeriodStart        time.Time  `gorm:"type:date;not null;index"`
-	PeriodEnd          time.Time  `gorm:"type:date;not null;index"`
-	RecordedAt         time.Time  `gorm:"not null;default:now()"`
-	SourceType         *string    `gorm:"size:50"`
-	SourceID           *uuid.UUID `gorm:"type:uuid"`
-	CreatedBy          *uuid.UUID `gorm:"type:uuid"`
-
-	SubscriptionItem SubscriptionItem `gorm:"foreignKey:SubscriptionItemID"`
-	Feature          FeatureRegistry  `gorm:"foreignKey:FeatureKey"`
-	Creator          *User            `gorm:"foreignKey:CreatedBy"`
+	UsageID             uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"usageId"`
+	SubscriptionItemID  uuid.UUID       `gorm:"type:uuid;not null;index" json:"subscriptionItemId"`
+	FeatureKey          string          `gorm:"type:varchar(100);not null" json:"featureKey"`
+	QuantityUsed        decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"quantityUsed"`
+	PeriodStart         time.Time       `gorm:"type:date;not null" json:"periodStart"`
+	PeriodEnd           time.Time       `gorm:"type:date;not null" json:"periodEnd"`
+	RecordedAt          time.Time       `gorm:"type:timestamptz;not null;default:now()" json:"recordedAt"`
+	SourceType          *string         `gorm:"type:varchar(50)" json:"sourceType,omitempty"`
+	SourceID            *uuid.UUID      `gorm:"type:uuid" json:"sourceId,omitempty"`
+	CreatedBy           *uuid.UUID      `gorm:"type:uuid" json:"createdBy,omitempty"`
 }
-
-func (Usage) TableName() string { return "usages" }
 
 
 
@@ -729,65 +646,23 @@ package models
 
 import (
 	"time"
-
 	"github.com/google/uuid"
-	"gorm.io/gorm"
+	"github.com/shopspring/decimal"
 )
 
 type RenewalPolicy struct {
-	RenewalPolicyID uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	CompanyID       uuid.UUID      `gorm:"type:uuid;not null;index"`
-	Name            string         `gorm:"size:100;not null"`
-	AutoRenew       bool           `gorm:"not null;default:true"`
-	GraceDays       int            `gorm:"not null;default:0"`
-	LateFeePercent  float64        `gorm:"type:numeric(5,2);default:0"`
-	NoticeDays      int            `gorm:"not null;default:0"`
-	IsActive        bool           `gorm:"not null;default:true"`
-	CreatedAt       time.Time      `gorm:"not null;default:now()"`
-	UpdatedAt       time.Time      `gorm:"not null;default:now()"`
-	DeletedAt       gorm.DeletedAt `gorm:"index"`
-
-	Company Company `gorm:"foreignKey:CompanyID"`
+	RenewalPolicyID uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"renewalPolicyId"`
+	CompanyID       uuid.UUID       `gorm:"type:uuid;not null;index" json:"companyId"`
+	Name            string          `gorm:"type:varchar(100);not null" json:"name"`
+	AutoRenew       bool            `gorm:"not null;default:true" json:"autoRenew"`
+	GraceDays       int             `gorm:"not null;default:0" json:"graceDays"`
+	LateFeePercent  decimal.Decimal `gorm:"type:numeric(5,2);default:0" json:"lateFeePercent"`
+	NoticeDays      int             `gorm:"not null;default:0" json:"noticeDays"`
+	IsActive        bool            `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt       time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt       time.Time       `gorm:"autoUpdateTime" json:"updatedAt"`
+	DeletedAt       *time.Time      `gorm:"index" json:"deletedAt,omitempty"`
 }
-
-func (RenewalPolicy) TableName() string { return "renewal_policies" }
-
-
-
-================================================================================
-FILE: ./models/external.go
-================================================================================
-
-package models
-
-import (
-	"time"
-
-	"github.com/google/uuid"
-	"gorm.io/gorm" // ✅ added import
-)
-
-// Placeholder for Company (from companies module)
-type Company struct {
-	CompanyID uuid.UUID `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	Name      string
-	CreatedAt time.Time
-	UpdatedAt time.Time
-	DeletedAt gorm.DeletedAt
-}
-
-func (Company) TableName() string { return "companies" }
-
-// Placeholder for User (from users module)
-type User struct {
-	UserID    uuid.UUID `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	Username  string
-	CreatedAt time.Time
-	UpdatedAt time.Time
-	DeletedAt gorm.DeletedAt
-}
-
-func (User) TableName() string { return "users" }
 
 
 
@@ -799,30 +674,27 @@ package models
 
 import (
 	"time"
-
 	"github.com/google/uuid"
-	"gorm.io/datatypes"
+	"auth-service/internal/subscription/models/enums"
 )
 
 type Benefit struct {
-	BenefitID          uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	PlanItemID         uuid.UUID      `gorm:"type:uuid;not null;index"`
-	BenefitType        string         `gorm:"size:50;not null;check:benefit_type IN ('discount','freebie','access','service','other')"`
-	BenefitDescription *string        `gorm:"type:text"`
-	Value              datatypes.JSON `gorm:"type:jsonb;not null"`
-	CreatedAt          time.Time      `gorm:"not null;default:now()"`
-	UpdatedAt          time.Time      `gorm:"not null;default:now()"`
-
-	PlanItem PlanItem `gorm:"foreignKey:PlanItemID"`
+	BenefitID          uuid.UUID          `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"benefitId"`
+	PlanItemID         uuid.UUID          `gorm:"type:uuid;not null;index" json:"planItemId"`
+	BenefitType        enums.BenefitType  `gorm:"type:varchar(50);not null" json:"benefitType"`
+	BenefitDescription *string            `gorm:"type:text" json:"benefitDescription,omitempty"`
+	Value              JSONB              `gorm:"type:jsonb;not null" json:"value"`
+	CreatedAt          time.Time          `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt          time.Time          `gorm:"autoUpdateTime" json:"updatedAt"`
 }
 
-func (Benefit) TableName() string { return "benefits" }
-
 
 
 ================================================================================
-FILE: ./models/online_session.go
+FILE: ./models/analytics_types.go
 ================================================================================
+
+// FILE: models/analytics_types.go
 
 package models
 
@@ -830,28 +702,461 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"gorm.io/datatypes"
+	"github.com/shopspring/decimal"
+
+	"auth-service/internal/subscription/models/enums"
 )
 
-type OnlineSession struct {
-	SessionID      uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	ScheduleID     uuid.UUID      `gorm:"type:uuid;not null;index"`
-	ProviderID     int16          `gorm:"not null"`
-	MeetingURL     string         `gorm:"type:text;not null"`
-	RecordingURL   *string        `gorm:"type:text"`
-	Notes          *string        `gorm:"type:text"`
-	AttachmentKeys []string       `gorm:"type:text[]"` // changed (nullable)
-	ChatLog        datatypes.JSON `gorm:"type:jsonb"`
-	Resources      datatypes.JSON `gorm:"type:jsonb"`
-	HostUserID     *uuid.UUID     `gorm:"type:uuid"`
-	CreatedAt      time.Time      `gorm:"not null;default:now()"`
-	UpdatedAt      time.Time      `gorm:"not null;default:now()"`
-	Schedule       Schedule       `gorm:"foreignKey:ScheduleID"`
-	Provider       Provider       `gorm:"foreignKey:ProviderID"`
-	Host           *User          `gorm:"foreignKey:HostUserID"`
+// -------------------------------------------------------------------------
+// Subscription KPIs
+// -------------------------------------------------------------------------
+
+type SubscriptionMetrics struct {
+	Total     int64 `json:"total"`
+	Active    int64 `json:"active"`
+	Paused    int64 `json:"paused"`
+	Expired   int64 `json:"expired"`
+	Cancelled int64 `json:"cancelled"`
+	Trial     int64 `json:"trial"`
+	Pending   int64 `json:"pending"`
 }
 
-func (OnlineSession) TableName() string { return "online_sessions" }
+type SubscriptionStatusMetric struct {
+	Status enums.SubscriptionStatus `json:"status"`
+	Count  int64                    `json:"count"`
+}
+
+type SubscriptionGrowthMetric struct {
+	Period           time.Time `json:"period"`
+	NewSubscriptions int64     `json:"newSubscriptions"`
+	ActiveAtPeriod   int64     `json:"activeAtPeriod"`
+}
+
+// -------------------------------------------------------------------------
+// Revenue
+// -------------------------------------------------------------------------
+
+type RevenueMetrics struct {
+	TotalRevenue                  decimal.Decimal `json:"totalRevenue"`
+	ActiveSubscriptions           int64           `json:"activeSubscriptions"`
+	ActiveCustomers               int64           `json:"activeCustomers"`
+	AverageRevenuePerSubscription decimal.Decimal `json:"averageRevenuePerSubscription"`
+	AverageQuantity               decimal.Decimal `json:"averageQuantity"`
+}
+
+type RevenueTrendMetric struct {
+	Period            time.Time       `json:"period"`
+	Revenue           decimal.Decimal `json:"revenue"`
+	SubscriptionCount int64           `json:"subscriptionCount"`
+}
+
+// -------------------------------------------------------------------------
+// Churn / Retention
+// -------------------------------------------------------------------------
+
+type ChurnMetrics struct {
+	ChurnedSubscriptions int64           `json:"churnedSubscriptions"`
+	ChurnedCustomers     int64           `json:"churnedCustomers"`
+	LostRevenue          decimal.Decimal `json:"lostRevenue"`
+	ChurnRate            decimal.Decimal `json:"churnRate"` // percentage
+}
+
+type RetentionMetrics struct {
+	TotalActive          int64           `json:"totalActive"`
+	RenewedSubscriptions int64           `json:"renewedSubscriptions"`
+	RetentionRate        decimal.Decimal `json:"retentionRate"` // percentage
+}
+
+// -------------------------------------------------------------------------
+// Trials
+// -------------------------------------------------------------------------
+
+type TrialMetrics struct {
+	TrialsStarted            int64           `json:"trialsStarted"`
+	TrialsConverted          int64           `json:"trialsConverted"`
+	TrialsExpired            int64           `json:"trialsExpired"`
+	AverageTrialDurationDays float64         `json:"averageTrialDurationDays"`
+	ConversionRate           decimal.Decimal `json:"conversionRate"` // percentage
+}
+
+// -------------------------------------------------------------------------
+// Renewals
+// -------------------------------------------------------------------------
+
+type RenewalMetrics struct {
+	RenewedSubscriptions int64           `json:"renewedSubscriptions"`
+	RenewalRate          decimal.Decimal `json:"renewalRate"` // percentage
+}
+
+type SubscriptionRenewalMetric struct {
+	SubscriptionID uuid.UUID `json:"subscriptionId"`
+	CustomerID     uuid.UUID `json:"customerId"`
+	EndDate        time.Time `json:"endDate"`
+}
+
+// -------------------------------------------------------------------------
+// Usage
+// -------------------------------------------------------------------------
+
+type UsageMetrics struct {
+	TotalUsageEvents             int64           `json:"totalUsageEvents"`
+	TotalQuantityUsed            decimal.Decimal `json:"totalQuantityUsed"`
+	DistinctFeaturesUsed         int64           `json:"distinctFeaturesUsed"`
+	ActiveSubscriptionsWithUsage int64           `json:"activeSubscriptionsWithUsage"`
+}
+
+type FeatureUsageMetric struct {
+	FeatureKey        string          `json:"featureKey"`
+	UsageCount        int64           `json:"usageCount"`
+	TotalQuantity     decimal.Decimal `json:"totalQuantity"`
+	SubscriptionCount int64           `json:"subscriptionCount"`
+}
+
+type PlanAnalyticsMetric struct {
+	PlanID            uuid.UUID       `json:"planId"`
+	PlanName          string          `json:"planName"`
+	SubscriptionCount int64           `json:"subscriptionCount"`
+	TotalRevenue      decimal.Decimal `json:"totalRevenue"`
+	CustomerCount     int64           `json:"customerCount"`
+}
+
+type AddonAnalyticsMetric struct {
+	AddonID           uuid.UUID       `json:"addonId"`
+	AddonName         string          `json:"addonName"`
+	UsageCount        int64           `json:"usageCount"`
+	TotalRevenue      decimal.Decimal `json:"totalRevenue"`
+	SubscriptionCount int64           `json:"subscriptionCount"`
+}
+
+// -------------------------------------------------------------------------
+// Customer
+// -------------------------------------------------------------------------
+
+type CustomerAnalyticsMetric struct {
+	CustomerID           uuid.UUID       `json:"customerId"`
+	SubscriptionCount    int64           `json:"subscriptionCount"`
+	TotalSpent           decimal.Decimal `json:"totalSpent"`
+	LastSubscriptionDate *time.Time      `json:"lastSubscriptionDate,omitempty"`
+}
+
+// -------------------------------------------------------------------------
+// Dashboard
+// -------------------------------------------------------------------------
+
+type SubscriptionDashboard struct {
+	SubscriptionMetrics *SubscriptionMetrics         `json:"subscriptionMetrics,omitempty"`
+	RevenueMetrics      *RevenueMetrics              `json:"revenueMetrics,omitempty"`
+	MRR                 decimal.Decimal              `json:"mrr"`
+	ARR                 decimal.Decimal              `json:"arr"`
+	ChurnMetrics        *ChurnMetrics                `json:"churnMetrics,omitempty"`
+	TrialMetrics        *TrialMetrics                `json:"trialMetrics,omitempty"`
+	TopFeatures         []*FeatureUsageMetric        `json:"topFeatures,omitempty"`
+	TopPlans            []*PlanAnalyticsMetric       `json:"topPlans,omitempty"`
+	UpcomingRenewals    []*SubscriptionRenewalMetric `json:"upcomingRenewals,omitempty"`
+}
+type SubscriptionFact struct {
+	FactID         uuid.UUID        `json:"factId"`
+	CompanyID      uuid.UUID        `json:"companyId"`
+	SubscriptionID uuid.UUID        `json:"subscriptionId"`
+	EventDate      time.Time        `json:"eventDate"`
+	EventType      string           `json:"eventType"`
+	PlanID         *uuid.UUID       `json:"planId,omitempty"`
+	CustomerID     *uuid.UUID       `json:"customerId,omitempty"`
+	OldStatusID    *int16           `json:"oldStatusId,omitempty"`
+	NewStatusID    *int16           `json:"newStatusId,omitempty"`
+	MRRChange      *decimal.Decimal `json:"mrrChange,omitempty"`
+	Metadata       JSONB            `json:"metadata,omitempty"`
+	CreatedAt      time.Time        `json:"createdAt"`
+}
+
+type UsageFact struct {
+	FactID             uuid.UUID       `json:"factId"`
+	CompanyID          uuid.UUID       `json:"companyId"`
+	SubscriptionItemID uuid.UUID       `json:"subscriptionItemId"`
+	FeatureKey         string          `json:"featureKey"`
+	Quantity           decimal.Decimal `json:"quantity"`
+	UsageDate          time.Time       `json:"usageDate"`
+	CreatedAt          time.Time       `json:"createdAt"`
+}
+
+// file: internal/subscription/models/analytics_types.go (append)
+
+// AddonUsageFact represents a usage record for an addon.
+type AddonUsageFact struct {
+	FactID         uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"factId"`
+	CompanyID      uuid.UUID       `gorm:"type:uuid;not null" json:"companyId"`
+	AddonID        uuid.UUID       `gorm:"type:uuid;not null" json:"addonId"`
+	SubscriptionID uuid.UUID       `gorm:"type:uuid;not null" json:"subscriptionId"`
+	Quantity       decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"quantity"`
+	UsageDate      time.Time       `gorm:"type:date;not null" json:"usageDate"`
+	CreatedAt      time.Time       `gorm:"default:now()" json:"createdAt"`
+}
+
+// DailyAddonMetrics stores aggregated metrics per addon per day.
+type DailyAddonMetrics struct {
+	CompanyID   uuid.UUID       `gorm:"type:uuid;primaryKey" json:"companyId"`
+	AddonID     uuid.UUID       `gorm:"type:uuid;primaryKey" json:"addonId"`
+	Date        time.Time       `gorm:"type:date;primaryKey" json:"date"`
+	ActiveCount int             `gorm:"not null;default:0" json:"activeCount"`
+	NewCount    int             `gorm:"not null;default:0" json:"newCount"`
+	Revenue     decimal.Decimal `gorm:"type:numeric(14,2);not null;default:0" json:"revenue"`
+	MRR         decimal.Decimal `gorm:"type:numeric(14,2);not null;default:0" json:"mrr"`
+	ARR         decimal.Decimal `gorm:"type:numeric(14,2);not null;default:0" json:"arr"`
+	UpdatedAt   time.Time       `gorm:"default:now()" json:"updatedAt"`
+}
+
+// DailyAddonMetricsDelta represents incremental changes to daily addon metrics.
+type DailyAddonMetricsDelta struct {
+	ActiveCount int             `json:"activeCount"` // change in number of subscriptions with this addon active
+	NewCount    int             `json:"newCount"`    // new subscriptions that attached this addon
+	Revenue     decimal.Decimal `json:"revenue"`     // total revenue change
+	MRR         decimal.Decimal `json:"mrr"`         // monthly recurring revenue change
+	ARR         decimal.Decimal `json:"arr"`         // annualised MRR change
+}
+type BenefitUsageFact struct {
+	FactID         uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"factId"`
+	CompanyID      uuid.UUID       `gorm:"type:uuid;not null" json:"companyId"`
+	BenefitID      uuid.UUID       `gorm:"type:uuid;not null" json:"benefitId"`
+	SubscriptionID uuid.UUID       `gorm:"type:uuid;not null" json:"subscriptionId"`
+	BenefitType    string          `gorm:"type:varchar(50);not null" json:"benefitType"`
+	Quantity       decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"quantity"`
+	UsageDate      time.Time       `gorm:"type:date;not null" json:"usageDate"`
+	CreatedAt      time.Time       `gorm:"default:now()" json:"createdAt"`
+}
+
+// DailyBenefitMetricsDelta represents incremental changes to daily benefit metrics.
+type DailyBenefitMetricsDelta struct {
+	ActiveCount int // subscriptions with this benefit active on that day
+	NewCount    int // new subscriptions that attached this benefit on that day
+}
+
+// BenefitAnalyticsMetric represents aggregated metrics for a benefit.
+type BenefitAnalyticsMetric struct {
+	BenefitID         uuid.UUID `json:"benefitId"`
+	BenefitType       string    `json:"benefitType"`
+	SubscriptionCount int64     `json:"subscriptionCount"`
+	UsageCount        int64     `json:"usageCount"`
+}
+
+// BillingPolicyUsageFact records each time a billing policy is referenced by a plan or addon.
+type BillingPolicyUsageFact struct {
+	FactID          uuid.UUID `json:"factId"`
+	CompanyID       uuid.UUID `json:"companyId"`
+	BillingPolicyID uuid.UUID `json:"billingPolicyId"`
+	EntityType      string    `json:"entityType"` // 'plan' or 'addon'
+	EntityID        uuid.UUID `json:"entityId"`
+	UsageDate       time.Time `json:"usageDate"`
+	CreatedAt       time.Time `json:"createdAt"`
+}
+
+// DailyBillingPolicyMetricsDelta represents incremental changes for daily billing policy metrics.
+type DailyBillingPolicyMetricsDelta struct {
+	ActiveCount int
+	NewCount    int
+	// Revenue decimal.Decimal // uncomment if tracking revenue
+}
+
+// BillingPolicyAnalyticsMetric holds aggregated analytics for a billing policy.
+type BillingPolicyAnalyticsMetric struct {
+	BillingPolicyID   uuid.UUID `json:"billingPolicyId"`
+	BillingPolicyName string    `json:"billingPolicyName"`
+	ActiveCount       int       `json:"activeCount"`
+	NewCount          int       `json:"newCount"`
+	// Revenue           decimal.Decimal `json:"revenue,omitempty"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// Inserted when a plan is created or its renewal_policy_id changes.
+type RenewalPolicyUsageFact struct {
+	FactID          uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"factId"`
+	CompanyID       uuid.UUID `gorm:"type:uuid;not null" json:"companyId"`
+	RenewalPolicyID uuid.UUID `gorm:"type:uuid;not null" json:"renewalPolicyId"`
+	PlanID          uuid.UUID `gorm:"type:uuid;not null" json:"planId"`
+	UsageDate       time.Time `gorm:"type:date;not null" json:"usageDate"` // day the association became active
+	CreatedAt       time.Time `gorm:"default:now()" json:"createdAt"`
+}
+
+// DailyRenewalPolicyMetricsDelta represents incremental changes to daily renewal policy metrics.
+type DailyRenewalPolicyMetricsDelta struct {
+	ActiveCount int
+	NewCount    int
+}
+
+// RenewalPolicyAnalyticsMetric holds aggregated metrics for a renewal policy.
+type RenewalPolicyAnalyticsMetric struct {
+	RenewalPolicyID   uuid.UUID `json:"renewalPolicyId"`
+	RenewalPolicyName string    `json:"renewalPolicyName"`
+	ActiveCount       int       `json:"activeCount"`
+	NewCount          int       `json:"newCount"`
+	UpdatedAt         time.Time `json:"updatedAt"`
+}
+
+// PausePolicyUsageFact records each plan's association with a pause policy.
+type PausePolicyUsageFact struct {
+	FactID        uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"factId"`
+	CompanyID     uuid.UUID `gorm:"type:uuid;not null" json:"companyId"`
+	PausePolicyID uuid.UUID `gorm:"type:uuid;not null" json:"pausePolicyId"`
+	EntityType    string    `gorm:"type:varchar(20);not null" json:"entityType"` // only 'plan' for now
+	EntityID      uuid.UUID `gorm:"type:uuid;not null" json:"entityId"`          // plan_id
+	UsageDate     time.Time `gorm:"type:date;not null" json:"usageDate"`
+	CreatedAt     time.Time `gorm:"default:now()" json:"createdAt"`
+}
+
+// DailyPausePolicyMetricsDelta represents incremental changes to daily pause policy metrics.
+type DailyPausePolicyMetricsDelta struct {
+	ActiveCount              int
+	NewCount                 int
+	PausedSubscriptionsCount int
+	PauseEventsCount         int
+	ResumeEventsCount        int
+	AvgPauseDurationDays     decimal.Decimal
+}
+
+// PausePolicyAnalyticsMetric holds aggregated metrics for a specific pause policy.
+type PausePolicyAnalyticsMetric struct {
+	PausePolicyID            uuid.UUID       `json:"pausePolicyId"`
+	PausePolicyName          string          `json:"pausePolicyName"`
+	ActiveCount              int             `json:"activeCount"`
+	NewCount                 int             `json:"newCount"`
+	PausedSubscriptionsCount int             `json:"pausedSubscriptionsCount"`
+	PauseEventsCount         int             `json:"pauseEventsCount"`
+	ResumeEventsCount        int             `json:"resumeEventsCount"`
+	AvgPauseDurationDays     decimal.Decimal `json:"avgPauseDurationDays"`
+	UpdatedAt                time.Time       `json:"updatedAt"`
+}
+type EntitlementUsageFact struct {
+	FactID         uuid.UUID        `json:"factId"`
+	CompanyID      uuid.UUID        `json:"companyId"`
+	SubscriptionID uuid.UUID        `json:"subscriptionId"`
+	PlanItemID     uuid.UUID        `json:"planItemId"`
+	FeatureKey     string           `json:"featureKey"`
+	LimitValue     *decimal.Decimal `json:"limitValue,omitempty"`
+	LimitPeriod    string           `json:"limitPeriod,omitempty"` // day, week, month, year, lifetime
+	IsEnabled      bool             `json:"isEnabled"`
+	GrantDate      time.Time        `json:"grantDate"`
+	CreatedAt      time.Time        `json:"createdAt"`
+}
+
+func (EntitlementUsageFact) TableName() string {
+	return "subscription_analytics.entitlement_usage_fact"
+}
+
+// DailyEntitlementMetrics holds daily aggregated counts per feature per company.
+// Corresponds to `subscription_analytics.daily_entitlement_metrics`.
+type DailyEntitlementMetrics struct {
+	CompanyID   uuid.UUID `json:"companyId"`
+	FeatureKey  string    `json:"featureKey"`
+	Date        time.Time `json:"date"`
+	ActiveCount int       `json:"activeCount"` // subscriptions with this entitlement enabled on that day
+	NewCount    int       `json:"newCount"`    // subscriptions that newly received this entitlement on that day
+	UpdatedAt   time.Time `json:"updatedAt"`
+}
+
+func (DailyEntitlementMetrics) TableName() string {
+	return "subscription_analytics.daily_entitlement_metrics"
+}
+
+// EntitlementLimitFact tracks changes to an entitlement's limit over time (optional).
+// Corresponds to `subscription_analytics.entitlement_limit_fact`.
+type EntitlementLimitFact struct {
+	FactID         uuid.UUID        `json:"factId"`
+	CompanyID      uuid.UUID        `json:"companyId"`
+	PlanItemID     uuid.UUID        `json:"planItemId"`
+	FeatureKey     string           `json:"featureKey"`
+	OldLimitValue  *decimal.Decimal `json:"oldLimitValue,omitempty"`
+	NewLimitValue  *decimal.Decimal `json:"newLimitValue,omitempty"`
+	OldLimitPeriod string           `json:"oldLimitPeriod,omitempty"`
+	NewLimitPeriod string           `json:"newLimitPeriod,omitempty"`
+	EffectiveDate  time.Time        `json:"effectiveDate"`
+	CreatedAt      time.Time        `json:"createdAt"`
+}
+
+func (EntitlementLimitFact) TableName() string {
+	return "subscription_analytics.entitlement_limit_fact"
+}
+
+// DailyEntitlementMetricsDelta represents incremental changes for daily aggregation.
+type DailyEntitlementMetricsDelta struct {
+	ActiveCount int
+	NewCount    int
+}
+
+// EntitlementAnalyticsMetric is a query result for a single feature's aggregated metrics.
+type EntitlementAnalyticsMetric struct {
+	FeatureKey  string `json:"featureKey"`
+	ActiveCount int    `json:"activeCount"`
+	NewCount    int    `json:"newCount"`
+	// optional: AvgLimitValue decimal.Decimal
+}
+
+// PlanChangeFact represents a single plan change event.
+type PlanChangeFact struct {
+	FactID         uuid.UUID        `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"factId"`
+	CompanyID      uuid.UUID        `gorm:"type:uuid;not null" json:"companyId"`
+	SubscriptionID uuid.UUID        `gorm:"type:uuid;not null" json:"subscriptionId"`
+	OldPlanID      uuid.UUID        `gorm:"type:uuid;not null" json:"oldPlanId"`
+	NewPlanID      uuid.UUID        `gorm:"type:uuid;not null" json:"newPlanId"`
+	ChangeType     string           `gorm:"type:varchar(20);not null" json:"changeType"` // 'upgrade', 'downgrade', 'lateral'
+	ChangeDate     time.Time        `gorm:"type:date;not null" json:"changeDate"`
+	OldPlanVersion *int             `gorm:"column:old_plan_version" json:"oldPlanVersion,omitempty"`
+	NewPlanVersion *int             `gorm:"column:new_plan_version" json:"newPlanVersion,omitempty"`
+	MRRDelta       *decimal.Decimal `gorm:"type:numeric(14,2)" json:"mrrDelta,omitempty"`
+	PerformedBy    *uuid.UUID       `gorm:"type:uuid" json:"performedBy,omitempty"`
+	Reason         *string          `gorm:"type:text" json:"reason,omitempty"`
+	CreatedAt      time.Time        `gorm:"not null;default:now()" json:"createdAt"`
+}
+
+// DailyPlanChangeMetrics stores daily aggregated plan change metrics.
+type DailyPlanChangeMetrics struct {
+	CompanyID         uuid.UUID `gorm:"type:uuid;not null;primaryKey" json:"companyId"`
+	PlanID            uuid.UUID `gorm:"type:uuid;not null;primaryKey" json:"planId"`
+	Date              time.Time `gorm:"type:date;primaryKey" json:"date"`
+	UpgradeInCount    int       `gorm:"not null;default:0" json:"upgradeInCount"`
+	UpgradeOutCount   int       `gorm:"not null;default:0" json:"upgradeOutCount"`
+	DowngradeInCount  int       `gorm:"not null;default:0" json:"downgradeInCount"`
+	DowngradeOutCount int       `gorm:"not null;default:0" json:"downgradeOutCount"`
+	LateralInCount    int       `gorm:"not null;default:0" json:"lateralInCount"`
+	LateralOutCount   int       `gorm:"not null;default:0" json:"lateralOutCount"`
+	NetChange         int       `gorm:"not null;default:0" json:"netChange"` // (incoming - outgoing) for all types combined
+	UpdatedAt         time.Time `gorm:"not null;default:now()" json:"updatedAt"`
+}
+
+// PlanChangeDelta represents incremental changes for a plan on a given date.
+type PlanChangeDelta struct {
+	UpgradeInCount    int
+	UpgradeOutCount   int
+	DowngradeInCount  int
+	DowngradeOutCount int
+	LateralInCount    int
+	LateralOutCount   int
+	NetChange         int
+}
+
+// PlanChangeMetricsSummary provides aggregated metrics for a plan over a period.
+type PlanChangeMetricsSummary struct {
+	PlanID                uuid.UUID `json:"planId"`
+	PlanName              string    `json:"planName"`
+	TotalUpgradeIn        int64     `json:"totalUpgradeIn"`
+	TotalUpgradeOut       int64     `json:"totalUpgradeOut"`
+	TotalDowngradeIn      int64     `json:"totalDowngradeIn"`
+	TotalDowngradeOut     int64     `json:"totalDowngradeOut"`
+	TotalLateralIn        int64     `json:"totalLateralIn"`
+	TotalLateralOut       int64     `json:"totalLateralOut"`
+	NetChange             int64     `json:"netChange"`
+	AverageDailyNetChange float64   `json:"averageDailyNetChange"`
+}
+
+// PlanChangeTrendMetric represents daily or aggregated trend data for plan changes.
+type PlanChangeTrendMetric struct {
+	Period       time.Time `json:"period"`
+	UpgradeIn    int       `json:"upgradeIn"`
+	UpgradeOut   int       `json:"upgradeOut"`
+	DowngradeIn  int       `json:"downgradeIn"`
+	DowngradeOut int       `json:"downgradeOut"`
+	LateralIn    int       `json:"lateralIn"`
+	LateralOut   int       `json:"lateralOut"`
+	NetChange    int       `json:"netChange"`
+}
 
 
 
@@ -863,45 +1168,486 @@ package models
 
 import (
 	"time"
-
-	"gorm.io/datatypes"
-
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"auth-service/internal/subscription/models/enums"
 )
 
 type SubscriptionItem struct {
-	SubItemID      uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	SubscriptionID uuid.UUID      `gorm:"type:uuid;not null;index"`
-	PlanItemID     uuid.UUID      `gorm:"type:uuid;not null"`
-	AddonID        *uuid.UUID     `gorm:"type:uuid"`
-	Quantity       float64        `gorm:"type:numeric(14,4);not null;default:1"`
-	UnitPrice      float64        `gorm:"type:numeric(14,2);not null"`
-	TotalPrice     float64        `gorm:"type:numeric(14,2);generated:always as (quantity * unit_price) stored"`
-	Currency       string         `gorm:"size:3;not null;default:'USD'"`
-	StatusID       int16          `gorm:"not null;default:7;index"`
-	StartDate      time.Time      `gorm:"type:date;not null;default:now()"`
-	EndDate        *time.Time     `gorm:"type:date"`
-	Metadata       datatypes.JSON `gorm:"type:jsonb"`
-	CreatedAt      time.Time      `gorm:"not null;default:now()"`
-	UpdatedAt      time.Time      `gorm:"not null;default:now()"`
-
-	// relationships
-	Subscription Subscription `gorm:"foreignKey:SubscriptionID"`
-	PlanItem     PlanItem     `gorm:"foreignKey:PlanItemID"`
-	Addon        *Addon       `gorm:"foreignKey:AddonID"`
-	Status       Status       `gorm:"foreignKey:StatusID"`
-	Usages       []Usage      `gorm:"foreignKey:SubscriptionItemID"`
+	SubItemID      uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"subItemId"`
+	SubscriptionID uuid.UUID       `gorm:"type:uuid;not null;index" json:"subscriptionId"`
+	PlanItemID     uuid.UUID       `gorm:"type:uuid;not null" json:"planItemId"`
+	AddonID        *uuid.UUID      `gorm:"type:uuid" json:"addonId,omitempty"`
+	Quantity       decimal.Decimal `gorm:"type:numeric(14,4);not null;default:1" json:"quantity"`
+	UnitPrice      decimal.Decimal `gorm:"type:numeric(14,2);not null" json:"unitPrice"`
+	TotalPrice     decimal.Decimal `gorm:"->" json:"totalPrice"` // generated column (quantity * unit_price)
+	Currency       string          `gorm:"type:varchar(3);not null;default:'USD'" json:"currency"`
+	Status         enums.ItemStatus `gorm:"type:varchar(20);not null;default:'active'" json:"status"`
+	StartDate      time.Time       `gorm:"type:date;not null;default:CURRENT_DATE" json:"startDate"`
+	EndDate        *time.Time      `gorm:"type:date" json:"endDate,omitempty"`
+	Metadata       JSONB           `gorm:"type:jsonb" json:"metadata,omitempty"`
+	CreatedAt      time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt      time.Time       `gorm:"autoUpdateTime" json:"updatedAt"`
+	ProductID      *uuid.UUID      `gorm:"type:uuid" json:"productId,omitempty"` // reference to sales.products
 }
 
-func (SubscriptionItem) TableName() string { return "subscription_items" }
+
+
+================================================================================
+FILE: ./models/enums/item_status.go
+================================================================================
+
+package enums
+
+type ItemStatus string
+
+const (
+	ItemStatusActive   ItemStatus = "active"
+	ItemStatusInactive ItemStatus = "inactive"
+)
+
+func (s ItemStatus) IsValid() bool {
+	switch s {
+	case ItemStatusActive, ItemStatusInactive:
+		return true
+	}
+	return false
+}
 
 
 
 ================================================================================
-FILE: ./models/workflow.go
+FILE: ./models/enums/item_type.go
 ================================================================================
 
-package models
+package enums
+
+type ItemType string
+
+const (
+	ItemTypeBase     ItemType = "base"
+	ItemTypeAddon    ItemType = "addon"
+	ItemTypeBenefit  ItemType = "benefit"
+	ItemTypeDiscount ItemType = "discount"
+	ItemTypeTax      ItemType = "tax"
+)
+
+func (t ItemType) IsValid() bool {
+	switch t {
+	case ItemTypeBase, ItemTypeAddon, ItemTypeBenefit, ItemTypeDiscount, ItemTypeTax:
+		return true
+	}
+	return false
+}
+
+
+
+================================================================================
+FILE: ./models/enums/benefit_type.go
+================================================================================
+
+package enums
+
+type BenefitType string
+
+const (
+	BenefitDiscount BenefitType = "discount"
+	BenefitFreebie  BenefitType = "freebie"
+	BenefitAccess   BenefitType = "access"
+	BenefitService  BenefitType = "service"
+	BenefitOther    BenefitType = "other"
+)
+
+func (b BenefitType) IsValid() bool {
+	switch b {
+	case BenefitDiscount, BenefitFreebie, BenefitAccess, BenefitService, BenefitOther:
+		return true
+	}
+	return false
+}
+
+
+
+================================================================================
+FILE: ./models/enums/timeline_event.go
+================================================================================
+
+package enums
+
+type TimelineEvent string
+
+const (
+	EventCreated   TimelineEvent = "created"
+	EventActivated TimelineEvent = "activated"
+	EventPaused    TimelineEvent = "paused"
+	EventResumed   TimelineEvent = "resumed"
+	EventCancelled TimelineEvent = "cancelled"
+	EventExpired   TimelineEvent = "expired"
+	EventRenewed   TimelineEvent = "renewed"
+	EventChanged   TimelineEvent = "changed"
+	EventTrialStart TimelineEvent = "trial_start"
+	EventTrialEnd   TimelineEvent = "trial_end"
+)
+
+func (e TimelineEvent) IsValid() bool {
+	switch e {
+	case EventCreated, EventActivated, EventPaused, EventResumed, EventCancelled, EventExpired, EventRenewed, EventChanged, EventTrialStart, EventTrialEnd:
+		return true
+	}
+	return false
+}
+
+
+
+================================================================================
+FILE: ./models/enums/billing_frequency.go
+================================================================================
+
+package enums
+
+type BillingFrequency string
+
+const (
+	FrequencyDaily     BillingFrequency = "daily"
+	FrequencyWeekly    BillingFrequency = "weekly"
+	FrequencyMonthly   BillingFrequency = "monthly"
+	FrequencyQuarterly BillingFrequency = "quarterly"
+	FrequencyHalfYear  BillingFrequency = "half_yearly"
+	FrequencyYearly    BillingFrequency = "yearly"
+)
+
+func (f BillingFrequency) IsValid() bool {
+	switch f {
+	case FrequencyDaily, FrequencyWeekly, FrequencyMonthly, FrequencyQuarterly, FrequencyHalfYear, FrequencyYearly:
+		return true
+	}
+	return false
+}
+
+
+
+================================================================================
+FILE: ./models/enums/upgrade_type.go
+================================================================================
+
+package enums
+
+type UpgradeType string
+
+const (
+	UpgradeChargeDiff UpgradeType = "charge_difference"
+	UpgradeRefund     UpgradeType = "refund"
+	UpgradeCreditNote UpgradeType = "credit_note"
+)
+
+func (u UpgradeType) IsValid() bool {
+	switch u {
+	case UpgradeChargeDiff, UpgradeRefund, UpgradeCreditNote:
+		return true
+	}
+	return false
+}
+
+
+
+================================================================================
+FILE: ./models/enums/trial_status.go
+================================================================================
+
+package enums
+
+type TrialStatus string
+
+const (
+	TrialActive    TrialStatus = "active"
+	TrialExpired   TrialStatus = "expired"
+	TrialConverted TrialStatus = "converted"
+	TrialCancelled TrialStatus = "cancelled"
+)
+
+func (t TrialStatus) IsValid() bool {
+	switch t {
+	case TrialActive, TrialExpired, TrialConverted, TrialCancelled:
+		return true
+	}
+	return false
+}
+
+
+
+================================================================================
+FILE: ./models/enums/subscription_status.go
+================================================================================
+
+package enums
+
+type SubscriptionStatus string
+
+const (
+	SubStatusActive    SubscriptionStatus = "active"
+	SubStatusPaused    SubscriptionStatus = "paused"
+	SubStatusExpired   SubscriptionStatus = "expired"
+	SubStatusCancelled SubscriptionStatus = "cancelled"
+	SubStatusTrial     SubscriptionStatus = "trial"
+	SubStatusPending   SubscriptionStatus = "pending"
+)
+
+func (s SubscriptionStatus) IsValid() bool {
+	switch s {
+	case SubStatusActive, SubStatusPaused, SubStatusExpired, SubStatusCancelled, SubStatusTrial, SubStatusPending:
+		return true
+	}
+	return false
+}
+
+
+
+================================================================================
+FILE: ./models/enums/pricing_model.go
+================================================================================
+
+package enums
+
+type PricingModel string
+
+const (
+	PricingFlat      PricingModel = "flat"
+	PricingPerUser   PricingModel = "per_user"
+	PricingPerSeat   PricingModel = "per_seat"
+	PricingPerVisit  PricingModel = "per_visit"
+	PricingPerUsage  PricingModel = "per_usage"
+	PricingTiered    PricingModel = "tiered"
+	PricingMetered   PricingModel = "metered"
+)
+
+func (p PricingModel) IsValid() bool {
+	switch p {
+	case PricingFlat, PricingPerUser, PricingPerSeat, PricingPerVisit, PricingPerUsage, PricingTiered, PricingMetered:
+		return true
+	}
+	return false
+}
+
+
+
+================================================================================
+FILE: ./models/enums/plan_type.go
+================================================================================
+
+package enums
+
+type PlanType string
+
+const (
+	PlanTypeRecurring PlanType = "recurring"
+	PlanTypeOneTime   PlanType = "one_time"
+	PlanTypeUsageBased PlanType = "usage_based"
+	PlanTypeContract  PlanType = "contract"
+)
+
+func (p PlanType) IsValid() bool {
+	switch p {
+	case PlanTypeRecurring, PlanTypeOneTime, PlanTypeUsageBased, PlanTypeContract:
+		return true
+	}
+	return false
+}
+
+
+
+================================================================================
+FILE: ./models/enums/downgrade_type.go
+================================================================================
+
+package enums
+
+type DowngradeType string
+
+const (
+	DowngradeCreditNext DowngradeType = "credit_next"
+	DowngradeRefund     DowngradeType = "refund"
+	DowngradeNone       DowngradeType = "none"
+)
+
+func (d DowngradeType) IsValid() bool {
+	switch d {
+	case DowngradeCreditNext, DowngradeRefund, DowngradeNone:
+		return true
+	}
+	return false
+}
+
+
+
+================================================================================
+FILE: ./models/enums/limit_period.go
+================================================================================
+
+package enums
+
+type LimitPeriod string
+
+const (
+	LimitPeriodDay      LimitPeriod = "day"
+	LimitPeriodWeek     LimitPeriod = "week"
+	LimitPeriodMonth    LimitPeriod = "month"
+	LimitPeriodYear     LimitPeriod = "year"
+	LimitPeriodLifetime LimitPeriod = "lifetime"
+)
+
+func (p LimitPeriod) IsValid() bool {
+	switch p {
+	case LimitPeriodDay, LimitPeriodWeek, LimitPeriodMonth, LimitPeriodYear, LimitPeriodLifetime:
+		return true
+	}
+	return false
+}
+
+
+
+================================================================================
+FILE: ./models/analytics/plan_usage_fact.go
+================================================================================
+
+package analytics
+
+import (
+	"time"
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type PlanUsageFact struct {
+	FactID          uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"factId"`
+	CompanyID       uuid.UUID       `gorm:"type:uuid;not null;index" json:"companyId"`
+	PlanID          uuid.UUID       `gorm:"type:uuid;not null" json:"planId"`
+	PlanItemID      uuid.UUID       `gorm:"type:uuid;not null" json:"planItemId"`
+	FeatureKey      string          `gorm:"type:varchar(100);not null" json:"featureKey"`
+	SubscriptionID  uuid.UUID       `gorm:"type:uuid;not null" json:"subscriptionId"`
+	Quantity        decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"quantity"`
+	UsageDate       time.Time       `gorm:"type:date;not null;index" json:"usageDate"`
+	CreatedAt       time.Time       `gorm:"default:now()" json:"createdAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/analytics/daily_plan_metrics.go
+================================================================================
+
+package analytics
+
+import (
+	"time"
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type DailyPlanMetrics struct {
+	CompanyID        uuid.UUID       `gorm:"type:uuid;primaryKey" json:"companyId"`
+	PlanID           uuid.UUID       `gorm:"type:uuid;primaryKey" json:"planId"`
+	Date             time.Time       `gorm:"type:date;primaryKey" json:"date"`
+	ActiveCount      int             `gorm:"not null;default:0" json:"activeCount"`
+	NewCount         int             `gorm:"not null;default:0" json:"newCount"`
+	CancelledCount   int             `gorm:"not null;default:0" json:"cancelledCount"`
+	Revenue          decimal.Decimal `gorm:"type:numeric(14,2);not null;default:0" json:"revenue"`
+	MRR              decimal.Decimal `gorm:"type:numeric(14,2);not null;default:0" json:"mrr"`
+	UpdatedAt        time.Time       `gorm:"default:now()" json:"updatedAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/analytics/benefit_usage_fact.go
+================================================================================
+
+package analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+// BenefitUsageFact records each benefit usage event (e.g., benefit attached to a subscription).
+type BenefitUsageFact struct {
+	FactID         uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"factId"`
+	CompanyID      uuid.UUID       `gorm:"type:uuid;not null;index" json:"companyId"`
+	BenefitID      uuid.UUID       `gorm:"type:uuid;not null;index" json:"benefitId"`
+	SubscriptionID uuid.UUID       `gorm:"type:uuid;not null;index" json:"subscriptionId"`
+	BenefitType    string          `gorm:"type:varchar(50);not null" json:"benefitType"` // denormalized
+	Quantity       decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"quantity"`  // typically 1
+	UsageDate      time.Time       `gorm:"type:date;not null;index" json:"usageDate"`
+	CreatedAt      time.Time       `gorm:"default:now()" json:"createdAt"`
+}
+
+// TableName specifies the table name.
+func (BenefitUsageFact) TableName() string {
+	return "subscription_analytics.benefit_usage_fact"
+}
+
+
+
+================================================================================
+FILE: ./models/analytics/daily_subscription_metrics.go
+================================================================================
+
+package analytics
+
+import (
+	"time"
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type DailySubscriptionMetrics struct {
+	CompanyID             uuid.UUID       `gorm:"type:uuid;primaryKey" json:"companyId"`
+	Date                  time.Time       `gorm:"type:date;primaryKey" json:"date"`
+	NewSubscriptions      int             `gorm:"not null;default:0" json:"newSubscriptions"`
+	ActiveSubscriptions   int             `gorm:"not null;default:0" json:"activeSubscriptions"`
+	CancelledSubscriptions int            `gorm:"not null;default:0" json:"cancelledSubscriptions"`
+	ExpiredSubscriptions  int             `gorm:"not null;default:0" json:"expiredSubscriptions"`
+	PausedSubscriptions   int             `gorm:"not null;default:0" json:"pausedSubscriptions"`
+	TrialStarts           int             `gorm:"not null;default:0" json:"trialStarts"`
+	TrialConversions      int             `gorm:"not null;default:0" json:"trialConversions"`
+	TrialExpirations      int             `gorm:"not null;default:0" json:"trialExpirations"`
+	MRR                   decimal.Decimal `gorm:"type:numeric(14,2);not null;default:0" json:"mrr"`
+	ARR                   decimal.Decimal `gorm:"type:numeric(14,2);not null;default:0" json:"arr"`
+	TotalRevenue          decimal.Decimal `gorm:"type:numeric(14,2);not null;default:0" json:"totalRevenue"`
+	ChurnedSubscriptions  int             `gorm:"not null;default:0" json:"churnedSubscriptions"`
+	UpdatedAt             time.Time       `gorm:"default:now()" json:"updatedAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/analytics/churn_reasons.go
+================================================================================
+
+package analytics
+
+import (
+	"time"
+	"github.com/google/uuid"
+)
+
+type ChurnReason struct {
+	CompanyID      uuid.UUID  `gorm:"type:uuid;primaryKey" json:"companyId"`
+	SubscriptionID uuid.UUID  `gorm:"type:uuid;primaryKey" json:"subscriptionId"`
+	ChurnDate      time.Time  `gorm:"type:date;not null" json:"churnDate"`
+	Reason         *string    `gorm:"type:text" json:"reason,omitempty"`
+	Category       *string    `gorm:"type:varchar(50)" json:"category,omitempty"`
+	CreatedAt      time.Time  `gorm:"default:now()" json:"createdAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/analytics/daily_benefit_metrics.go
+================================================================================
+
+package analytics
 
 import (
 	"time"
@@ -909,138 +1655,92 @@ import (
 	"github.com/google/uuid"
 )
 
-type Workflow struct {
-	WorkflowID   uuid.UUID `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	CompanyID    uuid.UUID `gorm:"type:uuid;not null;index"`
-	WorkflowName string    `gorm:"size:100;not null"`
-	TriggerEvent string    `gorm:"size:50;not null;index"`
-	IsActive     bool      `gorm:"not null;default:true"`
-	CreatedAt    time.Time `gorm:"not null;default:now()"`
-	UpdatedAt    time.Time `gorm:"not null;default:now()"`
-
-	Company Company        `gorm:"foreignKey:CompanyID"`
-	Steps   []WorkflowStep `gorm:"foreignKey:WorkflowID"`
+// DailyBenefitMetrics aggregates daily counts per benefit.
+type DailyBenefitMetrics struct {
+	CompanyID   uuid.UUID `gorm:"type:uuid;primaryKey" json:"companyId"`
+	BenefitID   uuid.UUID `gorm:"type:uuid;primaryKey" json:"benefitId"`
+	Date        time.Time `gorm:"type:date;primaryKey" json:"date"`
+	ActiveCount int       `gorm:"not null;default:0" json:"activeCount"` // subscriptions with this benefit active
+	NewCount    int       `gorm:"not null;default:0" json:"newCount"`    // new attachments on that date
+	// TotalDiscount decimal.Decimal `gorm:"type:numeric(14,2)" json:"totalDiscount,omitempty"` // optional
+	UpdatedAt time.Time `gorm:"default:now()" json:"updatedAt"`
 }
 
-func (Workflow) TableName() string { return "workflows" }
+// TableName specifies the table name.
+func (DailyBenefitMetrics) TableName() string {
+	return "subscription_analytics.daily_benefit_metrics"
+}
 
 
 
 ================================================================================
-FILE: ./models/schedule.go
+FILE: ./models/analytics/daily_plan_item_metrics.go
 ================================================================================
 
-package models
+package analytics
 
 import (
 	"time"
-
 	"github.com/google/uuid"
-	"gorm.io/gorm"
-	"gorm.io/datatypes"
+	"github.com/shopspring/decimal"
 )
 
-type Schedule struct {
-	ScheduleID      uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	SubscriptionID  uuid.UUID      `gorm:"type:uuid;not null;index"`
-	ScheduleTypeID  int16          `gorm:"not null"`
-	Title           string         `gorm:"size:255;not null"`
-	Description     *string        `gorm:"type:text"`
-	StartTime       time.Time      `gorm:"type:timestamptz;not null;index"`
-	EndTime         time.Time      `gorm:"type:timestamptz;not null;index"`
-	Location        *string        `gorm:"size:255"`
-	StatusID        int16          `gorm:"not null;default:1;index"`
-	RecurrenceRule  *string        `gorm:"size:100"`
-	RecurrenceEnd   *time.Time     `gorm:"type:timestamptz"`
-	Metadata        datatypes.JSON `gorm:"type:jsonb"`
-	CreatedAt       time.Time      `gorm:"not null;default:now()"`
-	UpdatedAt       time.Time      `gorm:"not null;default:now()"`
-	DeletedAt       gorm.DeletedAt `gorm:"index"`
-
-	Subscription Subscription   `gorm:"foreignKey:SubscriptionID"`
-	ScheduleType ScheduleType   `gorm:"foreignKey:ScheduleTypeID"`
-	Status       Status         `gorm:"foreignKey:StatusID"`
-	OnlineSessions []OnlineSession `gorm:"foreignKey:ScheduleID"`
-	Waitlists    []Waitlist     `gorm:"foreignKey:ScheduleID"`
+type DailyPlanItemMetrics struct {
+	CompanyID           uuid.UUID       `gorm:"type:uuid;primaryKey" json:"companyId"`
+	PlanItemID          uuid.UUID       `gorm:"type:uuid;primaryKey" json:"planItemId"`
+	Date                time.Time       `gorm:"type:date;primaryKey" json:"date"`
+	TotalQuantity       decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"totalQuantity"`
+	ActiveSubscriptions int             `gorm:"not null;default:0" json:"activeSubscriptions"`
+	Revenue             decimal.Decimal `gorm:"type:numeric(14,2);not null;default:0" json:"revenue"`
+	UpdatedAt           time.Time       `gorm:"default:now()" json:"updatedAt"`
 }
 
-func (Schedule) TableName() string { return "schedules" }
-
 
 
 ================================================================================
-FILE: ./models/enums/schedule_type.go
+FILE: ./models/analytics/daily_subscriber_metrics.go
 ================================================================================
 
-package enums
+package analytics
 
-type ScheduleType string
-
-const (
-	Class        ScheduleType = "class"
-	Appointment  ScheduleType = "appointment"
-	Meeting      ScheduleType = "meeting"
-	Delivery     ScheduleType = "delivery"
-	Visit        ScheduleType = "visit"
-	Workshop     ScheduleType = "workshop"
-	Event        ScheduleType = "event"
-	ServiceVisit ScheduleType = "service"
-	Maintenance  ScheduleType = "maintenance"
+import (
+	"time"
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
-func (st ScheduleType) String() string { return string(st) }
-
-
-
-================================================================================
-FILE: ./models/enums/business_model.go
-================================================================================
-
-package enums
-
-type BusinessModel string
-
-const (
-	Membership        BusinessModel = "membership"
-	RecurringProduct  BusinessModel = "recurring_product"
-	RecurringService  BusinessModel = "recurring_service"
-	UsageBased        BusinessModel = "usage_based"
-	Rental            BusinessModel = "rental"
-	Contract          BusinessModel = "contract"
-	Course            BusinessModel = "course"
-	SeatLicense       BusinessModel = "seat_license"
-	Insurance         BusinessModel = "insurance"
-	Leasing           BusinessModel = "leasing"
-	Custom            BusinessModel = "custom"
-)
-
-func (bm BusinessModel) String() string { return string(bm) }
-
-
-
-================================================================================
-FILE: ./models/enums/status.go
-================================================================================
-
-package enums
-
-type StatusCategory string
-
-const (
-	CategorySubscription StatusCategory = "subscription"
-	CategoryItem         StatusCategory = "item"
-	CategorySchedule     StatusCategory = "schedule"
-	CategoryResource     StatusCategory = "resource"
-	CategoryWaitlist     StatusCategory = "waitlist"
-)
-
-type Status struct {
-	ID       int16          `gorm:"primaryKey"`
-	Code     string         `gorm:"not null"`
-	Category StatusCategory `gorm:"not null"`
-	Name     string         `gorm:"not null"`
+type DailySubscriberMetrics struct {
+	CompanyID           uuid.UUID       `gorm:"type:uuid;primaryKey" json:"companyId"`
+	SubscriberType      string          `gorm:"type:varchar(20);primaryKey" json:"subscriberType"`
+	Date                time.Time       `gorm:"type:date;primaryKey" json:"date"`
+	ActiveSubscriptions int             `gorm:"not null;default:0" json:"activeSubscriptions"`
+	NewSubscriptions    int             `gorm:"not null;default:0" json:"newSubscriptions"`
+	TotalSpent          decimal.Decimal `gorm:"type:numeric(14,2);not null;default:0" json:"totalSpent"`
+	UpdatedAt           time.Time       `gorm:"default:now()" json:"updatedAt"`
 }
 
-func (Status) TableName() string { return "statuses" }
+
+
+================================================================================
+FILE: ./models/analytics/usage_fact.go
+================================================================================
+
+package analytics
+
+import (
+	"time"
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type UsageFact struct {
+	FactID              uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"factId"`
+	CompanyID           uuid.UUID       `gorm:"type:uuid;not null;index" json:"companyId"`
+	SubscriptionItemID  uuid.UUID       `gorm:"type:uuid;not null;index" json:"subscriptionItemId"`
+	FeatureKey          string          `gorm:"type:varchar(100);not null" json:"featureKey"`
+	Quantity            decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"quantity"`
+	UsageDate           time.Time       `gorm:"type:date;not null;index" json:"usageDate"`
+	CreatedAt           time.Time       `gorm:"default:now()" json:"createdAt"`
+}
 
 

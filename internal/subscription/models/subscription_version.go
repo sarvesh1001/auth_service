@@ -2,20 +2,14 @@ package models
 
 import (
 	"time"
-
 	"github.com/google/uuid"
-	"gorm.io/datatypes"
 )
 
 type SubscriptionVersion struct {
-	VersionID      uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	SubscriptionID uuid.UUID      `gorm:"type:uuid;not null;index"`
-	VersionNumber  int            `gorm:"not null"`
-	Snapshot       datatypes.JSON `gorm:"type:jsonb;not null"`
-	Reason         *string        `gorm:"type:text"`
-	CreatedAt      time.Time      `gorm:"not null;default:now()"`
-
-	Subscription Subscription `gorm:"foreignKey:SubscriptionID"`
+	VersionID      uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"versionId"`
+	SubscriptionID uuid.UUID  `gorm:"type:uuid;not null;index" json:"subscriptionId"`
+	VersionNumber  int        `gorm:"not null" json:"versionNumber"`
+	Snapshot       JSONB      `gorm:"type:jsonb;not null" json:"snapshot"`
+	Reason         *string    `gorm:"type:text" json:"reason,omitempty"`
+	CreatedAt      time.Time  `gorm:"not null;default:now()" json:"createdAt"`
 }
-
-func (SubscriptionVersion) TableName() string { return "subscription_versions" }

@@ -2,26 +2,20 @@ package models
 
 import (
 	"time"
-
 	"github.com/google/uuid"
-	"gorm.io/gorm"
+	"github.com/shopspring/decimal"
 )
 
 type Addon struct {
-	AddonID         uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	CompanyID       uuid.UUID      `gorm:"type:uuid;not null;index"`
-	Name            string         `gorm:"size:255;not null"`
-	Description     *string        `gorm:"type:text"`
-	BillingPolicyID uuid.UUID      `gorm:"type:uuid;not null"`
-	Price           float64        `gorm:"type:numeric(14,2);not null"`
-	Currency        string         `gorm:"size:3;not null;default:'USD'"`
-	IsActive        bool           `gorm:"not null;default:true"`
-	CreatedAt       time.Time      `gorm:"not null;default:now()"`
-	UpdatedAt       time.Time      `gorm:"not null;default:now()"`
-	DeletedAt       gorm.DeletedAt `gorm:"index"`
-
-	Company       Company       `gorm:"foreignKey:CompanyID"`
-	BillingPolicy BillingPolicy `gorm:"foreignKey:BillingPolicyID"`
+	AddonID         uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"addonId"`
+	CompanyID       uuid.UUID       `gorm:"type:uuid;not null;index" json:"companyId"`
+	Name            string          `gorm:"type:varchar(255);not null" json:"name"`
+	Description     *string         `gorm:"type:text" json:"description,omitempty"`
+	BillingPolicyID uuid.UUID       `gorm:"type:uuid;not null" json:"billingPolicyId"`
+	Price           decimal.Decimal `gorm:"type:numeric(14,2);not null" json:"price"`
+	Currency        string          `gorm:"type:varchar(3);not null;default:'USD'" json:"currency"`
+	IsActive        bool            `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt       time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt       time.Time       `gorm:"autoUpdateTime" json:"updatedAt"`
+	DeletedAt       *time.Time      `gorm:"index" json:"deletedAt,omitempty"`
 }
-
-func (Addon) TableName() string { return "addons" }

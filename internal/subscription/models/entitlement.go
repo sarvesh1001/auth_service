@@ -2,23 +2,18 @@ package models
 
 import (
 	"time"
-
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"auth-service/internal/subscription/models/enums"
 )
 
 type Entitlement struct {
-	EntitlementID uuid.UUID  `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	PlanItemID    uuid.UUID  `gorm:"type:uuid;not null;index"`
-	FeatureKey    string     `gorm:"size:100;not null"`
-	LimitValue    *float64   `gorm:"type:numeric(14,4)"`
-	LimitPeriod   *string    `gorm:"size:20;check:limit_period IN ('day','week','month','year','lifetime')"`
-	IsEnabled     bool       `gorm:"not null;default:true"`
-	CreatedAt     time.Time  `gorm:"not null;default:now()"`
-	UpdatedAt     time.Time  `gorm:"not null;default:now()"`
-
-	// relationships
-	PlanItem PlanItem        `gorm:"foreignKey:PlanItemID"`
-	Feature  FeatureRegistry `gorm:"foreignKey:FeatureKey"`
+	EntitlementID uuid.UUID          `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"entitlementId"`
+	PlanItemID    uuid.UUID          `gorm:"type:uuid;not null;index" json:"planItemId"`
+	FeatureKey    string             `gorm:"type:varchar(100);not null" json:"featureKey"`
+	LimitValue    *decimal.Decimal   `gorm:"type:numeric(14,4)" json:"limitValue,omitempty"`
+	LimitPeriod   enums.LimitPeriod  `gorm:"type:varchar(20);default:'month'" json:"limitPeriod,omitempty"`
+	IsEnabled     bool               `gorm:"not null;default:true" json:"isEnabled"`
+	CreatedAt     time.Time          `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt     time.Time          `gorm:"autoUpdateTime" json:"updatedAt"`
 }
-
-func (Entitlement) TableName() string { return "entitlements" }

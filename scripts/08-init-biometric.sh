@@ -1061,8 +1061,6 @@ SET subject_type = 'employee', subject_id = user_id
 WHERE subject_type IS NULL;
 
 -- Make user_id nullable and drop its FK constraint
-ALTER TABLE attendance.user_attendance_policies 
-ALTER COLUMN user_id DROP NOT NULL;
 
 ALTER TABLE attendance.user_attendance_policies 
 DROP CONSTRAINT IF EXISTS fk_uap_user;

@@ -1,0 +1,619 @@
+================================================================================
+CONSTRUCTOR FUNCTIONS EXTRACTED FOR FACTORY INIT
+================================================================================
+
+📄 handler/addon_handler.go
+  • NewAddonHandler(addonService service.AddonService, logger *zap.Logger) *AddonHandler
+
+📄 handler/analytics_handler.go
+  • NewAnalyticsHandler(analyticsService service.AnalyticsQueryService, logger *zap.Logger) *AnalyticsHandler
+
+📄 handler/base_handler.go
+  • NewBaseHandler(logger *zap.Logger) *BaseHandler
+
+📄 handler/benefit_handler.go
+  • NewBenefitHandler(benefitService service.BenefitService, logger *zap.Logger) *BenefitHandler
+
+📄 handler/billing_policy_handler.go
+  • NewBillingPolicyHandler(svc service.BillingPolicyService, logger *zap.Logger) *BillingPolicyHandler
+
+📄 handler/entitlement_handler.go
+  • NewEntitlementHandler(entitlementService service.EntitlementService, logger *zap.Logger) *EntitlementHandler
+
+📄 handler/feature_handler.go
+  • NewFeatureHandler(featureService service.FeatureService, logger *zap.Logger) *FeatureHandler
+
+📄 handler/pause_policy_handler.go
+  • NewPausePolicyHandler(pauseService service.PausePolicyService, logger *zap.Logger) *PausePolicyHandler
+
+📄 handler/plan_handler.go
+  • NewPlanHandler(planService service.PlanService,
+	planItemService service.PlanItemService,
+	planCloneService service.PlanCloneService,
+	planVersionService service.PlanVersionService,
+	logger *zap.Logger,) *PlanHandler
+
+📄 handler/proration_policy_handler.go
+  • NewProrationPolicyHandler(prorationService service.ProrationPolicyService, logger *zap.Logger) *ProrationPolicyHandler
+
+📄 handler/renewal_policy_handler.go
+  • NewRenewalPolicyHandler(renewalPolicyService service.RenewalPolicyService, logger *zap.Logger) *RenewalPolicyHandler
+
+📄 handler/subscription_handler.go
+  • NewSubscriptionHandler(subService service.SubscriptionService,
+	lifecycleService service.SubscriptionLifecycleService,
+	itemService service.SubscriptionItemService,
+	provisioningService service.SubscriptionProvisioningService,
+	logger *zap.Logger,) *SubscriptionHandler
+
+📄 handler/trial_handler.go
+  • NewTrialHandler(trialService service.TrialService, logger *zap.Logger) *TrialHandler
+
+📄 repository/addon_repository.go
+  • NewAddonRepository(logger *zap.Logger) AddonRepository
+
+📄 repository/analytics_repository.go
+  • NewAnalyticsRepository(logger *zap.Logger) AnalyticsRepository
+
+📄 repository/benefit_repository.go
+  • NewBenefitRepository(logger *zap.Logger) BenefitRepository
+
+📄 repository/billing_policy_repository.go
+  • NewBillingPolicyRepository(logger *zap.Logger) BillingPolicyRepository
+
+📄 repository/entitlement_repository.go
+  • NewEntitlementRepository(logger *zap.Logger) EntitlementRepository
+
+📄 repository/feature_repository.go
+  • NewFeatureRepository(logger *zap.Logger) FeatureRepository
+
+📄 repository/lookup_repository.go
+  • NewLookupRepository(logger *zap.Logger) LookupRepository
+
+📄 repository/pause_policy_repository.go
+  • NewPausePolicyRepository(logger *zap.Logger) PausePolicyRepository
+
+📄 repository/plan_item_repository.go
+  • NewPlanItemRepository(logger *zap.Logger) PlanItemRepository
+
+📄 repository/plan_repository.go
+  • NewPlanRepository(logger *zap.Logger) PlanRepository
+
+📄 repository/proration_policy_repository.go
+  • NewProrationPolicyRepository(logger *zap.Logger) ProrationPolicyRepository
+
+📄 repository/renewal_policy_repository.go
+  • NewRenewalPolicyRepository(logger *zap.Logger) RenewalPolicyRepository
+
+📄 repository/subscription_item_repository.go
+  • NewSubscriptionItemRepository(logger *zap.Logger) SubscriptionItemRepository
+
+📄 repository/subscription_repository.go
+  • NewSubscriptionRepository(logger *zap.Logger) SubscriptionRepository
+
+📄 repository/timeline_repository.go
+  • NewTimelineRepository(logger *zap.Logger) TimelineRepository
+
+📄 repository/trial_repository.go
+  • NewTrialRepository(logger *zap.Logger) TrialRepository
+
+📄 repository/usage_repository.go
+  • NewUsageRepository(logger *zap.Logger) UsageRepository
+
+📄 repository/version_repository.go
+  • NewVersionRepository(logger *zap.Logger) VersionRepository
+
+📄 service/addon_service.go
+  • NewAddonService(addonRepo repository.AddonRepository,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,) AddonService
+
+📄 service/analytics_query_service.go
+  • NewAnalyticsQueryService(repo repository.AnalyticsRepository,
+	db *sql.DB,
+	logger *zap.Logger,) AnalyticsQueryService
+
+📄 service/analytics_service.go
+  • NewSubscriptionAnalyticsService(analyticsRepo repository.AnalyticsRepository,
+	subRepo repository.SubscriptionRepository,
+	subItemRepo repository.SubscriptionItemRepository,
+	planRepo repository.PlanRepository,
+	planItemRepo repository.PlanItemRepository,
+	benefitRepo repository.BenefitRepository,
+	billingPolicyRepo repository.BillingPolicyRepository,
+	renewalPolicyRepo repository.RenewalPolicyRepository,
+	pausePolicyRepo repository.PausePolicyRepository,
+	entitlementRepo repository.EntitlementRepository,
+	featureRepo repository.FeatureRepository,
+	idempotencyStore idempotency.Store,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,) SubscriptionAnalyticsService
+
+📄 service/benefit_service.go
+  • NewBenefitService(benefitRepo repository.BenefitRepository,
+	planItemRepo repository.PlanItemRepository,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+	auditService *audit.AuditService,) BenefitService
+
+📄 service/billing_engine_service.go
+  • NewBillingEngineService(subRepo repository.SubscriptionRepository,
+	subItemRepo repository.SubscriptionItemRepository,
+	planRepo repository.PlanRepository,
+	planItemRepo repository.PlanItemRepository,
+	billingPolicyRepo repository.BillingPolicyRepository,
+	prorationPolicyRepo repository.ProrationPolicyRepository,
+	renewalPolicyRepo repository.RenewalPolicyRepository,
+	pricingService service.PricingService,
+	couponService service.CouponService,
+	discountService service.DiscountEngineService,
+	taxService service.TaxIntegrationService,
+	invoiceService service.InvoiceService,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,) *BillingEngineService
+
+📄 service/billing_policy_service.go
+  • NewBillingPolicyService(repo repository.BillingPolicyRepository,
+	lookupRepo repository.LookupRepository,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,) BillingPolicyService
+
+📄 service/entitlement_service.go
+  • NewEntitlementService(repo repository.EntitlementRepository,
+	planItemRepo repository.PlanItemRepository,
+	planRepo repository.PlanRepository,
+	subRepo repository.SubscriptionRepository,
+	subItemRepo repository.SubscriptionItemRepository,
+	usageRepo repository.UsageRepository,
+	featureRepo repository.FeatureRepository,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,) EntitlementService
+
+📄 service/feature_service.go
+  • NewFeatureService(repo repository.FeatureRepository,
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,) FeatureService
+
+📄 service/pause_policy_service.go
+  • NewPausePolicyService(repo repository.PausePolicyRepository,
+	planRepo repository.PlanRepository,
+	idempotencyStore idempotency.Store,
+	outboxRepo outbox.Repository,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,) PausePolicyService
+
+📄 service/plan_clone_service.go
+  • NewPlanCloneService(planRepo repository.PlanRepository,
+	planItemRepo repository.PlanItemRepository,
+	benefitRepo repository.BenefitRepository,
+	entitlementRepo repository.EntitlementRepository,
+	billingPolicyRepo repository.BillingPolicyRepository,
+	renewalPolicyRepo repository.RenewalPolicyRepository,
+	pausePolicyRepo repository.PausePolicyRepository,
+	prorationPolicyRepo repository.ProrationPolicyRepository,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,) PlanCloneService
+
+📄 service/plan_item_service.go
+  • NewPlanItemService(planItemRepo repository.PlanItemRepository,
+	planRepo repository.PlanRepository,
+	subscriptionRepo repository.SubscriptionRepository,
+	subItemRepo repository.SubscriptionItemRepository,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,) PlanItemService
+
+📄 service/plan_service.go
+  • NewPlanValidationService(planRepo repository.PlanRepository,
+	billingPolicyRepo repository.BillingPolicyRepository,
+	renewalPolicyRepo repository.RenewalPolicyRepository,
+	pausePolicyRepo repository.PausePolicyRepository,
+	prorationPolicyRepo repository.ProrationPolicyRepository,
+	logger *zap.Logger,) PlanValidationService
+  • NewPlanService(planRepo repository.PlanRepository,
+	planItemRepo repository.PlanItemRepository,
+	subscriptionRepo repository.SubscriptionRepository,
+	validationService PlanValidationService,
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,) PlanService
+
+📄 service/plan_version_service.go
+  • NewPlanVersionService(planRepo repository.PlanRepository,
+	versionRepo repository.VersionRepository,
+	planItemRepo repository.PlanItemRepository,
+	benefitRepo repository.BenefitRepository,
+	entitlementRepo repository.EntitlementRepository,
+	billingPolicyRepo repository.BillingPolicyRepository,
+	renewalPolicyRepo repository.RenewalPolicyRepository,
+	pausePolicyRepo repository.PausePolicyRepository,
+	prorationPolicyRepo repository.ProrationPolicyRepository,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,) PlanVersionService
+
+📄 service/proration_service.go
+  • NewProrationPolicyService(repo repository.ProrationPolicyRepository,
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,) ProrationPolicyService
+
+📄 service/renewal_engine_service.go
+  • NewRenewalEngineService(subRepo repository.SubscriptionRepository,
+	planRepo repository.PlanRepository,
+	renewalPolicyRepo repository.RenewalPolicyRepository,
+	billingEngine *BillingEngineService,
+	lifecycleService SubscriptionLifecycleService,
+	logger *zap.Logger,) *RenewalEngineService
+
+📄 service/renewal_service.go
+  • NewRenewalPolicyService(repo repository.RenewalPolicyRepository,
+	planRepo repository.PlanRepository,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,) RenewalPolicyService
+
+📄 service/subscription_item_service.go
+  • NewSubscriptionItemService(subItemRepo repository.SubscriptionItemRepository,
+	planItemRepo repository.PlanItemRepository,
+	addonRepo repository.AddonRepository,
+	subRepo repository.SubscriptionRepository,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,) SubscriptionItemService
+
+📄 service/subscription_lifecycle_service.go
+  • NewSubscriptionLifecycleService(subRepo repository.SubscriptionRepository,
+	subItemRepo repository.SubscriptionItemRepository,
+	timelineRepo repository.TimelineRepository,
+	trialRepo repository.TrialRepository,
+	usageRepo repository.UsageRepository,
+	planRepo repository.PlanRepository,
+	planItemRepo repository.PlanItemRepository,
+	entitlementService EntitlementService,
+	validationService SubscriptionValidationService,
+	billingEngine *BillingEngineService, // <-- NEW
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,) SubscriptionLifecycleService
+
+📄 service/subscription_provisioning_service.go
+  • NewSubscriptionProvisioningService(subRepo repository.SubscriptionRepository,
+	subItemRepo repository.SubscriptionItemRepository,
+	planRepo repository.PlanRepository,
+	planItemRepo repository.PlanItemRepository,
+	entitlementRepo repository.EntitlementRepository,
+	benefitRepo repository.BenefitRepository,
+	usageRepo repository.UsageRepository,
+	trialRepo repository.TrialRepository,
+	timelineRepo repository.TimelineRepository,
+	featureRepo repository.FeatureRepository,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,) SubscriptionProvisioningService
+
+📄 service/subscription_service.go
+  • NewSubscriptionService(subRepo repository.SubscriptionRepository,
+	subItemRepo repository.SubscriptionItemRepository,
+	timelineRepo repository.TimelineRepository,
+	validationService SubscriptionValidationService,
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,) SubscriptionService
+
+📄 service/trial_service.go
+  • NewTrialService(trialRepo repository.TrialRepository,
+	subRepo repository.SubscriptionRepository,
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,) TrialService
+
+📄 service/validation_service.go
+  • NewSubscriptionValidationService(subRepo repository.SubscriptionRepository,
+	subItemRepo repository.SubscriptionItemRepository,
+	planRepo repository.PlanRepository,
+	addonRepo repository.AddonRepository,
+	trialRepo repository.TrialRepository,
+	usageRepo repository.UsageRepository,
+	entitlementRepo repository.EntitlementRepository,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,) SubscriptionValidationService
+
+
+================================================================================
+CONSTRUCTOR PARAMETER SUMMARY (for dependency injection)
+================================================================================
+
+NewEntitlementService ← repo repository.EntitlementRepository,
+	planItemRepo repository.PlanItemRepository,
+	planRepo repository.PlanRepository,
+	subRepo repository.SubscriptionRepository,
+	subItemRepo repository.SubscriptionItemRepository,
+	usageRepo repository.UsageRepository,
+	featureRepo repository.FeatureRepository,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+NewBillingPolicyService ← repo repository.BillingPolicyRepository,
+	lookupRepo repository.LookupRepository,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+NewSubscriptionService ← subRepo repository.SubscriptionRepository,
+	subItemRepo repository.SubscriptionItemRepository,
+	timelineRepo repository.TimelineRepository,
+	validationService SubscriptionValidationService,
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+NewSubscriptionLifecycleService ← subRepo repository.SubscriptionRepository,
+	subItemRepo repository.SubscriptionItemRepository,
+	timelineRepo repository.TimelineRepository,
+	trialRepo repository.TrialRepository,
+	usageRepo repository.UsageRepository,
+	planRepo repository.PlanRepository,
+	planItemRepo repository.PlanItemRepository,
+	entitlementService EntitlementService,
+	validationService SubscriptionValidationService,
+	billingEngine *BillingEngineService, // <-- NEW
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+NewPlanItemService ← planItemRepo repository.PlanItemRepository,
+	planRepo repository.PlanRepository,
+	subscriptionRepo repository.SubscriptionRepository,
+	subItemRepo repository.SubscriptionItemRepository,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+NewAddonService ← addonRepo repository.AddonRepository,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+NewTrialService ← trialRepo repository.TrialRepository,
+	subRepo repository.SubscriptionRepository,
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+NewBillingEngineService ← subRepo repository.SubscriptionRepository,
+	subItemRepo repository.SubscriptionItemRepository,
+	planRepo repository.PlanRepository,
+	planItemRepo repository.PlanItemRepository,
+	billingPolicyRepo repository.BillingPolicyRepository,
+	prorationPolicyRepo repository.ProrationPolicyRepository,
+	renewalPolicyRepo repository.RenewalPolicyRepository,
+	pricingService service.PricingService,
+	couponService service.CouponService,
+	discountService service.DiscountEngineService,
+	taxService service.TaxIntegrationService,
+	invoiceService service.InvoiceService,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,
+NewRenewalEngineService ← subRepo repository.SubscriptionRepository,
+	planRepo repository.PlanRepository,
+	renewalPolicyRepo repository.RenewalPolicyRepository,
+	billingEngine *BillingEngineService,
+	lifecycleService SubscriptionLifecycleService,
+	logger *zap.Logger,
+NewBenefitService ← benefitRepo repository.BenefitRepository,
+	planItemRepo repository.PlanItemRepository,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+	auditService *audit.AuditService,
+NewPausePolicyService ← repo repository.PausePolicyRepository,
+	planRepo repository.PlanRepository,
+	idempotencyStore idempotency.Store,
+	outboxRepo outbox.Repository,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+NewProrationPolicyService ← repo repository.ProrationPolicyRepository,
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+NewPlanCloneService ← planRepo repository.PlanRepository,
+	planItemRepo repository.PlanItemRepository,
+	benefitRepo repository.BenefitRepository,
+	entitlementRepo repository.EntitlementRepository,
+	billingPolicyRepo repository.BillingPolicyRepository,
+	renewalPolicyRepo repository.RenewalPolicyRepository,
+	pausePolicyRepo repository.PausePolicyRepository,
+	prorationPolicyRepo repository.ProrationPolicyRepository,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+NewRenewalPolicyService ← repo repository.RenewalPolicyRepository,
+	planRepo repository.PlanRepository,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+NewPlanValidationService ← planRepo repository.PlanRepository,
+	billingPolicyRepo repository.BillingPolicyRepository,
+	renewalPolicyRepo repository.RenewalPolicyRepository,
+	pausePolicyRepo repository.PausePolicyRepository,
+	prorationPolicyRepo repository.ProrationPolicyRepository,
+	logger *zap.Logger,
+NewPlanService ← planRepo repository.PlanRepository,
+	planItemRepo repository.PlanItemRepository,
+	subscriptionRepo repository.SubscriptionRepository,
+	validationService PlanValidationService,
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+NewSubscriptionValidationService ← subRepo repository.SubscriptionRepository,
+	subItemRepo repository.SubscriptionItemRepository,
+	planRepo repository.PlanRepository,
+	addonRepo repository.AddonRepository,
+	trialRepo repository.TrialRepository,
+	usageRepo repository.UsageRepository,
+	entitlementRepo repository.EntitlementRepository,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+NewSubscriptionAnalyticsService ← analyticsRepo repository.AnalyticsRepository,
+	subRepo repository.SubscriptionRepository,
+	subItemRepo repository.SubscriptionItemRepository,
+	planRepo repository.PlanRepository,
+	planItemRepo repository.PlanItemRepository,
+	benefitRepo repository.BenefitRepository,
+	billingPolicyRepo repository.BillingPolicyRepository,
+	renewalPolicyRepo repository.RenewalPolicyRepository,
+	pausePolicyRepo repository.PausePolicyRepository,
+	entitlementRepo repository.EntitlementRepository,
+	featureRepo repository.FeatureRepository,
+	idempotencyStore idempotency.Store,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+NewFeatureService ← repo repository.FeatureRepository,
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+NewPlanVersionService ← planRepo repository.PlanRepository,
+	versionRepo repository.VersionRepository,
+	planItemRepo repository.PlanItemRepository,
+	benefitRepo repository.BenefitRepository,
+	entitlementRepo repository.EntitlementRepository,
+	billingPolicyRepo repository.BillingPolicyRepository,
+	renewalPolicyRepo repository.RenewalPolicyRepository,
+	pausePolicyRepo repository.PausePolicyRepository,
+	prorationPolicyRepo repository.ProrationPolicyRepository,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+NewSubscriptionItemService ← subItemRepo repository.SubscriptionItemRepository,
+	planItemRepo repository.PlanItemRepository,
+	addonRepo repository.AddonRepository,
+	subRepo repository.SubscriptionRepository,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+NewSubscriptionProvisioningService ← subRepo repository.SubscriptionRepository,
+	subItemRepo repository.SubscriptionItemRepository,
+	planRepo repository.PlanRepository,
+	planItemRepo repository.PlanItemRepository,
+	entitlementRepo repository.EntitlementRepository,
+	benefitRepo repository.BenefitRepository,
+	usageRepo repository.UsageRepository,
+	trialRepo repository.TrialRepository,
+	timelineRepo repository.TimelineRepository,
+	featureRepo repository.FeatureRepository,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+NewAnalyticsQueryService ← repo repository.AnalyticsRepository,
+	db *sql.DB,
+	logger *zap.Logger,
+NewSubscriptionHandler ← subService service.SubscriptionService,
+	lifecycleService service.SubscriptionLifecycleService,
+	itemService service.SubscriptionItemService,
+	provisioningService service.SubscriptionProvisioningService,
+	logger *zap.Logger,
+NewRenewalPolicyHandler ← renewalPolicyService service.RenewalPolicyService, logger *zap.Logger
+NewBillingPolicyHandler ← svc service.BillingPolicyService, logger *zap.Logger
+NewEntitlementHandler ← entitlementService service.EntitlementService, logger *zap.Logger
+NewPausePolicyHandler ← pauseService service.PausePolicyService, logger *zap.Logger
+NewBenefitHandler ← benefitService service.BenefitService, logger *zap.Logger
+NewTrialHandler ← trialService service.TrialService, logger *zap.Logger
+NewAddonHandler ← addonService service.AddonService, logger *zap.Logger
+NewProrationPolicyHandler ← prorationService service.ProrationPolicyService, logger *zap.Logger
+NewPlanHandler ← planService service.PlanService,
+	planItemService service.PlanItemService,
+	planCloneService service.PlanCloneService,
+	planVersionService service.PlanVersionService,
+	logger *zap.Logger,
+NewBaseHandler ← logger *zap.Logger
+NewFeatureHandler ← featureService service.FeatureService, logger *zap.Logger
+NewAnalyticsHandler ← analyticsService service.AnalyticsQueryService, logger *zap.Logger
+NewFeatureRepository ← logger *zap.Logger
+NewPlanItemRepository ← logger *zap.Logger
+NewTimelineRepository ← logger *zap.Logger
+NewPausePolicyRepository ← logger *zap.Logger
+NewPlanRepository ← logger *zap.Logger
+NewVersionRepository ← logger *zap.Logger
+NewSubscriptionItemRepository ← logger *zap.Logger
+NewRenewalPolicyRepository ← logger *zap.Logger
+NewLookupRepository ← logger *zap.Logger
+NewBenefitRepository ← logger *zap.Logger
+NewProrationPolicyRepository ← logger *zap.Logger
+NewEntitlementRepository ← logger *zap.Logger
+NewUsageRepository ← logger *zap.Logger
+NewSubscriptionRepository ← logger *zap.Logger
+NewAddonRepository ← logger *zap.Logger
+NewBillingPolicyRepository ← logger *zap.Logger
+NewAnalyticsRepository ← logger *zap.Logger
+NewTrialRepository ← logger *zap.Logger

@@ -2,25 +2,17 @@ package models
 
 import (
 	"time"
-
 	"github.com/google/uuid"
-	"gorm.io/datatypes"
+	"auth-service/internal/subscription/models/enums"
 )
 
 type SubscriptionTimeline struct {
-	TimelineID   uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	SubscriptionID uuid.UUID    `gorm:"type:uuid;not null;index"`
-	EventType    string         `gorm:"size:50;not null;index"`
-	OldStatusID  *int16         `gorm:"default:null"`
-	NewStatusID  *int16         `gorm:"default:null"`
-	PerformedBy  *uuid.UUID     `gorm:"type:uuid"`
-	Metadata     datatypes.JSON `gorm:"type:jsonb"`
-	CreatedAt    time.Time      `gorm:"not null;default:now()"`
-
-	Subscription Subscription `gorm:"foreignKey:SubscriptionID"`
-	OldStatus    *Status      `gorm:"foreignKey:OldStatusID"`
-	NewStatus    *Status      `gorm:"foreignKey:NewStatusID"`
-	Performer    *User        `gorm:"foreignKey:PerformedBy"`
+	TimelineID   uuid.UUID          `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"timelineId"`
+	SubscriptionID uuid.UUID        `gorm:"type:uuid;not null;index" json:"subscriptionId"`
+	EventType    enums.TimelineEvent `gorm:"type:varchar(50);not null" json:"eventType"`
+	OldStatus    *enums.SubscriptionStatus `gorm:"type:varchar(20)" json:"oldStatus,omitempty"`
+	NewStatus    *enums.SubscriptionStatus `gorm:"type:varchar(20)" json:"newStatus,omitempty"`
+	PerformedBy  *uuid.UUID          `gorm:"type:uuid" json:"performedBy,omitempty"`
+	Metadata     JSONB               `gorm:"type:jsonb" json:"metadata,omitempty"`
+	CreatedAt    time.Time           `gorm:"not null;default:now()" json:"createdAt"`
 }
-
-func (SubscriptionTimeline) TableName() string { return "subscription_timeline" }

@@ -3,8 +3,8 @@
 # File: scripts/init-kafka-topics.sh
 # Purpose: Create only the Kafka topics actually used
 #          after consolidating all academic events
-#          into "academics-events" and adding inventory
-#          and sales modules.
+#          into "academics-events" and adding inventory,
+#          sales, and subscription modules.
 # ===============================================
 
 set -e
@@ -91,7 +91,7 @@ echo "🚀 Creating Kafka topics..."
 echo ""
 
 # -----------------------------------------------
-# Topic definitions – only what's actually used
+# Topic definitions – all topics actually used
 # -----------------------------------------------
 declare -A TOPIC_CONFIGS=(
 
@@ -112,10 +112,14 @@ declare -A TOPIC_CONFIGS=(
     # Sales module
     ["sales-events"]="3 1 2592000000 gzip"
 
+    # Subscription module (plans, subscriptions, etc.) – used by SubscriptionAnalyticsService
+    ["subscription-events"]="3 1 2592000000 gzip"
+
     # Time‑series / analytics events (consumed by ClickHouse)
     ["device-events"]="3 1 2592000000 gzip"
     ["mpin-events"]="3 1 2592000000 gzip"
     ["otp-events"]="3 1 604800000 gzip"
+    ["attendance.events"]="3 1 2592000000 gzip"
 
     # Security audit (consumed by both ES and ClickHouse)
     ["security-events"]="3 1 7776000000 gzip"
@@ -128,6 +132,8 @@ declare -A TOPIC_CONFIGS=(
     ["accounting-events.dlq"]="3 1 604800000 gzip"
     ["inventory-events.dlq"]="3 1 604800000 gzip"
     ["sales-events.dlq"]="3 1 604800000 gzip"
+    ["subscription-events.dlq"]="3 1 604800000 gzip"
+    ["attendance.events.dlq"]="3 1 604800000 gzip"
 )
 
 FAILED_TOPICS=()
@@ -184,8 +190,12 @@ echo "🛒 Sales:"
 check_topic "sales-events"
 
 echo ""
+echo "📋 Subscription:"
+check_topic "subscription-events"
+
+echo ""
 echo "📈 Time‑Series / Analytics:"
-for t in "device-events" "mpin-events" "otp-events" "security-events" "audit-logs"; do check_topic $t; done
+for t in "device-events" "mpin-events" "otp-events" "security-events" "audit-logs" "attendance.events"; do check_topic $t; done
 
 echo ""
 echo "⚠️ DLQ Topics:"
@@ -193,6 +203,8 @@ check_topic "academics-events.dlq"
 check_topic "accounting-events.dlq"
 check_topic "inventory-events.dlq"
 check_topic "sales-events.dlq"
+check_topic "subscription-events.dlq"
+check_topic "attendance.events.dlq"
 
 echo ""
 

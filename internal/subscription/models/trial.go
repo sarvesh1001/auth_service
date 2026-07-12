@@ -2,24 +2,19 @@ package models
 
 import (
 	"time"
-
 	"github.com/google/uuid"
-	"gorm.io/datatypes"
+	"auth-service/internal/subscription/models/enums"
 )
 
 type Trial struct {
-	TrialID         uuid.UUID      `gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	SubscriptionID  uuid.UUID      `gorm:"type:uuid;not null;index"`
-	StartedAt       time.Time      `gorm:"not null;default:now()"`
-	EndedAt         *time.Time     `gorm:"type:timestamptz"`
-	TrialDays       int            `gorm:"not null"`
-	FeaturesEnabled datatypes.JSON `gorm:"type:jsonb;not null;default:'{}'"`
-	UsageConsumed   datatypes.JSON `gorm:"type:jsonb;not null;default:'{}'"`
-	Status          string         `gorm:"size:20;not null;default:'active';check:status IN ('active','expired','converted','cancelled')"`
-	CreatedAt       time.Time      `gorm:"not null;default:now()"`
-	UpdatedAt       time.Time      `gorm:"not null;default:now()"`
-
-	Subscription Subscription `gorm:"foreignKey:SubscriptionID"`
+	TrialID        uuid.UUID          `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"trialId"`
+	SubscriptionID uuid.UUID          `gorm:"type:uuid;not null;index" json:"subscriptionId"`
+	StartedAt      time.Time          `gorm:"type:timestamptz;not null;default:now()" json:"startedAt"`
+	EndedAt        *time.Time         `gorm:"type:timestamptz" json:"endedAt,omitempty"`
+	TrialDays      int                `gorm:"not null" json:"trialDays"`
+	FeaturesEnabled JSONB              `gorm:"type:jsonb;not null;default:'{}'" json:"featuresEnabled"`
+	UsageConsumed  JSONB              `gorm:"type:jsonb;not null;default:'{}'" json:"usageConsumed"`
+	Status         enums.TrialStatus  `gorm:"type:varchar(20);not null;default:'active'" json:"status"`
+	CreatedAt      time.Time          `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt      time.Time          `gorm:"autoUpdateTime" json:"updatedAt"`
 }
-
-func (Trial) TableName() string { return "trials" }
