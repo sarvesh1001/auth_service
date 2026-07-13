@@ -46,6 +46,13 @@ type ResolvedSubject struct {
 	PolicyCode  *string
 	PolicyType  *string
 	PolicyRules interface{} // can be *models.PolicyRules or JSON
+
+	// Subscription related (for customers)
+	SubscriptionStatus    string     `json:"subscription_status,omitempty"` // "active", "trial", "no_subscription"
+	SubscriptionID        *uuid.UUID `json:"subscription_id,omitempty"`
+	TrialID               *uuid.UUID `json:"trial_id,omitempty"`
+	HasActiveSubscription bool       `json:"has_active_subscription"`
+	HasActiveTrial        bool       `json:"has_active_trial"`
 }
 
 // SubjectResolver is the main interface for resolving any subject.

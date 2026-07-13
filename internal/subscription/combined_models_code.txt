@@ -193,14 +193,23 @@ package models
 
 import (
 	"time"
+
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
+
 	"auth-service/internal/subscription/models/enums"
 )
 
 type PlanItem struct {
-	PlanItemID      uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"planItemId"`
-	PlanID          uuid.UUID       `gorm:"type:uuid;not null;index" json:"planId"`
+	PlanItemID uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"planItemId"`
+	PlanID     uuid.UUID `gorm:"type:uuid;not null;index" json:"planId"`
+
+	// New fields for event‑driven product sync
+	CompanyID uuid.UUID              `gorm:"type:uuid;not null;index" json:"companyId"`   // ✅ Scoping for sales listener
+	TaxRate   *decimal.Decimal       `gorm:"type:numeric(10,2)" json:"taxRate,omitempty"` // ✅ Override product tax rate
+	ProductID *uuid.UUID             `gorm:"type:uuid;index" json:"productId,omitempty"`  // ✅ Link to sales.product
+	Metadata  map[string]interface{} `gorm:"type:jsonb" json:"metadata,omitempty"`        // ✅ Extensibility
+
 	ItemType        enums.ItemType  `gorm:"type:varchar(20);not null" json:"itemType"`
 	Name            string          `gorm:"type:varchar(255);not null" json:"name"`
 	Description     *string         `gorm:"type:text" json:"description,omitempty"`
@@ -1212,6 +1221,18 @@ func (s ItemStatus) IsValid() bool {
 		return true
 	}
 	return false
+}
+
+// internal/subscription/models/enums/item_status.go
+func (s ItemStatus) ToStatusID() int {
+	switch s {
+	case ItemStatusActive:
+		return 7 // from your statuses table
+	case ItemStatusInactive:
+		return 8
+	default:
+		return 7 // fallback
+	}
 }
 
 

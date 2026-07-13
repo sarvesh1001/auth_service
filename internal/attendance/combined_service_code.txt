@@ -644,11 +644,13 @@ type SchedulingService interface {
 	UpdateScheduleInstance(ctx context.Context, instanceID uuid.UUID, update ScheduleInstanceUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleInstance, error)
 	DeleteScheduleInstance(ctx context.Context, instanceID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
 	BulkCreateScheduleInstances(ctx context.Context, instances []*models.ScheduleInstance, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
+
 	// Leave Integration
 	ApplyApprovedLeave(ctx context.Context, leaveData *LeaveScheduleData, actorType string, actorID uuid.UUID) error
 	RollbackCancelledLeave(ctx context.Context, leaveData *LeaveScheduleData, actorType string, actorID uuid.UUID) error
-	// Schedule Generation
-	GenerateScheduleForUser(ctx context.Context, userID uuid.UUID, config ScheduleGenerationConfig, actorType string, actorID uuid.UUID) ([]*models.ScheduleInstance, error)
+
+	// Schedule Generation – FIXED: added companyID parameter
+	GenerateScheduleForUser(ctx context.Context, companyID, userID uuid.UUID, config ScheduleGenerationConfig, actorType string, actorID uuid.UUID) ([]*models.ScheduleInstance, error)
 	GenerateScheduleForCompany(ctx context.Context, companyID uuid.UUID, config ScheduleGenerationConfig, actorType string, actorID uuid.UUID) ([]*models.ScheduleInstance, error)
 
 	// Overrides
@@ -1022,12 +1024,13 @@ func (s *schedulingServiceImpl) BulkCreateScheduleInstances(ctx context.Context,
 
 // ---- Generation ----
 
-func (s *schedulingServiceImpl) GenerateScheduleForUser(ctx context.Context, userID uuid.UUID, config ScheduleGenerationConfig, actorType string, actorID uuid.UUID) ([]*models.ScheduleInstance, error) {
-	subject, err := s.subjectResolver.ResolveSubject(ctx, uuid.Nil, userID, "employee", config.StartDate)
+// GenerateScheduleForUser – FIXED: companyID is passed as parameter
+func (s *schedulingServiceImpl) GenerateScheduleForUser(ctx context.Context, companyID, userID uuid.UUID, config ScheduleGenerationConfig, actorType string, actorID uuid.UUID) ([]*models.ScheduleInstance, error) {
+	subject, err := s.subjectResolver.ResolveSubject(ctx, companyID, userID, "employee", config.StartDate)
 	if err != nil || subject == nil {
 		return nil, fmt.Errorf("failed to resolve subject: %w", err)
 	}
-	companyID := subject.CompanyID
+	// Use the passed companyID, not from subject
 	instances := s.generateInstancesForUser(ctx, companyID, userID, config, actorType, actorID)
 	if len(instances) == 0 {
 		return []*models.ScheduleInstance{}, nil
@@ -1063,20 +1066,69 @@ func (s *schedulingServiceImpl) generateInstancesForUser(ctx context.Context, co
 	now := time.Now().In(loc)
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 
+	s.logger.Info("Starting schedule generation for user",
+		zap.String("user_id", userID.String()),
+		zap.String("start_date", config.StartDate.Format("2006-01-02")),
+		zap.String("end_date", config.EndDate.Format("2006-01-02")),
+		zap.Bool("overwrite", config.Overwrite),
+	)
+
 	for d := config.StartDate; !d.After(config.EndDate); d = d.AddDate(0, 0, 1) {
 		if !d.After(today) {
+			s.logger.Debug("Skipping past date",
+				zap.String("date", d.Format("2006-01-02")),
+				zap.String("today", today.Format("2006-01-02")))
 			continue
 		}
+
 		if !config.Overwrite {
 			exists, _ := s.schedulingRepo.HasActiveSchedule(ctx, companyID, userID, d)
 			if exists {
+				s.logger.Debug("Active schedule exists, skipping",
+					zap.String("user", userID.String()),
+					zap.String("date", d.Format("2006-01-02")))
 				continue
 			}
 		}
+
 		resolved, err := s.ResolveUserDay(ctx, companyID, userID, d)
-		if err != nil || resolved.ScheduleStatus != "scheduled" {
+		if err != nil {
+			s.logger.Warn("ResolveUserDay failed",
+				zap.Error(err),
+				zap.String("user", userID.String()),
+				zap.String("date", d.Format("2006-01-02")))
 			continue
 		}
+
+		s.logger.Debug("ResolveUserDay result",
+			zap.String("user", userID.String()),
+			zap.String("date", d.Format("2006-01-02")),
+			zap.String("status", resolved.ScheduleStatus),
+			zap.Bool("is_schedulable", resolved.IsSchedulable),
+			zap.String("work_center", func() string {
+				if resolved.WorkCenterCode != nil {
+					return *resolved.WorkCenterCode
+				}
+				return "<nil>"
+			}()),
+			zap.Any("shift_id", resolved.ShiftID),
+		)
+
+		if resolved.ScheduleStatus != "scheduled" {
+			s.logger.Debug("Day not schedulable, skipping",
+				zap.String("user", userID.String()),
+				zap.String("date", d.Format("2006-01-02")),
+				zap.String("status", resolved.ScheduleStatus))
+			continue
+		}
+
+		if resolved.ShiftID == nil {
+			s.logger.Warn("Resolved day has no shift ID, skipping",
+				zap.String("user", userID.String()),
+				zap.String("date", d.Format("2006-01-02")))
+			continue
+		}
+
 		inst := &models.ScheduleInstance{
 			ScheduleInstanceID: uuid.New(),
 			CompanyID:          companyID,
@@ -1091,7 +1143,14 @@ func (s *schedulingServiceImpl) generateInstancesForUser(ctx context.Context, co
 			Status:             "active",
 		}
 		instances = append(instances, inst)
+		s.logger.Debug("Created instance for date",
+			zap.String("date", d.Format("2006-01-02")),
+			zap.String("template_id", resolved.ShiftID.String()))
 	}
+
+	s.logger.Info("Generated schedule instances",
+		zap.String("user_id", userID.String()),
+		zap.Int("count", len(instances)))
 	return instances
 }
 
@@ -1192,15 +1251,47 @@ func (s *schedulingServiceImpl) UpdateWorkCenterShiftMappingByKey(ctx context.Co
 // ---- Schedule Resolution ----
 
 func (s *schedulingServiceImpl) ResolveUserDay(ctx context.Context, companyID, userID uuid.UUID, date time.Time) (*PositionBasedResolvedDay, error) {
+	s.logger.Info("Resolving user day",
+		zap.String("user_id", userID.String()),
+		zap.String("date", date.Format("2006-01-02")))
+
 	subject, err := s.subjectResolver.ResolveSubject(ctx, companyID, userID, "employee", date)
 	if err != nil {
+		s.logger.Error("Failed to resolve subject", zap.Error(err))
 		return nil, err
 	}
+	if subject == nil {
+		s.logger.Warn("Subject resolution returned nil", zap.String("user_id", userID.String()))
+		return &PositionBasedResolvedDay{IsSchedulable: false, ScheduleStatus: "subject_not_found"}, nil
+	}
+
+	s.logger.Info("Subject resolved",
+		zap.String("user_id", userID.String()),
+		zap.String("position_id", func() string {
+			if subject.PositionID != nil {
+				return subject.PositionID.String()
+			}
+			return "<nil>"
+		}()),
+		zap.String("work_center_code", func() string {
+			if subject.WorkCenterCode != nil {
+				return *subject.WorkCenterCode
+			}
+			return "<nil>"
+		}()),
+		zap.Bool("is_active", subject.IsActive),
+		zap.Bool("attendance_required", subject.AttendanceRequired),
+		zap.Bool("overtime_allowed", subject.OvertimeAllowed),
+	)
+
 	if !subject.IsActive {
+		s.logger.Info("Subject is inactive", zap.String("user_id", userID.String()))
 		return &PositionBasedResolvedDay{IsSchedulable: false, ScheduleStatus: "inactive"}, nil
 	}
+
 	overrideInfo, _ := s.subjectResolver.ResolveOverride(ctx, companyID, userID, "employee", date)
 	if overrideInfo != nil && overrideInfo.IsOnLeave {
+		s.logger.Info("User on leave", zap.String("user_id", userID.String()))
 		return &PositionBasedResolvedDay{
 			Date:           date,
 			Timezone:       "UTC",
@@ -1212,16 +1303,27 @@ func (s *schedulingServiceImpl) ResolveUserDay(ctx context.Context, companyID, u
 			LeaveRequestID: overrideInfo.LeaveRequestID,
 		}, nil
 	}
+
 	schOverride, _ := s.schedulingRepo.GetScheduleOverrideByUserDate(ctx, userID, date)
 	if schOverride != nil && schOverride.OverrideType == "off" {
-		return &PositionBasedResolvedDay{IsSchedulable: false, ScheduleStatus: "override_off", IsOverride: true, OverrideType: &schOverride.OverrideType}, nil
+		s.logger.Info("Schedule override 'off' found", zap.String("user_id", userID.String()))
+		return &PositionBasedResolvedDay{
+			IsSchedulable:  false,
+			ScheduleStatus: "override_off",
+			IsOverride:     true,
+			OverrideType:   &schOverride.OverrideType,
+		}, nil
 	}
+
 	instances, _ := s.schedulingRepo.GetScheduleInstancesByUserDate(ctx, userID, date)
 	var instance *models.ScheduleInstance
 	if len(instances) > 0 {
 		instance = instances[0]
 	}
 	if instance != nil && instance.Status == "active" {
+		s.logger.Info("Active schedule instance exists",
+			zap.String("user_id", userID.String()),
+			zap.String("instance_id", instance.ScheduleInstanceID.String()))
 		return &PositionBasedResolvedDay{
 			Date:               instance.ScheduleDate,
 			Timezone:           instance.Timezone,
@@ -1239,51 +1341,89 @@ func (s *schedulingServiceImpl) ResolveUserDay(ctx context.Context, companyID, u
 			ScheduleStatus:     instance.Status,
 		}, nil
 	}
-	if subject.WorkCenterCode != nil {
-		mapping, err := s.schedulingRepo.GetWorkCenterShiftByCode(ctx, companyID, *subject.WorkCenterCode, date)
-		if err != nil || mapping == nil {
-			return &PositionBasedResolvedDay{
-				Date:               date,
-				Timezone:           "UTC",
-				IsSchedulable:      true,
-				AttendanceRequired: subject.AttendanceRequired,
-				OvertimeAllowed:    subject.OvertimeAllowed,
-				PositionID:         subject.PositionID,
-				PositionTitle:      &subject.PositionTitle,
-				WorkCenterCode:     subject.WorkCenterCode,
-				WorkCenterName:     &subject.WorkCenterName,
-				ScheduleStatus:     "no_shift_mapping",
-			}, nil
-		}
-		template, _ := s.schedulingRepo.GetScheduleTemplate(ctx, mapping.ShiftID)
-		if template == nil {
-			return nil, fmt.Errorf("shift template not found")
-		}
-		expectedStart, expectedEnd, err := s.calculateExpectedTimes(date, template, "UTC")
-		if err != nil {
-			return nil, err
-		}
+
+	if subject.WorkCenterCode == nil {
+		s.logger.Info("Subject has no work center code", zap.String("user_id", userID.String()))
+		return &PositionBasedResolvedDay{
+			Date:           date,
+			IsSchedulable:  false,
+			ScheduleStatus: "no_work_center",
+			PositionID:     subject.PositionID,
+			PositionTitle:  &subject.PositionTitle,
+		}, nil
+	}
+
+	mapping, err := s.schedulingRepo.GetWorkCenterShiftByCode(ctx, companyID, *subject.WorkCenterCode, date)
+	if err != nil {
+		s.logger.Error("Error fetching work center shift mapping",
+			zap.Error(err),
+			zap.String("work_center", *subject.WorkCenterCode))
+		return nil, err
+	}
+	if mapping == nil {
+		s.logger.Info("No shift mapping found for work center",
+			zap.String("work_center", *subject.WorkCenterCode),
+			zap.String("user_id", userID.String()),
+			zap.String("date", date.Format("2006-01-02")))
 		return &PositionBasedResolvedDay{
 			Date:               date,
 			Timezone:           "UTC",
 			IsSchedulable:      true,
 			AttendanceRequired: subject.AttendanceRequired,
 			OvertimeAllowed:    subject.OvertimeAllowed,
-			ExpectedStart:      expectedStart,
-			ExpectedEnd:        expectedEnd,
 			PositionID:         subject.PositionID,
 			PositionTitle:      &subject.PositionTitle,
 			WorkCenterCode:     subject.WorkCenterCode,
 			WorkCenterName:     &subject.WorkCenterName,
-			ShiftID:            &mapping.ShiftID,
-			ShiftName:          &template.Name,
-			ScheduleStatus:     "scheduled",
+			ScheduleStatus:     "no_shift_mapping",
 		}, nil
 	}
+
+	template, err := s.schedulingRepo.GetScheduleTemplate(ctx, mapping.ShiftID)
+	if err != nil || template == nil {
+		s.logger.Error("Shift template not found",
+			zap.String("shift_id", mapping.ShiftID.String()),
+			zap.Error(err))
+		return &PositionBasedResolvedDay{
+			Date:           date,
+			IsSchedulable:  false,
+			ScheduleStatus: "template_not_found",
+			PositionID:     subject.PositionID,
+			PositionTitle:  &subject.PositionTitle,
+			WorkCenterCode: subject.WorkCenterCode,
+		}, nil
+	}
+
+	expectedStart, expectedEnd, err := s.calculateExpectedTimes(date, template, "UTC")
+	if err != nil {
+		s.logger.Error("Failed to calculate expected times",
+			zap.Error(err),
+			zap.String("user_id", userID.String()))
+		return nil, err
+	}
+
+	s.logger.Info("Resolved to scheduled",
+		zap.String("user_id", userID.String()),
+		zap.String("work_center", *subject.WorkCenterCode),
+		zap.String("shift_id", mapping.ShiftID.String()),
+		zap.Time("expected_start", *expectedStart),
+		zap.Time("expected_end", *expectedEnd))
+
 	return &PositionBasedResolvedDay{
-		Date:           date,
-		IsSchedulable:  false,
-		ScheduleStatus: "no_work_center",
+		Date:               date,
+		Timezone:           "UTC",
+		IsSchedulable:      true,
+		AttendanceRequired: subject.AttendanceRequired,
+		OvertimeAllowed:    subject.OvertimeAllowed,
+		ExpectedStart:      expectedStart,
+		ExpectedEnd:        expectedEnd,
+		PositionID:         subject.PositionID,
+		PositionTitle:      &subject.PositionTitle,
+		WorkCenterCode:     subject.WorkCenterCode,
+		WorkCenterName:     &subject.WorkCenterName,
+		ShiftID:            &mapping.ShiftID,
+		ShiftName:          &template.Name,
+		ScheduleStatus:     "scheduled",
 	}, nil
 }
 
@@ -1480,9 +1620,7 @@ func (s *schedulingServiceImpl) ApplyApprovedLeave(ctx context.Context, leaveDat
 	}
 
 	reason := fmt.Sprintf("leave_%s", leaveData.LeaveRequestID.String())
-	// Iterate over each day in the range
 	for d := leaveData.StartDate; !d.After(leaveData.EndDate); d = d.AddDate(0, 0, 1) {
-		// Create override for this date
 		override := &models.ScheduleOverride{
 			OverrideID:   uuid.New(),
 			CompanyID:    leaveData.CompanyID,
@@ -1491,9 +1629,7 @@ func (s *schedulingServiceImpl) ApplyApprovedLeave(ctx context.Context, leaveDat
 			OverrideType: "off",
 			Reason:       &reason,
 		}
-		// Attempt to create; if it already exists, skip
 		if _, err := s.CreateScheduleOverride(ctx, leaveData.CompanyID, override, actorType, actorID, nil); err != nil {
-			// If error is "already exists", skip; otherwise return error
 			if !strings.Contains(err.Error(), "already exists") {
 				return fmt.Errorf("failed to create override for %s: %w", d.Format("2006-01-02"), err)
 			}
@@ -1512,20 +1648,15 @@ func (s *schedulingServiceImpl) RollbackCancelledLeave(ctx context.Context, leav
 	}
 	reason := fmt.Sprintf("leave_%s", leaveData.LeaveRequestID.String())
 
-	// 1. Delete overrides by reason
 	if err := s.schedulingRepo.DeleteScheduleOverridesByReason(ctx, leaveData.CompanyID, leaveData.UserID, reason); err != nil {
 		return fmt.Errorf("failed to delete leave overrides: %w", err)
 	}
 
-	// 2. Regenerate schedules for future dates in the range (only if date is in the future)
 	now := time.Now().UTC()
 	for d := leaveData.StartDate; !d.After(leaveData.EndDate); d = d.AddDate(0, 0, 1) {
-		// Only regenerate if the date is after today (future)
 		if d.After(now) {
-			// Use CreateScheduleInstanceFromPosition to regenerate
 			_, err := s.CreateScheduleInstanceFromPosition(ctx, leaveData.CompanyID, leaveData.UserID, d, actorType, actorID, nil)
 			if err != nil {
-				// Log but don't fail the whole operation; just warn
 				s.logger.Warn("Failed to regenerate schedule after leave rollback",
 					zap.String("user_id", leaveData.UserID.String()),
 					zap.String("date", d.Format("2006-01-02")),
@@ -2033,6 +2164,7 @@ package ingest
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -2047,6 +2179,10 @@ import (
 	"auth-service/internal/attendance/service/source"
 	auditservice "auth-service/internal/infrastructure/audit"
 )
+
+// ---------------------------------------------------------------------------
+// Request types
+// ---------------------------------------------------------------------------
 
 type PunchRequest struct {
 	CompanyID      uuid.UUID
@@ -2067,6 +2203,10 @@ type PunchSource struct {
 	IPAddress  *string
 }
 
+// ---------------------------------------------------------------------------
+// Main interface and service struct
+// ---------------------------------------------------------------------------
+
 type IngestService interface {
 	IngestPunch(ctx context.Context, req *PunchRequest) (*models.AttendanceEvent, error)
 }
@@ -2076,15 +2216,16 @@ type OMService interface {
 }
 
 type ingestService struct {
-	eventRepo         repository.EventRepository
-	deviceRepo        repository.DeviceRepository
-	sourceRepo        repository.SourceRepository
-	enrollmentService enrollment.EnrollmentService
-	sourceResolver    source.SourceResolver
-	adminService      admin.AdminService
-	omService         OMService
-	audit             *auditservice.AuditService
-	logger            *zap.Logger
+	eventRepo          repository.EventRepository
+	deviceRepo         repository.DeviceRepository
+	sourceRepo         repository.SourceRepository
+	enrollmentService  enrollment.EnrollmentService
+	sourceResolver     source.SourceResolver
+	adminService       admin.AdminService
+	omService          OMService
+	audit              *auditservice.AuditService
+	logger             *zap.Logger
+	sessionSummaryRepo repository.AttendanceSessionSummaryRepository
 }
 
 func NewIngestService(
@@ -2097,19 +2238,25 @@ func NewIngestService(
 	omService OMService,
 	audit *auditservice.AuditService,
 	logger *zap.Logger,
+	sessionSummaryRepo repository.AttendanceSessionSummaryRepository,
 ) IngestService {
 	return &ingestService{
-		eventRepo:         eventRepo,
-		deviceRepo:        deviceRepo,
-		sourceRepo:        sourceRepo,
-		enrollmentService: enrollmentService,
-		sourceResolver:    sourceResolver,
-		adminService:      adminService,
-		omService:         omService,
-		audit:             audit,
-		logger:            logger,
+		eventRepo:          eventRepo,
+		deviceRepo:         deviceRepo,
+		sourceRepo:         sourceRepo,
+		enrollmentService:  enrollmentService,
+		sourceResolver:     sourceResolver,
+		adminService:       adminService,
+		omService:          omService,
+		audit:              audit,
+		logger:             logger,
+		sessionSummaryRepo: sessionSummaryRepo,
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Core ingest logic
+// ---------------------------------------------------------------------------
 
 func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*models.AttendanceEvent, error) {
 	start := time.Now().UTC()
@@ -2119,7 +2266,7 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		zap.String("source_type", req.Source.SourceType),
 	)
 
-	// Basic validation
+	// 1. Basic validation
 	if req.CompanyID == uuid.Nil {
 		return nil, errors.New("company_id required")
 	}
@@ -2133,18 +2280,19 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		req.Context = &models.EventContext{}
 	}
 
-	// Resolve source rules
+	// 2. Resolve source rules
 	sourceRules, err := s.sourceResolver.Resolve(ctx, req.Source.SourceType)
 	if err != nil {
 		return nil, fmt.Errorf("invalid source type: %w", err)
 	}
 
-	// Resolve event time
+	// 3. Resolve event time
 	eventTime, err := s.resolveEventTime(ctx, req, sourceRules)
 	if err != nil {
 		return nil, err
 	}
 
+	// 4. Determine subject (via enrollment if device)
 	subjectType := req.SubjectType
 	subjectID := req.SubjectID
 	var deviceID *string
@@ -2176,14 +2324,15 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		}
 	}
 
-	// Resolve attendance rules – current adminService expects userID, we pass subjectID
-	// TODO: update adminService to be subject-aware
+	// 5. Resolve attendance rules (policy)
+	// --- FIX: add subjectType to the call ---
 	resolvedRules, err := s.adminService.ResolveAttendanceRules(
 		ctx,
-		subjectID, // temporary: treat as userID
+		subjectID,
 		req.CompanyID,
+		subjectType, // <-- added
 		derefString(req.Context.WorkCenterCode),
-		nil,
+		nil, // positionID
 		eventTime,
 	)
 	if err != nil {
@@ -2193,7 +2342,7 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		return nil, fmt.Errorf("source '%s' not allowed by rules", req.Source.SourceType)
 	}
 
-	// Resolve source ID
+	// 6. Ensure attendance source exists
 	if req.Source.SourceID == nil {
 		src, err := s.sourceRepo.GetByType(ctx, req.CompanyID, req.Source.SourceType)
 		if err != nil {
@@ -2205,7 +2354,7 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		req.Source.SourceID = &src.SourceID
 	}
 
-	// OM Authorization
+	// 7. OM authorization
 	var actorPtr *uuid.UUID
 	if req.ActorID != uuid.Nil {
 		actorPtr = &req.ActorID
@@ -2229,7 +2378,7 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		return nil, fmt.Errorf("not authorized: %s", reason)
 	}
 
-	// Create event
+	// 8. Build and store the event
 	event := &models.AttendanceEvent{
 		AttendanceEventID: uuid.New(),
 		CompanyID:         req.CompanyID,
@@ -2264,6 +2413,18 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		_ = s.deviceRepo.UpdateLastSeen(ctx, *deviceID)
 	}
 
+	// 9. If this punch is linked to a session, upsert the session summary
+	if req.Context.SessionID != nil && *req.Context.SessionID != uuid.Nil {
+		if err := s.updateSessionSummary(ctx, tx, event, *req.Context.SessionID); err != nil {
+			// Do not fail the whole transaction; just log.
+			s.logger.Warn("Failed to update session summary",
+				zap.String("event_id", event.AttendanceEventID.String()),
+				zap.String("session_id", req.Context.SessionID.String()),
+				zap.Error(err),
+			)
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
@@ -2277,6 +2438,10 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 	return event, nil
 }
 
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
 func derefString(s *string) string {
 	if s != nil {
 		return *s
@@ -2288,6 +2453,7 @@ func boolPtr(b bool) *bool {
 	return &b
 }
 
+// resolveEventTime determines the event timestamp based on source rules and company timezone.
 func (s *ingestService) resolveEventTime(ctx context.Context, req *PunchRequest, rules *source.ResolvedSourceRules) (time.Time, error) {
 	companyRules, err := s.adminService.GetCompanyAttendanceRules(ctx, req.CompanyID)
 	if err != nil {
@@ -2309,6 +2475,53 @@ func (s *ingestService) resolveEventTime(ctx context.Context, req *PunchRequest,
 	nowUTC := time.Now().UTC()
 	nowInLoc := nowUTC.In(loc)
 	return nowInLoc.UTC(), nil
+}
+
+// updateSessionSummary creates or updates the session summary based on the event.
+// Note: tx is *sql.Tx because that's what the repository expects.
+func (s *ingestService) updateSessionSummary(ctx context.Context, tx *sql.Tx, event *models.AttendanceEvent, sessionID uuid.UUID) error {
+	// Determine session date from event time (use UTC for simplicity; can be enhanced with company timezone)
+	sessionDate := event.EventTime.UTC().Truncate(24 * time.Hour)
+
+	status := mapEventTypeToSessionStatus(event.EventType)
+
+	summary := &models.AttendanceSessionSummary{
+		CompanyID:   event.CompanyID,
+		SubjectType: event.SubjectType,
+		SubjectID:   event.SubjectID,
+		SessionID:   sessionID,
+		SessionDate: sessionDate,
+		Status:      status,
+		MarkedAt:    event.EventTime,
+		MarkedBy:    event.CreatedBy,
+		SourceType:  event.SourceType,
+		DeviceID:    event.DeviceID,
+		IsAuto:      event.Metadata.IsAutoGenerated != nil && *event.Metadata.IsAutoGenerated,
+		Remarks:     nil,
+		Metadata: models.JSONB{
+			"event_id": event.AttendanceEventID.String(),
+		},
+	}
+
+	return s.sessionSummaryRepo.Upsert(ctx, tx, summary)
+}
+
+// mapEventTypeToSessionStatus converts an attendance event type to a session status.
+// Customize this mapping based on your business rules.
+func mapEventTypeToSessionStatus(eventType string) string {
+	switch eventType {
+	case "check_in", "shift_start", "class_start", "session_join", "present":
+		return "present"
+	case "absent_marked", "missing_punch", "absent":
+		return "absent"
+	case "late_entry", "late":
+		return "late"
+	case "excused", "exempted":
+		return "excused"
+	default:
+		// Default to "present" for unknown event types
+		return "present"
+	}
 }
 
 
@@ -2691,6 +2904,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -2715,6 +2929,11 @@ type AdminService interface {
 	GetPositionAttendancePolicy(ctx context.Context, positionID uuid.UUID) (*models.AttendancePolicy, error)
 	GetUsersByAttendancePolicy(ctx context.Context, policyID uuid.UUID, effectiveDate time.Time) ([]uuid.UUID, error)
 
+	// NEW: Polymorphic policy methods
+	AssignPolicyToSubject(ctx context.Context, subjectType string, subjectID uuid.UUID, policyID uuid.UUID, effectiveFrom time.Time, effectiveTo *time.Time, assignedBy *uuid.UUID) error
+	EndPolicyForSubject(ctx context.Context, subjectType string, subjectID uuid.UUID, policyID uuid.UUID, endDate time.Time) error
+	GetActivePolicyForSubject(ctx context.Context, subjectType string, subjectID uuid.UUID, date time.Time) (*models.AttendancePolicy, error)
+
 	// Company & department rules
 	GetCompanyAttendanceRules(ctx context.Context, companyID uuid.UUID) (*models.CompanyAttendanceRules, error)
 	UpdateCompanyAttendanceRules(ctx context.Context, rules *models.CompanyAttendanceRules, updatedBy uuid.UUID) error
@@ -2726,7 +2945,8 @@ type AdminService interface {
 	UpsertUserAttendanceProfile(ctx context.Context, profile *models.UserAttendanceProfile) error
 
 	// Rule resolution (used by ingest)
-	ResolveAttendanceRules(ctx context.Context, userID, companyID uuid.UUID, workCenterCode string, positionID *uuid.UUID, date time.Time) (*models.ResolvedAttendanceRules, error)
+	// CHANGED: added subjectType parameter
+	ResolveAttendanceRules(ctx context.Context, userID, companyID uuid.UUID, subjectType string, workCenterCode string, positionID *uuid.UUID, date time.Time) (*models.ResolvedAttendanceRules, error)
 
 	// Validation helpers
 	ValidateAttendanceEventType(ctx context.Context, eventType string) error
@@ -2865,6 +3085,9 @@ func (s *adminService) DeleteAttendancePolicy(ctx context.Context, policyID uuid
 	if len(users) > 0 {
 		return fmt.Errorf("cannot delete policy assigned to %d users", len(users))
 	}
+	// Also check for other subjects (students, teachers)
+	// TODO: implement cross-subject check if needed
+
 	tx, err := s.eventRepo.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -2876,48 +3099,70 @@ func (s *adminService) DeleteAttendancePolicy(ctx context.Context, policyID uuid
 	return tx.Commit()
 }
 
-func (s *adminService) AssignUserAttendancePolicy(ctx context.Context, userPolicy *models.UserAttendancePolicy, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error {
-	if userPolicy.UserID == uuid.Nil || userPolicy.PolicyID == uuid.Nil {
-		return fmt.Errorf("user_id and policy_id required")
+// =============================================================================
+// NEW POLYMORPHIC POLICY METHODS (for any subject)
+// =============================================================================
+
+// AssignPolicyToSubject assigns a policy to any subject (employee, student, teacher, etc.)
+func (s *adminService) AssignPolicyToSubject(ctx context.Context, subjectType string, subjectID uuid.UUID, policyID uuid.UUID, effectiveFrom time.Time, effectiveTo *time.Time, assignedBy *uuid.UUID) error {
+	if subjectType == "" || subjectID == uuid.Nil {
+		return errors.New("subject_type and subject_id are required")
 	}
-	if userPolicy.EffectiveFrom.IsZero() {
-		userPolicy.EffectiveFrom = time.Now().UTC()
+	if policyID == uuid.Nil {
+		return errors.New("policy_id is required")
 	}
-	policy, err := s.policyRepo.GetPolicyByID(ctx, userPolicy.PolicyID)
+	if effectiveFrom.IsZero() {
+		effectiveFrom = time.Now().UTC()
+	}
+	// Validate policy exists and is active
+	policy, err := s.policyRepo.GetPolicyByID(ctx, policyID)
 	if err != nil {
 		return fmt.Errorf("get policy: %w", err)
 	}
 	if policy == nil || !policy.IsActive {
-		return fmt.Errorf("policy not active")
+		return errors.New("policy not active or not found")
 	}
-	// End previous active policy
-	existing, err := s.policyRepo.GetUserActivePolicy(ctx, userPolicy.UserID, userPolicy.EffectiveFrom)
-	if err == nil && existing != nil && existing.PolicyID != userPolicy.PolicyID {
-		_ = s.policyRepo.EndUserPolicy(ctx, userPolicy.UserID, existing.PolicyID, userPolicy.EffectiveFrom)
+
+	// Idempotency: check if exact assignment already exists
+	// We'll use a helper method to find assignment by subject
+	existing, err := s.policyRepo.GetActivePolicyBySubject(ctx, subjectType, subjectID, effectiveFrom)
+	if err == nil && existing != nil {
+		// If the active policy at that date is the same, return success
+		if existing.PolicyID == policyID {
+			s.logger.Info("Policy already assigned to subject (idempotent)",
+				zap.String("subject_type", subjectType),
+				zap.String("subject_id", subjectID.String()),
+				zap.String("policy_id", policyID.String()),
+				zap.Time("effective_from", effectiveFrom))
+			return nil
+		}
+		// Otherwise, end the current active policy before assigning the new one
+		_ = s.EndPolicyForSubject(ctx, subjectType, subjectID, existing.PolicyID, effectiveFrom)
 	}
-	if userPolicy.AssignedBy == nil {
-		userPolicy.AssignedBy = &actorID
-	}
-	if userPolicy.CreatedAt.IsZero() {
-		userPolicy.CreatedAt = time.Now().UTC()
-	}
+
 	tx, err := s.eventRepo.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-	if err := s.policyRepo.AssignUserPolicy(ctx, tx, userPolicy); err != nil {
-		return fmt.Errorf("assign policy: %w", err)
+
+	if err := s.policyRepo.AssignPolicyToSubject(ctx, tx, subjectType, subjectID, policyID, &effectiveFrom, effectiveTo, assignedBy); err != nil {
+		return fmt.Errorf("assign policy to subject: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
-	s.logAudit(ctx, policy.CompanyID, "user_attendance_policy.assign", userPolicy.PolicyID, actorType, actorID, nil, userPolicy, metadata)
-	s.logger.Info("User attendance policy assigned", zap.String("user_id", userPolicy.UserID.String()), zap.String("policy_id", userPolicy.PolicyID.String()))
+
+	s.logger.Info("Policy assigned to subject",
+		zap.String("subject_type", subjectType),
+		zap.String("subject_id", subjectID.String()),
+		zap.String("policy_id", policyID.String()),
+		zap.Time("effective_from", effectiveFrom))
 	return nil
 }
 
-func (s *adminService) EndUserAttendancePolicy(ctx context.Context, userID, policyID uuid.UUID, endDate time.Time) error {
+// EndPolicyForSubject ends an active policy for a given subject
+func (s *adminService) EndPolicyForSubject(ctx context.Context, subjectType string, subjectID uuid.UUID, policyID uuid.UUID, endDate time.Time) error {
 	if endDate.IsZero() {
 		endDate = time.Now().UTC()
 	}
@@ -2926,10 +3171,108 @@ func (s *adminService) EndUserAttendancePolicy(ctx context.Context, userID, poli
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-	if err := s.policyRepo.EndUserPolicy(ctx, userID, policyID, endDate); err != nil {
-		return fmt.Errorf("end policy: %w", err)
+	if err := s.policyRepo.EndPolicyForSubject(ctx, subjectType, subjectID, policyID, endDate); err != nil {
+		return fmt.Errorf("end policy for subject: %w", err)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+	s.logger.Info("Policy ended for subject",
+		zap.String("subject_type", subjectType),
+		zap.String("subject_id", subjectID.String()),
+		zap.String("policy_id", policyID.String()),
+		zap.Time("end_date", endDate))
+	return nil
+}
+
+// GetActivePolicyForSubject retrieves the active policy for a given subject at a given date
+func (s *adminService) GetActivePolicyForSubject(ctx context.Context, subjectType string, subjectID uuid.UUID, date time.Time) (*models.AttendancePolicy, error) {
+	return s.policyRepo.GetActivePolicyBySubject(ctx, subjectType, subjectID, date)
+}
+
+// =============================================================================
+// LEGACY EMPLOYEE METHODS (kept for backward compatibility)
+// =============================================================================
+
+// AssignUserAttendancePolicy is the legacy employee-only assignment method.
+// It now populates SubjectType="employee" and SubjectID=userID before calling the repository.
+func (s *adminService) AssignUserAttendancePolicy(ctx context.Context, userPolicy *models.UserAttendancePolicy, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error {
+	if userPolicy.UserID == uuid.Nil || userPolicy.PolicyID == uuid.Nil {
+		return fmt.Errorf("user_id and policy_id required")
+	}
+	if userPolicy.EffectiveFrom.IsZero() {
+		userPolicy.EffectiveFrom = time.Now().UTC()
+	}
+	// Set polymorphic fields for employees
+	if userPolicy.SubjectType == "" {
+		userPolicy.SubjectType = "employee"
+	}
+	if userPolicy.SubjectID == nil {
+		userPolicy.SubjectID = &userPolicy.UserID
+	}
+
+	policy, err := s.policyRepo.GetPolicyByID(ctx, userPolicy.PolicyID)
+	if err != nil {
+		return fmt.Errorf("get policy: %w", err)
+	}
+	if policy == nil || !policy.IsActive {
+		return fmt.Errorf("policy not active")
+	}
+
+	// Idempotency check
+	existing, err := s.policyRepo.GetUserPolicyAssignment(ctx, userPolicy.UserID, userPolicy.PolicyID, userPolicy.EffectiveFrom)
+	if err != nil {
+		return fmt.Errorf("check existing assignment: %w", err)
+	}
+	if existing != nil {
+		s.logger.Info("Policy already assigned to user (idempotent)",
+			zap.String("user_id", userPolicy.UserID.String()),
+			zap.String("policy_id", userPolicy.PolicyID.String()),
+			zap.Time("effective_from", userPolicy.EffectiveFrom))
+		return nil
+	}
+
+	// End any previous active policy (if different)
+	active, err := s.policyRepo.GetActivePolicyBySubject(ctx, "employee", userPolicy.UserID, userPolicy.EffectiveFrom)
+	if err == nil && active != nil && active.PolicyID != userPolicy.PolicyID {
+		_ = s.policyRepo.EndPolicyForSubject(ctx, "employee", userPolicy.UserID, active.PolicyID, userPolicy.EffectiveFrom)
+	}
+
+	if userPolicy.AssignedBy == nil {
+		userPolicy.AssignedBy = &actorID
+	}
+	if userPolicy.CreatedAt.IsZero() {
+		userPolicy.CreatedAt = time.Now().UTC()
+	}
+
+	tx, err := s.eventRepo.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := s.policyRepo.AssignUserPolicy(ctx, tx, userPolicy); err != nil {
+		return fmt.Errorf("assign policy: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+
+	s.logAudit(ctx, policy.CompanyID, "user_attendance_policy.assign", userPolicy.PolicyID,
+		actorType, actorID, nil, userPolicy, metadata)
+	s.logger.Info("User attendance policy assigned",
+		zap.String("user_id", userPolicy.UserID.String()),
+		zap.String("policy_id", userPolicy.PolicyID.String()))
+	return nil
+}
+
+// EndUserAttendancePolicy is the legacy employee-only end method.
+// It now uses the polymorphic EndPolicyForSubject with subjectType="employee".
+func (s *adminService) EndUserAttendancePolicy(ctx context.Context, userID, policyID uuid.UUID, endDate time.Time) error {
+	if endDate.IsZero() {
+		endDate = time.Now().UTC()
+	}
+	return s.EndPolicyForSubject(ctx, "employee", userID, policyID, endDate)
 }
 
 func (s *adminService) GetPositionAttendancePolicy(ctx context.Context, positionID uuid.UUID) (*models.AttendancePolicy, error) {
@@ -3068,9 +3411,9 @@ func (s *adminService) UpsertUserAttendanceProfile(ctx context.Context, profile 
 
 // ------------------------------------------------------------
 // Rule resolution (used by ingest)
+// CHANGED: now uses polymorphic policy lookup
 // ------------------------------------------------------------
-
-func (s *adminService) ResolveAttendanceRules(ctx context.Context, userID, companyID uuid.UUID, workCenterCode string, positionID *uuid.UUID, date time.Time) (*models.ResolvedAttendanceRules, error) {
+func (s *adminService) ResolveAttendanceRules(ctx context.Context, userID, companyID uuid.UUID, subjectType string, workCenterCode string, positionID *uuid.UUID, date time.Time) (*models.ResolvedAttendanceRules, error) {
 	now := time.Now().UTC()
 	resolved := &models.ResolvedAttendanceRules{
 		CompanyID:             companyID,
@@ -3086,35 +3429,64 @@ func (s *adminService) ResolveAttendanceRules(ctx context.Context, userID, compa
 	if err != nil {
 		return nil, fmt.Errorf("get company rules: %w", err)
 	}
-	resolved.Timezone = companyRules.Timezone
-	resolved.AllowMultipleCheckins = companyRules.AllowMultipleCheckins
-	resolved.AllowedSourceTypes = companyRules.AllowedSourceTypes
-	for _, src := range companyRules.AllowedSourceTypes {
-		resolved.AllowedSourceTypesMap[src] = true
-	}
-
-	// 2. Resolve policy (user > work_center > position)
-	var resolvedPolicy *models.AttendancePolicy
-	if userID != uuid.Nil {
-		if p, err := s.policyRepo.GetUserActivePolicy(ctx, userID, date); err == nil && p != nil && p.IsActive {
-			resolvedPolicy = p
-			resolved.PolicySource = "user"
+	if companyRules == nil {
+		s.logger.Warn("No company attendance rules found, using defaults",
+			zap.String("company_id", companyID.String()))
+		resolved.Timezone = "UTC"
+		resolved.AllowMultipleCheckins = false
+		resolved.AllowedSourceTypes = []string{"mobile", "web", "biometric", "rfid"}
+		for _, src := range resolved.AllowedSourceTypes {
+			resolved.AllowedSourceTypesMap[src] = true
+		}
+	} else {
+		resolved.Timezone = companyRules.Timezone
+		resolved.AllowMultipleCheckins = companyRules.AllowMultipleCheckins
+		resolved.AllowedSourceTypes = companyRules.AllowedSourceTypes
+		for _, src := range companyRules.AllowedSourceTypes {
+			resolved.AllowedSourceTypesMap[src] = true
 		}
 	}
+
+	// 2. Resolve policy: subject-specific > work_center > position
+	var resolvedPolicy *models.AttendancePolicy
+
+	// 2a. Try subject-specific policy (polymorphic)
+	if userID != uuid.Nil && subjectType != "" {
+		if p, err := s.policyRepo.GetActivePolicyBySubject(ctx, subjectType, userID, date); err == nil && p != nil && p.IsActive {
+			resolvedPolicy = p
+			resolved.PolicySource = "subject"
+			s.logger.Debug("Resolved policy from subject assignment",
+				zap.String("subject_type", subjectType),
+				zap.String("subject_id", userID.String()),
+				zap.String("policy_id", p.PolicyID.String()),
+				zap.String("policy_code", p.PolicyCode))
+		}
+	}
+
+	// 2b. Fallback to work center policy
 	if resolvedPolicy == nil && workCenterCode != "" {
 		if p, err := s.policyRepo.GetWorkCenterPolicy(ctx, companyID, workCenterCode); err == nil && p != nil && p.IsActive {
 			resolvedPolicy = p
 			resolved.PolicySource = "work_center"
 			resolved.WorkCenterCode = &workCenterCode
+			s.logger.Debug("Resolved policy from work center",
+				zap.String("work_center", workCenterCode),
+				zap.String("policy_id", p.PolicyID.String()))
 		}
 	}
+
+	// 2c. Fallback to position policy
 	if resolvedPolicy == nil && positionID != nil {
 		if p, err := s.policyRepo.GetPositionPolicy(ctx, *positionID); err == nil && p != nil && p.IsActive {
 			resolvedPolicy = p
 			resolved.PolicySource = "position"
 			resolved.PositionID = positionID
+			s.logger.Debug("Resolved policy from position",
+				zap.String("position_id", positionID.String()),
+				zap.String("policy_id", p.PolicyID.String()))
 		}
 	}
+
 	if resolvedPolicy != nil {
 		resolved.PolicyID = &resolvedPolicy.PolicyID
 		resolved.PolicyRules = &resolvedPolicy.Rules
@@ -3134,9 +3506,15 @@ func (s *adminService) ResolveAttendanceRules(ctx context.Context, userID, compa
 		if rules.AllowDeviceMarking != nil && *rules.AllowDeviceMarking {
 			resolved.RequireDevice = true
 		}
+	} else {
+		s.logger.Warn("No attendance policy resolved for subject",
+			zap.String("subject_type", subjectType),
+			zap.String("subject_id", userID.String()),
+			zap.String("company_id", companyID.String()),
+			zap.String("work_center", workCenterCode))
 	}
 
-	// 3. User profile overrides
+	// 3. User profile overrides (still employee‑centric; could be extended)
 	if userID != uuid.Nil {
 		profile, err := s.ruleRepo.GetUserProfile(ctx, userID)
 		if err == nil && profile != nil {
@@ -3163,6 +3541,7 @@ func (s *adminService) ResolveAttendanceRules(ctx context.Context, userID, compa
 	if len(resolved.AllowedEventTypes) == 0 {
 		resolved.AllowAllEventTypes = true
 	}
+
 	return resolved, nil
 }
 
@@ -3544,31 +3923,23 @@ type DailyMetrics struct {
 
 // ResolutionService is the core engine for turning raw events into daily summaries.
 type ResolutionService interface {
-	// ResolveEvent triggers resolution for the day of a single event
 	ResolveEvent(ctx context.Context, eventID uuid.UUID) error
-
-	// ResolveDay resolves a specific day for a subject
 	ResolveDay(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) error
-
-	// ResolvePeriod resolves a range of days for a list of subjects
 	ResolvePeriod(ctx context.Context, companyID uuid.UUID, subjectIDs []uuid.UUID, subjectType string, startDate, endDate time.Time, recalculate bool) error
-
-	// BatchResolveEvents resolves the days of multiple events (deduplicated by subject+day)
 	BatchResolveEvents(ctx context.Context, eventIDs []uuid.UUID) error
-
-	// RecalculateDay forces a full recalculation of a day (deletes existing summary)
 	RecalculateDay(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) error
 }
 
 type resolutionService struct {
-	eventRepo    repository.EventRepository
-	summaryRepo  repository.SummaryRepository
-	scheduleRepo repository.ScheduleRepository
-	policyRepo   repository.PolicyRepository
-	subjectRes   resolver.SubjectResolver
-	adminSvc     admin.AdminService
-	logger       *zap.Logger
-	audit        *auditservice.AuditService
+	eventRepo     repository.EventRepository
+	summaryRepo   repository.SummaryRepository
+	scheduleRepo  repository.ScheduleRepository
+	policyRepo    repository.PolicyRepository
+	subjectRes    resolver.SubjectResolver
+	adminSvc      admin.AdminService
+	exemptionRepo repository.AttendanceExemptionRepository
+	logger        *zap.Logger
+	audit         *auditservice.AuditService
 }
 
 // NewResolutionService creates a new resolution service.
@@ -3579,18 +3950,20 @@ func NewResolutionService(
 	policyRepo repository.PolicyRepository,
 	subjectRes resolver.SubjectResolver,
 	adminSvc admin.AdminService,
+	exemptionRepo repository.AttendanceExemptionRepository,
 	logger *zap.Logger,
 	audit *auditservice.AuditService,
 ) ResolutionService {
 	return &resolutionService{
-		eventRepo:    eventRepo,
-		summaryRepo:  summaryRepo,
-		scheduleRepo: scheduleRepo,
-		policyRepo:   policyRepo,
-		subjectRes:   subjectRes,
-		adminSvc:     adminSvc,
-		logger:       logger,
-		audit:        audit,
+		eventRepo:     eventRepo,
+		summaryRepo:   summaryRepo,
+		scheduleRepo:  scheduleRepo,
+		policyRepo:    policyRepo,
+		subjectRes:    subjectRes,
+		adminSvc:      adminSvc,
+		exemptionRepo: exemptionRepo,
+		logger:        logger,
+		audit:         audit,
 	}
 }
 
@@ -3680,7 +4053,6 @@ func (s *resolutionService) BatchResolveEvents(ctx context.Context, eventIDs []u
 			continue
 		}
 
-		// resolveSubjectDay will determine the business date from the event time
 		key := dayKey{
 			CompanyID:    evt.CompanyID,
 			SubjectType:  evt.SubjectType,
@@ -3706,7 +4078,6 @@ func (s *resolutionService) BatchResolveEvents(ctx context.Context, eventIDs []u
 }
 
 func (s *resolutionService) RecalculateDay(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) error {
-	// Fetch existing summary to delete (if any)
 	existing, err := s.summaryRepo.GetBySubjectDate(ctx, companyID, subjectID, subjectType, date)
 	if err == nil && existing != nil {
 		if existing.IsPayrollLocked {
@@ -3721,7 +4092,6 @@ func (s *resolutionService) RecalculateDay(ctx context.Context, companyID, subje
 			s.logger.Warn("Failed to delete existing summary", zap.String("summary_id", existing.AttendanceSummaryID.String()), zap.Error(err))
 		}
 	}
-	// Now resolve the day fresh
 	return s.resolveSubjectDay(ctx, companyID, subjectID, subjectType, date)
 }
 
@@ -3730,7 +4100,6 @@ func (s *resolutionService) RecalculateDay(ctx context.Context, companyID, subje
 // ─────────────────────────────────────────────────────────────
 
 func (s *resolutionService) resolveSubjectDay(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, refTime time.Time) error {
-	// 1. Resolve the subject's context (timezone, schedule, policies, leave, etc.)
 	resolved, err := s.subjectRes.Resolve(ctx, companyID, subjectType, subjectID, refTime)
 	if err != nil {
 		return fmt.Errorf("resolve subject: %w", err)
@@ -3743,7 +4112,6 @@ func (s *resolutionService) resolveSubjectDay(ctx context.Context, companyID, su
 		return nil
 	}
 
-	// 2. Determine business date in subject's timezone
 	loc, err := time.LoadLocation(resolved.Timezone)
 	if err != nil {
 		loc = time.UTC
@@ -3751,7 +4119,6 @@ func (s *resolutionService) resolveSubjectDay(ctx context.Context, companyID, su
 	refLocal := refTime.In(loc)
 	businessDate := time.Date(refLocal.Year(), refLocal.Month(), refLocal.Day(), 0, 0, 0, 0, loc)
 
-	// 3. Check payroll lock (prevent resolution if already locked)
 	existingSummary, _ := s.summaryRepo.GetBySubjectDate(ctx, companyID, subjectID, subjectType, businessDate)
 	if existingSummary != nil && existingSummary.IsPayrollLocked {
 		s.logger.Info("Attendance locked by payroll, skipping resolution",
@@ -3762,7 +4129,6 @@ func (s *resolutionService) resolveSubjectDay(ctx context.Context, companyID, su
 		return nil
 	}
 
-	// 4. Fetch events in a wide window (36h before/after) to capture overnight shifts
 	fetchStart := businessDate.Add(-6 * time.Hour)
 	fetchEnd := businessDate.Add(36 * time.Hour)
 	events, err := s.eventRepo.GetEventsBySubject(ctx, companyID, subjectID, subjectType, fetchStart, fetchEnd)
@@ -3770,17 +4136,24 @@ func (s *resolutionService) resolveSubjectDay(ctx context.Context, companyID, su
 		return fmt.Errorf("fetch events: %w", err)
 	}
 
-	// 5. Resolve attendance rules (source types, etc.)
-	rules, err := s.adminSvc.ResolveAttendanceRules(ctx, subjectID, companyID, derefString(resolved.WorkCenterCode), resolved.PositionID, refTime)
+	// FIX: added subjectType as 4th argument
+	rules, err := s.adminSvc.ResolveAttendanceRules(
+		ctx,
+		subjectID,
+		companyID,
+		subjectType,
+		derefString(resolved.WorkCenterCode),
+		resolved.PositionID,
+		refTime,
+	)
 	if err != nil {
 		return fmt.Errorf("resolve rules: %w", err)
 	}
 
-	// 6. Apply rules and generate summary
 	return s.applyAttendanceRules(ctx, events, companyID, subjectID, subjectType, businessDate, resolved, rules)
 }
 
-// applyAttendanceRules does the heavy lifting: pairing, overrides, metrics, status, upsert
+// applyAttendanceRules does the heavy lifting: exemptions, pairing, overrides, metrics, status, upsert
 func (s *resolutionService) applyAttendanceRules(
 	ctx context.Context,
 	events []*models.AttendanceEvent,
@@ -3792,7 +4165,10 @@ func (s *resolutionService) applyAttendanceRules(
 ) error {
 	// ── Helper to upsert a summary with a given status and anomalies ──
 	upsertStatus := func(status string, anomalies []string) error {
-		isPayable := status != models.StatusAbsent && status != models.StatusLeaveUnpaid
+		isPayable := status != models.StatusAbsent &&
+			status != models.StatusLeaveUnpaid &&
+			status != models.StatusNotScheduled &&
+			status != models.StatusExcused
 
 		summary := &models.AttendanceDailySummary{
 			AttendanceSummaryID: uuid.New(),
@@ -3812,7 +4188,6 @@ func (s *resolutionService) applyAttendanceRules(
 			},
 		}
 
-		// Preserve existing summary ID if present (for idempotency)
 		if existing, _ := s.summaryRepo.GetBySubjectDate(ctx, companyID, subjectID, subjectType, businessDate); existing != nil {
 			summary.AttendanceSummaryID = existing.AttendanceSummaryID
 		}
@@ -3825,10 +4200,25 @@ func (s *resolutionService) applyAttendanceRules(
 		return events[i].EventTime.Before(events[j].EventTime)
 	})
 
-	// 2. Pair check‑in/out
+	// 2. Check exemptions
+	exemptions, err := s.exemptionRepo.GetActiveForSubject(ctx, nil, companyID, subjectID, subjectType, businessDate)
+	if err != nil {
+		s.logger.Warn("Failed to check exemptions", zap.Error(err))
+	}
+	if len(exemptions) > 0 {
+		s.logger.Info("Subject excused via exemption",
+			zap.String("subject_type", subjectType),
+			zap.String("subject_id", subjectID.String()),
+			zap.Time("date", businessDate),
+			zap.Int("count", len(exemptions)),
+		)
+		return upsertStatus(models.StatusExcused, nil)
+	}
+
+	// 3. Pair check‑in/out
 	pairedEvents := s.pairCheckInCheckOut(events)
 
-	// 3. Filter pairs that belong to the business date (by check‑in local date)
+	// 4. Filter pairs belonging to this business date
 	loc, _ := time.LoadLocation(resolved.Timezone)
 	if loc == nil {
 		loc = time.UTC
@@ -3845,7 +4235,7 @@ func (s *resolutionService) applyAttendanceRules(
 		}
 	}
 
-	// 4. Manual overrides (highest priority)
+	// 5. Manual overrides (highest priority)
 	for _, evt := range events {
 		if evt.Metadata.IsCorrection != nil && *evt.Metadata.IsCorrection {
 			if evt.EventType == "manual_override" && evt.Metadata.OverrideStatus != nil {
@@ -3856,7 +4246,7 @@ func (s *resolutionService) applyAttendanceRules(
 		}
 	}
 
-	// 5. Schedule overrides (leave, holiday, weekly off, etc.)
+	// 6. Schedule overrides (leave, holiday, weekly off)
 	if resolved.IsOnLeave {
 		var status string
 		if resolved.IsLeavePaid {
@@ -3866,7 +4256,6 @@ func (s *resolutionService) applyAttendanceRules(
 		}
 		return upsertStatus(status, nil)
 	}
-
 	switch resolved.ScheduleStatus {
 	case "weekly_off":
 		return upsertStatus(models.StatusWeeklyOff, nil)
@@ -3876,35 +4265,33 @@ func (s *resolutionService) applyAttendanceRules(
 		return upsertStatus(models.StatusNotScheduled, nil)
 	}
 
-	// 6. If no events at all → absent
+	// 7. If no events → absent
 	if len(events) == 0 {
 		return upsertStatus(models.StatusAbsent, nil)
 	}
 
-	// 7. Detect anomalies (missing check‑in/out, multiple pairs, excessive shift, etc.)
+	// 8. Detect anomalies (informational only)
 	anomalies := s.detectAnomaliesFromPairs(dayPairs)
 
-	// 8. Resolve policy (from user, position, workcenter, or default)
+	// 9. Resolve policy
 	policy, err := s.resolvePolicy(ctx, companyID, subjectID, subjectType, businessDate, resolved)
 	if err != nil {
-		s.logger.Warn("Failed to resolve policy, using default",
-			zap.String("subject_type", subjectType),
-			zap.String("subject_id", subjectID.String()),
-			zap.Error(err),
-		)
+		s.logger.Warn("Failed to resolve policy, using default", zap.Error(err))
 		policy = s.defaultPolicy()
 	}
 
-	// 9. Compute metrics
-	metrics := s.calculateMetrics(dayPairs, resolved, policy, anomalies)
+	// 10. Compute metrics (pass businessDate for end-of-day fallback)
+	metrics := s.calculateMetrics(dayPairs, resolved, policy, anomalies, businessDate)
 
-	// 10. Determine final status
+	// 11. Determine final status
 	status := s.determineStatus(metrics, resolved, policy)
 
-	// 11. Determine payable
-	isPayable := status != models.StatusAbsent && status != models.StatusLeaveUnpaid
-
 	// 12. Build and upsert summary
+	isPayable := status != models.StatusAbsent &&
+		status != models.StatusLeaveUnpaid &&
+		status != models.StatusNotScheduled &&
+		status != models.StatusExcused
+
 	summary := &models.AttendanceDailySummary{
 		AttendanceSummaryID: uuid.New(),
 		CompanyID:           companyID,
@@ -3927,7 +4314,7 @@ func (s *resolutionService) applyAttendanceRules(
 			TotalCheckOuts: &metrics.CheckOuts,
 			BreakMinutes:   metrics.BreakMinutes,
 			ScheduleStatus: &resolved.ScheduleStatus,
-			ShiftID:        resolved.ScheduleInstanceID, // could be shift or session ID
+			ShiftID:        resolved.ScheduleInstanceID,
 			Timezone:       &resolved.Timezone,
 			Anomalies:      anomalies,
 			PairedEvents:   convertPairedEvents(dayPairs),
@@ -3937,7 +4324,6 @@ func (s *resolutionService) applyAttendanceRules(
 		},
 	}
 
-	// Preserve existing summary ID
 	if existing, _ := s.summaryRepo.GetBySubjectDate(ctx, companyID, subjectID, subjectType, businessDate); existing != nil {
 		summary.AttendanceSummaryID = existing.AttendanceSummaryID
 	}
@@ -3958,7 +4344,7 @@ func (s *resolutionService) applyAttendanceRules(
 }
 
 // ─────────────────────────────────────────────────────────────
-// Helper methods (largely unchanged from HR implementation)
+// Helper methods
 // ─────────────────────────────────────────────────────────────
 
 func (s *resolutionService) pairCheckInCheckOut(events []*models.AttendanceEvent) []PairedEvent {
@@ -4081,11 +4467,15 @@ func (s *resolutionService) detectAnomaliesFromPairs(pairs []PairedEvent) []stri
 	return anomalies
 }
 
+// calculateMetrics computes worked minutes, late, overtime, etc. from all pairs.
+// It uses the earliest check-in for late minutes and latest check-out for overtime.
+// Unmatched check-ins are closed at expected end (or end of day).
 func (s *resolutionService) calculateMetrics(
 	pairs []PairedEvent,
 	resolved *resolver.ResolvedSubject,
 	policy *models.AttendancePolicy,
 	anomalies []string,
+	businessDate time.Time, // added to avoid using resolved.Date
 ) *DailyMetrics {
 	metrics := &DailyMetrics{
 		Status:       models.StatusPresent,
@@ -4099,7 +4489,6 @@ func (s *resolutionService) calculateMetrics(
 
 	var totalWorkedSec, totalBreakSec int64
 
-	// Expected start/end
 	var expectedStartLocal, expectedEndLocal *time.Time
 	if resolved.ExpectedStart != nil {
 		t := resolved.ExpectedStart.In(loc)
@@ -4117,31 +4506,25 @@ func (s *resolutionService) calculateMetrics(
 		}
 	}
 
+	var earliestCheckIn, latestCheckOut *time.Time
+
 	for _, p := range pairs {
 		if p.CheckIn != nil {
 			metrics.CheckIns++
 			if metrics.FirstCheckIn == nil || p.CheckInTime.Before(*metrics.FirstCheckIn) {
 				metrics.FirstCheckIn = p.CheckInTime
 			}
-			// Late calculation
-			if p.CheckInTime != nil && expectedStartLocal != nil {
-				checkInLocal := p.CheckInTime.In(loc)
-				if checkInLocal.After(*expectedStartLocal) {
-					lateSec := checkInLocal.Sub(*expectedStartLocal).Seconds()
-					lateMin := int(lateSec / 60)
-					if policy != nil && policy.Rules.GracePeriod != nil && lateMin <= *policy.Rules.GracePeriod {
-						lateMin = 0
-					}
-					if lateMin > 0 {
-						metrics.LateMinutes = &lateMin
-					}
-				}
+			if earliestCheckIn == nil || p.CheckInTime.Before(*earliestCheckIn) {
+				earliestCheckIn = p.CheckInTime
 			}
 		}
 		if p.CheckOut != nil {
 			metrics.CheckOuts++
 			if metrics.LastCheckOut == nil || p.CheckOutTime.After(*metrics.LastCheckOut) {
 				metrics.LastCheckOut = p.CheckOutTime
+			}
+			if latestCheckOut == nil || p.CheckOutTime.After(*latestCheckOut) {
+				latestCheckOut = p.CheckOutTime
 			}
 			if p.CheckInTime != nil && p.CheckOutTime != nil {
 				workDur := p.CheckOutTime.Sub(*p.CheckInTime)
@@ -4155,24 +4538,22 @@ func (s *resolutionService) calculateMetrics(
 					breakDur := p.BreakEnd.Sub(*p.BreakStart)
 					totalBreakSec += int64(breakDur.Seconds())
 				}
+			}
+		}
+	}
 
-				// Overtime
-				if expectedEndLocal != nil {
-					checkOutLocal := p.CheckOutTime.In(loc)
-					if checkOutLocal.After(*expectedEndLocal) {
-						otSec := checkOutLocal.Sub(*expectedEndLocal).Seconds()
-						otMin := int(otSec / 60)
-						if policy != nil && policy.Rules.OvertimeThreshold != nil && otMin < *policy.Rules.OvertimeThreshold {
-							otMin = 0
-						}
-						if otMin > 0 {
-							if metrics.OvertimeMinutes == nil {
-								metrics.OvertimeMinutes = &otMin
-							} else {
-								*metrics.OvertimeMinutes += otMin
-							}
-						}
-					}
+	// Handle unmatched check-ins (no checkout): close them at expected end (or end-of-day)
+	for _, p := range pairs {
+		if p.CheckIn != nil && p.CheckOut == nil {
+			closeTime := expectedEndLocal
+			if closeTime == nil {
+				endOfDay := time.Date(businessDate.Year(), businessDate.Month(), businessDate.Day(), 23, 59, 59, 0, loc)
+				closeTime = &endOfDay
+			}
+			if p.CheckInTime != nil && closeTime != nil {
+				workDur := closeTime.Sub(*p.CheckInTime)
+				if workDur > 0 {
+					totalWorkedSec += int64(workDur.Seconds())
 				}
 			}
 		}
@@ -4182,30 +4563,66 @@ func (s *resolutionService) calculateMetrics(
 	if netSec > 0 {
 		workedMin := int(netSec / 60)
 		metrics.WorkedMinutes = &workedMin
+	} else {
+		zero := 0
+		metrics.WorkedMinutes = &zero
 	}
+
 	if totalBreakSec > 0 {
 		breakMin := int(totalBreakSec / 60)
 		metrics.BreakMinutes = &breakMin
 	}
 
-	if metrics.ExpectedMinutes != nil {
-		if metrics.LateMinutes == nil {
-			zero := 0
-			metrics.LateMinutes = &zero
-		}
-		if metrics.OvertimeMinutes == nil {
-			zero := 0
-			metrics.OvertimeMinutes = &zero
+	// Late minutes: earliest check-in compared to expected start
+	if expectedStartLocal != nil && earliestCheckIn != nil {
+		if earliestCheckIn.After(*expectedStartLocal) {
+			lateSec := earliestCheckIn.Sub(*expectedStartLocal).Seconds()
+			lateMin := int(lateSec / 60)
+			if policy != nil && policy.Rules.GracePeriod != nil && lateMin <= *policy.Rules.GracePeriod {
+				lateMin = 0
+			}
+			metrics.LateMinutes = &lateMin
 		}
 	}
+	if metrics.LateMinutes == nil {
+		zero := 0
+		metrics.LateMinutes = &zero
+	}
+
+	// Overtime: latest checkout compared to expected end
+	if expectedEndLocal != nil && latestCheckOut != nil {
+		if latestCheckOut.After(*expectedEndLocal) {
+			otSec := latestCheckOut.Sub(*expectedEndLocal).Seconds()
+			otMin := int(otSec / 60)
+			if policy != nil && policy.Rules.OvertimeThreshold != nil && otMin < *policy.Rules.OvertimeThreshold {
+				otMin = 0
+			}
+			metrics.OvertimeMinutes = &otMin
+		}
+	}
+	if metrics.OvertimeMinutes == nil {
+		zero := 0
+		metrics.OvertimeMinutes = &zero
+	}
+
+	if metrics.ExpectedMinutes == nil && expectedStartLocal != nil && expectedEndLocal != nil {
+		expSec := expectedEndLocal.Sub(*expectedStartLocal).Seconds()
+		if expSec > 0 {
+			expMin := int(expSec / 60)
+			metrics.ExpectedMinutes = &expMin
+		}
+	}
+
 	return metrics
 }
 
+// determineStatus decides final status using metrics, resolved subject, and policy.
 func (s *resolutionService) determineStatus(
 	metrics *DailyMetrics,
 	resolved *resolver.ResolvedSubject,
 	policy *models.AttendancePolicy,
 ) string {
+	// Respect schedule overrides (already handled earlier, but double-check)
 	if resolved.ScheduleStatus != "" {
 		switch resolved.ScheduleStatus {
 		case "weekly_off":
@@ -4220,10 +4637,12 @@ func (s *resolutionService) determineStatus(
 		}
 	}
 
+	// No check-ins → absent
 	if metrics.CheckIns == 0 {
 		return models.StatusAbsent
 	}
 
+	// Late logic
 	if metrics.LateMinutes != nil && *metrics.LateMinutes > 0 {
 		if policy != nil && policy.Rules.MaxLateAllowed != nil && *metrics.LateMinutes > *policy.Rules.MaxLateAllowed {
 			return models.StatusAbsent
@@ -4231,25 +4650,34 @@ func (s *resolutionService) determineStatus(
 		return models.StatusLate
 	}
 
-	if metrics.WorkedMinutes != nil && policy != nil && policy.Rules.HalfDayAfter != nil {
+	// Half-day: if worked < half-day threshold (and policy has threshold)
+	if policy != nil && policy.Rules.HalfDayAfter != nil && metrics.WorkedMinutes != nil && metrics.ExpectedMinutes != nil {
 		if *metrics.WorkedMinutes < *policy.Rules.HalfDayAfter {
 			return models.StatusHalfDay
 		}
 	}
 
+	// If there is at least one check-in, but no check-outs, and auto-checkout is allowed
 	if metrics.CheckIns > 0 && metrics.CheckOuts == 0 {
 		if policy != nil && policy.Rules.AutoCheckout != nil && *policy.Rules.AutoCheckout {
-			if metrics.WorkedMinutes != nil && *metrics.WorkedMinutes >= 240 {
+			if metrics.WorkedMinutes != nil && *metrics.WorkedMinutes >= 240 { // 4 hours minimum to be considered present
 				return models.StatusPresent
 			}
 		}
-		return "incomplete"
-	}
-	if metrics.CheckIns == 0 && metrics.CheckOuts > 0 {
-		return "incomplete"
+		// Otherwise, it's a half-day or absent (if no work)
+		if metrics.WorkedMinutes != nil && *metrics.WorkedMinutes > 0 {
+			return models.StatusHalfDay
+		}
+		return models.StatusAbsent
 	}
 
-	return models.StatusPresent
+	// If some work was done, mark present
+	if metrics.WorkedMinutes != nil && *metrics.WorkedMinutes > 0 {
+		return models.StatusPresent
+	}
+
+	// Fallback
+	return models.StatusAbsent
 }
 
 func (s *resolutionService) resolvePolicy(
@@ -4259,21 +4687,20 @@ func (s *resolutionService) resolvePolicy(
 	date time.Time,
 	resolved *resolver.ResolvedSubject,
 ) (*models.AttendancePolicy, error) {
-	// We only support employees for now (students may have separate logic later)
+	// 1. Try subject-specific policy (polymorphic – works for any subject type)
+	policy, err := s.policyRepo.GetActivePolicyBySubject(ctx, subjectType, subjectID, date)
+	if err == nil && policy != nil {
+		return policy, nil
+	}
+
+	// 2. For employees only, fallback to position/work center policies (legacy)
 	if subjectType == models.SubjectTypeEmployee {
-		// user policy
-		userPolicy, err := s.policyRepo.GetUserActivePolicy(ctx, subjectID, date)
-		if err == nil && userPolicy != nil {
-			return userPolicy, nil
-		}
-		// position policy
 		if resolved.PositionID != nil {
 			posPolicy, err := s.policyRepo.GetPositionPolicy(ctx, *resolved.PositionID)
 			if err == nil && posPolicy != nil {
 				return posPolicy, nil
 			}
 		}
-		// workcenter policy
 		if resolved.WorkCenterCode != nil {
 			wcPolicy, err := s.policyRepo.GetWorkCenterPolicy(ctx, companyID, *resolved.WorkCenterCode)
 			if err == nil && wcPolicy != nil {
@@ -4281,10 +4708,9 @@ func (s *resolutionService) resolvePolicy(
 			}
 		}
 	}
-	// fallback (company default)
+
 	return s.defaultPolicy(), nil
 }
-
 func (s *resolutionService) defaultPolicy() *models.AttendancePolicy {
 	return &models.AttendancePolicy{
 		PolicyID:   uuid.New(),
@@ -5667,6 +6093,7 @@ import (
 
 // QueryService provides high-level read operations for attendance data.
 type QueryService interface {
+	// --- Existing methods ---
 	GetEventByID(ctx context.Context, eventID uuid.UUID) (*models.AttendanceEvent, error)
 	ListEvents(ctx context.Context, filter EventFilter) ([]*models.AttendanceEvent, int64, error)
 	GetDailySummary(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) (*models.AttendanceDailySummary, error)
@@ -5679,6 +6106,14 @@ type QueryService interface {
 	ListSourceTypes(ctx context.Context) ([]*models.AttendanceSourceType, error)
 	GetAttendancePolicyByID(ctx context.Context, policyID uuid.UUID) (*models.AttendancePolicy, error)
 	GetAttendancePoliciesByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.AttendancePolicy, error)
+
+	// --- NEW: Session Summary methods ---
+	GetSessionSummary(ctx context.Context, sessionID, subjectID uuid.UUID, subjectType string) (*models.AttendanceSessionSummary, error)
+	ListSessionSummaries(ctx context.Context, filter repository.SessionSummaryFilter, page, pageSize int) ([]*models.AttendanceSessionSummary, int64, error)
+
+	// --- NEW: Exemption methods ---
+	GetExemptionsForSubject(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) ([]*models.AttendanceExemption, error)
+	ListExemptions(ctx context.Context, filter repository.ExemptionFilter, page, pageSize int) ([]*models.AttendanceExemption, int64, error)
 }
 
 type EventFilter struct {
@@ -5695,31 +6130,38 @@ type EventFilter struct {
 }
 
 type queryService struct {
-	eventRepo   repository.EventRepository
-	summaryRepo repository.SummaryRepository
-	sourceRepo  repository.SourceRepository
-	policyRepo  repository.PolicyRepository // <-- add this
-
-	logger *zap.Logger
+	eventRepo          repository.EventRepository
+	summaryRepo        repository.SummaryRepository
+	sourceRepo         repository.SourceRepository
+	policyRepo         repository.PolicyRepository
+	sessionSummaryRepo repository.AttendanceSessionSummaryRepository // 👈 NEW
+	exemptionRepo      repository.AttendanceExemptionRepository      // 👈 NEW
+	logger             *zap.Logger
 }
 
+// NewQueryService creates a new query service.
+// Now accepts sessionSummaryRepo and exemptionRepo.
 func NewQueryService(
 	eventRepo repository.EventRepository,
 	summaryRepo repository.SummaryRepository,
 	sourceRepo repository.SourceRepository,
-	policyRepo repository.PolicyRepository, // <-- add this parameter
-
+	policyRepo repository.PolicyRepository,
+	sessionSummaryRepo repository.AttendanceSessionSummaryRepository, // 👈 NEW PARAM
+	exemptionRepo repository.AttendanceExemptionRepository, // 👈 NEW PARAM
 	logger *zap.Logger,
 ) QueryService {
 	return &queryService{
-		eventRepo:   eventRepo,
-		summaryRepo: summaryRepo,
-		sourceRepo:  sourceRepo,
-		policyRepo:  policyRepo,
-
-		logger: logger,
+		eventRepo:          eventRepo,
+		summaryRepo:        summaryRepo,
+		sourceRepo:         sourceRepo,
+		policyRepo:         policyRepo,
+		sessionSummaryRepo: sessionSummaryRepo,
+		exemptionRepo:      exemptionRepo,
+		logger:             logger,
 	}
 }
+
+// --- Existing methods (unchanged) ---
 
 func (s *queryService) GetEventByID(ctx context.Context, eventID uuid.UUID) (*models.AttendanceEvent, error) {
 	if eventID == uuid.Nil {
@@ -5787,7 +6229,6 @@ func (s *queryService) ListCompanySummaries(ctx context.Context, companyID uuid.
 	if companyID == uuid.Nil {
 		return nil, fmt.Errorf("company ID is required")
 	}
-	// Use a large limit; in production, consider pagination or a dedicated stats method.
 	summaries, _, err := s.summaryRepo.GetByCompanyRange(ctx, companyID, from, to, 1, 100000)
 	if err != nil {
 		return nil, err
@@ -5822,7 +6263,7 @@ func (s *queryService) GetCompanyStats(ctx context.Context, companyID uuid.UUID,
 		AverageAttendance:  0,
 	}
 	var totalWorkedMin, totalOvertimeMin int
-	subjectSet := make(map[string]bool) // track unique subjects
+	subjectSet := make(map[string]bool)
 	for _, sum := range summaries {
 		key := sum.SubjectType + ":" + sum.SubjectID.String()
 		if !subjectSet[key] {
@@ -5929,6 +6370,7 @@ func (s *queryService) ListEventTypes(ctx context.Context, activeOnly bool) ([]*
 func (s *queryService) ListSourceTypes(ctx context.Context) ([]*models.AttendanceSourceType, error) {
 	return s.sourceRepo.GetSourceTypes(ctx, true)
 }
+
 func (s *queryService) GetAttendancePolicyByID(ctx context.Context, policyID uuid.UUID) (*models.AttendancePolicy, error) {
 	if policyID == uuid.Nil {
 		return nil, fmt.Errorf("policy ID is required")
@@ -5941,6 +6383,66 @@ func (s *queryService) GetAttendancePoliciesByCompany(ctx context.Context, compa
 		return nil, fmt.Errorf("company ID is required")
 	}
 	return s.policyRepo.GetPoliciesByCompany(ctx, companyID, activeOnly)
+}
+
+// ─────────────────────────────────────────────────────────────
+// NEW: Session Summary Methods
+// ─────────────────────────────────────────────────────────────
+
+func (s *queryService) GetSessionSummary(ctx context.Context, sessionID, subjectID uuid.UUID, subjectType string) (*models.AttendanceSessionSummary, error) {
+	if sessionID == uuid.Nil || subjectID == uuid.Nil || subjectType == "" {
+		return nil, fmt.Errorf("session_id, subject_id, and subject_type are required")
+	}
+	return s.sessionSummaryRepo.GetBySessionAndSubject(ctx, nil, sessionID, subjectID, subjectType)
+}
+
+func (s *queryService) ListSessionSummaries(ctx context.Context, filter repository.SessionSummaryFilter, page, pageSize int) ([]*models.AttendanceSessionSummary, int64, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 1000 {
+		pageSize = 100
+	}
+	pag := repository.Pagination{Limit: pageSize, Offset: (page - 1) * pageSize}
+	summaries, err := s.sessionSummaryRepo.List(ctx, nil, filter, pag)
+	if err != nil {
+		return nil, 0, err
+	}
+	total, err := s.sessionSummaryRepo.Count(ctx, nil, filter)
+	if err != nil {
+		return nil, 0, err
+	}
+	return summaries, total, nil
+}
+
+// ─────────────────────────────────────────────────────────────
+// NEW: Exemption Methods
+// ─────────────────────────────────────────────────────────────
+
+func (s *queryService) GetExemptionsForSubject(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) ([]*models.AttendanceExemption, error) {
+	if companyID == uuid.Nil || subjectID == uuid.Nil || subjectType == "" {
+		return nil, fmt.Errorf("company_id, subject_id, and subject_type are required")
+	}
+	return s.exemptionRepo.GetActiveForSubject(ctx, nil, companyID, subjectID, subjectType, date)
+}
+
+func (s *queryService) ListExemptions(ctx context.Context, filter repository.ExemptionFilter, page, pageSize int) ([]*models.AttendanceExemption, int64, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 1000 {
+		pageSize = 100
+	}
+	pag := repository.Pagination{Limit: pageSize, Offset: (page - 1) * pageSize}
+	exemptions, err := s.exemptionRepo.List(ctx, nil, filter, pag)
+	if err != nil {
+		return nil, 0, err
+	}
+	total, err := s.exemptionRepo.Count(ctx, nil, filter)
+	if err != nil {
+		return nil, 0, err
+	}
+	return exemptions, total, nil
 }
 
 
@@ -5971,12 +6473,12 @@ type EnrollmentDataProvider interface {
 }
 
 type TimetableEntry struct {
-	EntryID   uuid.UUID // renamed from TimetableEntryID
+	EntryID   uuid.UUID
 	SubjectID uuid.UUID
 	TeacherID uuid.UUID
 	RoomID    *uuid.UUID
-	StartTime time.Time
-	EndTime   time.Time
+	StartTime time.Time // only time part (date portion is zero)
+	EndTime   time.Time // only time part (date portion is zero)
 	SlotID    uuid.UUID
 	DayOfWeek int
 }
@@ -6044,13 +6546,20 @@ func (r *StudentResolver) Resolve(ctx context.Context, companyID uuid.UUID, subj
 		}, nil
 	}
 
+	// Combine the date from the input `date` with the time from each entry.
+	// Both are in UTC; the business date is already a UTC timestamp at midnight.
 	var earliestStart, latestEnd *time.Time
 	for _, e := range entries {
-		if earliestStart == nil || e.StartTime.Before(*earliestStart) {
-			earliestStart = &e.StartTime
+		start := time.Date(date.Year(), date.Month(), date.Day(),
+			e.StartTime.Hour(), e.StartTime.Minute(), e.StartTime.Second(), e.StartTime.Nanosecond(), time.UTC)
+		end := time.Date(date.Year(), date.Month(), date.Day(),
+			e.EndTime.Hour(), e.EndTime.Minute(), e.EndTime.Second(), e.EndTime.Nanosecond(), time.UTC)
+
+		if earliestStart == nil || start.Before(*earliestStart) {
+			earliestStart = &start
 		}
-		if latestEnd == nil || e.EndTime.After(*latestEnd) {
-			latestEnd = &e.EndTime
+		if latestEnd == nil || end.After(*latestEnd) {
+			latestEnd = &end
 		}
 	}
 
@@ -6062,7 +6571,8 @@ func (r *StudentResolver) Resolve(ctx context.Context, companyID uuid.UUID, subj
 		}
 	}
 
-	timezone := "UTC" // default, could be from company
+	// TODO: fetch company timezone for proper localisation, but UTC works for now.
+	timezone := "UTC"
 
 	return &ResolvedSubject{
 		IsActive:           true,
@@ -6074,6 +6584,133 @@ func (r *StudentResolver) Resolve(ctx context.Context, companyID uuid.UUID, subj
 		IsOnLeave:          false,
 		IsLeavePaid:        false,
 	}, nil
+}
+
+
+
+================================================================================
+FILE: ./service/resolver/leave_provider.go
+================================================================================
+
+package resolver
+
+import (
+	"context"
+	"time"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	leaveService "auth-service/internal/hr/leave/service"
+)
+
+type leaveDataProvider struct {
+	leaveQuerySvc leaveService.LeaveQueryService
+	logger        *zap.Logger
+}
+
+func NewLeaveDataProvider(leaveQuerySvc leaveService.LeaveQueryService, logger *zap.Logger) LeaveDataProvider {
+	return &leaveDataProvider{
+		leaveQuerySvc: leaveQuerySvc,
+		logger:        logger,
+	}
+}
+
+func (p *leaveDataProvider) GetLeaveStatus(ctx context.Context, companyID, userID uuid.UUID, date time.Time) (isOnLeave bool, isPaid bool, leaveTypeID, leaveRequestID *uuid.UUID, err error) {
+	// 1. Get approved leave request for the date
+	leave, err := p.leaveQuerySvc.GetApprovedLeaveForDate(ctx, companyID, userID, date)
+	if err != nil {
+		p.logger.Warn("Failed to get leave status", zap.Error(err))
+		return false, false, nil, nil, err
+	}
+	if leave == nil {
+		return false, false, nil, nil, nil
+	}
+
+	// 2. Fetch leave type to determine if it's paid
+	leaveType, err := p.leaveQuerySvc.GetLeaveTypeByID(ctx, companyID, leave.LeaveTypeID)
+	if err != nil {
+		p.logger.Warn("Failed to get leave type", zap.Error(err))
+		return false, false, nil, nil, err
+	}
+	if leaveType == nil {
+		p.logger.Warn("Leave type not found", zap.String("leave_type_id", leave.LeaveTypeID.String()))
+		return false, false, nil, nil, nil
+	}
+
+	return true, leaveType.IsPaid, &leave.LeaveTypeID, &leave.LeaveRequestID, nil
+}
+
+
+
+================================================================================
+FILE: ./service/resolver/session_data_provider.go
+================================================================================
+
+package resolver
+
+import (
+	"context"
+	"database/sql"
+	"time"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	academicsRepo "auth-service/internal/academics/repository"
+)
+
+// sessionDataProvider implements SessionDataProvider using the academics session repository.
+type sessionDataProvider struct {
+	db          *sql.DB
+	sessionRepo academicsRepo.AcademicSessionRepository
+	logger      *zap.Logger
+}
+
+// NewSessionDataProvider creates a new session data provider.
+func NewSessionDataProvider(
+	db *sql.DB,
+	sessionRepo academicsRepo.AcademicSessionRepository,
+	logger *zap.Logger,
+) SessionDataProvider {
+	return &sessionDataProvider{
+		db:          db,
+		sessionRepo: sessionRepo,
+		logger:      logger,
+	}
+}
+
+// GetAcademicSession retrieves the academic session for a given timetable entry and date.
+// Returns the session ID, start time, end time, and any error.
+// If no session exists, returns (nil, nil, nil, nil).
+func (p *sessionDataProvider) GetAcademicSession(
+	ctx context.Context,
+	timetableEntryID uuid.UUID,
+	date time.Time,
+) (sessionID *uuid.UUID, startTime, endTime *time.Time, err error) {
+	p.logger.Info("GetAcademicSession called",
+		zap.String("timetable_entry_id", timetableEntryID.String()),
+		zap.String("date", date.Format("2006-01-02")),
+	)
+
+	session, err := p.sessionRepo.GetByTimetableEntryAndDate(ctx, p.db, timetableEntryID, date)
+	if err != nil {
+		p.logger.Error("GetByTimetableEntryAndDate failed", zap.Error(err))
+		return nil, nil, nil, err
+	}
+	if session == nil {
+		p.logger.Warn("No academic session found for timetable entry",
+			zap.String("timetable_entry_id", timetableEntryID.String()),
+		)
+		return nil, nil, nil, nil
+	}
+
+	p.logger.Info("Academic session found",
+		zap.String("session_id", session.SessionID.String()),
+		zap.Time("start_time", session.StartTime),
+		zap.Time("end_time", session.EndTime),
+	)
+	return &session.SessionID, &session.StartTime, &session.EndTime, nil
 }
 
 
@@ -6133,6 +6770,219 @@ type ScheduleSubjectResolver interface {
 
 	// GetActiveSubjectsByCompany returns active subject IDs for a company (optionally filtered by position/work center).
 	GetActiveSubjectsByCompany(ctx context.Context, companyID uuid.UUID, filters map[string]interface{}) ([]uuid.UUID, error)
+}
+
+
+
+================================================================================
+FILE: ./service/resolver/student_data_provider.go
+================================================================================
+
+package resolver
+
+import (
+	"context"
+	"database/sql"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	academicsRepo "auth-service/internal/academics/repository"
+)
+
+type studentDataProvider struct {
+	db          *sql.DB
+	studentRepo academicsRepo.StudentRepository
+	logger      *zap.Logger
+}
+
+func NewStudentDataProvider(db *sql.DB, studentRepo academicsRepo.StudentRepository, logger *zap.Logger) StudentDataProvider {
+	return &studentDataProvider{
+		db:          db,
+		studentRepo: studentRepo,
+		logger:      logger,
+	}
+}
+
+func (p *studentDataProvider) GetStudent(ctx context.Context, companyID, studentID uuid.UUID) (active bool, err error) {
+	p.logger.Info("GetStudent called",
+		zap.String("company_id", companyID.String()),
+		zap.String("student_id", studentID.String()),
+	)
+
+	student, err := p.studentRepo.GetByID(ctx, p.db, studentID)
+	if err != nil {
+		p.logger.Error("GetByID failed", zap.Error(err))
+		return false, err
+	}
+	if student == nil {
+		p.logger.Warn("Student not found", zap.String("student_id", studentID.String()))
+		return false, nil
+	}
+	if student.CompanyID != companyID {
+		p.logger.Warn("Student belongs to different company",
+			zap.String("student_id", studentID.String()),
+			zap.String("actual_company", student.CompanyID.String()),
+		)
+		return false, nil
+	}
+	// Convert StudentStatus to string for logging
+	if student.Status != "active" {
+		p.logger.Warn("Student inactive",
+			zap.String("student_id", studentID.String()),
+			zap.String("status", string(student.Status)), // ✅ convert to string
+		)
+		return false, nil
+	}
+
+	p.logger.Info("Student found and active", zap.String("student_id", studentID.String()))
+	return true, nil
+}
+
+
+
+================================================================================
+FILE: ./service/resolver/employee_provider.go
+================================================================================
+
+package resolver
+
+import (
+	"context"
+	"time"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"auth-service/internal/attendance/repository"
+	hrRepository "auth-service/internal/hr/repository"
+)
+
+type employeeDataProvider struct {
+	employeeRepo hrRepository.EmployeeRepository
+	scheduleRepo repository.ScheduleRepository
+	logger       *zap.Logger
+}
+
+func NewEmployeeDataProvider(
+	employeeRepo hrRepository.EmployeeRepository,
+	scheduleRepo repository.ScheduleRepository,
+	logger *zap.Logger,
+) EmployeeDataProvider {
+	return &employeeDataProvider{
+		employeeRepo: employeeRepo,
+		scheduleRepo: scheduleRepo,
+		logger:       logger,
+	}
+}
+
+func (p *employeeDataProvider) GetEmployee(ctx context.Context, companyID, userID uuid.UUID) (active bool, positionID *uuid.UUID, workCenterCode *string, err error) {
+	p.logger.Info("GetEmployee called",
+		zap.String("company_id", companyID.String()),
+		zap.String("user_id", userID.String()),
+	)
+
+	// 1. Get company employee record
+	ce, err := p.employeeRepo.GetCompanyEmployeeByUserID(ctx, userID)
+	if err != nil {
+		p.logger.Error("GetCompanyEmployeeByUserID failed", zap.Error(err))
+		return false, nil, nil, err
+	}
+	if ce == nil {
+		p.logger.Warn("CompanyEmployee not found", zap.String("user_id", userID.String()))
+		return false, nil, nil, nil
+	}
+	if !ce.IsActive {
+		p.logger.Warn("Employee is inactive", zap.String("user_id", userID.String()))
+		return false, nil, nil, nil
+	}
+	active = true
+	p.logger.Info("CompanyEmployee found",
+		zap.String("employee_id", ce.EmployeeID),
+		zap.String("position_id", func() string {
+			if ce.PositionID != nil {
+				return ce.PositionID.String()
+			}
+			return "<nil>"
+		}()),
+	)
+
+	// 2. Get position if available
+	if ce.PositionID != nil {
+		positionID = ce.PositionID
+		p.logger.Info("Fetching position", zap.String("position_id", positionID.String()))
+		pos, err := p.employeeRepo.GetPositionByID(ctx, *positionID)
+		if err != nil {
+			p.logger.Error("GetPositionByID failed", zap.Error(err), zap.String("position_id", positionID.String()))
+			// Continue without work center
+		} else if pos != nil {
+			workCenterCode = pos.WorkCenterCode
+			p.logger.Info("Position fetched successfully",
+				zap.String("position_id", positionID.String()),
+				zap.String("work_center", func() string {
+					if workCenterCode != nil {
+						return *workCenterCode
+					}
+					return "<nil>"
+				}()),
+			)
+		} else {
+			p.logger.Warn("Position not found (nil)", zap.String("position_id", positionID.String()))
+		}
+	} else {
+		p.logger.Warn("Employee has no position_id", zap.String("user_id", userID.String()))
+	}
+
+	// 3. Fallback to work center assignment
+	if workCenterCode == nil {
+		assigned, err := p.scheduleRepo.GetUserWorkCenterAssignment(ctx, userID, time.Now())
+		if err == nil && assigned != nil {
+			workCenterCode = &assigned.WorkCenterCode
+			p.logger.Info("Work center from assignment", zap.String("work_center", *workCenterCode))
+		} else {
+			if err != nil {
+				p.logger.Warn("GetUserWorkCenterAssignment error", zap.Error(err))
+			} else {
+				p.logger.Warn("No work center assignment found")
+			}
+		}
+	}
+
+	p.logger.Info("GetEmployee result",
+		zap.Bool("active", active),
+		zap.String("position_id", func() string {
+			if positionID != nil {
+				return positionID.String()
+			}
+			return "<nil>"
+		}()),
+		zap.String("work_center_code", func() string {
+			if workCenterCode != nil {
+				return *workCenterCode
+			}
+			return "<nil>"
+		}()),
+	)
+
+	return active, positionID, workCenterCode, nil
+}
+
+func (p *employeeDataProvider) GetWorkCenterAssignment(ctx context.Context, userID uuid.UUID, date time.Time) (workCenterCode *string, err error) {
+	p.logger.Debug("GetWorkCenterAssignment called",
+		zap.String("user_id", userID.String()),
+		zap.String("date", date.Format("2006-01-02")),
+	)
+	assignment, err := p.scheduleRepo.GetUserWorkCenterAssignment(ctx, userID, date)
+	if err != nil {
+		p.logger.Error("GetUserWorkCenterAssignment failed", zap.Error(err))
+		return nil, err
+	}
+	if assignment != nil {
+		p.logger.Info("Work center assignment found", zap.String("work_center", assignment.WorkCenterCode))
+		return &assignment.WorkCenterCode, nil
+	}
+	p.logger.Warn("No work center assignment found for user", zap.String("user_id", userID.String()))
+	return nil, nil
 }
 
 
@@ -6273,6 +7123,80 @@ func (r *CustomerResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 
 
 ================================================================================
+FILE: ./service/resolver/timetable_data_provider.go
+================================================================================
+
+package resolver
+
+import (
+	"context"
+	"database/sql"
+	"time"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	academicsRepo "auth-service/internal/academics/repository"
+)
+
+type timetableDataProvider struct {
+	db            *sql.DB
+	timetableRepo academicsRepo.TimetableRepository
+	logger        *zap.Logger
+}
+
+func NewTimetableDataProvider(db *sql.DB, timetableRepo academicsRepo.TimetableRepository, logger *zap.Logger) TimetableDataProvider {
+	return &timetableDataProvider{
+		db:            db,
+		timetableRepo: timetableRepo,
+		logger:        logger,
+	}
+}
+
+func (p *timetableDataProvider) GetTimetableForSection(ctx context.Context, sectionID uuid.UUID, date time.Time) (timetableID *uuid.UUID, entries []TimetableEntry, err error) {
+	// Fetch all active entries for the exact date range (single day)
+	entriesWithDetails, err := p.timetableRepo.GetActiveTimetableEntriesForDateRange(ctx, p.db, date, date)
+	if err != nil {
+		p.logger.Error("GetActiveTimetableEntriesForDateRange failed", zap.Error(err))
+		return nil, nil, err
+	}
+
+	// Filter by sectionID
+	var filtered []*academicsRepo.TimetableEntryWithDetails
+	var firstTimetableID *uuid.UUID
+	for _, e := range entriesWithDetails {
+		if e.SectionID == sectionID {
+			filtered = append(filtered, e)
+			if firstTimetableID == nil {
+				firstTimetableID = &e.TimetableID
+			}
+		}
+	}
+	if len(filtered) == 0 {
+		p.logger.Warn("No timetable entries for section on date")
+		return nil, nil, nil
+	}
+
+	// Convert to the resolver's TimetableEntry type
+	entries = make([]TimetableEntry, len(filtered))
+	for i, e := range filtered {
+		entries[i] = TimetableEntry{
+			EntryID:   e.EntryID,
+			SubjectID: e.SubjectID,
+			TeacherID: e.TeacherID,
+			RoomID:    e.RoomID,
+			StartTime: e.StartTime,
+			EndTime:   e.EndTime,
+			SlotID:    e.SlotID,
+			DayOfWeek: e.DayOfWeek,
+		}
+	}
+	return firstTimetableID, entries, nil
+}
+
+
+
+================================================================================
 FILE: ./service/resolver/employee_resolver.go
 ================================================================================
 
@@ -6330,21 +7254,43 @@ func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 		return nil, fmt.Errorf("employee resolver called with subject_type=%s", subjectType)
 	}
 
+	r.logger.Info("EmployeeResolver.Resolve called",
+		zap.String("company_id", companyID.String()),
+		zap.String("subject_id", subjectID.String()),
+		zap.String("date", date.Format("2006-01-02")),
+	)
+
 	active, positionID, workCenterCode, err := r.employeeRepo.GetEmployee(ctx, companyID, subjectID)
 	if err != nil {
+		r.logger.Error("GetEmployee failed", zap.Error(err))
 		return nil, fmt.Errorf("get employee: %w", err)
 	}
 	if !active {
+		r.logger.Warn("Employee inactive", zap.String("subject_id", subjectID.String()))
 		return &ResolvedSubject{IsActive: false}, nil
 	}
 
-	if workCenterCode == nil && positionID != nil {
-		// Optionally fetch from position, but we skip for brevity
-	}
+	r.logger.Info("Employee resolved",
+		zap.String("position_id", func() string {
+			if positionID != nil {
+				return positionID.String()
+			}
+			return "<nil>"
+		}()),
+		zap.String("work_center", func() string {
+			if workCenterCode != nil {
+				return *workCenterCode
+			}
+			return "<nil>"
+		}()),
+	)
+
+	// If work center still nil, try assignment again (though provider already did)
 	if workCenterCode == nil {
 		assigned, err := r.employeeRepo.GetWorkCenterAssignment(ctx, subjectID, date)
 		if err == nil && assigned != nil {
 			workCenterCode = assigned
+			r.logger.Info("Work center from assignment (fallback)", zap.String("work_center", *workCenterCode))
 		}
 	}
 
@@ -6363,10 +7309,12 @@ func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 		scheduleStatus = "working"
 		if inst.WorkCenterCode != nil {
 			workCenterCode = inst.WorkCenterCode
+			r.logger.Info("Work center from existing schedule instance", zap.String("work_center", *workCenterCode))
 		}
 	} else {
 		scheduleStatus = "not_schedulable"
 		timezone = "UTC"
+		r.logger.Debug("No schedule instances found for user on date")
 	}
 
 	isOnLeave := false
@@ -6379,6 +7327,8 @@ func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 			isLeavePaid = paid
 			leaveTypeID = ltID
 			leaveRequestID = lrID
+		} else {
+			r.logger.Warn("GetLeaveStatus failed", zap.Error(err))
 		}
 	}
 	if isOnLeave {
@@ -6401,6 +7351,8 @@ func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 			policyCode = &wcPolicy.PolicyCode
 			policyType = &wcPolicy.PolicyType
 			policyRules = wcPolicy.Rules
+		} else {
+			r.logger.Warn("Work center policy not found", zap.String("work_center", *workCenterCode), zap.Error(err))
 		}
 	} else if positionID != nil {
 		posPolicy, err := r.policyRepo.GetPositionPolicy(ctx, *positionID)
@@ -6409,7 +7361,11 @@ func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 			policyCode = &posPolicy.PolicyCode
 			policyType = &posPolicy.PolicyType
 			policyRules = posPolicy.Rules
+		} else {
+			r.logger.Warn("Position policy not found", zap.String("position_id", positionID.String()), zap.Error(err))
 		}
+	} else {
+		r.logger.Warn("No policy source: both workCenterCode and positionID are nil")
 	}
 
 	// Override handling
@@ -6427,9 +7383,10 @@ func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 		case "holiday_override":
 			scheduleStatus = "holiday"
 		}
+		r.logger.Info("Schedule override applied", zap.String("type", override.OverrideType))
 	}
 
-	return &ResolvedSubject{
+	resolved := &ResolvedSubject{
 		IsActive:           active,
 		Timezone:           timezone,
 		ScheduleStatus:     scheduleStatus,
@@ -6449,7 +7406,71 @@ func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 		PolicyCode:         policyCode,
 		PolicyType:         policyType,
 		PolicyRules:        policyRules,
-	}, nil
+	}
+
+	r.logger.Info("Resolved subject",
+		zap.String("position_id", func() string {
+			if resolved.PositionID != nil {
+				return resolved.PositionID.String()
+			}
+			return "<nil>"
+		}()),
+		zap.String("work_center", func() string {
+			if resolved.WorkCenterCode != nil {
+				return *resolved.WorkCenterCode
+			}
+			return "<nil>"
+		}()),
+		zap.String("schedule_status", resolved.ScheduleStatus),
+	)
+
+	return resolved, nil
+}
+
+
+
+================================================================================
+FILE: ./service/resolver/enrollment_data_provider.go
+================================================================================
+
+package resolver
+
+import (
+	"context"
+	"database/sql"
+	"time"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	academicsRepo "auth-service/internal/academics/repository"
+)
+
+type enrollmentDataProvider struct {
+	db             *sql.DB
+	enrollmentRepo academicsRepo.EnrollmentRepository
+	logger         *zap.Logger
+}
+
+func NewEnrollmentDataProvider(db *sql.DB, enrollmentRepo academicsRepo.EnrollmentRepository, logger *zap.Logger) EnrollmentDataProvider {
+	return &enrollmentDataProvider{
+		db:             db,
+		enrollmentRepo: enrollmentRepo,
+		logger:         logger,
+	}
+}
+
+func (p *enrollmentDataProvider) GetActiveEnrollment(ctx context.Context, companyID, studentID uuid.UUID, date time.Time) (sectionID *uuid.UUID, academicYearID *uuid.UUID, err error) {
+	enrollment, err := p.enrollmentRepo.GetActiveEnrollmentByStudentOnDate(ctx, p.db, companyID, studentID, date)
+	if err != nil {
+		p.logger.Error("GetActiveEnrollmentByStudentOnDate failed", zap.Error(err))
+		return nil, nil, err
+	}
+	if enrollment == nil {
+		p.logger.Warn("No active enrollment on date")
+		return nil, nil, nil
+	}
+	return &enrollment.SectionID, &enrollment.AcademicYearID, nil
 }
 
 

@@ -82,6 +82,12 @@ func NewEntitlementService(
 	pgClient *client.PostgresClient,
 	logger *zap.Logger,
 ) EntitlementService {
+	if featureRepo == nil {
+		panic("featureRepo cannot be nil")
+	}
+	if pgClient == nil || pgClient.DB == nil {
+		panic("pgClient or its DB is nil")
+	}
 	return &entitlementService{
 		repo:             repo,
 		planItemRepo:     planItemRepo,
@@ -134,6 +140,9 @@ func idempotencyKey(prefix, id string) string {
 	return fmt.Sprintf("%s-%s", prefix, id)
 }
 
+// ----------------------------------------------------------------------------
+// FIX: validateEntitlement now uses pgClient.DB instead of nil
+// ----------------------------------------------------------------------------
 func (s *entitlementService) validateEntitlement(ctx context.Context, ent *models.Entitlement) error {
 	if ent.PlanItemID == uuid.Nil {
 		return errors.ErrInvalidInput
@@ -141,17 +150,29 @@ func (s *entitlementService) validateEntitlement(ctx context.Context, ent *model
 	if ent.FeatureKey == "" {
 		return errors.ErrInvalidInput
 	}
-	exists, err := s.featureRepo.Exists(ctx, nil, ent.FeatureKey)
+
+	// Use the service's underlying DB connection for read-only validation
+	db := s.pgClient.DB
+	if db == nil {
+		return fmt.Errorf("database connection is nil")
+	}
+
+	// Check if feature exists
+	exists, err := s.featureRepo.Exists(ctx, db, ent.FeatureKey)
 	if err != nil {
 		return err
 	}
 	if !exists {
 		return errors.ErrInvalidInput
 	}
+
+	// Validate limit period if limit value is set
 	if ent.LimitValue != nil && !ent.LimitPeriod.IsValid() {
 		return errors.ErrInvalidInput
 	}
-	planItemExists, err := s.planItemRepo.Exists(ctx, nil, ent.PlanItemID)
+
+	// Check if plan item exists
+	planItemExists, err := s.planItemRepo.Exists(ctx, db, ent.PlanItemID)
 	if err != nil {
 		return err
 	}
@@ -398,7 +419,9 @@ func (s *entitlementService) GetByID(ctx context.Context, entitlementID uuid.UUI
 	if entitlementID == uuid.Nil {
 		return nil, errors.ErrInvalidInput
 	}
-	return s.repo.GetByID(ctx, nil, entitlementID)
+	// Passing nil DBTX is allowed if the repository implementation handles it by using a default db.
+	// However, to be safe, we pass the underlying DB connection.
+	return s.repo.GetByID(ctx, s.pgClient.DB, entitlementID)
 }
 
 // ----------------------------------------------------------------------------
@@ -787,12 +810,12 @@ func (s *entitlementService) Exists(ctx context.Context, entitlementID uuid.UUID
 	if entitlementID == uuid.Nil {
 		return false, errors.ErrInvalidInput
 	}
-	return s.repo.Exists(ctx, nil, entitlementID)
+	return s.repo.Exists(ctx, s.pgClient.DB, entitlementID)
 }
 
 func (s *entitlementService) HasFeature(ctx context.Context, planItemID uuid.UUID, featureID uuid.UUID) (bool, error) {
-	featureKey := featureID.String() // assuming featureID is actually the key; adjust if needed
-	return s.repo.ExistsByFeature(ctx, nil, planItemID, featureKey)
+	featureKey := featureID.String()
+	return s.repo.ExistsByFeature(ctx, s.pgClient.DB, planItemID, featureKey)
 }
 
 // ----------------------------------------------------------------------------
@@ -800,19 +823,19 @@ func (s *entitlementService) HasFeature(ctx context.Context, planItemID uuid.UUI
 // ----------------------------------------------------------------------------
 
 func (s *entitlementService) List(ctx context.Context, filter repository.EntitlementFilter, p repository.Pagination, srt repository.Sort) ([]*models.Entitlement, int64, error) {
-	return s.repo.List(ctx, nil, filter, p, srt)
+	return s.repo.List(ctx, s.pgClient.DB, filter, p, srt)
 }
 
 func (s *entitlementService) Search(ctx context.Context, planItemID uuid.UUID, query string, limit, offset int) ([]*models.Entitlement, int64, error) {
-	return s.repo.Search(ctx, nil, planItemID, query, limit, offset)
+	return s.repo.Search(ctx, s.pgClient.DB, planItemID, query, limit, offset)
 }
 
 func (s *entitlementService) GetByPlanItem(ctx context.Context, planItemID uuid.UUID) ([]*models.Entitlement, error) {
-	return s.repo.GetByPlanItem(ctx, nil, planItemID)
+	return s.repo.GetByPlanItem(ctx, s.pgClient.DB, planItemID)
 }
 
 func (s *entitlementService) GetByFeature(ctx context.Context, featureID uuid.UUID) ([]*models.Entitlement, error) {
-	return s.repo.GetByFeature(ctx, nil, featureID.String())
+	return s.repo.GetByFeature(ctx, s.pgClient.DB, featureID.String())
 }
 
 func (s *entitlementService) GetBySubscription(ctx context.Context, subscriptionID uuid.UUID) ([]*models.Entitlement, error) {

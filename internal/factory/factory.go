@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"auth-service/internal/accounting"
+	"auth-service/internal/attendance/service/usage_integration"
 	"auth-service/internal/bucketing"
 	"auth-service/internal/client"
 	"auth-service/internal/config"
@@ -39,9 +40,11 @@ import (
 	"auth-service/internal/repository/redis"
 	"auth-service/internal/repository/scylla"
 	"auth-service/internal/sales"
+	salesRepo "auth-service/internal/sales/repository"
 	"auth-service/internal/service"
 	"auth-service/internal/sms"
 	"auth-service/internal/subscription"
+	subRepo "auth-service/internal/subscription/repository"
 	"auth-service/internal/tls"
 	"auth-service/internal/util"
 )
@@ -257,6 +260,7 @@ func (m *KafkaLoggingManager) HealthCheck(ctx context.Context) map[string]error 
 	return errs
 }
 
+// NewFactory creates and initializes the application factory.
 func NewFactory() (*Factory, error) {
 	cfg := config.LoadConfig()
 	logger := util.Get()
@@ -398,6 +402,41 @@ func NewFactory() (*Factory, error) {
 		f.EncryptionManager(),
 	)
 	f.attendanceFactory = attendanceFactory
+
+	// -------------------------------------------------------------
+	// NEW: INJECT CUSTOMER RESOLVER & USAGE INTEGRATION DEPENDENCIES
+	// -------------------------------------------------------------
+	// Create repositories needed for customer resolver and usage.
+	// Note: we use the imported salesRepo and subRepo packages.
+	// -------------------------------------------------------------
+	// NEW: INJECT CUSTOMER RESOLVER & USAGE INTEGRATION DEPENDENCIES
+	// -------------------------------------------------------------
+	// Create repositories needed for customer resolver and usage.
+	// Note: these constructors only accept a logger; they use the global DB.
+	customerRepo := salesRepo.NewCustomerRepository(f.logger)
+	subscriptionRepo := subRepo.NewSubscriptionRepository(f.logger)
+	trialRepo := subRepo.NewTrialRepository(f.logger)
+	subItemRepo := subRepo.NewSubscriptionItemRepository(f.logger)
+	planItemRepo := subRepo.NewPlanItemRepository(f.logger)
+	entitlementRepo := subRepo.NewEntitlementRepository(f.logger)
+	usageRepo := subRepo.NewUsageRepository(f.logger)
+
+	// Set customer resolver dependencies (for SubjectResolver)
+	attendanceFactory.SetCustomerResolverDependencies(customerRepo, subscriptionRepo, trialRepo)
+
+	// Create and set usage integration service – pass the underlying *sql.DB
+	usageSvc := usage_integration.NewUsageIntegrationService(
+		f.PostgresClient().DB, // <-- *sql.DB
+		subscriptionRepo,
+		subItemRepo,
+		planItemRepo,
+		entitlementRepo,
+		usageRepo,
+		f.logger,
+	)
+	attendanceFactory.SetUsageIntegrationService(usageSvc)
+
+	// -------------------------------------------------------------
 
 	// Start attendance background services
 	ctx := context.Background()
@@ -633,7 +672,6 @@ func NewFactory() (*Factory, error) {
 
 	return f, nil
 }
-
 func (f *Factory) Close() error {
 	f.closeOnce.Do(func() {
 		close(f.closed)

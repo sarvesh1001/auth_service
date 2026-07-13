@@ -25,10 +25,11 @@ import (
 	"auth-service/internal/attendance/service/resolver"
 	"auth-service/internal/attendance/service/scheduling"
 	"auth-service/internal/attendance/service/source"
+	"auth-service/internal/attendance/service/usage_integration" // added
 	"auth-service/internal/attendance/service/workcenter"
 	"auth-service/internal/client"
 	"auth-service/internal/config"
-	"auth-service/internal/encryption" // <-- added
+	"auth-service/internal/encryption"
 	"auth-service/internal/infrastructure/audit"
 	"auth-service/internal/infrastructure/idempotency"
 	infraOutbox "auth-service/internal/infrastructure/outbox"
@@ -40,6 +41,10 @@ import (
 	leaverepo "auth-service/internal/hr/leave/repository"
 	hrleavesvc "auth-service/internal/hr/leave/service"
 	hrpostgres "auth-service/internal/hr/repository"
+
+	// Sales & Subscription imports (for customer resolver)
+	salesRepo "auth-service/internal/sales/repository"
+	subRepo "auth-service/internal/subscription/repository"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -56,7 +61,7 @@ type AttendanceFactory struct {
 	auditService      *audit.AuditService
 	logger            *zap.Logger
 	cfg               *config.Config
-	encryptionManager *encryption.EncryptionManager // <-- added
+	encryptionManager *encryption.EncryptionManager
 
 	// configuration
 	deviceTokenPrefix   string
@@ -95,6 +100,14 @@ type AttendanceFactory struct {
 	academicEnrollmentRepo academicsRepo.EnrollmentRepository
 	academicTimetableRepo  academicsRepo.TimetableRepository
 	academicSessionRepo    academicsRepo.AcademicSessionRepository
+
+	// ---------- customer resolver dependencies ----------
+	customerRepo     salesRepo.CustomerRepository
+	subscriptionRepo subRepo.SubscriptionRepository
+	trialRepo        subRepo.TrialRepository
+
+	// ---------- usage integration service ----------
+	usageIntegrationService *usage_integration.UsageIntegrationService // added
 
 	// resolvers
 	subjectResolver         resolver.SubjectResolver
@@ -175,7 +188,7 @@ func NewAttendanceFactory(
 	cfg *config.Config,
 	logger *zap.Logger,
 	config AttendanceFactoryConfig,
-	encryptionManager *encryption.EncryptionManager, // <-- new param
+	encryptionManager *encryption.EncryptionManager,
 ) *AttendanceFactory {
 	return &AttendanceFactory{
 		postgresClient:      postgresClient,
@@ -186,11 +199,31 @@ func NewAttendanceFactory(
 		auditService:        auditService,
 		cfg:                 cfg,
 		logger:              logger.Named("attendance_factory"),
-		encryptionManager:   encryptionManager, // <-- store it
+		encryptionManager:   encryptionManager,
 		deviceTokenPrefix:   config.DeviceTokenPrefix,
 		deviceTokenSecret:   config.DeviceTokenSecret,
 		deviceTokenValidity: config.DeviceTokenValidity,
 	}
+}
+
+// ---------- Setter for customer resolver dependencies ----------
+// SetCustomerResolverDependencies injects the repositories needed for customer resolution.
+func (f *AttendanceFactory) SetCustomerResolverDependencies(
+	customerRepo salesRepo.CustomerRepository,
+	subscriptionRepo subRepo.SubscriptionRepository,
+	trialRepo subRepo.TrialRepository,
+) {
+	f.customerRepo = customerRepo
+	f.subscriptionRepo = subscriptionRepo
+	f.trialRepo = trialRepo
+	f.logger.Info("Customer resolver dependencies set")
+}
+
+// ---------- Setter for usage integration service ----------
+// SetUsageIntegrationService injects the usage integration service.
+func (f *AttendanceFactory) SetUsageIntegrationService(svc *usage_integration.UsageIntegrationService) {
+	f.usageIntegrationService = svc
+	f.logger.Info("Usage integration service set")
 }
 
 // ---------- Repositories ----------
@@ -328,12 +361,11 @@ func (f *AttendanceFactory) DeviceEmbeddingSyncRepository() biometricRepoPkg.Dev
 	return f.deviceSyncRepo
 }
 
-// ---------- Academic Repositories (FIXED) ----------
+// ---------- Academic Repositories ----------
 // These now use the encryption manager passed in.
 
 func (f *AttendanceFactory) StudentRepository() academicsRepo.StudentRepository {
 	if f.academicStudentRepo == nil {
-		// ✅ Pass the encryption manager (non-nil)
 		f.academicStudentRepo = academicsRepo.NewStudentRepository(f.logger, f.encryptionManager)
 	}
 	return f.academicStudentRepo
@@ -364,7 +396,7 @@ func (f *AttendanceFactory) AcademicSessionRepository() academicsRepo.AcademicSe
 
 func (f *AttendanceFactory) StudentDataProvider() resolver.StudentDataProvider {
 	return resolver.NewStudentDataProvider(
-		f.postgresClient.DB, // *sql.DB, not a function
+		f.postgresClient.DB, // *sql.DB
 		f.StudentRepository(),
 		f.logger,
 	)
@@ -450,8 +482,23 @@ func (f *AttendanceFactory) SubjectResolver() resolver.SubjectResolver {
 			f.logger.Info("Using externally provided student resolver")
 		}
 
-		// Add other resolvers if needed (customer, etc.)
-		// Example: resolvers["customer"] = customerResolver
+		// 4. Customer resolver (if dependencies are set)
+		if f.customerRepo != nil && f.subscriptionRepo != nil && f.trialRepo != nil {
+			customerResolver := resolver.NewCustomerResolverWithSubscription(
+				f.postgresClient.DB,
+				f.customerRepo,
+				f.subscriptionRepo,
+				f.trialRepo,
+				f.logger,
+			)
+			resolvers["customer"] = customerResolver
+			f.logger.Info("Customer resolver with subscription checks enabled")
+		} else {
+			// Fallback: use a simple stub that always returns active
+			customerResolver := resolver.NewCustomerResolver(f.logger)
+			resolvers["customer"] = customerResolver
+			f.logger.Info("Using fallback customer resolver (no subscription checks)")
+		}
 
 		f.subjectResolver = resolver.NewCompositeResolver(resolvers)
 	}
@@ -581,6 +628,7 @@ func (f *AttendanceFactory) IngestService() ingest.IngestService {
 			f.auditService,
 			f.logger,
 			f.SessionSummaryRepository(),
+			f.usageIntegrationService, // pass the usage integration service (may be nil)
 		)
 	}
 	return f.ingestService

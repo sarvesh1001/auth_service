@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 
 	"auth-service/internal/attendance/models"
@@ -15,6 +16,7 @@ import (
 	"auth-service/internal/attendance/service/admin"
 	"auth-service/internal/attendance/service/enrollment"
 	"auth-service/internal/attendance/service/source"
+	"auth-service/internal/attendance/service/usage_integration"
 	auditservice "auth-service/internal/infrastructure/audit"
 )
 
@@ -64,6 +66,7 @@ type ingestService struct {
 	audit              *auditservice.AuditService
 	logger             *zap.Logger
 	sessionSummaryRepo repository.AttendanceSessionSummaryRepository
+	usageService       *usage_integration.UsageIntegrationService
 }
 
 func NewIngestService(
@@ -77,6 +80,7 @@ func NewIngestService(
 	audit *auditservice.AuditService,
 	logger *zap.Logger,
 	sessionSummaryRepo repository.AttendanceSessionSummaryRepository,
+	usageService *usage_integration.UsageIntegrationService,
 ) IngestService {
 	return &ingestService{
 		eventRepo:          eventRepo,
@@ -89,6 +93,7 @@ func NewIngestService(
 		audit:              audit,
 		logger:             logger,
 		sessionSummaryRepo: sessionSummaryRepo,
+		usageService:       usageService,
 	}
 }
 
@@ -163,12 +168,11 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 	}
 
 	// 5. Resolve attendance rules (policy)
-	// --- FIX: add subjectType to the call ---
 	resolvedRules, err := s.adminService.ResolveAttendanceRules(
 		ctx,
 		subjectID,
 		req.CompanyID,
-		subjectType, // <-- added
+		subjectType,
 		derefString(req.Context.WorkCenterCode),
 		nil, // positionID
 		eventTime,
@@ -237,9 +241,21 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		CreatedBy: actorPtr,
 	}
 
+	s.logger.Debug("Creating transaction via eventRepo.BeginTx",
+		zap.String("event_id", event.AttendanceEventID.String()),
+	)
 	tx, err := s.eventRepo.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	// Log the transaction pointer and nil status
+	s.logger.Debug("Transaction created",
+		zap.Any("tx_ptr", tx),
+		zap.Bool("tx_is_nil", tx == nil),
+	)
+	if tx == nil {
+		s.logger.Error("Transaction is nil but no error returned from BeginTx")
+		return nil, errors.New("failed to begin transaction: tx is nil")
 	}
 	defer tx.Rollback()
 
@@ -254,11 +270,51 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 	// 9. If this punch is linked to a session, upsert the session summary
 	if req.Context.SessionID != nil && *req.Context.SessionID != uuid.Nil {
 		if err := s.updateSessionSummary(ctx, tx, event, *req.Context.SessionID); err != nil {
-			// Do not fail the whole transaction; just log.
 			s.logger.Warn("Failed to update session summary",
 				zap.String("event_id", event.AttendanceEventID.String()),
 				zap.String("session_id", req.Context.SessionID.String()),
 				zap.Error(err),
+			)
+		}
+	}
+
+	// 10. Process usage for customer check-ins (if applicable)
+	if subjectType == "customer" && req.EventType == "check_in" {
+		featureKey := s.getFeatureKeyForEvent(req.EventType, req.Source.SourceType)
+		if featureKey != "" {
+			s.logger.Debug("Attempting to process usage",
+				zap.String("customer_id", subjectID.String()),
+				zap.String("feature_key", featureKey),
+				zap.Any("tx_ptr", tx),
+				zap.Bool("tx_is_nil", tx == nil),
+				zap.Bool("usageService_is_nil", s.usageService == nil),
+			)
+			if s.usageService == nil {
+				s.logger.Error("usageService is nil; cannot process usage")
+				return nil, errors.New("usage service not available")
+			}
+			if tx == nil {
+				s.logger.Error("Transaction is nil before calling ProcessCheckIn")
+				return nil, errors.New("transaction is nil")
+			}
+			if err := s.usageService.ProcessCheckIn(
+				ctx,
+				tx,
+				req.CompanyID,
+				subjectID,
+				event.AttendanceEventID,
+				featureKey,
+				decimal.NewFromInt(1),
+			); err != nil {
+				s.logger.Error("Usage processing failed, rejecting punch",
+					zap.Error(err),
+					zap.String("customer_id", subjectID.String()),
+				)
+				return nil, fmt.Errorf("usage processing failed: %w", err)
+			}
+		} else {
+			s.logger.Debug("No feature key mapped for this event; skipping usage",
+				zap.String("event_type", req.EventType),
 			)
 		}
 	}
@@ -292,11 +348,29 @@ func boolPtr(b bool) *bool {
 }
 
 // resolveEventTime determines the event timestamp based on source rules and company timezone.
+// If company attendance rules are missing, it falls back to UTC and logs a warning.
 func (s *ingestService) resolveEventTime(ctx context.Context, req *PunchRequest, rules *source.ResolvedSourceRules) (time.Time, error) {
 	companyRules, err := s.adminService.GetCompanyAttendanceRules(ctx, req.CompanyID)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("get company rules: %w", err)
 	}
+
+	// If company rules are nil, fallback to UTC and log warning
+	if companyRules == nil {
+		s.logger.Warn("No company attendance rules found; falling back to UTC timezone",
+			zap.String("company_id", req.CompanyID.String()))
+		if rules.RequiresDevice {
+			if req.EventTime == nil {
+				return time.Time{}, errors.New("event_time required for device events")
+			}
+			return req.EventTime.UTC(), nil
+		}
+		if rules.IsSystem {
+			return time.Now().UTC(), nil
+		}
+		return time.Now().UTC(), nil
+	}
+
 	loc, err := time.LoadLocation(companyRules.Timezone)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("invalid timezone: %w", err)
@@ -316,9 +390,7 @@ func (s *ingestService) resolveEventTime(ctx context.Context, req *PunchRequest,
 }
 
 // updateSessionSummary creates or updates the session summary based on the event.
-// Note: tx is *sql.Tx because that's what the repository expects.
 func (s *ingestService) updateSessionSummary(ctx context.Context, tx *sql.Tx, event *models.AttendanceEvent, sessionID uuid.UUID) error {
-	// Determine session date from event time (use UTC for simplicity; can be enhanced with company timezone)
 	sessionDate := event.EventTime.UTC().Truncate(24 * time.Hour)
 
 	status := mapEventTypeToSessionStatus(event.EventType)
@@ -345,7 +417,6 @@ func (s *ingestService) updateSessionSummary(ctx context.Context, tx *sql.Tx, ev
 }
 
 // mapEventTypeToSessionStatus converts an attendance event type to a session status.
-// Customize this mapping based on your business rules.
 func mapEventTypeToSessionStatus(eventType string) string {
 	switch eventType {
 	case "check_in", "shift_start", "class_start", "session_join", "present":
@@ -357,7 +428,18 @@ func mapEventTypeToSessionStatus(eventType string) string {
 	case "excused", "exempted":
 		return "excused"
 	default:
-		// Default to "present" for unknown event types
 		return "present"
+	}
+}
+
+// getFeatureKeyForEvent maps an attendance event to a subscription feature key.
+func (s *ingestService) getFeatureKeyForEvent(eventType, sourceType string) string {
+	switch eventType {
+	case "check_in":
+		return "gym_visit"
+	case "class_start":
+		return "class_attendance"
+	default:
+		return ""
 	}
 }
