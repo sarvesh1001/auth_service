@@ -1,4 +1,3 @@
-// internal/config/config.go
 package config
 
 import (
@@ -42,7 +41,7 @@ type Config struct {
 	QR            QRConfig
 	WebSocket     WebSocketConfig
 	HR            HRConfig
-	Email         EmailConfig // ✅ NEW: SMTP email configuration
+	Email         EmailConfig
 }
 
 // ----------------------------
@@ -116,18 +115,19 @@ type EncryptionConfig struct {
 }
 
 type ServerConfig struct {
-	Port         int
-	ReadTimeout  time.Duration
-	WriteTimeout time.Duration
-	IdleTimeout  time.Duration
-	EnableTLS    bool
-	TLSPort      int    `mapstructure:"tls_port"`
-	CertFile     string `mapstructure:"cert_file"`
-	KeyFile      string `mapstructure:"key_file"`
-	AutoCert     bool   `mapstructure:"auto_cert"`
-	AutoCertDir  string `mapstructure:"auto_cert_dir"`
-	Domain       string `mapstructure:"domain"`
-	Email        string `mapstructure:"email"`
+	Port          int
+	ReadTimeout   time.Duration
+	WriteTimeout  time.Duration
+	IdleTimeout   time.Duration
+	EnableTLS     bool
+	TLSPort       int    `mapstructure:"tls_port"`
+	CertFile      string `mapstructure:"cert_file"`
+	KeyFile       string `mapstructure:"key_file"`
+	AutoCert      bool   `mapstructure:"auto_cert"`
+	AutoCertDir   string `mapstructure:"auto_cert_dir"`
+	Domain        string `mapstructure:"domain"`
+	Email         string `mapstructure:"email"`
+	PublicBaseURL string `mapstructure:"public_base_url"` // ✅ NEW: public base URL for external access (e.g., ngrok)
 }
 
 type RedisConfig struct {
@@ -232,7 +232,6 @@ type OTPConfig struct {
 	BypassRateLimitDev bool          `json:"bypass_rate_limit_dev"`
 }
 
-// ✅ NEW: QR Web Login configuration
 type QRConfig struct {
 	HMACSecret       string        `mapstructure:"hmac_secret"`
 	Expiry           time.Duration `mapstructure:"expiry"`
@@ -246,7 +245,6 @@ type QRConfig struct {
 	LogScansInDev    bool          `mapstructure:"log_scans_in_dev"`
 }
 
-// ✅ NEW: WebSocket configuration
 type WebSocketConfig struct {
 	ReadBufferSize    int           `mapstructure:"read_buffer_size"`
 	WriteBufferSize   int           `mapstructure:"write_buffer_size"`
@@ -260,7 +258,6 @@ type WebSocketConfig struct {
 	EnableCompression bool          `mapstructure:"enable_compression"`
 }
 
-// ✅ NEW: Email (SMTP) configuration
 type EmailConfig struct {
 	SMTPHost     string
 	SMTPPort     int
@@ -295,21 +292,19 @@ func LoadConfig() *Config {
 			Environment: environment,
 
 			Server: ServerConfig{
-				Port:         getEnvAsInt("SERVER_PORT", 8080),
-				TLSPort:      getEnvAsInt("SERVER_TLS_PORT", 8443),
-				ReadTimeout:  getEnvAsDuration("SERVER_READ_TIMEOUT", 30*time.Second),
-				WriteTimeout: getEnvAsDuration("SERVER_WRITE_TIMEOUT", 30*time.Second),
-				IdleTimeout:  getEnvAsDuration("SERVER_IDLE_TIMEOUT", 60*time.Second),
-
-				// UPDATED TLS SETTINGS
-				EnableTLS: false,
-				AutoCert:  false,
-				CertFile:  "",
-				KeyFile:   "",
-
-				AutoCertDir: getEnv("SERVER_AUTO_CERT_DIR", "/app/certs"),
-				Domain:      getEnv("SERVER_DOMAIN", "localhost"),
-				Email:       getEnv("SERVER_EMAIL", "admin@localhost"),
+				Port:          getEnvAsInt("SERVER_PORT", 8080),
+				TLSPort:       getEnvAsInt("SERVER_TLS_PORT", 8443),
+				ReadTimeout:   getEnvAsDuration("SERVER_READ_TIMEOUT", 30*time.Second),
+				WriteTimeout:  getEnvAsDuration("SERVER_WRITE_TIMEOUT", 30*time.Second),
+				IdleTimeout:   getEnvAsDuration("SERVER_IDLE_TIMEOUT", 60*time.Second),
+				EnableTLS:     false,
+				AutoCert:      false,
+				CertFile:      "",
+				KeyFile:       "",
+				AutoCertDir:   getEnv("SERVER_AUTO_CERT_DIR", "/app/certs"),
+				Domain:        getEnv("SERVER_DOMAIN", "localhost"),
+				Email:         getEnv("SERVER_EMAIL", "admin@localhost"),
+				PublicBaseURL: getEnv("SERVER_PUBLIC_BASE_URL", ""), // ✅ NEW: read from env
 			},
 
 			Postgres: PostgresConfig{
@@ -369,7 +364,8 @@ func LoadConfig() *Config {
 					DeviceTokenSecret:   getSecureEnv("HR_ATTENDANCE_DEVICE_TOKEN_SECRET", "dev-device-secret-change-me"),
 					DeviceTokenValidity: getEnvAsDuration("HR_ATTENDANCE_DEVICE_TOKEN_VALIDITY", 30*24*time.Hour),
 				},
-			}, Security: SecurityConfig{
+			},
+			Security: SecurityConfig{
 				JWTSecret:    getSecureEnv("JWT_SECRET", "default-insecure-secret-change-in-production"),
 				APIKey:       getSecureEnv("API_KEY", ""),
 				CORSOrigins:  getEnvAsSlice("CORS_ORIGINS", []string{"*"}, ","),
@@ -426,7 +422,6 @@ func LoadConfig() *Config {
 				KEKEnabled: getEnvAsBool("ENCRYPTION_KEK_ENABLED", false),
 			},
 
-			// ✅ NEW: Email (SMTP) configuration
 			Email: EmailConfig{
 				SMTPHost:     getEnv("SMTP_HOST", ""),
 				SMTPPort:     getEnvAsInt("SMTP_PORT", 587),
@@ -458,9 +453,10 @@ func LoadConfig() *Config {
 			zap.Bool("jwt_rotate_refresh", cfg.JWT.RotateRefreshTokens),
 			zap.Duration("qr_expiry", cfg.QR.Expiry),
 			zap.Int("websocket_max_connections", cfg.WebSocket.MaxConnections),
-			zap.String("smtp_host", cfg.Email.SMTPHost), // ✅ NEW: log SMTP host
+			zap.String("smtp_host", cfg.Email.SMTPHost),
 			zap.Int("smtp_port", cfg.Email.SMTPPort),
 			zap.String("smtp_from", cfg.Email.FromAddress),
+			zap.String("public_base_url", cfg.Server.PublicBaseURL), // ✅ NEW: log public base URL
 		)
 	})
 
@@ -546,7 +542,7 @@ func loadOTPConfig(env string) OTPConfig {
 }
 
 // ----------------------------
-// ✅ NEW: loadQRConfig
+// loadQRConfig
 // ----------------------------
 
 func loadQRConfig(env string) QRConfig {
@@ -567,7 +563,7 @@ func loadQRConfig(env string) QRConfig {
 }
 
 // ----------------------------
-// ✅ NEW: loadWebSocketConfig
+// loadWebSocketConfig
 // ----------------------------
 
 func loadWebSocketConfig() WebSocketConfig {
@@ -725,15 +721,12 @@ func validateConfig(cfg *Config) {
 		if cfg.Security.JWTSecret == "default-insecure-secret-change-in-production" {
 			util.Warn("JWT_SECRET is using default value")
 		}
-		// ============================
 		if cfg.HR.Documents.MaxSizeMB <= 0 {
 			util.Warn("HR_DOCUMENT_MAX_SIZE_MB must be greater than 0")
 		}
-
 		if cfg.HR.Documents.BasePath == "" {
 			util.Warn("HR_DOCUMENT_BASE_PATH is empty - documents may not be stored correctly")
 		}
-
 		if cfg.IsProduction() {
 			if strings.HasPrefix(cfg.HR.Documents.BasePath, "/tmp") {
 				util.Warn("HR_DOCUMENT_BASE_PATH uses /tmp in production - data may be lost on restart")
@@ -759,7 +752,6 @@ func validateConfig(cfg *Config) {
 			util.Warn("OTP logging enabled in production")
 		}
 
-		// ✅ NEW: QR validation
 		if cfg.QR.HMACSecret == "default-qr-hmac-secret-change-in-production" {
 			util.Warn("QR_HMAC_SECRET is using default value - change in production")
 		}
@@ -770,7 +762,6 @@ func validateConfig(cfg *Config) {
 			util.Warn("QR_ALLOW_SAME_DEVICE is enabled - this may reduce security")
 		}
 
-		// ✅ NEW: WebSocket validation
 		if cfg.WebSocket.MaxConnections < 1000 {
 			util.Warn("WS_MAX_CONNECTIONS is low - consider increasing for production")
 		}
@@ -778,7 +769,6 @@ func validateConfig(cfg *Config) {
 			util.Warn("WS_ALLOWED_ORIGINS is set to '*' - consider restricting in production")
 		}
 
-		// ✅ NEW: Email validation
 		if cfg.Email.SMTPHost == "" {
 			util.Warn("SMTP_HOST is not set - email sending will fail")
 		}
@@ -788,7 +778,6 @@ func validateConfig(cfg *Config) {
 		if cfg.Email.FromAddress == "" {
 			util.Warn("SMTP_FROM_ADDRESS is not set - emails may be rejected")
 		}
-		// Password may be optional if server does not require auth, but we warn if username is set but password missing
 		if cfg.Email.SMTPUsername != "" && cfg.Email.SMTPPassword == "" {
 			util.Warn("SMTP_USERNAME provided but SMTP_PASSWORD is empty - authentication may fail")
 		}

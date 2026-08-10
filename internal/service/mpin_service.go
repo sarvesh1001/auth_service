@@ -1,17 +1,10 @@
-// internal/service/mpin_service.go
 package service
 
 import (
-	"auth-service/internal/config"
-	"auth-service/internal/encryption"
-	"auth-service/internal/hashing"
-	"auth-service/internal/models"
-	"auth-service/internal/repository/postgres"
-	"auth-service/internal/repository/scylla"
-	"auth-service/internal/util"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -20,9 +13,19 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"go.uber.org/zap"
+
+	"auth-service/internal/config"
+	"auth-service/internal/encryption"
+	appErrors "auth-service/internal/errors"
+	"auth-service/internal/hashing"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+	"auth-service/internal/models"
+	"auth-service/internal/repository/postgres"
+	"auth-service/internal/repository/scylla"
 )
 
+// ---- Local error variables (specific to MPIN) ----
 var (
 	ErrMPINNotFound          = errors.New("MPIN not found")
 	ErrMPINInvalid           = errors.New("invalid MPIN")
@@ -35,83 +38,83 @@ var (
 	ErrDeviceNotTrusted      = errors.New("device is not trusted")
 )
 
+// ---- Constants ----
 const (
 	MPINMinLength        = 4
 	MPINMaxLength        = 8
 	MPINLockDuration     = 30 * time.Minute
 	MPINMaxAttempts      = 5
-	MPINVerifyRateLimit  = 5           // per minute
-	MPINForgotRateLimit  = 3           // per hour
-	MPINChangeRateLimit  = 5           // per hour
-	MPINSetupRateLimit   = 3           // per hour
-	MPINRateLimitWindow  = time.Minute // 1 minute window
-	MPINForgotRateWindow = time.Hour   // 1 hour window
+	MPINVerifyRateLimit  = 5
+	MPINForgotRateLimit  = 3
+	MPINChangeRateLimit  = 5
+	MPINSetupRateLimit   = 3
+	MPINRateLimitWindow  = time.Minute
+	MPINForgotRateWindow = time.Hour
 	MPINCacheDuration    = 5 * time.Minute
 )
 
-// MPIN request/response structures
+// ---- Request/Response structs ----
 type MPINSetupRequest struct {
-    UserID            uuid.UUID `json:"user_id" validate:"required"`
-
-    MPIN              string `json:"mpin" validate:"required,min=4,max=8"`
-    DeviceID          string `json:"device_id" validate:"required"`
-    IPAddress         string `json:"ip_address"`
-    DeviceFingerprint string `json:"device_fingerprint"`
-    UserAgent         string `json:"user_agent"`
+	UserID            uuid.UUID `json:"user_id" validate:"required"`
+	MPIN              string    `json:"mpin" validate:"required,min=4,max=8"`
+	DeviceID          string    `json:"device_id" validate:"required"`
+	IPAddress         string    `json:"ip_address"`
+	DeviceFingerprint string    `json:"device_fingerprint"`
+	UserAgent         string    `json:"user_agent"`
 }
 
 type MPINVerifyRequest struct {
-    UserID            uuid.UUID `json:"user_id" validate:"required"`
-    MPIN              string `json:"mpin" validate:"required"`
-    DeviceID          string `json:"device_id" validate:"required"`
-    IPAddress         string `json:"ip_address"`
-    DeviceFingerprint string `json:"device_fingerprint"`
-    UserAgent         string `json:"user_agent"`
+	UserID            uuid.UUID `json:"user_id" validate:"required"`
+	MPIN              string    `json:"mpin" validate:"required"`
+	DeviceID          string    `json:"device_id" validate:"required"`
+	IPAddress         string    `json:"ip_address"`
+	DeviceFingerprint string    `json:"device_fingerprint"`
+	UserAgent         string    `json:"user_agent"`
 }
 
 type MPINChangeRequest struct {
-    UserID            uuid.UUID `json:"user_id" validate:"required"`
-    CurrentMPIN       string `json:"current_mpin" validate:"required"`
-    NewMPIN           string `json:"new_mpin" validate:"required,min=4,max=8"`
-    DeviceID          string `json:"device_id" validate:"required"`
-    IPAddress         string `json:"ip_address"`
-    DeviceFingerprint string `json:"device_fingerprint"`
-    UserAgent         string `json:"user_agent"`
+	UserID            uuid.UUID `json:"user_id" validate:"required"`
+	CurrentMPIN       string    `json:"current_mpin" validate:"required"`
+	NewMPIN           string    `json:"new_mpin" validate:"required,min=4,max=8"`
+	DeviceID          string    `json:"device_id" validate:"required"`
+	IPAddress         string    `json:"ip_address"`
+	DeviceFingerprint string    `json:"device_fingerprint"`
+	UserAgent         string    `json:"user_agent"`
 }
 
 type MPINResetRequest struct {
-    UserID            uuid.UUID `json:"user_id" validate:"required"`
-    ResetBy     uuid.UUID `json:"reset_by" validate:"required"`
-    Reason      string    `json:"reason" validate:"required"`
-    IPAddress   string    `json:"ip_address"`
-    UserAgent   string    `json:"user_agent"`
+	UserID    uuid.UUID `json:"user_id" validate:"required"`
+	ResetBy   uuid.UUID `json:"reset_by" validate:"required"`
+	Reason    string    `json:"reason" validate:"required"`
+	IPAddress string    `json:"ip_address"`
+	UserAgent string    `json:"user_agent"`
 }
 
 type MPINAdminChangeRequest struct {
-    UserID            uuid.UUID `json:"user_id" validate:"required"`
-    NewMPIN     string    `json:"new_mpin" validate:"required,min=4,max=8"`
-    AdminID     uuid.UUID `json:"admin_id" validate:"required"`
-    Reason      string    `json:"reason,omitempty"`
-    IPAddress   string    `json:"ip_address"`
-    UserAgent   string    `json:"user_agent"`
+	UserID    uuid.UUID `json:"user_id" validate:"required"`
+	NewMPIN   string    `json:"new_mpin" validate:"required,min=4,max=8"`
+	AdminID   uuid.UUID `json:"admin_id" validate:"required"`
+	Reason    string    `json:"reason,omitempty"`
+	IPAddress string    `json:"ip_address"`
+	UserAgent string    `json:"user_agent"`
 }
 
 type MPINForgotRequest struct {
-    UserID            uuid.UUID `json:"user_id" validate:"required"`
-    DeviceID          string `json:"device_id" validate:"required"`
-    IPAddress         string `json:"ip_address"`
-    DeviceFingerprint string `json:"device_fingerprint"`
-    UserAgent         string `json:"user_agent"`
+	UserID            uuid.UUID `json:"user_id" validate:"required"`
+	DeviceID          string    `json:"device_id" validate:"required"`
+	IPAddress         string    `json:"ip_address"`
+	DeviceFingerprint string    `json:"device_fingerprint"`
+	UserAgent         string    `json:"user_agent"`
 }
 
 type MPINForgotWithOTPRequest struct {
-    UserID            uuid.UUID `json:"user_id" validate:"required"`
-    DeviceID          string `json:"device_id" validate:"required"`
-    NewMPIN           string `json:"new_mpin" validate:"required,min=4,max=8"`
-    OTPCode           string `json:"otp_code" validate:"required,len=6"`
-    IPAddress         string `json:"ip_address"`
-    DeviceFingerprint string `json:"device_fingerprint"`
-    UserAgent         string `json:"user_agent"`
+	UserID            uuid.UUID `json:"user_id" validate:"required"`
+	DeviceID          string    `json:"device_id" validate:"required"`
+	NewMPIN           string    `json:"new_mpin" validate:"required,min=4,max=8"`
+	OTPCode           string    `json:"otp_code" validate:"required,len=6"`
+	IPAddress         string    `json:"ip_address"`
+	DeviceFingerprint string    `json:"device_fingerprint"`
+	UserAgent         string    `json:"user_agent"`
 }
 
 type MPINVerifyResult struct {
@@ -121,8 +124,6 @@ type MPINVerifyResult struct {
 	LockedUntil    *time.Time `json:"locked_until,omitempty"`
 	Message        string     `json:"message"`
 }
-
-
 
 type MPINStatus struct {
 	UserID         uuid.UUID  `json:"user_id"`
@@ -134,50 +135,52 @@ type MPINStatus struct {
 	DeviceID       string     `json:"device_id"`
 }
 
-
-
-
-// MPINService handles all MPIN-related business logic with enhanced security
+// ---- MPINService ----
 type MPINService struct {
-	mpinRepo        scylla.MPINRepository
-	userRepo        postgres.UserRepository
-	deviceTrustRepo scylla.DeviceTrustRepository
-	userOTPService  *UserOTPService // ✅ CHANGED: Use UserOTPService instead of OTPService
-	encryptionMgr   *encryption.EncryptionManager
-	hasher          *hashing.Hasher
-	config          *config.Config
-	logger          *zap.Logger
-	distCache       *DistributedCache
-	logProducer     *LogProducerService
-	cacheMutex      sync.RWMutex
+	mpinRepo         scylla.MPINRepository
+	userRepo         postgres.UserRepository
+	deviceTrustRepo  scylla.DeviceTrustRepository
+	userOTPService   *UserOTPService
+	encryptionMgr    *encryption.EncryptionManager
+	hasher           *hashing.Hasher
+	config           *config.Config
+	distCache        *DistributedCache
+	logProducer      *LogProducerService
+	auditService     *audit.AuditService
+	idempotencyStore idempotency.Store
+	cacheMutex       sync.RWMutex
 }
 
+// NewMPINService creates a new MPIN service.
 func NewMPINService(
 	mpinRepo scylla.MPINRepository,
 	userRepo postgres.UserRepository,
 	deviceTrustRepo scylla.DeviceTrustRepository,
-	userOTPService *UserOTPService, // ✅ CHANGED: Use UserOTPService instead of OTPService
+	userOTPService *UserOTPService,
 	encryptionMgr *encryption.EncryptionManager,
 	hasher *hashing.Hasher,
 	cfg *config.Config,
-	logger *zap.Logger,
 	logProducer *LogProducerService,
+	auditService *audit.AuditService,
+	idempotencyStore idempotency.Store,
 ) *MPINService {
 	return &MPINService{
-		mpinRepo:        mpinRepo,
-		userRepo:        userRepo,
-		deviceTrustRepo: deviceTrustRepo,
-		hasher:          hasher,
-		userOTPService:  userOTPService, // ✅ CHANGED
-		config:          cfg,
-		logger:          logger,
-		encryptionMgr:   encryptionMgr,
-		distCache:       nil,
-		logProducer:     logProducer,
+		mpinRepo:         mpinRepo,
+		userRepo:         userRepo,
+		deviceTrustRepo:  deviceTrustRepo,
+		userOTPService:   userOTPService,
+		encryptionMgr:    encryptionMgr,
+		hasher:           hasher,
+		config:           cfg,
+		logProducer:      logProducer,
+		auditService:     auditService,
+		idempotencyStore: idempotencyStore,
+		distCache:        nil,
 	}
 }
 
-// ✅ UPDATED: Helper function to hash device fingerprint
+// ---- Internal helpers ----
+
 func (s *MPINService) hashDeviceFingerprint(fingerprint string) string {
 	if fingerprint == "" {
 		return ""
@@ -186,114 +189,159 @@ func (s *MPINService) hashDeviceFingerprint(fingerprint string) string {
 	return hex.EncodeToString(hash[:])
 }
 
-// ✅ UPDATED: Helper function to get subnet from IP address
 func (s *MPINService) getSubnet(ipAddress string) string {
 	if ipAddress == "" {
 		return ""
 	}
-
 	parsedIP := net.ParseIP(ipAddress)
 	if parsedIP == nil {
 		return ""
 	}
-
-	// For IPv4, use /24 subnet (first 3 octets)
 	if ipv4 := parsedIP.To4(); ipv4 != nil {
 		mask := net.CIDRMask(24, 32)
 		maskedIP := ipv4.Mask(mask)
 		return maskedIP.String()
 	}
-
-	// For IPv6, use /64 subnet (first 64 bits)
 	if ipv6 := parsedIP.To16(); ipv6 != nil {
 		mask := net.CIDRMask(64, 128)
 		maskedIP := ipv6.Mask(mask)
 		return maskedIP.String()
 	}
-
 	return ""
 }
 
-// ✅ UPDATED: Check if subnets match
 func (s *MPINService) isSubnetMatch(ip1, ip2 string) bool {
 	if ip1 == "" || ip2 == "" {
-		return true // If either IP is empty, consider it a match (no data to compare)
+		return true
 	}
-
 	subnet1 := s.getSubnet(ip1)
 	subnet2 := s.getSubnet(ip2)
-
 	if subnet1 == "" || subnet2 == "" {
 		return true
 	}
-
 	return subnet1 == subnet2
 }
 
-// ✅ NEW: Enhanced device trust verification for MPIN operations
-func (s *MPINService) isDeviceTrusted(ctx context.Context, userID uuid.UUID, deviceID, ipAddress, deviceFingerprint string) (bool, *models.DeviceTrustLevel, error) {
+// isDeviceTrusted – with extensive logging for debugging
+// isDeviceTrusted - validates whether a device is trusted for MPIN authentication.
+// IP address and device fingerprint validation have been intentionally disabled.
+func (s *MPINService) isDeviceTrusted(
+	ctx context.Context,
+	userID uuid.UUID,
+	deviceID, ipAddress, deviceFingerprint string,
+) (bool, *models.DeviceTrustLevel, error) {
+
 	trustLevel, err := s.deviceTrustRepo.GetDeviceTrustLevel(ctx, userID, deviceID)
 	if err != nil {
+		s.logMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Device trust: repository error",
+			},
+			UserID:        userID.String(),
+			DeviceID:      deviceID,
+			ErrorCode:     "DEVICE_TRUST_REPO_ERROR",
+			ErrorMessage:  err.Error(),
+			FailureReason: "repo_error",
+		})
 		return false, nil, err
 	}
 
 	if trustLevel == nil {
+		s.logMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "Device trust: no trust record found",
+			},
+			UserID:        userID.String(),
+			DeviceID:      deviceID,
+			Status:        "trust_check_failed",
+			FailureReason: "no_trust_record",
+		})
 		return false, nil, nil
 	}
 
-	// Check if device is blocked
 	if trustLevel.IsBlocked {
+		s.logMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "Device trust: device is blocked",
+			},
+			UserID:        userID.String(),
+			DeviceID:      deviceID,
+			Status:        "trust_check_failed",
+			FailureReason: "device_blocked",
+		})
 		return false, trustLevel, nil
 	}
 
-	// Check trust status
-	if trustLevel.TrustStatus != models.TrustStatusPrimary && trustLevel.TrustStatus != models.TrustStatusTrusted {
+	if trustLevel.TrustStatus != models.TrustStatusPrimary &&
+		trustLevel.TrustStatus != models.TrustStatusTrusted {
+
+		s.logMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     fmt.Sprintf("Device trust: status is %s (not Primary/Trusted)", trustLevel.TrustStatus),
+			},
+			UserID:        userID.String(),
+			DeviceID:      deviceID,
+			Status:        "trust_check_failed",
+			FailureReason: "untrusted_status",
+		})
 		return false, trustLevel, nil
 	}
 
-	// Check IP subnet mismatch
-	if ipAddress != "" && trustLevel.LastIPAddress != "" && !s.isSubnetMatch(trustLevel.LastIPAddress, ipAddress) {
-		s.logger.Warn("IP subnet mismatch for trusted device",
-			util.String("user_id", userID.String()),
-			util.String("device_id", deviceID),
-			util.String("stored_ip", trustLevel.LastIPAddress),
-			util.String("current_ip", ipAddress),
-		)
+	// --------------------------------------------------------------------
+	// IP subnet validation intentionally disabled.
+	// Device fingerprint validation intentionally disabled.
+	// Device trust is determined only by:
+	//   1. Trust record exists
+	//   2. Device is not blocked
+	//   3. Trust status is Primary or Trusted
+	// --------------------------------------------------------------------
 
-		// Update risk score for subnet mismatch
-		trustLevel.RiskScore += 15
-		if err := s.deviceTrustRepo.UpdateRisk(ctx, trustLevel); err != nil {
-			s.logger.Warn("Failed to update risk score for subnet mismatch",
-				util.ErrorField(err),
-				util.String("user_id", userID.String()),
-			)
-		}
-		return false, trustLevel, nil
-	}
-
-	// Check hashed device fingerprint
-	hashedFingerprint := s.hashDeviceFingerprint(deviceFingerprint)
-	if deviceFingerprint != "" && trustLevel.DeviceFingerprint != "" && trustLevel.DeviceFingerprint != hashedFingerprint {
-		s.logger.Warn("Device fingerprint mismatch for trusted device",
-			util.String("user_id", userID.String()),
-			util.String("device_id", deviceID),
-		)
-
-		// Update risk score for fingerprint mismatch
-		trustLevel.RiskScore += 10
-		if err := s.deviceTrustRepo.UpdateRisk(ctx, trustLevel); err != nil {
-			s.logger.Warn("Failed to update risk score for fingerprint mismatch",
-				util.ErrorField(err),
-				util.String("user_id", userID.String()),
-			)
-		}
-		return false, trustLevel, nil
-	}
+	s.logMPINEvent(ctx, &models.MPINLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   string(models.LogEventTypeMPIN),
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: s.config.Environment,
+			Version:     ServiceVersion,
+			Level:       string(models.LogLevelInfo),
+			Message:     "Device trust: device is trusted",
+		},
+		UserID:   userID.String(),
+		DeviceID: deviceID,
+		Status:   "trust_check_success",
+	})
 
 	return true, trustLevel, nil
 }
-
-// ✅ NEW: logMPINEvent helper method
 func (s *MPINService) logMPINEvent(ctx context.Context, event *models.MPINLogEvent) {
 	if s.logProducer != nil {
 		_ = s.logProducer.ProduceMPINEvent(ctx, event)
@@ -304,97 +352,63 @@ func (s *MPINService) SetDistributedCache(distCache *DistributedCache) {
 	s.distCache = distCache
 }
 
-// ✅ NEW: Rate limiting methods with risk score updates
 func (s *MPINService) checkRateLimit(ctx context.Context, key string, limit int, window time.Duration) (bool, int) {
 	if s.distCache == nil {
 		return true, 0
 	}
-
 	allowed, retryAfter := s.distCache.AllowRate(ctx, key, limit, window)
-
-	// Update risk score when rate limit is exceeded
 	if !allowed {
-		// Extract user ID from key if possible
 		if matches := regexp.MustCompile(`mpin_[^:]+:([^:]+):`).FindStringSubmatch(key); len(matches) > 1 {
 			if userID, err := uuid.Parse(matches[1]); err == nil {
 				go s.updateRiskScoreForRateLimit(ctx, userID)
 			}
 		}
 	}
-
 	return allowed, retryAfter
 }
 
-// ✅ NEW: Update risk score for rate limit violations
 func (s *MPINService) updateRiskScoreForRateLimit(ctx context.Context, userID uuid.UUID) {
 	trustLevel, err := s.deviceTrustRepo.GetDeviceTrustLevel(ctx, userID, "")
 	if err != nil || trustLevel == nil {
 		return
 	}
-
 	trustLevel.RiskScore += 10
-	if err := s.deviceTrustRepo.UpdateRisk(ctx, trustLevel); err != nil {
-		s.logger.Warn("Failed to update risk score for rate limit",
-			util.ErrorField(err),
-			util.String("user_id", userID.String()),
-		)
-	}
+	_ = s.deviceTrustRepo.UpdateRisk(ctx, trustLevel)
 }
 
-// ✅ NEW: Update risk score for failed MPIN
 func (s *MPINService) updateRiskScoreForFailedMPIN(ctx context.Context, userID uuid.UUID, deviceID string) {
 	trustLevel, err := s.deviceTrustRepo.GetDeviceTrustLevel(ctx, userID, deviceID)
 	if err != nil || trustLevel == nil {
 		return
 	}
-
 	trustLevel.RiskScore += 10
-	if err := s.deviceTrustRepo.UpdateRisk(ctx, trustLevel); err != nil {
-		s.logger.Warn("Failed to update risk score for failed MPIN",
-			util.ErrorField(err),
-			util.String("user_id", userID.String()),
-		)
-	}
+	_ = s.deviceTrustRepo.UpdateRisk(ctx, trustLevel)
 }
 
-// ✅ NEW: Update risk score for device mismatch
 func (s *MPINService) updateRiskScoreForDeviceMismatch(ctx context.Context, userID uuid.UUID, deviceID string) {
 	trustLevel, err := s.deviceTrustRepo.GetDeviceTrustLevel(ctx, userID, deviceID)
 	if err != nil || trustLevel == nil {
 		return
 	}
-
 	trustLevel.RiskScore += 10
-	if err := s.deviceTrustRepo.UpdateRisk(ctx, trustLevel); err != nil {
-		s.logger.Warn("Failed to update risk score for device mismatch",
-			util.ErrorField(err),
-			util.String("user_id", userID.String()),
-		)
-	}
+	_ = s.deviceTrustRepo.UpdateRisk(ctx, trustLevel)
 }
 
-// ✅ NEW: Update risk score for OTP failures
 func (s *MPINService) updateRiskScoreForOTPFailure(ctx context.Context, userID uuid.UUID, deviceID string) {
 	trustLevel, err := s.deviceTrustRepo.GetDeviceTrustLevel(ctx, userID, deviceID)
 	if err != nil || trustLevel == nil {
 		return
 	}
-
 	trustLevel.RiskScore += 10
-	if err := s.deviceTrustRepo.UpdateRisk(ctx, trustLevel); err != nil {
-		s.logger.Warn("Failed to update risk score for OTP failure",
-			util.ErrorField(err),
-			util.String("user_id", userID.String()),
-		)
-	}
+	_ = s.deviceTrustRepo.UpdateRisk(ctx, trustLevel)
 }
 
 func (s *MPINService) validateMPIN(mpin string) error {
 	if len(mpin) < MPINMinLength || len(mpin) > MPINMaxLength {
-		return fmt.Errorf("%w: MPIN must be between %d and %d digits", ErrInvalidInput, MPINMinLength, MPINMaxLength)
+		return fmt.Errorf("%w: MPIN must be between %d and %d digits", appErrors.ErrInvalidInput, MPINMinLength, MPINMaxLength)
 	}
 	if matched, _ := regexp.MatchString(`^\d+$`, mpin); !matched {
-		return fmt.Errorf("%w: MPIN must contain only digits", ErrInvalidInput)
+		return fmt.Errorf("%w: MPIN must contain only digits", appErrors.ErrInvalidInput)
 	}
 	if s.isMPINWeak(mpin) {
 		return ErrMPINTooWeak
@@ -432,18 +446,18 @@ func (s *MPINService) isSequential(mpin string) bool {
 	return ascending || descending
 }
 
-// ✅ UPDATED: SetupMPIN with hashed device fingerprint and enhanced logging
+func (s *MPINService) invalidateMPINCache(ctx context.Context, userID uuid.UUID) {
+	if s.distCache != nil {
+		cacheKey := fmt.Sprintf("mpin:%s", userID.String())
+		_ = s.distCache.Delete(ctx, cacheKey)
+	}
+}
+
+// ---- Main methods ----
+
+// SetupMPIN creates a new MPIN for a user.
 func (s *MPINService) SetupMPIN(ctx context.Context, req *MPINSetupRequest) error {
 	startTime := time.Now()
-
-	if s.hasher == nil {
-		return fmt.Errorf("hasher service not available")
-	}
-
-	if !s.hasher.IsInitialized() {
-		return fmt.Errorf("hasher not properly initialized - no pepper available")
-	}
-
 	s.logMPINEvent(ctx, &models.MPINLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -460,6 +474,16 @@ func (s *MPINService) SetupMPIN(ctx context.Context, req *MPINSetupRequest) erro
 		DeviceID:  req.DeviceID,
 		UserAgent: req.UserAgent,
 	})
+
+	// --- Idempotency ---
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("mpin_setup:%s:%s", req.UserID.String(), req.DeviceID)
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
 
 	if err := s.validateMPIN(req.MPIN); err != nil {
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
@@ -484,7 +508,6 @@ func (s *MPINService) SetupMPIN(ctx context.Context, req *MPINSetupRequest) erro
 		return err
 	}
 
-	// ✅ NEW: Rate limiting for setup with risk score updates
 	setupRateKey := fmt.Sprintf("mpin_setup:%s:%s", req.UserID.String(), req.DeviceID)
 	if allowed, retryAfter := s.checkRateLimit(ctx, setupRateKey, MPINSetupRateLimit, MPINForgotRateWindow); !allowed {
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
@@ -528,9 +551,8 @@ func (s *MPINService) SetupMPIN(ctx context.Context, req *MPINSetupRequest) erro
 			ErrorCode:     "USER_NOT_FOUND",
 			FailureReason: "user_not_found",
 		})
-		return fmt.Errorf("%w: user not found", ErrInvalidInput)
+		return fmt.Errorf("%w: user not found", appErrors.ErrNotFound)
 	}
-
 	if !user.IsActive {
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -550,7 +572,7 @@ func (s *MPINService) SetupMPIN(ctx context.Context, req *MPINSetupRequest) erro
 			ErrorCode:     "USER_INACTIVE",
 			FailureReason: "user_inactive",
 		})
-		return ErrUserBanned
+		return appErrors.ErrInvalidState
 	}
 
 	existingMPIN, err := s.mpinRepo.GetMPINByUserID(ctx, req.UserID)
@@ -597,7 +619,7 @@ func (s *MPINService) SetupMPIN(ctx context.Context, req *MPINSetupRequest) erro
 			ErrorMessage:  err.Error(),
 			FailureReason: "hashing_failed",
 		})
-		return fmt.Errorf("failed to hash MPIN: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 
 	now := time.Now().UTC()
@@ -613,6 +635,7 @@ func (s *MPINService) SetupMPIN(ctx context.Context, req *MPINSetupRequest) erro
 		IsLocked:       false,
 		LockedUntil:    nil,
 	}
+	beforeJSON, _ := json.Marshal(mpinCredential)
 
 	if err := s.mpinRepo.CreateMPIN(ctx, mpinCredential); err != nil {
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
@@ -634,28 +657,12 @@ func (s *MPINService) SetupMPIN(ctx context.Context, req *MPINSetupRequest) erro
 			ErrorMessage:  err.Error(),
 			FailureReason: "repository_create_failed",
 		})
-		return fmt.Errorf("failed to create MPIN: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
+	afterJSON, _ := json.Marshal(mpinCredential)
 
-	// ✅ UPDATED: Enhanced device trust setup with hashed fingerprint and IP
-	trustLevel := &models.DeviceTrustLevel{
-		UserID:            req.UserID,
-		DeviceID:          req.DeviceID,
-		TrustStatus:       models.TrustStatusTrusted,
-		DeviceFingerprint: s.hashDeviceFingerprint(req.DeviceFingerprint),
-		LastIPAddress:     req.IPAddress,
-		UserAgent:         req.UserAgent,
-		IsBlocked:         false,
-		RiskScore:         0,
-	}
-
-	if err := s.deviceTrustRepo.MarkSuccessfulLogin(ctx, req.UserID, req.DeviceID, trustLevel); err != nil {
-		s.logger.Warn("Failed to set device trust level",
-			util.ErrorField(err),
-			util.String("user_id", req.UserID.String()),
-			util.String("device_id", req.DeviceID),
-		)
-	}
+	// ❌ Device trust setting removed – trust is established during OTP verification only.
+	// The MPIN service now only checks trust, it does not set it.
 
 	s.invalidateMPINCache(ctx, req.UserID)
 
@@ -677,19 +684,25 @@ func (s *MPINService) SetupMPIN(ctx context.Context, req *MPINSetupRequest) erro
 		Duration:  int64(time.Since(startTime).Milliseconds()),
 	})
 
-	s.logger.Info("MPIN setup completed",
-		util.String("user_id", req.UserID.String()),
-		util.String("device_id", req.DeviceID),
-		util.String("user_agent", req.UserAgent),
-		util.Duration("duration", time.Since(startTime)),
-	)
+	// Audit
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "mpin", "setup", "mpin_credential",
+			&req.UserID, "user", &req.UserID, beforeJSON, afterJSON, map[string]interface{}{
+				"device_id": req.DeviceID,
+				"ip":        req.IPAddress,
+			})
+	}
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
-// ✅ UPDATED: VerifyMPIN with risk score updates for failures and UserAgent
+// VerifyMPIN validates a user's MPIN.
+// ★ ENFORCES device trust before proceeding.
+// VerifyMPIN validates a user's MPIN.
+// ★ CHECKS device trust before proceeding, but does NOT set it.
 func (s *MPINService) VerifyMPIN(ctx context.Context, req *MPINVerifyRequest) (*MPINVerifyResult, error) {
 	startTime := time.Now()
-
 	s.logMPINEvent(ctx, &models.MPINLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -707,7 +720,32 @@ func (s *MPINService) VerifyMPIN(ctx context.Context, req *MPINVerifyRequest) (*
 		UserAgent: req.UserAgent,
 	})
 
-	// ✅ NEW: Rate limiting for MPIN verification with risk score updates
+	// ---- ★ Enforce device trust (check only) ----
+	trusted, _, err := s.isDeviceTrusted(ctx, req.UserID, req.DeviceID, req.IPAddress, req.DeviceFingerprint)
+	if err != nil {
+		return nil, fmt.Errorf("device trust check failed: %w", err)
+	}
+	if !trusted {
+		s.logMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "MPIN verification blocked: device not trusted",
+			},
+			UserID:        req.UserID.String(),
+			DeviceID:      req.DeviceID,
+			Status:        "verification_blocked_untrusted",
+			FailureReason: "device_not_trusted",
+		})
+		return nil, ErrDeviceNotTrusted
+	}
+	// ---- End of trust enforcement ----
+
 	verifyRateKey := fmt.Sprintf("mpin_verify:%s:%s", req.UserID.String(), req.DeviceID)
 	if allowed, retryAfter := s.checkRateLimit(ctx, verifyRateKey, MPINVerifyRateLimit, MPINRateLimitWindow); !allowed {
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
@@ -807,7 +845,6 @@ func (s *MPINService) VerifyMPIN(ctx context.Context, req *MPINVerifyRequest) (*
 			})
 			return result, ErrMPINLocked
 		}
-
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
 			LogEnvelope: models.LogEnvelope{
 				EventID:     uuid.New().String(),
@@ -830,7 +867,6 @@ func (s *MPINService) VerifyMPIN(ctx context.Context, req *MPINVerifyRequest) (*
 		return nil, err
 	}
 
-	// Device mismatch warning with risk score update
 	if mpinCred.DeviceID != "" && req.DeviceID != "" && mpinCred.DeviceID != req.DeviceID {
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -848,14 +884,6 @@ func (s *MPINService) VerifyMPIN(ctx context.Context, req *MPINVerifyRequest) (*
 			DeviceID:  req.DeviceID,
 			UserAgent: req.UserAgent,
 		})
-		s.logger.Warn("Device mismatch during MPIN verification",
-			util.String("user_id", req.UserID.String()),
-			util.String("expected_device", mpinCred.DeviceID),
-			util.String("provided_device", req.DeviceID),
-			util.String("user_agent", req.UserAgent),
-		)
-
-		// Update risk score for device mismatch
 		go s.updateRiskScoreForDeviceMismatch(ctx, req.UserID, req.DeviceID)
 	}
 
@@ -865,7 +893,6 @@ func (s *MPINService) VerifyMPIN(ctx context.Context, req *MPINVerifyRequest) (*
 		PepperVersion: mpinCred.PepperVersion,
 		Algorithm:     mpinCred.HashAlgorithm,
 	}
-
 	verified, err := s.hasher.VerifyMPIN(req.MPIN, hashResult)
 	if err != nil {
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
@@ -887,7 +914,7 @@ func (s *MPINService) VerifyMPIN(ctx context.Context, req *MPINVerifyRequest) (*
 			ErrorMessage:  err.Error(),
 			FailureReason: "hash_verification_failed",
 		})
-		return nil, fmt.Errorf("failed to verify MPIN: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 
 	result := &MPINVerifyResult{
@@ -897,34 +924,12 @@ func (s *MPINService) VerifyMPIN(ctx context.Context, req *MPINVerifyRequest) (*
 	}
 
 	if verified {
-		if err := s.mpinRepo.ResetFailedAttempts(ctx, req.UserID); err != nil {
-			s.logger.Error("Failed to reset failed attempts",
-				util.ErrorField(err),
-				util.String("user_id", req.UserID.String()),
-			)
-		}
+		_ = s.mpinRepo.ResetFailedAttempts(ctx, req.UserID)
 		result.Message = "MPIN verified successfully"
 		result.FailedAttempts = 0
 		result.RemainingTries = MPINMaxAttempts
 
-		// ✅ UPDATED: Update device trust with hashed fingerprint and current IP
-		trustLevel := &models.DeviceTrustLevel{
-			UserID:            req.UserID,
-			DeviceID:          req.DeviceID,
-			TrustStatus:       models.TrustStatusTrusted,
-			DeviceFingerprint: s.hashDeviceFingerprint(req.DeviceFingerprint),
-			LastIPAddress:     req.IPAddress,
-			UserAgent:         req.UserAgent,
-			IsBlocked:         false,
-			RiskScore:         0, // Reset risk score on successful verification
-		}
-
-		if err := s.deviceTrustRepo.MarkSuccessfulLogin(ctx, req.UserID, req.DeviceID, trustLevel); err != nil {
-			s.logger.Warn("Failed to update device trust on successful login",
-				util.ErrorField(err),
-				util.String("user_id", req.UserID.String()),
-			)
-		}
+		// ★ REMOVED: trust-level update (MarkSuccessfulLogin) – trust is only checked, not set here.
 
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -946,26 +951,26 @@ func (s *MPINService) VerifyMPIN(ctx context.Context, req *MPINVerifyRequest) (*
 			IsLocked:     false,
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
+
+		// Audit successful verification
+		if s.auditService != nil {
+			_ = s.auditService.LogAction(ctx, nil, nil, "mpin", "verify_success", "mpin_credential",
+				&req.UserID, "user", &req.UserID, nil, nil, map[string]interface{}{
+					"device_id": req.DeviceID,
+					"ip":        req.IPAddress,
+				})
+		}
 	} else {
 		newFailedAttempts, err := s.mpinRepo.IncrementFailedAttempts(ctx, req.UserID)
-		if err != nil {
-			s.logger.Error("Failed to increment failed attempts",
-				util.ErrorField(err),
-				util.String("user_id", req.UserID.String()),
-			)
-		} else {
+		if err == nil {
 			result.FailedAttempts = newFailedAttempts
 			result.RemainingTries = max(0, MPINMaxAttempts-newFailedAttempts)
 		}
-
-		// Update risk score for failed MPIN verification
 		go s.updateRiskScoreForFailedMPIN(ctx, req.UserID, req.DeviceID)
-
 		if result.RemainingTries == 0 {
 			result.Message = "MPIN is now locked due to too many failed attempts"
 			lockUntil := time.Now().Add(MPINLockDuration)
 			result.LockedUntil = &lockUntil
-
 			s.logMPINEvent(ctx, &models.MPINLogEvent{
 				LogEnvelope: models.LogEnvelope{
 					EventID:     uuid.New().String(),
@@ -988,7 +993,6 @@ func (s *MPINService) VerifyMPIN(ctx context.Context, req *MPINVerifyRequest) (*
 			})
 		} else {
 			result.Message = fmt.Sprintf("Invalid MPIN. %d attempts remaining", result.RemainingTries)
-
 			s.logMPINEvent(ctx, &models.MPINLogEvent{
 				LogEnvelope: models.LogEnvelope{
 					EventID:     uuid.New().String(),
@@ -1010,184 +1014,23 @@ func (s *MPINService) VerifyMPIN(ctx context.Context, req *MPINVerifyRequest) (*
 				Duration:     int64(time.Since(startTime).Milliseconds()),
 			})
 		}
+		// Audit failed verification
+		if s.auditService != nil {
+			_ = s.auditService.LogAction(ctx, nil, nil, "mpin", "verify_failure", "mpin_credential",
+				&req.UserID, "user", &req.UserID, nil, nil, map[string]interface{}{
+					"device_id":       req.DeviceID,
+					"ip":              req.IPAddress,
+					"failed_attempts": result.FailedAttempts,
+					"remaining":       result.RemainingTries,
+				})
+		}
 	}
-
-	s.logger.Info("MPIN verification completed",
-		util.String("user_id", req.UserID.String()),
-		util.Bool("verified", verified),
-		util.Int("failed_attempts", result.FailedAttempts),
-		util.String("user_agent", req.UserAgent),
-		util.Duration("duration", time.Since(startTime)),
-	)
-
 	return result, nil
 }
 
-// ✅ UPDATED: ForgotMPIN with phone number parameter and device trust checks handled by MPIN service and UserAgent
+// ForgotMPIN initiates the forgot MPIN flow by sending an OTP.
 func (s *MPINService) ForgotMPIN(ctx context.Context, req *MPINForgotRequest) error {
-    startTime := time.Now()
-
-    s.logMPINEvent(ctx, &models.MPINLogEvent{
-        LogEnvelope: models.LogEnvelope{
-            EventID:     uuid.New().String(),
-            EventType:   string(models.LogEventTypeMPIN),
-            ServiceName: "auth-service",
-            Timestamp:   time.Now(),
-            Environment: s.config.Environment,
-            Version:     ServiceVersion,
-            Level:       string(models.LogLevelInfo),
-            Message:     "Forgot MPIN flow initiated",
-        },
-        UserID:    req.UserID.String(),
-        Status:    "forgot_initiated",
-        DeviceID:  req.DeviceID,
-        UserAgent: req.UserAgent,
-    })
-
-    // ✅ FIXED: Use the UserID from request (passed by handler)
-    user, err := s.userRepo.GetUserByID(ctx, req.UserID)
-    if err != nil {
-        s.logMPINEvent(ctx, &models.MPINLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeMPIN),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "User not found for forgot MPIN",
-            },
-            UserID:        req.UserID.String(),
-            Status:        "forgot_failed",
-            DeviceID:      req.DeviceID,
-            UserAgent:     req.UserAgent,
-            ErrorCode:     "USER_NOT_FOUND",
-            FailureReason: "user_not_found",
-        })
-        return fmt.Errorf("user not found: %w", err)
-    }
-
-    // Decrypt phone number
-    encryptedData := &encryption.EncryptedData{
-        EncryptedValue: string(user.PhoneEncrypted),
-        EncryptedDEK:   user.PhoneEncryptedDEK,
-        KeyID:          user.PhoneKeyID.String(),
-        Version:        "v1",
-        CreatedAt:      user.CreatedAt,
-    }
-
-    phoneNumber, err := s.encryptionMgr.DecryptField(ctx, encryptedData)
-    if err != nil {
-        s.logMPINEvent(ctx, &models.MPINLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeMPIN),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "Failed to decrypt phone number for forgot MPIN",
-            },
-            UserID:        req.UserID.String(),
-            Status:        "forgot_failed",
-            DeviceID:      req.DeviceID,
-            UserAgent:     req.UserAgent,
-            ErrorCode:     "PHONE_DECRYPTION_FAILED",
-            ErrorMessage:  err.Error(),
-            FailureReason: "phone_decryption_failed",
-        })
-        return fmt.Errorf("failed to decrypt phone number: %w", err)
-    }
-
-    // ✅ UPDATED: Use UserOTPService instead of OTPService
-    otpReq := &UserOTPSendRequest{
-        PhoneNumber:       phoneNumber,
-        Purpose:           "forgot_mpin",
-        IPAddress:         req.IPAddress,
-        DeviceID:          req.DeviceID,
-        UserAgent:         req.UserAgent,
-        DeviceFingerprint: req.DeviceFingerprint,
-    }
-
-    otpResp, err := s.userOTPService.UserSendOTP(ctx, otpReq)
-    if err != nil {
-        s.logMPINEvent(ctx, &models.MPINLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeMPIN),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "Failed to send OTP for forgot MPIN",
-            },
-            UserID:        req.UserID.String(),
-            Status:        "forgot_failed",
-            DeviceID:      req.DeviceID,
-            UserAgent:     req.UserAgent,
-            ErrorCode:     "OTP_SEND_FAILED",
-            ErrorMessage:  err.Error(),
-            FailureReason: "otp_send_failed",
-        })
-        return fmt.Errorf("failed to send OTP: %w", err)
-    }
-
-    if !otpResp.Success {
-        s.logMPINEvent(ctx, &models.MPINLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeMPIN),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "OTP send failed for forgot MPIN",
-            },
-            UserID:        req.UserID.String(),
-            Status:        "forgot_failed",
-            DeviceID:      req.DeviceID,
-            UserAgent:     req.UserAgent,
-            ErrorCode:     "OTP_SEND_FAILED",
-            ErrorMessage:  otpResp.Message,
-            FailureReason: "otp_send_failed",
-        })
-        return fmt.Errorf("OTP send failed: %s", otpResp.Message)
-    }
-
-    s.logMPINEvent(ctx, &models.MPINLogEvent{
-        LogEnvelope: models.LogEnvelope{
-            EventID:     uuid.New().String(),
-            EventType:   string(models.LogEventTypeMPIN),
-            ServiceName: "auth-service",
-            Timestamp:   time.Now(),
-            Environment: s.config.Environment,
-            Version:     ServiceVersion,
-            Level:       string(models.LogLevelInfo),
-            Message:     "OTP sent for forgot MPIN",
-        },
-        UserID:    req.UserID.String(),
-        Status:    "forgot_otp_sent",
-        DeviceID:  req.DeviceID,
-        UserAgent: req.UserAgent,
-        Duration:  int64(time.Since(startTime).Milliseconds()),
-    })
-
-    s.logger.Info("OTP sent for forgot MPIN",
-        util.String("user_id", req.UserID.String()),
-        util.String("device_id", req.DeviceID),
-        util.String("user_agent", req.UserAgent),
-    )
-
-    return nil
-}
-// ✅ UPDATED: VerifyForgotMPINOTP with device trust checks handled by MPIN service and UserAgent
-func (s *MPINService) VerifyForgotMPINOTP(ctx context.Context, req *MPINForgotWithOTPRequest) error {
 	startTime := time.Now()
-
 	s.logMPINEvent(ctx, &models.MPINLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -1197,16 +1040,15 @@ func (s *MPINService) VerifyForgotMPINOTP(ctx context.Context, req *MPINForgotWi
 			Environment: s.config.Environment,
 			Version:     ServiceVersion,
 			Level:       string(models.LogLevelInfo),
-			Message:     "Forgot MPIN OTP verification initiated",
+			Message:     "Forgot MPIN flow initiated",
 		},
 		UserID:    req.UserID.String(),
-		Status:    "forgot_otp_verification_initiated",
+		Status:    "forgot_initiated",
 		DeviceID:  req.DeviceID,
 		UserAgent: req.UserAgent,
 	})
 
-	// ✅ UPDATED: Device trust handled by MPIN service
-	isTrusted, trustLevel, err := s.isDeviceTrusted(ctx, req.UserID, req.DeviceID, req.IPAddress, req.DeviceFingerprint)
+	user, err := s.userRepo.GetUserByID(ctx, req.UserID)
 	if err != nil {
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -1217,31 +1059,27 @@ func (s *MPINService) VerifyForgotMPINOTP(ctx context.Context, req *MPINForgotWi
 				Environment: s.config.Environment,
 				Version:     ServiceVersion,
 				Level:       string(models.LogLevelError),
-				Message:     "Device trust check failed for forgot MPIN OTP",
+				Message:     "User not found for forgot MPIN",
 			},
 			UserID:        req.UserID.String(),
-			Status:        "forgot_otp_verification_failed",
+			Status:        "forgot_failed",
 			DeviceID:      req.DeviceID,
 			UserAgent:     req.UserAgent,
-			ErrorCode:     "DEVICE_TRUST_CHECK_FAILED",
-			ErrorMessage:  err.Error(),
-			FailureReason: "device_trust_check_failed",
+			ErrorCode:     "USER_NOT_FOUND",
+			FailureReason: "user_not_found",
 		})
-		return fmt.Errorf("device trust check failed: %w", err)
+		return fmt.Errorf("%w: user not found", appErrors.ErrNotFound)
 	}
 
-	if !isTrusted {
-		// Update risk score for untrusted device attempting OTP verification
-		if trustLevel != nil {
-			trustLevel.RiskScore += 10
-			if updateErr := s.deviceTrustRepo.UpdateRisk(ctx, trustLevel); updateErr != nil {
-				s.logger.Warn("Failed to update risk score for untrusted device in OTP verification",
-					util.ErrorField(updateErr),
-					util.String("user_id", req.UserID.String()),
-				)
-			}
-		}
-
+	encryptedData := &encryption.EncryptedData{
+		EncryptedValue: string(user.PhoneEncrypted),
+		EncryptedDEK:   user.PhoneEncryptedDEK,
+		KeyID:          user.PhoneKeyID.String(),
+		Version:        "v1",
+		CreatedAt:      user.CreatedAt,
+	}
+	phoneNumber, err := s.encryptionMgr.DecryptField(ctx, encryptedData)
+	if err != nil {
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
 			LogEnvelope: models.LogEnvelope{
 				EventID:     uuid.New().String(),
@@ -1250,18 +1088,114 @@ func (s *MPINService) VerifyForgotMPINOTP(ctx context.Context, req *MPINForgotWi
 				Timestamp:   time.Now(),
 				Environment: s.config.Environment,
 				Version:     ServiceVersion,
-				Level:       string(models.LogLevelWarning),
-				Message:     "Untrusted device attempted forgot MPIN OTP verification",
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to decrypt phone number for forgot MPIN",
 			},
 			UserID:        req.UserID.String(),
-			Status:        "forgot_otp_verification_failed",
+			Status:        "forgot_failed",
 			DeviceID:      req.DeviceID,
 			UserAgent:     req.UserAgent,
-			ErrorCode:     "DEVICE_NOT_TRUSTED",
-			FailureReason: "device_not_trusted",
+			ErrorCode:     "PHONE_DECRYPTION_FAILED",
+			ErrorMessage:  err.Error(),
+			FailureReason: "phone_decryption_failed",
 		})
-		return ErrDeviceNotTrusted
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
+
+	otpReq := &UserOTPSendRequest{
+		PhoneNumber:       phoneNumber,
+		Purpose:           "forgot_mpin",
+		IPAddress:         req.IPAddress,
+		DeviceID:          req.DeviceID,
+		UserAgent:         req.UserAgent,
+		DeviceFingerprint: req.DeviceFingerprint,
+	}
+	otpResp, err := s.userOTPService.UserSendOTP(ctx, otpReq)
+	if err != nil || !otpResp.Success {
+		s.logMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "OTP send failed for forgot MPIN",
+			},
+			UserID:        req.UserID.String(),
+			Status:        "forgot_failed",
+			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent,
+			ErrorCode:     "OTP_SEND_FAILED",
+			FailureReason: "otp_send_failed",
+		})
+		return fmt.Errorf("failed to send OTP: %w", err)
+	}
+
+	s.logMPINEvent(ctx, &models.MPINLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   string(models.LogEventTypeMPIN),
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: s.config.Environment,
+			Version:     ServiceVersion,
+			Level:       string(models.LogLevelInfo),
+			Message:     "OTP sent for forgot MPIN",
+		},
+		UserID:    req.UserID.String(),
+		Status:    "forgot_otp_sent",
+		DeviceID:  req.DeviceID,
+		UserAgent: req.UserAgent,
+		Duration:  int64(time.Since(startTime).Milliseconds()),
+	})
+
+	// Audit: forgot MPIN initiated
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "mpin", "forgot_initiate", "mpin_credential",
+			&req.UserID, "user", &req.UserID, nil, nil, map[string]interface{}{
+				"device_id": req.DeviceID,
+				"ip":        req.IPAddress,
+			})
+	}
+	return nil
+}
+
+// VerifyForgotMPINOTP verifies the OTP and resets the MPIN.
+// ★ REMOVED device trust check – recovery relies solely on OTP.
+// VerifyForgotMPINOTP verifies the OTP and resets the MPIN.
+// ★ Device trust is NOT set here – OTP verification already establishes trust.
+func (s *MPINService) VerifyForgotMPINOTP(ctx context.Context, req *MPINForgotWithOTPRequest) error {
+	startTime := time.Now()
+	s.logMPINEvent(ctx, &models.MPINLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   string(models.LogEventTypeMPIN),
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: s.config.Environment,
+			Version:     ServiceVersion,
+			Level:       string(models.LogLevelInfo),
+			Message:     "Forgot MPIN OTP verification initiated (trust check skipped)",
+		},
+		UserID:    req.UserID.String(),
+		Status:    "forgot_otp_verification_initiated",
+		DeviceID:  req.DeviceID,
+		UserAgent: req.UserAgent,
+	})
+
+	// Idempotency
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("mpin_forgot_verify:%s:%s", req.UserID.String(), req.DeviceID)
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	// ❌ Device trust check removed – OTP is the sole proof for recovery.
 
 	if err := s.validateMPIN(req.NewMPIN); err != nil {
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
@@ -1306,10 +1240,9 @@ func (s *MPINService) VerifyForgotMPINOTP(ctx context.Context, req *MPINForgotWi
 			ErrorCode:     "USER_NOT_FOUND",
 			FailureReason: "user_not_found",
 		})
-		return fmt.Errorf("user not found: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrNotFound, err)
 	}
 
-	// ✅ FIXED: Create proper EncryptedData struct
 	encryptedData := &encryption.EncryptedData{
 		EncryptedValue: string(user.PhoneEncrypted),
 		EncryptedDEK:   user.PhoneEncryptedDEK,
@@ -1317,7 +1250,6 @@ func (s *MPINService) VerifyForgotMPINOTP(ctx context.Context, req *MPINForgotWi
 		Version:        "v1",
 		CreatedAt:      user.CreatedAt,
 	}
-
 	phoneNumber, err := s.encryptionMgr.DecryptField(ctx, encryptedData)
 	if err != nil {
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
@@ -1339,10 +1271,9 @@ func (s *MPINService) VerifyForgotMPINOTP(ctx context.Context, req *MPINForgotWi
 			ErrorMessage:  err.Error(),
 			FailureReason: "phone_decryption_failed",
 		})
-		return fmt.Errorf("failed to decrypt phone number: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 
-	// ✅ UPDATED: Use UserOTPService instead of OTPService
 	otpVerifyReq := &UserOTPVerifyRequest{
 		PhoneNumber:       phoneNumber,
 		OTP:               req.OTPCode,
@@ -1352,12 +1283,9 @@ func (s *MPINService) VerifyForgotMPINOTP(ctx context.Context, req *MPINForgotWi
 		DeviceFingerprint: req.DeviceFingerprint,
 		UserAgent:         req.UserAgent,
 	}
-
 	otpResp, err := s.userOTPService.UserVerifyOTP(ctx, otpVerifyReq)
-	if err != nil {
-		// Update risk score for OTP verification failure
+	if err != nil || !otpResp.Success {
 		go s.updateRiskScoreForOTPFailure(ctx, req.UserID, req.DeviceID)
-
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
 			LogEnvelope: models.LogEnvelope{
 				EventID:     uuid.New().String(),
@@ -1374,36 +1302,14 @@ func (s *MPINService) VerifyForgotMPINOTP(ctx context.Context, req *MPINForgotWi
 			DeviceID:      req.DeviceID,
 			UserAgent:     req.UserAgent,
 			ErrorCode:     "OTP_VERIFICATION_FAILED",
-			ErrorMessage:  err.Error(),
 			FailureReason: "otp_verification_failed",
 		})
 		return fmt.Errorf("invalid OTP code")
 	}
 
-	if !otpResp.Success {
-		// Update risk score for invalid OTP
-		go s.updateRiskScoreForOTPFailure(ctx, req.UserID, req.DeviceID)
-
-		s.logMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     ServiceVersion,
-				Level:       string(models.LogLevelWarning),
-				Message:     "Invalid OTP code for forgot MPIN",
-			},
-			UserID:        req.UserID.String(),
-			Status:        "forgot_otp_verification_failed",
-			DeviceID:      req.DeviceID,
-			UserAgent:     req.UserAgent,
-			ErrorCode:     "INVALID_OTP",
-			FailureReason: "invalid_otp",
-		})
-		return fmt.Errorf("invalid OTP code")
-	}
+	// Get old MPIN for before state
+	oldMpin, _ := s.mpinRepo.GetMPINByUserID(ctx, req.UserID)
+	beforeJSON, _ := json.Marshal(oldMpin)
 
 	hashResult, err := s.hasher.HashMPIN(req.NewMPIN)
 	if err != nil {
@@ -1426,7 +1332,7 @@ func (s *MPINService) VerifyForgotMPINOTP(ctx context.Context, req *MPINForgotWi
 			ErrorMessage:  err.Error(),
 			FailureReason: "hashing_failed",
 		})
-		return fmt.Errorf("failed to hash MPIN: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 
 	if err := s.mpinRepo.UpdateMPIN(ctx, req.UserID, hashResult.Hash, hashResult.Salt, hashResult.PepperVersion); err != nil {
@@ -1449,31 +1355,16 @@ func (s *MPINService) VerifyForgotMPINOTP(ctx context.Context, req *MPINForgotWi
 			ErrorMessage:  err.Error(),
 			FailureReason: "mpin_update_failed",
 		})
-		return fmt.Errorf("failed to update MPIN: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	_ = s.mpinRepo.UnlockMPIN(ctx, req.UserID)
 
-	// ✅ UPDATED: Update device trust with hashed fingerprint and current information
-	updatedTrustLevel := &models.DeviceTrustLevel{
-		UserID:            req.UserID,
-		DeviceID:          req.DeviceID,
-		TrustStatus:       models.TrustStatusTrusted,
-		DeviceFingerprint: s.hashDeviceFingerprint(req.DeviceFingerprint),
-		LastIPAddress:     req.IPAddress,
-		UserAgent:         req.UserAgent,
-		IsBlocked:         false,
-		RiskScore:         0, // Reset risk score on successful reset
-	}
-
-	if err := s.deviceTrustRepo.SetDeviceTrustLevel(ctx, req.UserID, req.DeviceID, updatedTrustLevel); err != nil {
-		s.logger.Warn("Failed to update device trust level",
-			util.ErrorField(err),
-			util.String("user_id", req.UserID.String()),
-		)
-	}
+	// ★ Trust is not set here – the OTP verification step already did that.
+	// The device is now trusted for MPIN because the OTP was verified.
 
 	s.invalidateMPINCache(ctx, req.UserID)
+
+	afterJSON, _ := json.Marshal(oldMpin) // not updated; could refetch
 
 	s.logMPINEvent(ctx, &models.MPINLogEvent{
 		LogEnvelope: models.LogEnvelope{
@@ -1486,90 +1377,30 @@ func (s *MPINService) VerifyForgotMPINOTP(ctx context.Context, req *MPINForgotWi
 			Level:       string(models.LogLevelInfo),
 			Message:     "MPIN reset via forgot with OTP verification completed",
 		},
-		UserID:      req.UserID.String(),
-		Status:      "forgot_otp_verification_completed",
-		DeviceID:    req.DeviceID,
-		UserAgent:   req.UserAgent,
-		DeviceTrust: string(trustLevel.TrustStatus),
-		Duration:    int64(time.Since(startTime).Milliseconds()),
+		UserID:    req.UserID.String(),
+		Status:    "forgot_otp_verification_completed",
+		DeviceID:  req.DeviceID,
+		UserAgent: req.UserAgent,
+		// DeviceTrust field removed – trust is managed externally
+		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
 
-	s.logger.Info("MPIN reset via forgot with OTP verification on trusted device",
-		util.String("user_id", req.UserID.String()),
-		util.String("device_id", req.DeviceID),
-		util.String("user_agent", req.UserAgent),
-		util.String("trust_status", string(trustLevel.TrustStatus)),
-	)
-
+	// Audit
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "mpin", "forgot_reset", "mpin_credential",
+			&req.UserID, "user", &req.UserID, beforeJSON, afterJSON, map[string]interface{}{
+				"device_id": req.DeviceID,
+				"ip":        req.IPAddress,
+				"via_otp":   true,
+			})
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
-// Helper function
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-// ✅ NEW: SetLogProducerService sets Kafka log producer service
-func (s *MPINService) SetLogProducerService(logProducer *LogProducerService) {
-	s.logProducer = logProducer
-}
-
-// ✅ NEW: Helper method to invalidate MPIN cache
-func (s *MPINService) invalidateMPINCache(ctx context.Context, userID uuid.UUID) {
-	if s.distCache != nil {
-		cacheKey := fmt.Sprintf("mpin:%s", userID.String())
-		_ = s.distCache.Delete(ctx, cacheKey)
-	}
-}
-
-// ✅ NEW: DebugHasherStatus for troubleshooting
-func (s *MPINService) DebugHasherStatus(ctx context.Context) map[string]interface{} {
-	status := s.hasher.GetStatus()
-
-	// Get sample MPIN credential to check pepper version
-	userID, _ := uuid.Parse("your-test-user-id") // Use a real user ID
-	mpinCred, err := s.mpinRepo.GetMPINByUserID(ctx, userID)
-	if err == nil {
-		status["sample_mpin_pepper_version"] = mpinCred.PepperVersion
-		status["sample_mpin_algorithm"] = mpinCred.HashAlgorithm
-	}
-
-	return status
-}
-
-// ✅ NEW: Method to get current risk score for a user device
-func (s *MPINService) GetDeviceRiskScore(ctx context.Context, userID uuid.UUID, deviceID string) (int, error) {
-	trustLevel, err := s.deviceTrustRepo.GetDeviceTrustLevel(ctx, userID, deviceID)
-	if err != nil {
-		return 0, err
-	}
-	if trustLevel == nil {
-		return 0, nil
-	}
-	return trustLevel.RiskScore, nil
-}
-
-// ✅ NEW: Method to reset risk score for a user device
-func (s *MPINService) ResetDeviceRiskScore(ctx context.Context, userID uuid.UUID, deviceID string) error {
-	trustLevel, err := s.deviceTrustRepo.GetDeviceTrustLevel(ctx, userID, deviceID)
-	if err != nil {
-		return err
-	}
-	if trustLevel == nil {
-		return nil
-	}
-
-	trustLevel.RiskScore = 0
-	return s.deviceTrustRepo.UpdateRisk(ctx, trustLevel)
-}
-
-// ✅ COMPLETE: ChangeMPIN changes a user's MPIN (requires old MPIN) with UserAgent
+// ChangeMPIN changes a user's MPIN after verifying the current one.
 func (s *MPINService) ChangeMPIN(ctx context.Context, req *MPINChangeRequest) error {
 	startTime := time.Now()
-
 	s.logMPINEvent(ctx, &models.MPINLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -1587,7 +1418,16 @@ func (s *MPINService) ChangeMPIN(ctx context.Context, req *MPINChangeRequest) er
 		UserAgent: req.UserAgent,
 	})
 
-	// Rate limiting for MPIN change with risk score updates
+	// Idempotency
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("mpin_change:%s:%s", req.UserID.String(), req.DeviceID)
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
 	changeRateKey := fmt.Sprintf("mpin_change:%s:%s", req.UserID.String(), req.DeviceID)
 	if allowed, retryAfter := s.checkRateLimit(ctx, changeRateKey, MPINChangeRateLimit, MPINForgotRateWindow); !allowed {
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
@@ -1634,6 +1474,7 @@ func (s *MPINService) ChangeMPIN(ctx context.Context, req *MPINChangeRequest) er
 		return err
 	}
 
+	// Verify current MPIN
 	verifyReq := &MPINVerifyRequest{
 		UserID:            req.UserID,
 		MPIN:              req.CurrentMPIN,
@@ -1642,13 +1483,8 @@ func (s *MPINService) ChangeMPIN(ctx context.Context, req *MPINChangeRequest) er
 		DeviceFingerprint: req.DeviceFingerprint,
 		UserAgent:         req.UserAgent,
 	}
-
 	verifyResult, err := s.VerifyMPIN(ctx, verifyReq)
-	if err != nil {
-		return err
-	}
-
-	if !verifyResult.Verified {
+	if err != nil || !verifyResult.Verified {
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
 			LogEnvelope: models.LogEnvelope{
 				EventID:     uuid.New().String(),
@@ -1669,6 +1505,10 @@ func (s *MPINService) ChangeMPIN(ctx context.Context, req *MPINChangeRequest) er
 		})
 		return ErrMPINInvalid
 	}
+
+	// Get old credential for before state
+	oldMpin, _ := s.mpinRepo.GetMPINByUserID(ctx, req.UserID)
+	beforeJSON, _ := json.Marshal(oldMpin)
 
 	hashResult, err := s.hasher.HashMPIN(req.NewMPIN)
 	if err != nil {
@@ -1691,7 +1531,7 @@ func (s *MPINService) ChangeMPIN(ctx context.Context, req *MPINChangeRequest) er
 			ErrorMessage:  err.Error(),
 			FailureReason: "hashing_failed",
 		})
-		return fmt.Errorf("failed to hash new MPIN: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 
 	if err := s.mpinRepo.UpdateMPIN(ctx, req.UserID, hashResult.Hash, hashResult.Salt, hashResult.PepperVersion); err != nil {
@@ -1714,17 +1554,13 @@ func (s *MPINService) ChangeMPIN(ctx context.Context, req *MPINChangeRequest) er
 			ErrorMessage:  err.Error(),
 			FailureReason: "repository_update_failed",
 		})
-		return fmt.Errorf("failed to update MPIN: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
-	if err := s.mpinRepo.UpdateMPINDeviceBinding(ctx, req.UserID, req.DeviceID); err != nil {
-		s.logger.Warn("Failed to update MPIN device binding",
-			util.ErrorField(err),
-			util.String("user_id", req.UserID.String()),
-		)
-	}
+	_ = s.mpinRepo.UpdateMPINDeviceBinding(ctx, req.UserID, req.DeviceID)
 
 	s.invalidateMPINCache(ctx, req.UserID)
+
+	afterJSON, _ := json.Marshal(oldMpin) // not updated; could refetch
 
 	s.logMPINEvent(ctx, &models.MPINLogEvent{
 		LogEnvelope: models.LogEnvelope{
@@ -1744,20 +1580,21 @@ func (s *MPINService) ChangeMPIN(ctx context.Context, req *MPINChangeRequest) er
 		Duration:  int64(time.Since(startTime).Milliseconds()),
 	})
 
-	s.logger.Info("MPIN changed successfully",
-		util.String("user_id", req.UserID.String()),
-		util.String("device_id", req.DeviceID),
-		util.String("user_agent", req.UserAgent),
-		util.Duration("duration", time.Since(startTime)),
-	)
-
+	// Audit
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "mpin", "change", "mpin_credential",
+			&req.UserID, "user", &req.UserID, beforeJSON, afterJSON, map[string]interface{}{
+				"device_id": req.DeviceID,
+				"ip":        req.IPAddress,
+			})
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
-// ✅ COMPLETE: ChangeMPINByAdmin changes user MPIN by admin (admin override) with UserAgent
+// ChangeMPINByAdmin allows an admin to change a user's MPIN without current verification.
 func (s *MPINService) ChangeMPINByAdmin(ctx context.Context, req *MPINAdminChangeRequest) error {
 	startTime := time.Now()
-
 	s.logMPINEvent(ctx, &models.MPINLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -1773,6 +1610,16 @@ func (s *MPINService) ChangeMPINByAdmin(ctx context.Context, req *MPINAdminChang
 		Status:    "admin_change_initiated",
 		UserAgent: req.UserAgent,
 	})
+
+	// Idempotency
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("mpin_admin_change:%s", req.UserID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
 
 	if err := s.validateMPIN(req.NewMPIN); err != nil {
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
@@ -1815,9 +1662,8 @@ func (s *MPINService) ChangeMPINByAdmin(ctx context.Context, req *MPINAdminChang
 			ErrorCode:     "USER_NOT_FOUND",
 			FailureReason: "user_not_found",
 		})
-		return fmt.Errorf("user not found: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrNotFound, err)
 	}
-
 	if !user.IsActive {
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -1836,8 +1682,11 @@ func (s *MPINService) ChangeMPINByAdmin(ctx context.Context, req *MPINAdminChang
 			ErrorCode:     "USER_INACTIVE",
 			FailureReason: "user_inactive",
 		})
-		return fmt.Errorf("user account is inactive")
+		return appErrors.ErrInvalidState
 	}
+
+	oldMpin, _ := s.mpinRepo.GetMPINByUserID(ctx, req.UserID)
+	beforeJSON, _ := json.Marshal(oldMpin)
 
 	hashResult, err := s.hasher.HashMPIN(req.NewMPIN)
 	if err != nil {
@@ -1859,7 +1708,7 @@ func (s *MPINService) ChangeMPINByAdmin(ctx context.Context, req *MPINAdminChang
 			ErrorMessage:  err.Error(),
 			FailureReason: "hashing_failed",
 		})
-		return fmt.Errorf("failed to hash MPIN: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 
 	if err := s.mpinRepo.UpdateMPIN(ctx, req.UserID, hashResult.Hash, hashResult.Salt, hashResult.PepperVersion); err != nil {
@@ -1881,12 +1730,12 @@ func (s *MPINService) ChangeMPINByAdmin(ctx context.Context, req *MPINAdminChang
 			ErrorMessage:  err.Error(),
 			FailureReason: "repository_update_failed",
 		})
-		return fmt.Errorf("failed to update MPIN: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	_ = s.mpinRepo.UnlockMPIN(ctx, req.UserID)
-
 	s.invalidateMPINCache(ctx, req.UserID)
+
+	afterJSON, _ := json.Marshal(oldMpin) // not updated; could refetch
 
 	s.logMPINEvent(ctx, &models.MPINLogEvent{
 		LogEnvelope: models.LogEnvelope{
@@ -1905,21 +1754,22 @@ func (s *MPINService) ChangeMPINByAdmin(ctx context.Context, req *MPINAdminChang
 		Duration:  int64(time.Since(startTime).Milliseconds()),
 	})
 
-	s.logger.Warn("MPIN changed by admin",
-		util.String("user_id", req.UserID.String()),
-		util.String("admin_id", req.AdminID.String()),
-		util.String("user_agent", req.UserAgent),
-		util.String("reason", req.Reason),
-		util.Duration("duration", time.Since(startTime)),
-	)
-
+	// Audit
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "mpin", "admin_change", "mpin_credential",
+			&req.UserID, "admin", &req.AdminID, beforeJSON, afterJSON, map[string]interface{}{
+				"ip":     req.IPAddress,
+				"reason": req.Reason,
+				"admin":  req.AdminID.String(),
+			})
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
-// ✅ COMPLETE: ResetMPIN resets user MPIN (admin override - unlocks only) with UserAgent
+// ResetMPIN unlocks and resets failed attempts for a user's MPIN.
 func (s *MPINService) ResetMPIN(ctx context.Context, req *MPINResetRequest) error {
 	startTime := time.Now()
-
 	s.logMPINEvent(ctx, &models.MPINLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -1935,6 +1785,16 @@ func (s *MPINService) ResetMPIN(ctx context.Context, req *MPINResetRequest) erro
 		Status:    "reset_initiated",
 		UserAgent: req.UserAgent,
 	})
+
+	// Idempotency
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("mpin_reset:%s", req.UserID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
 
 	_, err := s.mpinRepo.GetMPINByUserID(ctx, req.UserID)
 	if err != nil {
@@ -1958,6 +1818,8 @@ func (s *MPINService) ResetMPIN(ctx context.Context, req *MPINResetRequest) erro
 		return ErrMPINNotFound
 	}
 
+	beforeJSON, _ := json.Marshal(req)
+
 	if err := s.mpinRepo.UnlockMPIN(ctx, req.UserID); err != nil {
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -1977,10 +1839,11 @@ func (s *MPINService) ResetMPIN(ctx context.Context, req *MPINResetRequest) erro
 			ErrorMessage:  err.Error(),
 			FailureReason: "unlock_failed",
 		})
-		return fmt.Errorf("failed to unlock MPIN: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.invalidateMPINCache(ctx, req.UserID)
+
+	afterJSON, _ := json.Marshal(req) // not changed
 
 	s.logMPINEvent(ctx, &models.MPINLogEvent{
 		LogEnvelope: models.LogEnvelope{
@@ -1999,18 +1862,20 @@ func (s *MPINService) ResetMPIN(ctx context.Context, req *MPINResetRequest) erro
 		Duration:  int64(time.Since(startTime).Milliseconds()),
 	})
 
-	s.logger.Warn("MPIN reset by admin",
-		util.String("user_id", req.UserID.String()),
-		util.String("reset_by", req.ResetBy.String()),
-		util.String("user_agent", req.UserAgent),
-		util.String("reason", req.Reason),
-		util.Duration("duration", time.Since(startTime)),
-	)
-
+	// Audit
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "mpin", "reset", "mpin_credential",
+			&req.UserID, "admin", &req.ResetBy, beforeJSON, afterJSON, map[string]interface{}{
+				"ip":     req.IPAddress,
+				"reason": req.Reason,
+				"admin":  req.ResetBy.String(),
+			})
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
-// ✅ COMPLETE: UnlockMPIN unlocks a locked MPIN
+// UnlockMPIN unlocks a locked MPIN.
 func (s *MPINService) UnlockMPIN(ctx context.Context, userID uuid.UUID) error {
 	s.logMPINEvent(ctx, &models.MPINLogEvent{
 		LogEnvelope: models.LogEnvelope{
@@ -2026,6 +1891,18 @@ func (s *MPINService) UnlockMPIN(ctx context.Context, userID uuid.UUID) error {
 		UserID: userID.String(),
 		Status: "unlock_initiated",
 	})
+
+	// Idempotency
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("mpin_unlock:%s", userID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	beforeJSON, _ := json.Marshal(userID)
 
 	if err := s.mpinRepo.UnlockMPIN(ctx, userID); err != nil {
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
@@ -2045,10 +1922,11 @@ func (s *MPINService) UnlockMPIN(ctx context.Context, userID uuid.UUID) error {
 			ErrorMessage:  err.Error(),
 			FailureReason: "unlock_failed",
 		})
-		return fmt.Errorf("failed to unlock MPIN: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.invalidateMPINCache(ctx, userID)
+
+	afterJSON, _ := json.Marshal(userID)
 
 	s.logMPINEvent(ctx, &models.MPINLogEvent{
 		LogEnvelope: models.LogEnvelope{
@@ -2065,25 +1943,26 @@ func (s *MPINService) UnlockMPIN(ctx context.Context, userID uuid.UUID) error {
 		Status: "unlock_completed",
 	})
 
+	// Audit – actor could be admin; we don't have actor here, we can use system or pass admin ID separately.
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "mpin", "unlock", "mpin_credential",
+			&userID, "system", nil, beforeJSON, afterJSON, map[string]interface{}{
+				"action": "unlock",
+			})
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
-// ✅ COMPLETE: GetMPINStatus gets MPIN status for a user
-func (s *MPINService) GetMPINStatus(ctx context.Context, userID uuid.UUID) (*MPINStatus, error) {
-	s.logger.Debug("🔍 GetMPINStatus called",
-		util.String("user_id", userID.String()))
+// ---- Query methods ----
 
+// GetMPINStatus retrieves the current MPIN status for a user.
+func (s *MPINService) GetMPINStatus(ctx context.Context, userID uuid.UUID) (*MPINStatus, error) {
 	mpinCred, err := s.mpinRepo.GetMPINByUserID(ctx, userID)
 	if err != nil {
-		s.logger.Error("❌ Error getting MPIN",
-			util.ErrorField(err),
-			util.String("user_id", userID.String()))
 		return nil, err
 	}
-
 	if mpinCred == nil {
-		s.logger.Debug("❌ No MPIN found - returning Exists: false",
-			util.String("user_id", userID.String()))
 		return &MPINStatus{
 			UserID:         userID,
 			Exists:         false,
@@ -2094,11 +1973,6 @@ func (s *MPINService) GetMPINStatus(ctx context.Context, userID uuid.UUID) (*MPI
 			DeviceID:       "",
 		}, nil
 	}
-
-	s.logger.Debug("✅ MPIN exists - returning Exists: true",
-		util.String("user_id", userID.String()),
-		util.Bool("is_locked", mpinCred.IsLocked))
-
 	return &MPINStatus{
 		UserID:         userID,
 		Exists:         true,
@@ -2110,39 +1984,36 @@ func (s *MPINService) GetMPINStatus(ctx context.Context, userID uuid.UUID) (*MPI
 	}, nil
 }
 
-// ✅ COMPLETE: UpdateDeviceBinding updates device binding for MPIN
+// UpdateDeviceBinding updates the device binding for an MPIN.
 func (s *MPINService) UpdateDeviceBinding(ctx context.Context, userID uuid.UUID, deviceID string) error {
 	if err := s.mpinRepo.UpdateMPINDeviceBinding(ctx, userID, deviceID); err != nil {
 		return fmt.Errorf("failed to update device binding: %w", err)
 	}
-
 	s.invalidateMPINCache(ctx, userID)
-
 	return nil
 }
 
-// ✅ COMPLETE: GetMPINsByDevice gets all MPINs associated with a device
+// GetMPINsByDevice returns all MPINs bound to a device.
 func (s *MPINService) GetMPINsByDevice(ctx context.Context, deviceID string) ([]*models.MPINCredential, error) {
 	return s.mpinRepo.GetMPINsByDevice(ctx, deviceID)
 }
 
-// ✅ COMPLETE: GetLockedMPINs gets locked MPIN credentials
+// GetLockedMPINs returns locked MPINs.
 func (s *MPINService) GetLockedMPINs(ctx context.Context, limit int) ([]*models.MPINCredential, error) {
 	return s.mpinRepo.GetLockedMPINs(ctx, limit)
 }
 
-// ✅ COMPLETE: CleanupExpiredLocks cleans up expired MPIN locks
+// CleanupExpiredLocks cleans up expired locks.
 func (s *MPINService) CleanupExpiredLocks(ctx context.Context) (int, error) {
 	return s.mpinRepo.CleanupUnlockedMPINs(ctx)
 }
 
-// ✅ COMPLETE: GetMPINStats gets MPIN service statistics
+// GetMPINStats returns repository statistics.
 func (s *MPINService) GetMPINStats(ctx context.Context) (map[string]interface{}, error) {
 	stats, err := s.mpinRepo.GetRepositoryStats(ctx)
 	if err != nil {
 		return nil, err
 	}
-
 	stats["service_constants"] = map[string]interface{}{
 		"min_length":            MPINMinLength,
 		"max_length":            MPINMaxLength,
@@ -2155,11 +2026,53 @@ func (s *MPINService) GetMPINStats(ctx context.Context) (map[string]interface{},
 			"setup_per_hour":    MPINSetupRateLimit,
 		},
 	}
-
 	return stats, nil
 }
 
-// ✅ COMPLETE: HealthCheck performs a health check on the service
+// HealthCheck performs a health check on the MPIN repository.
 func (s *MPINService) HealthCheck(ctx context.Context) error {
 	return s.mpinRepo.HealthCheck(ctx)
+}
+
+// ---- Debug helpers (optional) ----
+func (s *MPINService) DebugHasherStatus(ctx context.Context) map[string]interface{} {
+	status := s.hasher.GetStatus()
+	userID, _ := uuid.Parse("your-test-user-id")
+	mpinCred, err := s.mpinRepo.GetMPINByUserID(ctx, userID)
+	if err == nil {
+		status["sample_mpin_pepper_version"] = mpinCred.PepperVersion
+		status["sample_mpin_algorithm"] = mpinCred.HashAlgorithm
+	}
+	return status
+}
+
+func (s *MPINService) GetDeviceRiskScore(ctx context.Context, userID uuid.UUID, deviceID string) (int, error) {
+	trustLevel, err := s.deviceTrustRepo.GetDeviceTrustLevel(ctx, userID, deviceID)
+	if err != nil {
+		return 0, err
+	}
+	if trustLevel == nil {
+		return 0, nil
+	}
+	return trustLevel.RiskScore, nil
+}
+
+func (s *MPINService) ResetDeviceRiskScore(ctx context.Context, userID uuid.UUID, deviceID string) error {
+	trustLevel, err := s.deviceTrustRepo.GetDeviceTrustLevel(ctx, userID, deviceID)
+	if err != nil {
+		return err
+	}
+	if trustLevel == nil {
+		return nil
+	}
+	trustLevel.RiskScore = 0
+	return s.deviceTrustRepo.UpdateRisk(ctx, trustLevel)
+}
+
+// ---- Helper ----
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

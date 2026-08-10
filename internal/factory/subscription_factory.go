@@ -779,7 +779,7 @@ func (f *SubscriptionInfraFactory) RegisterRoutes(r chi.Router) {
 		SubscriptionHandler:    f.SubscriptionHandler(),
 		TrialHandler:           f.TrialHandler(),
 	}
-	router.RegisterSubscriptionRoutes(r, handlers, f.logger)
+	router.RegisterSubscriptionRoutes(r, handlers)
 }
 
 // SubscriptionHandlers returns all subscription handlers for route registration.

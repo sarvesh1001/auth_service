@@ -879,7 +879,7 @@ func (f *SalesInfraFactory) RegisterRoutes(r chi.Router, jwtService *mainservice
 		SalesRepHandler:    f.SalesRepHandler(),
 		TaxHandler:         f.TaxHandler(),
 	}
-	sales.RegisterSalesRoutes(r, handlers, f.logger, jwtService)
+	sales.RegisterSalesRoutes(r, handlers, jwtService)
 }
 
 // Close performs any necessary cleanup (placeholder for future use).

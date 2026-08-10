@@ -2,7 +2,7 @@ package rbac
 
 // HasPermission checks if permission exists in bitmask
 func HasPermission(mask []uint64, permission string) bool {
-	if mask == nil || len(mask) == 0 {
+	if len(mask) == 0 {
 		return false
 	}
 

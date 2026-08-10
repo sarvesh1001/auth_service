@@ -11,6 +11,12 @@ import (
 // =========================================================
 // USERS (Updated with username and full_name)
 // =========================================================
+type EmployeeSearchResult struct {
+	UserID     uuid.UUID `json:"user_id"`
+	Username   string    `json:"username"`
+	FullName   string    `json:"full_name"`
+	EmployeeID string    `json:"employee_id"`
+}
 
 type User struct {
 	UserID            uuid.UUID  `db:"user_id" json:"user_id"`
@@ -362,6 +368,9 @@ type CompanyEmployee struct {
 	ReportsTo  *uuid.UUID `db:"reports_to" json:"reports_to,omitempty"`
 	CreatedAt  time.Time  `db:"created_at" json:"created_at"`
 	UpdatedAt  time.Time  `db:"updated_at" json:"updated_at"`
+	// New fields
+	Username string  `db:"username" json:"username"`
+	FullName *string `db:"full_name" json:"full_name,omitempty"` // can be NULL in DB
 }
 
 // =========================================================
@@ -633,4 +642,23 @@ type WorkCenter struct {
 	IsActive       bool      `json:"is_active" db:"is_active"`
 	CreatedAt      time.Time `json:"created_at" db:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at" db:"updated_at"`
+}
+
+// EmployeeWithPositionDetails – used by the RBAC detail endpoint
+type EmployeeWithPositionDetails struct {
+	CompanyEmployee        // embeds all existing fields
+	RoleName        string `json:"role_name"`
+	PositionTitle   string `json:"position_title"`
+	WorkCenterCode  string `json:"work_center_code"`
+	DepartmentName  string `json:"department_name"`
+	Username        string `json:"username"`
+	FullName        string `json:"full_name"`
+}
+
+// EmployeeSummary – minimal representation for lists and username search
+type EmployeeSummary struct {
+	UserID     uuid.UUID `json:"user_id"`
+	EmployeeID string    `json:"employee_id"`
+	Username   string    `json:"username"`
+	FullName   string    `json:"full_name"`
 }

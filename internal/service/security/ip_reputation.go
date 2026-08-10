@@ -2,14 +2,11 @@ package security
 
 import (
 	"bufio"
-
 	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
-
-	"go.uber.org/zap"
 )
 
 type IPReputation struct {
@@ -18,7 +15,6 @@ type IPReputation struct {
 	vpnRanges        []*net.IPNet
 	proxyRanges      []*net.IPNet
 	mu               sync.RWMutex
-	logger           *zap.Logger
 	lastUpdated      time.Time
 }
 
@@ -34,27 +30,18 @@ type IPInfo struct {
 	LastUpdated  time.Time `json:"last_updated"`
 }
 
-func NewIPReputation(logger *zap.Logger) *IPReputation {
+func NewIPReputation() *IPReputation {
 	ipRep := &IPReputation{
 		torList:     make(map[string]bool),
-		logger:      logger,
 		lastUpdated: time.Now(),
 	}
-
-	// Initialize with basic datacenter ranges
 	ipRep.initializeDatacenterRanges()
-
-	// Load TOR nodes in background
 	go ipRep.loadTORNodes()
-
-	// Load VPN/Proxy lists in background
 	go ipRep.loadVPNProxyLists()
-
 	return ipRep
 }
 
 func (r *IPReputation) initializeDatacenterRanges() {
-	// Common cloud and datacenter IP ranges
 	datacenterCIDRs := []string{
 		// AWS
 		"3.0.0.0/9", "3.128.0.0/10", "3.192.0.0/11", "3.224.0.0/12",
@@ -83,7 +70,6 @@ func (r *IPReputation) loadTORNodes() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Try to fetch from Tor Project
 	urls := []string{
 		"https://check.torproject.org/exit-addresses",
 		"https://raw.githubusercontent.com/SecOps-Institute/Tor-IP-Addresses/master/tor-exit-nodes.lst",
@@ -92,7 +78,6 @@ func (r *IPReputation) loadTORNodes() {
 	for _, url := range urls {
 		resp, err := http.Get(url)
 		if err != nil {
-			r.logger.Warn("Failed to fetch TOR nodes", zap.String("url", url), zap.Error(err))
 			continue
 		}
 		defer resp.Body.Close()
@@ -107,18 +92,16 @@ func (r *IPReputation) loadTORNodes() {
 					r.torList[ip] = true
 				}
 			} else if net.ParseIP(line) != nil {
-				// For GitHub format - just IPs
 				r.torList[line] = true
 			}
 		}
 
 		if len(r.torList) > 0 {
-			r.logger.Info("Loaded TOR nodes", zap.Int("count", len(r.torList)))
 			break
 		}
 	}
 
-	// If no TOR nodes loaded, add some known ones as fallback
+	// Fallback known TOR nodes
 	if len(r.torList) == 0 {
 		knownTORs := []string{
 			"185.220.101.1", "185.220.101.2", "185.220.101.3",
@@ -128,16 +111,13 @@ func (r *IPReputation) loadTORNodes() {
 		for _, ip := range knownTORs {
 			r.torList[ip] = true
 		}
-		r.logger.Info("Using fallback TOR nodes", zap.Int("count", len(r.torList)))
 	}
-
 	r.lastUpdated = time.Now()
 }
 
 func (r *IPReputation) loadVPNProxyLists() {
-	// This would load from free VPN/Proxy lists
-	// For now, we'll use the datacenter ranges as a proxy for VPN/Proxy detection
-	r.logger.Info("VPN/Proxy list loading would be implemented here")
+	// Placeholder – would load from free VPN/Proxy lists.
+	// For now, use datacenter ranges as a proxy.
 }
 
 func (r *IPReputation) CheckIP(ipStr string) *IPInfo {
@@ -154,19 +134,13 @@ func (r *IPReputation) CheckIP(ipStr string) *IPInfo {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	// Check TOR
 	info.IsTOR = r.torList[ipStr]
-
-	// Check datacenter
 	info.IsDataCenter = r.isInDatacenterRange(ip)
-
-	// For now, treat datacenter IPs as potential VPN/Proxy
+	// Treat datacenter IPs as potential VPN/Proxy
 	info.IsVPN = info.IsDataCenter
 	info.IsProxy = info.IsDataCenter
 
-	// Calculate risk score
 	info.RiskScore = r.calculateRiskScore(info)
-
 	return info
 }
 
@@ -181,7 +155,6 @@ func (r *IPReputation) isInDatacenterRange(ip net.IP) bool {
 
 func (r *IPReputation) calculateRiskScore(info *IPInfo) int {
 	score := 0
-
 	if info.IsTOR {
 		score += 40
 	}
@@ -194,7 +167,6 @@ func (r *IPReputation) calculateRiskScore(info *IPInfo) int {
 	if info.IsDataCenter {
 		score += 20
 	}
-
 	return score
 }
 
@@ -213,7 +185,6 @@ func (r *IPReputation) IsVPN(ipStr string) bool {
 }
 
 func (r *IPReputation) IsProxy(ipStr string) bool {
-	// For now, use same logic as VPN
 	return r.IsVPN(ipStr)
 }
 
@@ -225,13 +196,11 @@ func (r *IPReputation) IsDataCenterIP(ipStr string) bool {
 	return r.isInDatacenterRange(ip)
 }
 
-// QuickCheck provides a fast reputation check without full IPInfo
 func (r *IPReputation) QuickCheck(ipStr string) (bool, int) {
 	info := r.CheckIP(ipStr)
 	if info == nil {
 		return false, 0
 	}
-
 	isRisky := info.RiskScore >= 30
 	return isRisky, info.RiskScore
 }

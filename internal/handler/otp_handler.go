@@ -1,49 +1,93 @@
-// internal/handler/otp_handler.go - FIXED VERSION
 package handler
 
 import (
+	"auth-service/internal/contextkeys"
+	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
-	"time"
-
-	"auth-service/internal/service"
-	"auth-service/internal/util"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-playground/validator/v10"
-	"go.uber.org/zap"
+
+	customErrors "auth-service/internal/errors"
+	"auth-service/internal/service"
+	"auth-service/internal/util"
 )
 
-// OTPHandler handles HTTP requests for OTP operations
+// OTPHandler handles HTTP requests for OTP operations.
 type OTPHandler struct {
 	otpService     *service.OTPService
 	sessionService *service.SessionService
 	validator      *validator.Validate
-	logger         *zap.Logger
 }
 
+// NewOTPHandler creates a new OTPHandler.
 func NewOTPHandler(
 	otpService *service.OTPService,
 	sessionService *service.SessionService,
-	logger *zap.Logger,
 ) *OTPHandler {
 	return &OTPHandler{
 		otpService:     otpService,
 		sessionService: sessionService,
 		validator:      validator.New(),
-		logger:         logger,
 	}
 }
 
-// RegisterRoutes registers all OTP routes
+// ---------- Context injection ----------
+
+func (h *OTPHandler) getIdempotencyKey(r *http.Request) string {
+	return r.Header.Get("Idempotency-Key")
+}
+
+// injectIdempotencyKey adds the idempotency key to the request context.
+func (h *OTPHandler) injectIdempotencyKey(ctx context.Context, r *http.Request) context.Context {
+	key := h.getIdempotencyKey(r)
+	if key != "" {
+		// Use the shared context key type
+		return context.WithValue(ctx, "idempotency_key", key) // plain string
+	}
+	return ctx
+}
+
+// injectClientIP adds the client IP to the request context.
+func (h *OTPHandler) injectClientIP(ctx context.Context, r *http.Request) context.Context {
+	ip := h.getClientIP(r)
+	return context.WithValue(ctx, contextkeys.ClientIP, ip)
+}
+
+// getClientIP extracts client IP.
+func (h *OTPHandler) getClientIP(r *http.Request) string {
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		if ips := strings.Split(forwarded, ","); len(ips) > 0 {
+			ip := strings.TrimSpace(ips[0])
+			if parsedIP := net.ParseIP(ip); parsedIP != nil {
+				return ip
+			}
+		}
+	}
+	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+		if parsedIP := net.ParseIP(realIP); parsedIP != nil {
+			return realIP
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// RegisterRoutes registers all OTP routes.
 func (h *OTPHandler) RegisterRoutes(router chi.Router) {
 	router.Route("/otp", func(r chi.Router) {
-		r.Post("/send", h.SendOTP)
-		r.Post("/verify", h.VerifyOTP)
+		// Apply idempotency middleware directly on these two endpoints
+		r.With(IdempotencyMiddleware).Post("/send", h.SendOTP)
+		r.With(IdempotencyMiddleware).Post("/verify", h.VerifyOTP)
 		r.Get("/health", h.HealthCheck)
-
 		r.Group(func(r chi.Router) {
 			r.Get("/stats", h.GetOTPStats)
 			r.Post("/cleanup", h.CleanupExpiredOTPs)
@@ -51,10 +95,20 @@ func (h *OTPHandler) RegisterRoutes(router chi.Router) {
 	})
 }
 
-// SendOTP handles OTP send requests
+// SendOTP handles OTP send requests.
+// @Summary Send OTP
+// @Description Sends an OTP to the provided phone number.
+// @Tags otp
+// @Accept json
+// @Produce json
+// @Param body body service.OTPSendRequest true "OTP send request"
+// @Success 200 {object} map[string]interface{} "OTP sent"
+// @Failure 400 {object} map[string]interface{} "Validation failed"
+// @Failure 404 {object} map[string]interface{} "Phone not registered"
+// @Failure 429 {object} map[string]interface{} "Rate limit exceeded"
+// @Router /api/v1/otp/send [post]
 func (h *OTPHandler) SendOTP(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	var req service.OTPSendRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -62,62 +116,56 @@ func (h *OTPHandler) SendOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Sanitize inputs
 	req.PhoneNumber = util.SanitizeInput(strings.TrimSpace(req.PhoneNumber))
 	req.Purpose = util.SanitizeInput(strings.TrimSpace(strings.ToLower(req.Purpose)))
 	req.DeviceID = util.SanitizeInput(req.DeviceID)
 	req.Provider = util.SanitizeInput(req.Provider)
-
-	// Get IP address from request
 	req.IPAddress = h.getClientIP(r)
 
-	// Validate request
 	if err := h.validator.Struct(req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Validation failed")
 		return
 	}
 
-	// Check for suspicious patterns
 	if util.ContainsSuspicious(req.PhoneNumber) || util.ContainsSuspicious(req.DeviceID) {
-		h.logger.Warn("Blocked suspicious OTP send request",
-			util.String("phone", req.PhoneNumber),
-			util.String("device_id", req.DeviceID),
-			util.String("ip", req.IPAddress),
-		)
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("suspicious input detected"),
-			"Invalid request")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Invalid request")
 		return
 	}
 
-	// Send OTP
 	response, err := h.otpService.SendOTP(ctx, &req)
 	if err != nil {
-		statusCode := h.getStatusCodeForError(err)
-
-		if errors.Is(err, service.ErrOTPRateLimitExceeded) && response != nil {
-			w.Header().Set("Retry-After", string(rune(response.RetryAfter)))
+		statusCode, msg := h.mapServiceError(err)
+		if response != nil {
+			// Retry-After header must be a string containing seconds
+			if response.RetryAfter > 0 {
+				w.Header().Set("Retry-After", strconv.Itoa(response.RetryAfter))
+			}
 			h.respondWithJSON(w, statusCode, response)
 			return
 		}
-
-		h.respondWithError(w, statusCode, err, "Failed to send OTP")
+		h.respondWithError(w, statusCode, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "OTP sent successfully"))
-
-	h.logger.Info("OTP send request completed",
-		util.String("purpose", req.Purpose),
-		util.String("ip", req.IPAddress),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// ✅ FIXED: VerifyOTP handles OTP verification requests
+// VerifyOTP verifies OTP and optionally issues tokens.
+// @Summary Verify OTP
+// @Description Verifies the OTP and can issue authentication tokens.
+// @Tags otp
+// @Accept json
+// @Produce json
+// @Param body body service.OTPVerifyRequest true "OTP verification request"
+// @Success 200 {object} map[string]interface{} "Verification result with tokens"
+// @Failure 400 {object} map[string]interface{} "Validation failed"
+// @Failure 401 {object} map[string]interface{} "Invalid OTP"
+// @Failure 423 {object} map[string]interface{} "Attempts exceeded"
+// @Failure 429 {object} map[string]interface{} "Too many attempts"
+// @Failure 410 {object} map[string]interface{} "OTP expired"
+// @Router /api/v1/otp/verify [post]
 func (h *OTPHandler) VerifyOTP(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	var req service.OTPVerifyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -125,220 +173,150 @@ func (h *OTPHandler) VerifyOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Sanitize inputs
 	req.PhoneNumber = util.SanitizeInput(strings.TrimSpace(req.PhoneNumber))
 	req.OTP = strings.TrimSpace(req.OTP)
 	req.Purpose = util.SanitizeInput(strings.TrimSpace(strings.ToLower(req.Purpose)))
-
-	// Get IP address
 	req.IPAddress = h.getClientIP(r)
+	req.DeviceID = r.Header.Get("X-Device-ID")
 
-	// ✅ FIXED: Get device ID from header instead of request body
-	deviceID := r.Header.Get("X-Device-ID")
-
-	// Validate request
 	if err := h.validator.Struct(req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Validation failed")
 		return
 	}
 
-	// Verify OTP
 	response, err := h.otpService.VerifyOTP(ctx, &req)
 	if err != nil {
-		statusCode := h.getStatusCodeForError(err)
-
-		if (errors.Is(err, service.ErrOTPRateLimitExceeded) ||
-			errors.Is(err, service.ErrOTPInvalid)) && response != nil {
+		statusCode, msg := h.mapServiceError(err)
+		if response != nil {
+			if response.RetryAfter > 0 {
+				w.Header().Set("Retry-After", strconv.Itoa(response.RetryAfter))
+			}
 			h.respondWithJSON(w, statusCode, response)
 			return
 		}
-
-		h.respondWithError(w, statusCode, err, "OTP verification failed")
+		h.respondWithError(w, statusCode, err, msg)
 		return
 	}
 
-	// ✅ FIXED: If verification successful, issue JWT tokens
-	if response.Success && deviceID != "" {
-		userID := "user-" + req.PhoneNumber // ⚠️ REPLACE WITH ACTUAL DB LOOKUP
-
+	// Issue tokens if successful and device ID present
+	if response.Success && req.DeviceID != "" {
+		userID := "user-" + req.PhoneNumber // placeholder – replace with actual user ID lookup
 		tokenPair, err := h.sessionService.IssueTokenPair(ctx, &service.IssueTokenPairRequest{
 			UserID:      userID,
 			Role:        "user",
-			DeviceID:    deviceID, // ✅ Use deviceID from header
+			DeviceID:    req.DeviceID,
 			SessionType: "user",
 			IPAddress:   req.IPAddress,
 		})
 		if err != nil {
-			h.logger.Error("Failed to issue JWT tokens after OTP verification",
-				util.ErrorField(err),
-				util.String("phone", req.PhoneNumber),
-			)
-			h.respondWithError(w, http.StatusInternalServerError, err, "Failed to issue authentication tokens")
+			status, msg := h.mapServiceError(err)
+			h.respondWithError(w, status, err, msg)
 			return
 		}
-
-		// ✅ Return both verification result and tokens
 		h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
 			"verified": true,
 			"tokens":   tokenPair,
 			"message":  "OTP verified successfully",
 		}, "OTP verified successfully"))
-
-		h.logger.Info("OTP verification completed with token issuance",
-			util.String("user_id", userID),
-			util.String("purpose", req.Purpose),
-			util.String("ip", req.IPAddress),
-			util.Bool("success", true),
-			util.Duration("duration", time.Since(startTime)),
-		)
 		return
 	}
 
-	// OTP verification failed or no device ID
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "OTP verification completed"))
-
-	h.logger.Info("OTP verification completed",
-		util.String("purpose", req.Purpose),
-		util.String("ip", req.IPAddress),
-		util.Bool("success", response.Success),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// ResendOTP handles OTP resend requests
-// @Summary Resend OTP
-// @Description Resend OTP to phone number
-// @Tags otp
-// @Accept json
-// @Produce json
-// @Param request body service.OTPResendRequest true "OTP resend request"
-// @Success 200 {object} Response
-// @Failure 400 {object} Response
-// @Failure 429 {object} Response
-// @Failure 500 {object} Response
-// @Router /otp/resend [post]
-
-// HealthCheck handles OTP service health check
-// @Summary OTP Health Check
-// @Description Check OTP service health
+// HealthCheck checks OTP service health.
+// @Summary OTP service health
 // @Tags otp
 // @Produce json
-// @Success 200 {object} Response
-// @Failure 500 {object} Response
-// @Router /otp/health [get]
+// @Success 200 {object} map[string]interface{} "Service healthy"
+// @Failure 500 {object} map[string]interface{} "Service unhealthy"
+// @Router /api/v1/otp/health [get]
 func (h *OTPHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
+	ctx := h.injectClientIP(r.Context(), r)
 	if err := h.otpService.HealthCheck(ctx); err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "OTP service unhealthy")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]string{
 		"status":  "healthy",
 		"service": "otp",
 	}, "OTP service is healthy"))
 }
 
-// GetOTPStats handles OTP statistics requests (admin only)
-// @Summary Get OTP Statistics
-// @Description Get OTP service statistics
+// GetOTPStats returns OTP statistics (admin only).
+// @Summary Get OTP stats
 // @Tags otp
 // @Produce json
-// @Success 200 {object} Response
-// @Failure 500 {object} Response
-// @Router /otp/stats [get]
+// @Success 200 {object} map[string]interface{} "Statistics"
+// @Failure 500 {object} map[string]interface{} "Failed to get stats"
+// @Router /api/v1/otp/stats [get]
 func (h *OTPHandler) GetOTPStats(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
+	ctx := h.injectClientIP(r.Context(), r)
 	stats, err := h.otpService.GetOTPStats(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get OTP stats")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(stats, "OTP statistics retrieved"))
 }
 
-// CleanupExpiredOTPs handles manual cleanup of expired OTPs (admin only)
-// @Summary Cleanup Expired OTPs
-// @Description Manually cleanup expired OTPs
+// CleanupExpiredOTPs triggers cleanup (admin only).
+// @Summary Cleanup expired OTPs
 // @Tags otp
 // @Produce json
-// @Success 200 {object} Response
-// @Failure 500 {object} Response
-// @Router /otp/cleanup [post]
+// @Success 200 {object} map[string]interface{} "Cleanup result"
+// @Failure 500 {object} map[string]interface{} "Cleanup failed"
+// @Router /api/v1/otp/cleanup [post]
 func (h *OTPHandler) CleanupExpiredOTPs(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	// This is a backup cleanup - TTL handles this automatically
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 	count, err := h.otpService.CleanupExpiredOTPs(ctx, 1000)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Cleanup failed")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
 		"deleted_count": count,
 		"message":       "Cleanup completed",
 	}, "OTP cleanup successful"))
 }
 
-// ============================================
-// HELPER METHODS
-// ============================================
-func (h *OTPHandler) getClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		ips := strings.Split(xff, ",")
-		return strings.TrimSpace(ips[0])
+// ---------- Error mapping ----------
+func (h *OTPHandler) mapServiceError(err error) (int, string) {
+	if err == nil {
+		return http.StatusOK, ""
 	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
-	ip := r.RemoteAddr
-	if colon := strings.LastIndex(ip, ":"); colon != -1 {
-		ip = ip[:colon]
-	}
-	return ip
-}
-
-func (h *OTPHandler) getStatusCodeForError(err error) int {
 	switch {
-	case errors.Is(err, service.ErrOTPNotFound):
-		return http.StatusNotFound
-	case errors.Is(err, service.ErrOTPExpired):
-		return http.StatusGone
-	case errors.Is(err, service.ErrOTPInvalid):
-		return http.StatusUnauthorized
-	case errors.Is(err, service.ErrOTPAttemptsExceeded):
-		return http.StatusLocked
-	case errors.Is(err, service.ErrOTPRateLimitExceeded):
-		return http.StatusTooManyRequests
-	case errors.Is(err, service.ErrInvalidInput):
-		return http.StatusBadRequest
+	case errors.Is(err, customErrors.ErrNotFound),
+		errors.Is(err, customErrors.ErrOTPNotFound),
+		errors.Is(err, customErrors.ErrPhoneNotRegistered):
+		return http.StatusNotFound, err.Error()
+	case errors.Is(err, customErrors.ErrInvalidInput):
+		return http.StatusBadRequest, err.Error()
+	case errors.Is(err, customErrors.ErrOTPExpired):
+		return http.StatusGone, err.Error()
+	case errors.Is(err, customErrors.ErrOTPInvalid):
+		return http.StatusUnauthorized, err.Error()
+	case errors.Is(err, customErrors.ErrOTPAttemptsExceeded):
+		return http.StatusLocked, err.Error()
+	case errors.Is(err, customErrors.ErrOTPRateLimitExceeded),
+		errors.Is(err, customErrors.ErrDailyQuotaExceeded),
+		errors.Is(err, customErrors.ErrSecurityCheckFailed):
+		return http.StatusTooManyRequests, err.Error()
 	default:
-		return http.StatusInternalServerError
+		return http.StatusInternalServerError, "internal server error"
 	}
 }
 
-func (h *OTPHandler) respondWithJSON(w http.ResponseWriter, statusCode int, payload interface{}) {
+// ---------- Response helpers ----------
+func (h *OTPHandler) respondWithJSON(w http.ResponseWriter, statusCode int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
-
-	if err := json.NewEncoder(w).Encode(payload); err != nil {
-		h.logger.Error("Failed to encode JSON response",
-			util.ErrorField(err),
-		)
-	}
+	_ = json.NewEncoder(w).Encode(data)
 }
 
 func (h *OTPHandler) respondWithError(w http.ResponseWriter, statusCode int, err error, message string) {
-	response := errorResponse(err, message)
-	h.respondWithJSON(w, statusCode, response)
-
-	h.logger.Warn("OTP operation failed",
-		util.ErrorField(err),
-		util.String("message", message),
-		util.Int("status_code", statusCode),
-	)
+	h.respondWithJSON(w, statusCode, errorResponse(err, message))
 }

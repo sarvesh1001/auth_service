@@ -12,8 +12,21 @@ import (
 	"auth-service/internal/config"
 	"auth-service/internal/factory"
 	"auth-service/internal/util"
+
+	// Swagger UI and generated docs
+	_ "auth-service/docs" // auto‑generated Swagger docs (created by `swag init`)
+
+	httpSwagger "github.com/swaggo/http-swagger"
 )
 
+// @title B2B Suite API
+// @version 1.0
+// @description Auth Service for B2B Suite – admin, employee, attendance, etc.
+// @host localhost:8080
+// @BasePath /api/v1
+// @securityDefinitions.apikey BearerAuth
+// @in header
+// @name Authorization
 func main() {
 	// Initialize factory
 	f, err := factory.NewFactory()
@@ -27,6 +40,11 @@ func main() {
 
 	// Initialize router
 	router := f.GetRouter()
+
+	// ----- SWAGGER UI -----
+	// Exposes Swagger UI at http://localhost:8080/swagger/index.html
+	// Raw OpenAPI JSON is available at http://localhost:8080/swagger/doc.json
+	router.Get("/swagger/*", httpSwagger.WrapHandler)
 
 	// Determine server address
 	var addr string

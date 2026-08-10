@@ -8,12 +8,10 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 )
 
 func CompanyAccessMiddlewareWithDeviceSupport(
 	jwtService *service.JWTService,
-	logger *zap.Logger,
 ) func(http.Handler) http.Handler {
 
 	return func(next http.Handler) http.Handler {
@@ -21,46 +19,40 @@ func CompanyAccessMiddlewareWithDeviceSupport(
 
 			ctx := r.Context()
 
-			// --------------------------------------------------
 			// Session type (MUST exist)
-			// --------------------------------------------------
 			sessionType, ok := ctx.Value("session_type").(string)
 			if !ok {
-				respondWithJWTError(w, logger, http.StatusUnauthorized, "Session type missing")
+				util.JSONError(w, http.StatusUnauthorized, "Session type missing")
 				return
 			}
 
-			// --------------------------------------------------
-			// DEVICE SESSION ✅ (TRUST TOKEN CONTEXT)
-			// --------------------------------------------------
+			// DEVICE SESSION (TRUST TOKEN CONTEXT)
 			if sessionType == "device" {
 				if _, ok := ctx.Value("company_id").(uuid.UUID); !ok {
-					respondWithJWTError(w, logger, http.StatusUnauthorized, "device company context missing")
+					util.JSONError(w, http.StatusUnauthorized, "device company context missing")
 					return
 				}
 				next.ServeHTTP(w, r)
 				return
 			}
 
-			// --------------------------------------------------
 			// USER / ADMIN SESSION
-			// --------------------------------------------------
 			companyIDStr := chi.URLParam(r, "companyID")
 			companyID, err := uuid.Parse(companyIDStr)
 			if err != nil {
-				respondWithJWTError(w, logger, http.StatusBadRequest, "Invalid company ID")
+				util.JSONError(w, http.StatusBadRequest, "Invalid company ID")
 				return
 			}
 
 			userIDStr, ok := ctx.Value("user_id").(string)
 			if !ok {
-				respondWithJWTError(w, logger, http.StatusUnauthorized, "User not authenticated")
+				util.JSONError(w, http.StatusUnauthorized, "User not authenticated")
 				return
 			}
 
 			userID, err := uuid.Parse(userIDStr)
 			if err != nil {
-				respondWithJWTError(w, logger, http.StatusBadRequest, "Invalid user ID")
+				util.JSONError(w, http.StatusBadRequest, "Invalid user ID")
 				return
 			}
 
@@ -75,13 +67,13 @@ func CompanyAccessMiddlewareWithDeviceSupport(
 			// Normal user: enforce validated company
 			validatedCompanyID, ok := ctx.Value("validated_company_id").(string)
 			if !ok {
-				respondWithJWTError(w, logger, http.StatusForbidden, "Company access denied")
+				util.JSONError(w, http.StatusForbidden, "Company access denied")
 				return
 			}
 
 			validatedUUID, err := uuid.Parse(validatedCompanyID)
 			if err != nil || validatedUUID != companyID {
-				respondWithJWTError(w, logger, http.StatusForbidden, "Company access violation")
+				util.JSONError(w, http.StatusForbidden, "Company access violation")
 				return
 			}
 
@@ -90,27 +82,5 @@ func CompanyAccessMiddlewareWithDeviceSupport(
 
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
-	}
-}
-
-// ==========================
-// HELPER
-// ==========================
-func respondWithJWTError(
-	w http.ResponseWriter,
-	logger *zap.Logger,
-	status int,
-	message string,
-) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-
-	resp := map[string]interface{}{
-		"success": false,
-		"error":   message,
-	}
-
-	if err := util.JSONEncode(w, resp); err != nil {
-		logger.Error("failed to encode jwt error response", util.ErrorField(err))
 	}
 }

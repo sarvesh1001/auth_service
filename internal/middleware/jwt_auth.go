@@ -2,15 +2,12 @@ package middleware
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"strings"
 
 	"auth-service/internal/models"
 	"auth-service/internal/service"
 	"auth-service/internal/util"
-
-	"go.uber.org/zap"
 )
 
 //
@@ -19,27 +16,19 @@ import (
 // ============================================================================
 //
 
-func parseBearerToken(r *http.Request, logger *zap.Logger) (string, bool) {
+func parseBearerToken(r *http.Request) (string, bool) {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
-		logger.Warn("Missing Authorization header")
 		return "", false
 	}
-
 	fields := strings.Fields(authHeader)
 	if len(fields) < 2 || !strings.EqualFold(fields[0], "Bearer") {
-		logger.Warn("Invalid Authorization header format",
-			zap.String("header", authHeader))
 		return "", false
 	}
-
 	tokenStr := strings.TrimSpace(strings.Trim(strings.Join(fields[1:], " "), `"`))
 	if strings.Count(tokenStr, ".") != 2 {
-		logger.Warn("Malformed JWT token",
-			zap.Int("dot_count", strings.Count(tokenStr, ".")))
 		return "", false
 	}
-
 	return tokenStr, true
 }
 
@@ -51,13 +40,10 @@ func parseBearerToken(r *http.Request, logger *zap.Logger) (string, bool) {
 
 func JWTAuthMiddlewareWithRedis(
 	sessionService *service.SessionService,
-	logger *zap.Logger,
 ) func(http.Handler) http.Handler {
-
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
-			tokenStr, ok := parseBearerToken(r, logger)
+			tokenStr, ok := parseBearerToken(r)
 			if !ok {
 				util.JSONError(w, http.StatusUnauthorized, "missing or invalid authorization header")
 				return
@@ -65,9 +51,6 @@ func JWTAuthMiddlewareWithRedis(
 
 			claims, err := sessionService.ValidateAccessToken(r.Context(), tokenStr)
 			if err != nil {
-				logger.Warn("JWT validation failed",
-					util.ErrorField(err),
-					util.String("token", util.MaskString(tokenStr, 8)))
 				util.JSONError(w, http.StatusUnauthorized, "invalid, expired, or revoked token")
 				return
 			}
@@ -80,7 +63,6 @@ func JWTAuthMiddlewareWithRedis(
 			ctx = context.WithValue(ctx, "jti", claims.JTI)
 			ctx = context.WithValue(ctx, "permission_mask", claims.PermissionMask)
 
-			// ✅ COMPANY CONTEXT (STRING ONLY)
 			if claims.CompanyID != "" {
 				ctx = context.WithValue(ctx, "company_id", claims.CompanyID)
 				ctx = context.WithValue(ctx, "validated_company_id", claims.CompanyID)
@@ -99,13 +81,10 @@ func JWTAuthMiddlewareWithRedis(
 
 func AdminJWTAuthMiddleware(
 	sessionService *service.SessionService,
-	logger *zap.Logger,
 ) func(http.Handler) http.Handler {
-
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
-			tokenStr, ok := parseBearerToken(r, logger)
+			tokenStr, ok := parseBearerToken(r)
 			if !ok {
 				util.JSONError(w, http.StatusUnauthorized, "missing or invalid authorization header")
 				return
@@ -131,7 +110,6 @@ func AdminJWTAuthMiddleware(
 			ctx = context.WithValue(ctx, "jti", claims.JTI)
 			ctx = context.WithValue(ctx, "permission_mask", claims.PermissionMask)
 
-			// ✅ COMPANY CONTEXT (STRING ONLY)
 			if claims.CompanyID != "" {
 				ctx = context.WithValue(ctx, "company_id", claims.CompanyID)
 				ctx = context.WithValue(ctx, "validated_company_id", claims.CompanyID)
@@ -150,13 +128,10 @@ func AdminJWTAuthMiddleware(
 
 func UserAuthMiddleware(
 	sessionService *service.SessionService,
-	logger *zap.Logger,
 ) func(http.Handler) http.Handler {
-
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
-			tokenStr, ok := parseBearerToken(r, logger)
+			tokenStr, ok := parseBearerToken(r)
 			if !ok {
 				util.JSONError(w, http.StatusUnauthorized, "missing or invalid authorization header")
 				return
@@ -181,7 +156,6 @@ func UserAuthMiddleware(
 			ctx = context.WithValue(ctx, "jti", claims.JTI)
 			ctx = context.WithValue(ctx, "permission_mask", claims.PermissionMask)
 
-			// ✅ COMPANY CONTEXT (STRING ONLY)
 			if claims.CompanyID != "" {
 				ctx = context.WithValue(ctx, "company_id", claims.CompanyID)
 				ctx = context.WithValue(ctx, "validated_company_id", claims.CompanyID)
@@ -201,13 +175,11 @@ func UserAuthMiddleware(
 func AdminRoleMiddleware(requiredRole string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
 			role, ok := r.Context().Value("role").(string)
 			if !ok || getRoleLevel(role) < getRoleLevel(requiredRole) {
 				util.JSONError(w, http.StatusForbidden, "insufficient admin privileges")
 				return
 			}
-
 			next.ServeHTTP(w, r)
 		})
 	}
@@ -238,31 +210,26 @@ func getRoleLevel(role string) int {
 // ============================================================================
 //
 
-func AdminPermissionMiddleware(requiredPermission string, logger *zap.Logger) func(http.Handler) http.Handler {
+func AdminPermissionMiddleware(requiredPermission string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
 			if r.Context().Value("session_type") != "admin" {
 				util.JSONError(w, http.StatusForbidden, "admin session required")
 				return
 			}
-
 			mask, ok := r.Context().Value("permission_mask").([]uint64)
 			if !ok || mask == nil {
 				util.JSONError(w, http.StatusForbidden, "permission mask not found")
 				return
 			}
-
 			if r.Context().Value("role") == models.RoleAdminSuperAdmin {
 				next.ServeHTTP(w, r)
 				return
 			}
-
 			if !hasAdminPermission(mask, requiredPermission) {
 				util.JSONError(w, http.StatusForbidden, "insufficient admin permissions")
 				return
 			}
-
 			next.ServeHTTP(w, r)
 		})
 	}
@@ -284,12 +251,9 @@ func hasAdminPermission(mask []uint64, permission string) bool {
 
 func CombinedMiddleware(
 	sessionService *service.SessionService,
-	logger *zap.Logger,
 ) func(http.Handler) http.Handler {
-
-	jwt := JWTAuthMiddlewareWithRedis(sessionService, logger)
-	session := SessionValidationMiddleware(sessionService, logger)
-
+	jwt := JWTAuthMiddlewareWithRedis(sessionService)
+	session := SessionValidationMiddleware(sessionService)
 	return func(next http.Handler) http.Handler {
 		return jwt(session(next))
 	}
@@ -297,12 +261,9 @@ func CombinedMiddleware(
 
 func CombinedAdminMiddleware(
 	sessionService *service.SessionService,
-	logger *zap.Logger,
 ) func(http.Handler) http.Handler {
-
-	admin := AdminJWTAuthMiddleware(sessionService, logger)
-	session := SessionValidationMiddleware(sessionService, logger)
-
+	admin := AdminJWTAuthMiddleware(sessionService)
+	session := SessionValidationMiddleware(sessionService)
 	return func(next http.Handler) http.Handler {
 		return admin(session(next))
 	}
@@ -318,37 +279,29 @@ func AdminRoleOrPermissionMiddleware(
 	minRole string,
 	requiredPermission string,
 	sessionService *service.SessionService,
-	logger *zap.Logger,
 ) func(http.Handler) http.Handler {
-
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
-			tokenStr, ok := parseBearerToken(r, logger)
+			tokenStr, ok := parseBearerToken(r)
 			if !ok {
 				util.JSONError(w, http.StatusUnauthorized, "missing or invalid authorization header")
 				return
 			}
-
 			claims, err := sessionService.ValidateAccessToken(r.Context(), tokenStr)
 			if err != nil {
 				util.JSONError(w, http.StatusUnauthorized, "invalid or expired token")
 				return
 			}
-
 			if claims.SessionType != "admin" {
 				util.JSONError(w, http.StatusForbidden, "admin session required")
 				return
 			}
-
 			if getRoleLevel(claims.Role) >= getRoleLevel(minRole) ||
 				hasAdminPermission(claims.PermissionMask, requiredPermission) {
-
 				ctx := buildContext(r.Context(), claims)
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
-
 			util.JSONError(w, http.StatusForbidden, "insufficient permissions")
 		})
 	}
@@ -373,29 +326,5 @@ func buildContext(ctx context.Context, claims *models.JWTClaims) context.Context
 		ctx = context.WithValue(ctx, "company_id", claims.CompanyID)
 		ctx = context.WithValue(ctx, "validated_company_id", claims.CompanyID)
 	}
-
 	return ctx
-}
-
-//
-// ============================================================================
-// JWT ERROR RESPONSE
-// ============================================================================
-//
-
-func respondWithJWTError(w http.ResponseWriter, logger *zap.Logger, statusCode int, message string) {
-	if logger != nil {
-		logger.Warn("JWT auth error",
-			zap.Int("status_code", statusCode),
-			zap.String("message", message))
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(statusCode)
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": false,
-		"error":   message,
-		"message": "Authentication failed",
-		"code":    statusCode,
-	})
 }

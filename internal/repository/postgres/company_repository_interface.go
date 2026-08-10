@@ -102,11 +102,11 @@ type CompanyRepository interface {
 	// UpdateEmployeeDepartment(ctx context.Context, companyID, userID, departmentID uuid.UUID) error
 	DeactivateEmployee(ctx context.Context, companyID, userID uuid.UUID) error
 	ReactivateEmployee(ctx context.Context, companyID, userID uuid.UUID) error
+	UpdateEmployeeOfCompany(ctx context.Context, companyID, userID uuid.UUID, updates map[string]interface{}) error
 
 	// Employee Queries
 	GetEmployeeCount(ctx context.Context, companyID uuid.UUID) (int, error)
 	GetActiveEmployeeCount(ctx context.Context, companyID uuid.UUID) (int, error)
-	GetEmployeesByCompany(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]*models.CompanyEmployee, int, error)
 	GetEmployeesByDepartment(ctx context.Context, departmentID uuid.UUID, limit, offset int) ([]*models.CompanyEmployee, int, error)
 	GetEmployeesByRole(ctx context.Context, roleID uuid.UUID, limit, offset int) ([]*models.CompanyEmployee, int, error)
 	ListActiveEmployees(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]*models.CompanyEmployee, int, error)
@@ -114,7 +114,10 @@ type CompanyRepository interface {
 	GetUsersByRoleLevel(ctx context.Context, companyID uuid.UUID, minLevel, maxLevel int) ([]*models.CompanyEmployee, error)
 	GetEmployeeDepartment(ctx context.Context, companyID, userID uuid.UUID) (*models.Department, error)
 	GetEmployeeDepartments(ctx context.Context, companyID, userID uuid.UUID) ([]*models.Department, error)
-
+	GetEmployeeWithPosition(ctx context.Context, companyID, userID uuid.UUID) (*models.EmployeeWithPositionDetails, error)
+	GetEmployeeSummariesByCompany(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]models.EmployeeSummary, int, error)
+	// GetEmployeesByCompany returns a list of employee summaries (only user_id, employee_id, username, full_name).
+	GetEmployeesByCompany(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]*models.CompanyEmployee, int, error)
 	// ============================================================
 	// Permission & RBAC Queries
 	// ============================================================
@@ -327,7 +330,7 @@ type CompanyRepository interface {
 
 	// CheckDepartmentLimit validates if a new department can be created
 	CheckDepartmentLimit(ctx context.Context, companyID uuid.UUID) error
-
+	GetRoleDepartmentsForPermission(ctx context.Context, roleID uuid.UUID) ([]*models.Department, error)
 	// UpdateMaxDepartments updates department quota safely
 	UpdateMaxDepartments(ctx context.Context, companyID uuid.UUID, newMaxDepartments int) error
 	// GetPositionsByDepartment returns paginated positions for a department
@@ -385,11 +388,6 @@ type CompanyRepository interface {
 	) error
 
 	// GetEmployeeWithPosition retrieves employee details along with position (if any)
-	GetEmployeeWithPosition(
-		ctx context.Context,
-		companyID uuid.UUID,
-		userID uuid.UUID,
-	) (*models.CompanyEmployee, *models.Position, error)
 	WorkCenterExists(ctx context.Context, companyID uuid.UUID, workCenterCode string) (bool, error)
 	GetOpenPositions(ctx context.Context, companyID uuid.UUID, isOpen *bool, limit, offset int) ([]*models.Position, int, error)
 	AddRoleDepartments(
@@ -430,6 +428,6 @@ type CompanyRepository interface {
 		companyID uuid.UUID,
 		departmentName string,
 	) (*models.Department, error)
-
+	GetDeactivatedDepartments(ctx context.Context, companyID uuid.UUID) ([]*models.Department, error)
 	// Queries
 }

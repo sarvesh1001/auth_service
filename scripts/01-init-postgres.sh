@@ -941,6 +941,7 @@ CREATE TABLE IF NOT EXISTS payroll.employee_statutory_contribution (
             period_end
         )
 );
+
 CREATE TABLE IF NOT EXISTS user_avatars (
     avatar_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id           UUID NOT NULL,
@@ -949,12 +950,20 @@ CREATE TABLE IF NOT EXISTS user_avatars (
     avatar_object_key TEXT NOT NULL,
     avatar_mime_type  VARCHAR(50),
     is_active         BOOLEAN NOT NULL DEFAULT true,
-    is_primary        BOOLEAN NOT NULL DEFAULT true,
+    is_primary        BOOLEAN NOT NULL DEFAULT false,        -- ✅ Fixed default
+    variants          JSONB NOT NULL DEFAULT '{}'::jsonb,    -- 🆕 NEW: stores small/medium/large keys
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT fk_user_avatars_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
-    CONSTRAINT uq_user_primary_avatar UNIQUE (user_id, is_primary)
+    CONSTRAINT fk_user_avatars_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    -- ❌ REMOVED: CONSTRAINT uq_user_primary_avatar UNIQUE (user_id, is_primary)
 );
+
+-- ✅ Partial unique index – only one primary per user
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_avatars_single_primary 
+    ON user_avatars (user_id) 
+    WHERE is_primary = true;
+
+
 CREATE TABLE IF NOT EXISTS admin_avatars (
     avatar_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     admin_id          UUID NOT NULL,
@@ -963,12 +972,42 @@ CREATE TABLE IF NOT EXISTS admin_avatars (
     avatar_object_key TEXT NOT NULL,
     avatar_mime_type  VARCHAR(50),
     is_active         BOOLEAN NOT NULL DEFAULT true,
-    is_primary        BOOLEAN NOT NULL DEFAULT true,
+    is_primary        BOOLEAN NOT NULL DEFAULT false,  -- ✅ FIXED
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT fk_admin_avatars_admin FOREIGN KEY (admin_id) REFERENCES admin_users(admin_id) ON DELETE CASCADE,
-    CONSTRAINT uq_admin_primary_avatar UNIQUE (admin_id, is_primary)
+    CONSTRAINT fk_admin_avatars_admin FOREIGN KEY (admin_id) REFERENCES admin_users(admin_id) ON DELETE CASCADE
+    -- ❌ REMOVED: CONSTRAINT uq_admin_primary_avatar UNIQUE (admin_id, is_primary)
 );
+
+-- ✅ FIXED: Partial unique index for admins
+CREATE UNIQUE INDEX IF NOT EXISTS idx_admin_avatars_single_primary 
+    ON admin_avatars (admin_id) 
+    WHERE is_primary = true;
+-- ==================== KYC DOCUMENTS ====================
+CREATE TABLE IF NOT EXISTS kyc_documents (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id          UUID NOT NULL,
+    document_type    VARCHAR(50) NOT NULL,          -- 'identity', 'address', 'business', 'selfie'
+    file_key         TEXT NOT NULL,                 -- local file path (e.g., 'kyc/123e4567/uuid_filename.jpg')
+    file_metadata    JSONB,                         -- { size, mime_type, original_name }
+    upload_status    VARCHAR(20) DEFAULT 'pending', -- pending | uploaded | verified | rejected
+    verification_notes TEXT,
+    verified_by      UUID REFERENCES admin_users(admin_id) ON DELETE SET NULL,
+    verified_at      TIMESTAMPTZ,
+    expires_at       TIMESTAMPTZ,                   -- for address proofs (3 months), etc.
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_kyc_documents_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_kyc_documents_user ON kyc_documents(user_id);
+CREATE INDEX idx_kyc_documents_status ON kyc_documents(upload_status);
+CREATE INDEX idx_kyc_documents_type ON kyc_documents(document_type);
+
+CREATE TRIGGER update_kyc_documents_updated_at
+    BEFORE UPDATE ON kyc_documents FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+    
 CREATE TABLE IF NOT EXISTS audit.audit_logs (
     audit_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id   UUID,
@@ -2980,7 +3019,16 @@ INSERT INTO system_departments (name, module_code, description, bitmask) VALUES
     ('Payroll', 'payroll', 'Payroll management and processing', 1 << 21),
     ('Academics', 'academics', 'Academic management system', 1 << 22)
 ON CONFLICT (name) DO NOTHING;
-INSERT INTO permissions (permission_name, description, category, module, scope, requires_tier, bit_index) VALUES
+INSERT INTO permissions (
+    permission_name,
+    description,
+    category,
+    module,
+    scope,
+    requires_tier,
+    bit_index
+)
+VALUES
     ('hr.employee.create', 'Create employees', 'employee', 'hr', 'user', 'basic', 0),
     ('hr.employee.update', 'Update employees', 'employee', 'hr', 'user', 'basic', 1),
     ('hr.employee.delete', 'Delete employees', 'employee', 'hr', 'user', 'basic', 2),
@@ -3190,6 +3238,7 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('rnd.document.update', 'Update R&D documents', 'document', 'rnd', 'user', 'basic', 206),
     ('rnd.document.view', 'View R&D documents', 'document', 'rnd', 'user', 'basic', 207),
     ('rnd.document.delete', 'Delete R&D documents', 'document', 'rnd', 'user', 'basic', 208),
+    -- bit 209 is intentionally skipped
     ('administration.company.view', 'View company administration settings', 'company', 'administration', 'user', 'basic', 210),
     ('administration.company.update', 'Update company administration settings', 'company', 'administration', 'user', 'basic', 211),
     ('administration.policy.create', 'Create company policies', 'policy', 'administration', 'user', 'basic', 212),
@@ -3215,6 +3264,7 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('payroll.run.process', 'Process payroll runs', 'payroll', 'payroll', 'user', 'basic', 232),
     ('payroll.component.manage', 'Manage payroll components', 'payroll', 'payroll', 'user', 'basic', 233),
     ('payroll.tax.manage', 'Manage tax rules and profiles', 'payroll', 'payroll', 'user', 'basic', 234),
+    -- ===== ADMIN PERMISSIONS (235–254) =====
     ('admin.employee.create', 'Create admin employees', 'employee', 'employee_management', 'admin', 'admin', 235),
     ('admin.employee.update', 'Update admin employees', 'employee', 'employee_management', 'admin', 'admin', 236),
     ('admin.employee.view', 'View admin employees', 'employee', 'employee_management', 'admin', 'admin', 237),
@@ -3235,6 +3285,7 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('admin.super.manage_departments', 'Manage all departments', 'department', 'super_admin', 'admin', 'super_admin', 252),
     ('admin.super.system_config', 'Configure system settings', 'system', 'super_admin', 'admin', 'super_admin', 253),
     ('admin.super.audit_logs', 'View audit logs', 'audit', 'super_admin', 'admin', 'super_admin', 254),
+    -- ===== ACADEMICS PERMISSIONS (255–467) =====
     ('academics.academic_year.read', 'View academic years', 'academics', 'academics', 'user', 'basic', 255),
     ('academics.academic_year.create', 'Create academic years', 'academics', 'academics', 'user', 'basic', 256),
     ('academics.academic_year.update', 'Update academic years', 'academics', 'academics', 'user', 'basic', 257),

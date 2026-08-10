@@ -6,43 +6,44 @@ import (
 	"time"
 
 	"auth-service/internal/models"
-	"auth-service/internal/util"
 
 	"github.com/gorilla/websocket"
-	"go.uber.org/zap"
 )
 
+// WebSocketService manages WebSocket connections for pairing status updates.
 type WebSocketService struct {
 	clients    map[string]*WebSocketClient
 	clientsMux sync.RWMutex
 	broadcast  chan *WebSocketMessage
 	register   chan *WebSocketClient
 	unregister chan *WebSocketClient
-	logger     *zap.Logger
 }
 
+// WebSocketClient represents an active WebSocket connection.
 type WebSocketClient struct {
 	SessionID string
 	Conn      *websocket.Conn
 	Send      chan []byte
 }
 
+// WebSocketMessage is the message structure sent over WebSocket.
 type WebSocketMessage struct {
 	SessionID string      `json:"session_id"`
 	Type      string      `json:"type"`
 	Payload   interface{} `json:"payload"`
 }
 
-func NewWebSocketService(logger *zap.Logger) *WebSocketService {
+// NewWebSocketService creates a new WebSocketService.
+func NewWebSocketService() *WebSocketService {
 	return &WebSocketService{
 		clients:    make(map[string]*WebSocketClient),
 		broadcast:  make(chan *WebSocketMessage, 100),
 		register:   make(chan *WebSocketClient, 100),
 		unregister: make(chan *WebSocketClient, 100),
-		logger:     logger,
 	}
 }
 
+// Run starts the main event loop for the WebSocket service.
 func (s *WebSocketService) Run() {
 	for {
 		select {
@@ -70,11 +71,6 @@ func (s *WebSocketService) registerClient(client *WebSocketClient) {
 
 	s.clients[client.SessionID] = client
 
-	s.logger.Debug("WebSocket client registered",
-		util.String("session_id", client.SessionID),
-		util.Int("total_clients", len(s.clients)),
-	)
-
 	// Start reader and writer goroutines
 	go s.readPump(client)
 	go s.writePump(client)
@@ -88,11 +84,6 @@ func (s *WebSocketService) unregisterClient(client *WebSocketClient) {
 		close(client.Send)
 		delete(s.clients, client.SessionID)
 	}
-
-	s.logger.Debug("WebSocket client unregistered",
-		util.String("session_id", client.SessionID),
-		util.Int("total_clients", len(s.clients)),
-	)
 }
 
 func (s *WebSocketService) broadcastToSession(sessionID string, message *WebSocketMessage) {
@@ -110,6 +101,7 @@ func (s *WebSocketService) broadcastToSession(sessionID string, message *WebSock
 	}
 }
 
+// SendStatusUpdate sends a pairing status update to the client.
 func (s *WebSocketService) SendStatusUpdate(sessionID string, status *models.PairingStatusResponse) {
 	message := &WebSocketMessage{
 		SessionID: sessionID,
@@ -119,6 +111,7 @@ func (s *WebSocketService) SendStatusUpdate(sessionID string, status *models.Pai
 	s.broadcast <- message
 }
 
+// SendPaired sends the token pair after successful pairing.
 func (s *WebSocketService) SendPaired(sessionID string, tokenPair *models.TokenPairResponse) {
 	message := &WebSocketMessage{
 		SessionID: sessionID,
@@ -189,12 +182,12 @@ func (s *WebSocketService) marshalMessage(message *WebSocketMessage) []byte {
 	return data
 }
 
-// Exported method to register a client
+// Register adds a client to the service.
 func (s *WebSocketService) Register(client *WebSocketClient) {
 	s.register <- client
 }
 
-// Exported method to unregister a client
+// Unregister removes a client.
 func (s *WebSocketService) Unregister(client *WebSocketClient) {
 	s.unregister <- client
 }

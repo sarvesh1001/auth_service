@@ -4,7 +4,6 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
-	"go.uber.org/zap"
 
 	"auth-service/internal/attendance/handler"
 )
@@ -34,10 +33,9 @@ func RegisterAttendanceRoutes(
 	// Middleware functions (provided by main router)
 	jwtAuthMiddleware func(http.Handler) http.Handler,
 	sessionValidationMiddleware func(http.Handler) http.Handler,
-	bitmaskPermissionMiddleware func(permission string, logger *zap.Logger) func(http.Handler) http.Handler,
+	bitmaskPermissionMiddleware func(permission string) func(http.Handler) http.Handler,
 	deviceAuthMiddleware func(http.Handler) http.Handler,
 	companyAccessMiddleware func(http.Handler) http.Handler,
-	logger *zap.Logger,
 ) {
 	// ============================================================
 	// 1. USER‑AUTHENTICATED ROUTES (JWT + session + permissions)
@@ -48,126 +46,126 @@ func RegisterAttendanceRoutes(
 
 		// ----- Self punches -----
 		r.With(
-			bitmaskPermissionMiddleware("attendance.self.punch", logger),
+			bitmaskPermissionMiddleware("attendance.self.punch"),
 			companyAccessMiddleware,
 		).Post("/self/punch", ingestHandler.SelfPunchAttendance)
 
 		// ----- Team/Admin punches -----
 		r.With(
-			bitmaskPermissionMiddleware("attendance.team.punch", logger),
+			bitmaskPermissionMiddleware("attendance.team.punch"),
 			companyAccessMiddleware,
 		).Post("/punch", ingestHandler.PunchAttendance)
 
 		// ----- Events -----
 		r.With(
-			bitmaskPermissionMiddleware("hr.attendance.view", logger),
+			bitmaskPermissionMiddleware("hr.attendance.view"),
 			companyAccessMiddleware,
 		).Get("/events/search", queryHandler.SearchEvents)
 
 		r.With(
-			bitmaskPermissionMiddleware("hr.attendance.view", logger),
+			bitmaskPermissionMiddleware("hr.attendance.view"),
 			companyAccessMiddleware,
 		).Get("/events/{eventID}", queryHandler.GetEvent)
 
 		// ----- Daily summaries & stats -----
 		r.With(
-			bitmaskPermissionMiddleware("hr.attendance.view", logger),
+			bitmaskPermissionMiddleware("hr.attendance.view"),
 			companyAccessMiddleware,
 		).Get("/summary/{subjectType}/{subjectID}/{date}", queryHandler.GetDailySummary)
 
 		r.With(
-			bitmaskPermissionMiddleware("hr.attendance.view", logger),
+			bitmaskPermissionMiddleware("hr.attendance.view"),
 			companyAccessMiddleware,
 		).Get("/summaries/{subjectType}/{subjectID}", queryHandler.GetSubjectSummaries)
 
 		r.With(
-			bitmaskPermissionMiddleware("hr.attendance.view", logger),
+			bitmaskPermissionMiddleware("hr.attendance.view"),
 			companyAccessMiddleware,
 		).Get("/stats/company", queryHandler.GetCompanyStats)
 
 		r.With(
-			bitmaskPermissionMiddleware("hr.attendance.view", logger),
+			bitmaskPermissionMiddleware("hr.attendance.view"),
 			companyAccessMiddleware,
 		).Get("/stats/subject/{subjectType}/{subjectID}", queryHandler.GetSubjectStats)
 
 		// ----- Session summaries -----
 		r.With(
-			bitmaskPermissionMiddleware("hr.attendance.view", logger),
+			bitmaskPermissionMiddleware("hr.attendance.view"),
 			companyAccessMiddleware,
 		).Get("/session-summaries", queryHandler.ListSessionSummaries)
 
 		r.With(
-			bitmaskPermissionMiddleware("hr.attendance.view", logger),
+			bitmaskPermissionMiddleware("hr.attendance.view"),
 			companyAccessMiddleware,
 		).Get("/session-summary/{sessionID}", queryHandler.GetSessionSummary)
 
 		// ----- Exemptions -----
 		r.With(
-			bitmaskPermissionMiddleware("attendance.manage_exemptions", logger),
+			bitmaskPermissionMiddleware("attendance.manage_exemptions"),
 			companyAccessMiddleware,
 		).Post("/exemptions", exemptionHandler.CreateExemption)
 
 		r.With(
-			bitmaskPermissionMiddleware("attendance.manage_exemptions", logger),
+			bitmaskPermissionMiddleware("attendance.manage_exemptions"),
 			companyAccessMiddleware,
 		).Put("/exemptions/{exemptionID}", exemptionHandler.UpdateExemption)
 
 		r.With(
-			bitmaskPermissionMiddleware("attendance.manage_exemptions", logger),
+			bitmaskPermissionMiddleware("attendance.manage_exemptions"),
 			companyAccessMiddleware,
 		).Delete("/exemptions/{exemptionID}", exemptionHandler.DeleteExemption)
 
 		r.With(
-			bitmaskPermissionMiddleware("hr.attendance.view", logger),
+			bitmaskPermissionMiddleware("hr.attendance.view"),
 			companyAccessMiddleware,
 		).Get("/exemptions", queryHandler.ListExemptions)
 
 		// ----- Corrections -----
 		r.With(
-			bitmaskPermissionMiddleware("attendance.correct", logger),
+			bitmaskPermissionMiddleware("attendance.correct"),
 			companyAccessMiddleware,
 		).Post("/corrections", correctionHandler.CreateCorrection)
 
 		// ----- Resolution / Recalculation (now using attendance.configure) -----
 		r.With(
-			bitmaskPermissionMiddleware("attendance.configure", logger),
+			bitmaskPermissionMiddleware("attendance.configure"),
 			companyAccessMiddleware,
 		).Post("/resolve/event", resolutionHandler.ResolveEvent)
 
 		r.With(
-			bitmaskPermissionMiddleware("attendance.configure", logger),
+			bitmaskPermissionMiddleware("attendance.configure"),
 			companyAccessMiddleware,
 		).Post("/resolve/day", resolutionHandler.ResolveDay)
 
 		r.With(
-			bitmaskPermissionMiddleware("attendance.configure", logger),
+			bitmaskPermissionMiddleware("attendance.configure"),
 			companyAccessMiddleware,
 		).Post("/resolve/batch", resolutionHandler.BatchResolve)
 
 		r.With(
-			bitmaskPermissionMiddleware("attendance.configure", logger),
+			bitmaskPermissionMiddleware("attendance.configure"),
 			companyAccessMiddleware,
 		).Post("/resolve/period", resolutionHandler.BatchResolveByPeriod)
 
 		r.With(
-			bitmaskPermissionMiddleware("attendance.configure", logger),
+			bitmaskPermissionMiddleware("attendance.configure"),
 			companyAccessMiddleware,
 		).Post("/resolve/day/{userID}/{date}", resolutionHandler.ResolveDayByPath)
 
 		// ----- Reports -----
 		r.With(
-			bitmaskPermissionMiddleware("hr.attendance.view", logger),
+			bitmaskPermissionMiddleware("hr.attendance.view"),
 			companyAccessMiddleware,
 		).Get("/reports", reportHandler.GenerateReport)
 
 		r.With(
-			bitmaskPermissionMiddleware("hr.attendance.view", logger),
+			bitmaskPermissionMiddleware("hr.attendance.view"),
 			companyAccessMiddleware,
 		).Get("/reports/stream", reportHandler.StreamEvents)
 
 		// ----- Admin (policies, rules, sources) -----
 		r.Route("/admin", func(r chi.Router) {
-			r.Use(bitmaskPermissionMiddleware("attendance.configure", logger))
+			r.Use(bitmaskPermissionMiddleware("attendance.configure"))
 			r.Use(companyAccessMiddleware)
 
 			r.Post("/policies", adminHandler.CreatePolicy)
@@ -188,7 +186,7 @@ func RegisterAttendanceRoutes(
 
 		// ----- Device management -----
 		r.Route("/devices", func(r chi.Router) {
-			r.Use(bitmaskPermissionMiddleware("attendance.configure", logger))
+			r.Use(bitmaskPermissionMiddleware("attendance.configure"))
 			r.Use(companyAccessMiddleware)
 
 			r.Post("/", deviceHandler.CreateDevice)
@@ -218,27 +216,35 @@ func RegisterAttendanceRoutes(
 			})
 		})
 
-		// ----- Work Centers -----
+		// ============================================================
+		// ----- Work Centers (updated to administration permissions) -----
+		// ============================================================
 		r.Route("/work-centers", func(r chi.Router) {
-			r.Use(bitmaskPermissionMiddleware("operations.task.view", logger))
+			// Reads: administration.company.view
+			r.Use(bitmaskPermissionMiddleware("administration.company.view"))
 			r.Use(companyAccessMiddleware)
 
 			r.Get("/", workCenterHandler.ListWorkCenters)
 			r.Get("/search", workCenterHandler.SearchWorkCenters)
 			r.Get("/active", workCenterHandler.GetActiveWorkCenters)
-			r.Post("/", workCenterHandler.CreateWorkCenter)
 			r.Get("/health", workCenterHandler.HealthCheck)
+
+			// Writes: administration.company.update
+			r.With(bitmaskPermissionMiddleware("administration.company.update")).
+				Post("/", workCenterHandler.CreateWorkCenter)
 
 			r.Route("/{workCenterCode}", func(r chi.Router) {
 				r.Get("/", workCenterHandler.GetWorkCenter)
-				r.Put("/", workCenterHandler.UpdateWorkCenter)
-				r.Delete("/", workCenterHandler.DeleteWorkCenter)
+				r.With(bitmaskPermissionMiddleware("administration.company.update")).
+					Put("/", workCenterHandler.UpdateWorkCenter)
+				r.With(bitmaskPermissionMiddleware("administration.company.update")).
+					Delete("/", workCenterHandler.DeleteWorkCenter)
 			})
 		})
 
 		// ----- Scheduling -----
 		r.Route("/scheduling", func(r chi.Router) {
-			r.Use(bitmaskPermissionMiddleware("operations.shift.view", logger))
+			r.Use(bitmaskPermissionMiddleware("operations.shift.view"))
 			r.Use(companyAccessMiddleware)
 
 			r.Get("/health", schedulingHandler.HealthCheck)

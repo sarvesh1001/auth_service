@@ -8,35 +8,40 @@ import (
 	"time"
 
 	"auth-service/internal/config"
+	appErrors "auth-service/internal/errors"
+	"auth-service/internal/infrastructure/audit"
 	"auth-service/internal/models"
 	"auth-service/internal/repository/postgres"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 )
 
+// JWTService handles JWT token creation, validation, and refresh token generation.
+// It uses audit logging for token operations and does not use zap logger.
 type JWTService struct {
-	config      *config.Config
-	companyRepo postgres.CompanyRepository
-	adminRepo   postgres.AdminRepository
-	logger      *zap.Logger
+	config       *config.Config
+	companyRepo  postgres.CompanyRepository
+	adminRepo    postgres.AdminRepository
+	auditService *audit.AuditService
 }
 
+// NewJWTService creates a new JWTService with audit capability.
 func NewJWTService(
 	cfg *config.Config,
 	companyRepo postgres.CompanyRepository,
 	adminRepo postgres.AdminRepository,
-	logger *zap.Logger,
+	auditService *audit.AuditService,
 ) *JWTService {
 	return &JWTService{
-		config:      cfg,
-		companyRepo: companyRepo,
-		adminRepo:   adminRepo,
-		logger:      logger,
+		config:       cfg,
+		companyRepo:  companyRepo,
+		adminRepo:    adminRepo,
+		auditService: auditService,
 	}
 }
 
+// CreateAccessTokenRequest holds parameters for access token creation.
 type CreateAccessTokenRequest struct {
 	UserID         string
 	Role           string
@@ -47,18 +52,26 @@ type CreateAccessTokenRequest struct {
 	PermissionMask []uint64
 }
 
+// CreateAccessToken generates a new JWT access token with the given claims.
+// It validates required fields and builds a permission mask if not provided.
 func (s *JWTService) CreateAccessToken(ctx context.Context, req *CreateAccessTokenRequest) (string, string, error) {
 	if req.UserID == "" {
-		return "", "", fmt.Errorf("user ID is required")
+		return "", "", appErrors.ErrInvalidInput
 	}
 	if req.DeviceID == "" {
-		return "", "", fmt.Errorf("device ID is required")
+		return "", "", appErrors.ErrInvalidInput
 	}
 	if req.SessionType == "" {
-		return "", "", fmt.Errorf("session type is required")
+		return "", "", appErrors.ErrInvalidInput
 	}
 	if req.Role == "" {
-		return "", "", fmt.Errorf("role is required")
+		return "", "", appErrors.ErrInvalidInput
+	}
+
+	// Extract IP from context if not provided in request
+	ip, _ := ctx.Value("ip_address").(string)
+	if ip == "" && req.IPAddress != "" {
+		ip = req.IPAddress
 	}
 
 	jti := uuid.NewString()
@@ -69,77 +82,47 @@ func (s *JWTService) CreateAccessToken(ctx context.Context, req *CreateAccessTok
 	// Use provided permission mask if given
 	if req.PermissionMask != nil {
 		permissionMask = req.PermissionMask
-		s.logger.Info("Using provided permission mask",
-			zap.String("user_id", req.UserID),
-			zap.String("session_type", req.SessionType),
-			zap.Int("mask_segments", len(permissionMask)))
 	} else {
 		// Fallback to fetching based on session type
 		switch req.SessionType {
 		case "admin":
 			adminID, err := uuid.Parse(req.UserID)
 			if err != nil {
-				return "", "", fmt.Errorf("invalid admin ID format: %w", err)
+				return "", "", fmt.Errorf("%w: invalid admin ID format", appErrors.ErrInvalidInput)
 			}
 			mask, err := s.adminRepo.GetAdminPermissionBitmask(ctx, adminID)
 			if err != nil {
-				s.logger.Warn("Failed to get admin permission mask, using full access",
-					zap.String("admin_id", req.UserID),
-					zap.Error(err))
-				permissionMask = models.CreateFullPermissionMask() // must return 13 blocks
+				// On error, use full access mask (13 blocks)
+				permissionMask = models.CreateFullPermissionMask()
 			} else {
 				permissionMask = mask
 			}
-			s.logger.Info("🔐 ADMIN session token created",
-				zap.String("admin_id", req.UserID),
-				zap.String("role", req.Role),
-				zap.Int("mask_segments", len(permissionMask)),
-				zap.Any("permission_mask", permissionMask))
-
 		case "user":
+			if req.CompanyID == "" {
+				return "", "", fmt.Errorf("%w: company ID required for user session", appErrors.ErrInvalidInput)
+			}
 			userID, err := uuid.Parse(req.UserID)
 			if err != nil {
-				return "", "", fmt.Errorf("invalid user ID format: %w", err)
-			}
-			if req.CompanyID == "" {
-				return "", "", fmt.Errorf("company ID is required for user sessions")
+				return "", "", fmt.Errorf("%w: invalid user ID format", appErrors.ErrInvalidInput)
 			}
 			companyID, err := uuid.Parse(req.CompanyID)
 			if err != nil {
-				return "", "", fmt.Errorf("invalid company ID format: %w", err)
+				return "", "", fmt.Errorf("%w: invalid company ID format", appErrors.ErrInvalidInput)
 			}
-			s.logger.Info("🔍 Fetching USER permission bitmask",
-				zap.String("user_id", req.UserID),
-				zap.String("company_id", req.CompanyID),
-				zap.String("session_type", req.SessionType),
-				zap.String("role", req.Role))
 			mask, err := s.companyRepo.GetUserPermissionBitmask(ctx, companyID, userID)
 			if err != nil {
-				s.logger.Warn("⚠️ Failed to get user permission mask, using empty mask",
-					zap.String("user_id", req.UserID),
-					zap.String("company_id", req.CompanyID),
-					zap.Error(err))
-				// ✅ FIXED: 13 blocks instead of 4
+				// On error, use empty mask (13 zeros)
 				permissionMask = make([]uint64, 13)
 			} else {
 				permissionMask = mask
-				s.logger.Info("✅ User permission mask retrieved",
-					zap.String("user_id", req.UserID),
-					zap.String("company_id", req.CompanyID),
-					zap.Int("mask_segments", len(permissionMask)))
 			}
-
 		default:
-			// For other session types like "student"
-			// ✅ FIXED: 13 blocks instead of empty slice
+			// For other session types, use empty mask (13 blocks)
 			permissionMask = make([]uint64, 13)
-			s.logger.Info("Using empty permission mask for session type",
-				zap.String("user_id", req.UserID),
-				zap.String("session_type", req.SessionType))
 		}
 	}
 
-	// ✅ CRITICAL FIX – Normalise mask to exactly 13 blocks
+	// Normalise mask to exactly 13 blocks
 	if len(permissionMask) < 13 {
 		fullMask := make([]uint64, 13)
 		copy(fullMask, permissionMask)
@@ -161,23 +144,32 @@ func (s *JWTService) CreateAccessToken(ctx context.Context, req *CreateAccessTok
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	signed, err := token.SignedString([]byte(s.config.JWT.Secret))
 	if err != nil {
-		return "", "", fmt.Errorf("failed to sign token: %w", err)
+		return "", "", fmt.Errorf("%w: failed to sign token", appErrors.ErrInternal)
 	}
 
-	s.logger.Info("🎫 JWT access token created",
-		zap.String("user_id", req.UserID),
-		zap.String("session_type", req.SessionType),
-		zap.String("company_id", req.CompanyID),
-		zap.String("role", req.Role),
-		zap.String("jti", jti),
-		zap.Int64("expires_at", claims.ExpiresAt))
+	// Audit log for token creation
+	if s.auditService != nil {
+		actorID, _ := uuid.Parse(req.UserID)
+		_ = s.auditService.LogAction(ctx, nil, nil, "jwt", "create_access_token", "session",
+			nil, req.SessionType, &actorID, nil, nil, map[string]interface{}{
+				"jti":          jti,
+				"device_id":    req.DeviceID,
+				"session_type": req.SessionType,
+				"role":         req.Role,
+				"company_id":   req.CompanyID,
+				"ip_address":   ip,
+				"expires_at":   claims.ExpiresAt,
+			})
+	}
 
 	return signed, jti, nil
 }
 
+// ValidateAccessToken parses and validates a JWT token string.
+// It returns the claims if valid, or an error.
 func (s *JWTService) ValidateAccessToken(ctx context.Context, tokenStr string) (*models.JWTClaims, error) {
 	if tokenStr == "" {
-		return nil, fmt.Errorf("token string is empty")
+		return nil, appErrors.ErrInvalidInput
 	}
 
 	token, err := jwt.ParseWithClaims(tokenStr, &models.JWTClaims{}, func(t *jwt.Token) (interface{}, error) {
@@ -187,57 +179,80 @@ func (s *JWTService) ValidateAccessToken(ctx context.Context, tokenStr string) (
 		return []byte(s.config.JWT.Secret), nil
 	})
 	if err != nil {
-		s.logger.Warn("JWT token parse failed", zap.Error(err))
-		return nil, fmt.Errorf("token parse error: %w", err)
+		return nil, fmt.Errorf("%w: token parse failed", appErrors.ErrUnauthorized)
 	}
 	if !token.Valid {
-		return nil, fmt.Errorf("invalid token")
+		return nil, fmt.Errorf("%w: invalid token", appErrors.ErrUnauthorized)
 	}
 
 	claims, ok := token.Claims.(*models.JWTClaims)
 	if !ok {
-		return nil, fmt.Errorf("invalid token claims")
+		return nil, fmt.Errorf("%w: invalid claims", appErrors.ErrUnauthorized)
 	}
 
-	if claims.UserID == "" {
-		return nil, fmt.Errorf("token missing user ID")
-	}
-	if claims.SessionType == "" {
-		return nil, fmt.Errorf("token missing session type")
-	}
-	if claims.Role == "" {
-		return nil, fmt.Errorf("token missing role")
+	if claims.UserID == "" || claims.SessionType == "" || claims.Role == "" {
+		return nil, fmt.Errorf("%w: missing required claims", appErrors.ErrUnauthorized)
 	}
 	if claims.SessionType != "admin" && claims.CompanyID == "" {
-		return nil, fmt.Errorf("non-admin token missing company ID")
+		return nil, fmt.Errorf("%w: non-admin token missing company ID", appErrors.ErrUnauthorized)
 	}
 
-	s.logger.Debug("JWT token validated successfully",
-		zap.String("user_id", claims.UserID),
-		zap.String("session_type", claims.SessionType),
-		zap.String("role", claims.Role),
-		zap.String("jti", claims.JTI))
+	// Audit log for validation success (only if claims are valid)
+	if s.auditService != nil {
+		actorID, _ := uuid.Parse(claims.UserID)
+		ip, _ := ctx.Value("ip_address").(string)
+		_ = s.auditService.LogAction(ctx, nil, nil, "jwt", "validate_access_token", "session",
+			nil, claims.SessionType, &actorID, nil, nil, map[string]interface{}{
+				"jti":          claims.JTI,
+				"user_id":      claims.UserID,
+				"session_type": claims.SessionType,
+				"ip_address":   ip,
+				"valid":        true,
+			})
+	}
 
 	return claims, nil
 }
 
+// GenerateRefreshToken creates a cryptographically secure refresh token (hex string).
 func (s *JWTService) GenerateRefreshToken() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
-		return "", fmt.Errorf("failed to generate random token: %w", err)
+		return "", fmt.Errorf("%w: failed to generate random token", appErrors.ErrInternal)
 	}
 	return hex.EncodeToString(b), nil
 }
 
+// CreateTokenPair generates both an access token and a refresh token.
+// It uses CreateAccessToken internally and adds audit logging for the pair creation.
 func (s *JWTService) CreateTokenPair(ctx context.Context, req *CreateAccessTokenRequest) (*models.TokenPairResponse, error) {
-	accessToken, _, err := s.CreateAccessToken(ctx, req)
+	accessToken, jti, err := s.CreateAccessToken(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create access token: %w", err)
+		return nil, err
 	}
 	refreshToken, err := s.GenerateRefreshToken()
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate refresh token: %w", err)
+		return nil, err
 	}
+
+	// Audit log for token pair creation
+	if s.auditService != nil {
+		actorID, _ := uuid.Parse(req.UserID)
+		ip, _ := ctx.Value("ip_address").(string)
+		if ip == "" && req.IPAddress != "" {
+			ip = req.IPAddress
+		}
+		_ = s.auditService.LogAction(ctx, nil, nil, "jwt", "create_token_pair", "session",
+			nil, req.SessionType, &actorID, nil, nil, map[string]interface{}{
+				"jti":          jti,
+				"device_id":    req.DeviceID,
+				"session_type": req.SessionType,
+				"role":         req.Role,
+				"company_id":   req.CompanyID,
+				"ip_address":   ip,
+			})
+	}
+
 	return &models.TokenPairResponse{
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
@@ -246,7 +261,10 @@ func (s *JWTService) CreateTokenPair(ctx context.Context, req *CreateAccessToken
 	}, nil
 }
 
+// VerifyTokenExpiration checks if the token claims are still valid based on expiry.
 func (s *JWTService) VerifyTokenExpiration(claims *models.JWTClaims) bool {
-	now := time.Now().Unix()
-	return claims.ExpiresAt > now
+	if claims == nil {
+		return false
+	}
+	return claims.ExpiresAt > time.Now().Unix()
 }

@@ -1,21 +1,25 @@
 package handler
 
 import (
+	"auth-service/internal/contextkeys"
+	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
+	"strings"
 
+	customErrors "auth-service/internal/errors"
 	"auth-service/internal/models"
 	"auth-service/internal/service"
-	"auth-service/internal/util"
 
 	"github.com/gorilla/websocket"
-	"go.uber.org/zap"
 )
 
+// PairingHandler handles QR code pairing and WebSocket updates.
 type PairingHandler struct {
 	pairingService *service.PairingService
 	wsService      *service.WebSocketService
-	logger         *zap.Logger
 }
 
 var upgrader = websocket.Upgrader{
@@ -27,54 +31,107 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
+// NewPairingHandler creates a new PairingHandler.
 func NewPairingHandler(
 	pairingService *service.PairingService,
 	wsService *service.WebSocketService,
-	logger *zap.Logger,
 ) *PairingHandler {
 	return &PairingHandler{
 		pairingService: pairingService,
 		wsService:      wsService,
-		logger:         logger,
 	}
 }
 
-/* -----------------------------------------------------------
-   Generate QR
------------------------------------------------------------ */
+// ---------- Context injection helpers ----------
 
+func (h *PairingHandler) getIdempotencyKey(r *http.Request) string {
+	return r.Header.Get("Idempotency-Key")
+}
+
+// injectIdempotencyKey adds the idempotency key to the request context.
+func (h *PairingHandler) injectIdempotencyKey(ctx context.Context, r *http.Request) context.Context {
+	key := h.getIdempotencyKey(r)
+	if key != "" {
+		// Use the shared context key type
+		return context.WithValue(ctx, "idempotency_key", key) // plain string
+	}
+	return ctx
+}
+
+// injectClientIP adds the client IP to the request context.
+func (h *PairingHandler) injectClientIP(ctx context.Context, r *http.Request) context.Context {
+	ip := h.getClientIP(r)
+	return context.WithValue(ctx, contextkeys.ClientIP, ip)
+}
+
+// getClientIP extracts client IP from request.
+func (h *PairingHandler) getClientIP(r *http.Request) string {
+	// reuse from admin or define
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		if ips := strings.Split(forwarded, ","); len(ips) > 0 {
+			ip := strings.TrimSpace(ips[0])
+			if net.ParseIP(ip) != nil {
+				return ip
+			}
+		}
+	}
+	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+		if net.ParseIP(realIP) != nil {
+			return realIP
+		}
+	}
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if host == "" {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// ---------- Endpoint handlers ----------
+
+// GenerateQR generates a QR code for pairing.
+// @Summary Generate QR code
+// @Description Generates a new QR session for mobile-web pairing.
+// @Tags pairing
+// @Produce json
+// @Success 200 {object} map[string]interface{} "QR data and session ID"
+// @Failure 500 {object} map[string]interface{} "Generation failed"
+// @Router /api/v1/web/login/qr [get]
 func (h *PairingHandler) GenerateQR(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	req := &service.GenerateQRRequest{
-		IPAddress: getIPAddress(r),
+		IPAddress: h.getClientIP(r),
 		UserAgent: r.UserAgent(),
 	}
 
 	response, err := h.pairingService.GenerateQRCode(ctx, req)
 	if err != nil {
-		h.logger.Error("Failed to generate QR code",
-			util.ErrorField(err),
-			util.String("ip_address", req.IPAddress),
-		)
-		util.JSONError(w, http.StatusInternalServerError, "Failed to generate QR code")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
-	util.JSONResponse(w, http.StatusOK, response)
+	h.respondWithJSON(w, http.StatusOK, successResponse(response, "QR code generated"))
 }
 
-/* -----------------------------------------------------------
-   Pair Mobile Device → Web QR Session
-   Supports USER + ADMIN JWT claims
------------------------------------------------------------ */
-
+// Pair pairs a mobile device to a web session.
+// @Summary Pair device
+// @Description Authenticates and pairs the device with a QR session.
+// @Tags pairing
+// @Accept json
+// @Produce json
+// @Param body body models.PairingRequest true "Pairing request"
+// @Success 200 {object} map[string]interface{} "Pairing successful"
+// @Failure 400 {object} map[string]interface{} "Invalid request"
+// @Failure 401 {object} map[string]interface{} "Authentication required"
+// @Router /api/v1/web/login/pair [post]
 func (h *PairingHandler) Pair(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	var req models.PairingRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		util.JSONError(w, http.StatusBadRequest, "Invalid request body")
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
 
@@ -82,34 +139,28 @@ func (h *PairingHandler) Pair(w http.ResponseWriter, r *http.Request) {
 	userID, _ := ctx.Value("user_id").(string)
 	phoneNumber, _ := ctx.Value("phone_number").(string)
 	deviceID, _ := ctx.Value("device_id").(string)
-
-	// NEW — Session type identifying admin/user tokens
 	sessionType, _ := ctx.Value("session_type").(string)
 	role, _ := ctx.Value("role").(string)
+	companyID, _ := ctx.Value("company_id").(string) // 👈 NEW
 
-	// NEW — Admin specific fields
 	var adminRoleLevel string
 	var adminPermissions []string
 
 	if sessionType == "admin" {
 		adminRoleLevel, _ = ctx.Value("admin_role_level").(string)
-
 		if perms, ok := ctx.Value("admin_permissions").([]string); ok {
 			adminPermissions = perms
 		}
-
-		// For admin login use the admin role level as the effective "role"
 		if adminRoleLevel != "" {
 			role = adminRoleLevel
 		}
 	}
 
 	if userID == "" || deviceID == "" {
-		util.JSONError(w, http.StatusUnauthorized, "Authentication required")
+		h.respondWithError(w, http.StatusUnauthorized, customErrors.ErrUnauthorized, "Authentication required")
 		return
 	}
 
-	// Build updated PairRequest
 	pairReq := &service.PairRequest{
 		SessionID:   req.SessionID,
 		QRData:      req.Signature,
@@ -119,101 +170,101 @@ func (h *PairingHandler) Pair(w http.ResponseWriter, r *http.Request) {
 		SessionType: sessionType,
 		Role:        role,
 		Permissions: adminPermissions,
+		CompanyID:   companyID, // 👈 NEW
 	}
 
-	// Process pairing
 	if err := h.pairingService.PairDevice(ctx, pairReq); err != nil {
-		h.logger.Error("Failed to pair device",
-			util.ErrorField(err),
-			util.String("user_id", userID),
-			util.String("session_id", req.SessionID),
-			util.String("session_type", sessionType),
-		)
-		util.JSONError(w, http.StatusBadRequest, err.Error())
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	status, _ := h.pairingService.GetPairingStatus(ctx, req.SessionID)
 	h.wsService.SendStatusUpdate(req.SessionID, status)
 
-	util.JSONResponse(w, http.StatusOK, map[string]interface{}{
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"status":       "paired",
 		"message":      "Device paired successfully",
 		"session_type": sessionType,
 	})
 }
 
-/* -----------------------------------------------------------
-   Get Pairing Status
------------------------------------------------------------ */
-
+// Status returns the pairing status.
+// @Summary Get pairing status
+// @Tags pairing
+// @Produce json
+// @Param session_id query string true "Session ID"
+// @Success 200 {object} map[string]interface{} "Status details"
+// @Failure 400 {object} map[string]interface{} "Missing session_id"
+// @Failure 404 {object} map[string]interface{} "Session not found"
+// @Router /api/v1/web/login/status [get]
 func (h *PairingHandler) Status(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	sessionID := r.URL.Query().Get("session_id")
 	if sessionID == "" {
-		util.JSONError(w, http.StatusBadRequest, "session_id is required")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "session_id is required")
 		return
 	}
 
 	status, err := h.pairingService.GetPairingStatus(ctx, sessionID)
 	if err != nil {
-		util.JSONError(w, http.StatusNotFound, "Session not found")
+		statusCode, msg := h.mapServiceError(err)
+		h.respondWithError(w, statusCode, err, msg)
 		return
 	}
 
-	util.JSONResponse(w, http.StatusOK, status)
+	h.respondWithJSON(w, http.StatusOK, successResponse(status, "Status retrieved"))
 }
 
-/* -----------------------------------------------------------
-   Confirm Pairing (User/Admin)
------------------------------------------------------------ */
-
+// Confirm confirms the pairing and returns tokens.
+// @Summary Confirm pairing
+// @Tags pairing
+// @Accept json
+// @Produce json
+// @Param body body object true "Session ID" example({"session_id":"abc123"})
+// @Success 200 {object} map[string]interface{} "Token pair"
+// @Failure 400 {object} map[string]interface{} "Invalid request"
+// @Router /api/v1/web/login/confirm [post]
 func (h *PairingHandler) Confirm(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	var req struct {
 		SessionID string `json:"session_id"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		util.JSONError(w, http.StatusBadRequest, "Invalid request body")
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
 
 	tokenPair, err := h.pairingService.ConfirmPairing(ctx, req.SessionID)
 	if err != nil {
-		h.logger.Error("Failed to confirm pairing",
-			util.ErrorField(err),
-			util.String("session_id", req.SessionID),
-		)
-		util.JSONError(w, http.StatusBadRequest, err.Error())
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
-	// Notify all WebSocket subscribers
 	h.wsService.SendPaired(req.SessionID, tokenPair)
-
-	util.JSONResponse(w, http.StatusOK, tokenPair)
+	h.respondWithJSON(w, http.StatusOK, successResponse(tokenPair, "Pairing confirmed"))
 }
 
-/* -----------------------------------------------------------
-   WebSocket for Real-Time Updates
------------------------------------------------------------ */
-
+// WebSocket handles WebSocket connection for real-time updates.
+// @Summary WebSocket for pairing updates
+// @Tags pairing
+// @Param session_id query string true "Session ID"
+// @Success 101 "Switching Protocols"
+// @Failure 400 {object} map[string]interface{} "Missing session_id"
+// @Router /api/v1/web/login/ws [get]
 func (h *PairingHandler) WebSocket(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.URL.Query().Get("session_id")
 	if sessionID == "" {
-		util.JSONError(w, http.StatusBadRequest, "session_id is required")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "session_id is required")
 		return
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		h.logger.Error("WebSocket upgrade failed",
-			util.ErrorField(err),
-			util.String("session_id", sessionID),
-		)
+		// no JSON response possible; log would be needed, but we skip
 		return
 	}
 
@@ -224,38 +275,58 @@ func (h *PairingHandler) WebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.wsService.Register(client)
-
-	h.logger.Debug("WebSocket connection established",
-		util.String("session_id", sessionID),
-	)
 }
 
-/* -----------------------------------------------------------
-   Admin Cleanup Expired Sessions
------------------------------------------------------------ */
-
+// Cleanup cleans up expired pairing sessions (admin only).
+// @Summary Cleanup expired sessions
+// @Tags pairing
+// @Produce json
+// @Success 200 {object} map[string]interface{} "Cleanup result"
+// @Failure 500 {object} map[string]interface{} "Cleanup failed"
+// @Router /api/v1/web/login/cleanup [post]
 func (h *PairingHandler) Cleanup(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	count, err := h.pairingService.CleanupExpiredSessions(ctx)
 	if err != nil {
-		util.JSONError(w, http.StatusInternalServerError, "Cleanup failed")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
-	util.JSONResponse(w, http.StatusOK, map[string]interface{}{
+	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
 		"cleaned_sessions": count,
 		"message":          "Cleanup completed",
-	})
+	}, "Cleanup successful"))
 }
 
-/* -----------------------------------------------------------
-   Helper: Extract IP Address
------------------------------------------------------------ */
-
-func getIPAddress(r *http.Request) string {
-	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-		return forwarded
+// ---------- Error mapping ----------
+func (h *PairingHandler) mapServiceError(err error) (int, string) {
+	if err == nil {
+		return http.StatusOK, ""
 	}
-	return r.RemoteAddr
+	// Use custom errors if available
+	switch {
+	case errors.Is(err, customErrors.ErrNotFound):
+		return http.StatusNotFound, err.Error()
+	case errors.Is(err, customErrors.ErrInvalidInput):
+		return http.StatusBadRequest, err.Error()
+	case errors.Is(err, customErrors.ErrUnauthorized):
+		return http.StatusUnauthorized, err.Error()
+	case errors.Is(err, customErrors.ErrPermissionDenied):
+		return http.StatusForbidden, err.Error()
+	default:
+		return http.StatusInternalServerError, "internal server error"
+	}
+}
+
+// ---------- Response helpers ----------
+func (h *PairingHandler) respondWithJSON(w http.ResponseWriter, statusCode int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(data)
+}
+
+func (h *PairingHandler) respondWithError(w http.ResponseWriter, statusCode int, err error, message string) {
+	h.respondWithJSON(w, statusCode, errorResponse(err, message))
 }

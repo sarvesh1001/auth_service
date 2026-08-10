@@ -1,40 +1,87 @@
-// File: internal/handler/device_handler.go
 package handler
 
 import (
+	"auth-service/internal/contextkeys"
+	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	customErrors "auth-service/internal/errors"
 	"auth-service/internal/service"
-	"auth-service/internal/util"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 )
 
-// DeviceHandler handles device-related HTTP requests
+// DeviceHandler handles device-related HTTP requests.
 type DeviceHandler struct {
 	deviceService *service.DeviceService
-	logger        *zap.Logger
 }
 
-// ✅ FIXED: Remove LogProducerService parameter - service already has it
+// NewDeviceHandler creates a new DeviceHandler.
 func NewDeviceHandler(
 	deviceService *service.DeviceService,
-	logger *zap.Logger,
 ) *DeviceHandler {
 	return &DeviceHandler{
 		deviceService: deviceService,
-		logger:        logger,
 	}
 }
 
-// RegisterRoutes registers all device routes
+// ---------- Context injection ----------
+
+func (h *DeviceHandler) getIdempotencyKey(r *http.Request) string {
+	return r.Header.Get("Idempotency-Key")
+}
+
+// injectIdempotencyKey adds the idempotency key to the request context.
+func (h *DeviceHandler) injectIdempotencyKey(ctx context.Context, r *http.Request) context.Context {
+	key := h.getIdempotencyKey(r)
+	if key != "" {
+		// Use the shared context key type
+		return context.WithValue(ctx, "idempotency_key", key) // plain string
+	}
+	return ctx
+}
+
+// injectClientIP adds the client IP to the request context.
+func (h *DeviceHandler) injectClientIP(ctx context.Context, r *http.Request) context.Context {
+	ip := h.getClientIP(r)
+	return context.WithValue(ctx, contextkeys.ClientIP, ip)
+}
+
+// getClientIP extracts client IP.
+func (h *DeviceHandler) getClientIP(r *http.Request) string {
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		if ips := strings.Split(forwarded, ","); len(ips) > 0 {
+			ip := strings.TrimSpace(ips[0])
+			if parsedIP := net.ParseIP(ip); parsedIP != nil {
+				return ip
+			}
+		}
+	}
+	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+		if parsedIP := net.ParseIP(realIP); parsedIP != nil {
+			return realIP
+		}
+	}
+	if cfConnectingIP := r.Header.Get("CF-Connecting-IP"); cfConnectingIP != "" {
+		if parsedIP := net.ParseIP(cfConnectingIP); parsedIP != nil {
+			return cfConnectingIP
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// RegisterRoutes registers all device routes.
 func (h *DeviceHandler) RegisterRoutes(r chi.Router) {
 	r.Route("/devices", func(r chi.Router) {
 		r.Post("/bind", h.BindDevice)
@@ -49,121 +96,80 @@ func (h *DeviceHandler) RegisterRoutes(r chi.Router) {
 	})
 }
 
-// getClientIP extracts the client IP address from the request
-func (h *DeviceHandler) getClientIP(r *http.Request) string {
-	// Check for forwarded IP first (load balancer, proxy, etc.)
-	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-		// X-Forwarded-For can be a list of IPs, take the first one
-		if ips := strings.Split(forwarded, ","); len(ips) > 0 {
-			ip := strings.TrimSpace(ips[0])
-			// Validate IP format
-			if parsedIP := net.ParseIP(ip); parsedIP != nil {
-				return ip
-			}
-		}
-	}
-
-	// Check for other common headers
-	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
-		if parsedIP := net.ParseIP(realIP); parsedIP != nil {
-			return realIP
-		}
-	}
-
-	if cfConnectingIP := r.Header.Get("CF-Connecting-IP"); cfConnectingIP != "" {
-		if parsedIP := net.ParseIP(cfConnectingIP); parsedIP != nil {
-			return cfConnectingIP
-		}
-	}
-
-	// Check Forwarded header (RFC 7239)
-	if forwarded := r.Header.Get("Forwarded"); forwarded != "" {
-		// Parse: for=192.0.2.60;proto=http;by=203.0.113.43
-		if strings.Contains(forwarded, "for=") {
-			parts := strings.Split(forwarded, ";")
-			for _, part := range parts {
-				part = strings.TrimSpace(part)
-				if strings.HasPrefix(part, "for=") {
-					ip := strings.TrimPrefix(part, "for=")
-					// Remove quotes and port if present
-					ip = strings.Trim(ip, `"`)
-					if idx := strings.LastIndex(ip, ":"); idx != -1 {
-						// Check if it's a port (not IPv6)
-						if !strings.Contains(ip, "]") {
-							ip = ip[:idx]
-						}
-					}
-					if parsedIP := net.ParseIP(ip); parsedIP != nil {
-						return ip
-					}
-				}
-			}
-		}
-	}
-
-	// Fall back to RemoteAddr
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		// If SplitHostPort fails, try to use RemoteAddr as-is
-		return r.RemoteAddr
-	}
-	return host
-}
-
-// BindDevice handles device binding
+// BindDevice binds a device to a user.
+// @Summary Bind device
+// @Description Associates a device ID with a user.
+// @Tags devices
+// @Accept json
+// @Produce json
+// @Param body body service.BindDeviceRequest true "Bind request"
+// @Success 200 {object} map[string]interface{} "Device bound"
+// @Failure 400 {object} map[string]interface{} "Invalid request"
+// @Failure 500 {object} map[string]interface{} "Binding failed"
+// @Router /api/v1/devices/bind [post]
 func (h *DeviceHandler) BindDevice(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	var req service.BindDeviceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
-
-	// ✅ EXTRACT IP ADDRESS AND USER AGENT
 	req.IPAddress = h.getClientIP(r)
 	req.UserAgent = r.UserAgent()
 
 	response, err := h.deviceService.BindDevice(ctx, req)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to bind device")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Device bound successfully"))
-
-	h.logger.Info("Device bound via HTTP",
-		util.String("user_id", req.UserID.String()),
-		util.String("ip_address", req.IPAddress),
-		util.Duration("duration", time.Since(startTime)))
 }
 
-// ValidateDevice handles device validation
+// ValidateDevice validates a device.
+// @Summary Validate device
+// @Description Checks if a device is trusted and valid.
+// @Tags devices
+// @Accept json
+// @Produce json
+// @Param body body service.ValidateDeviceRequest true "Validation request"
+// @Success 200 {object} map[string]interface{} "Validation result"
+// @Failure 400 {object} map[string]interface{} "Invalid request"
+// @Failure 500 {object} map[string]interface{} "Validation failed"
+// @Router /api/v1/devices/validate [post]
 func (h *DeviceHandler) ValidateDevice(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	var req service.ValidateDeviceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
-
-	// ✅ EXTRACT IP ADDRESS
 	req.IPAddress = h.getClientIP(r)
 
 	response, err := h.deviceService.ValidateDevice(ctx, req)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to validate device")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Device validation completed"))
 }
 
-// GetActiveDevice retrieves active device
+// GetActiveDevice retrieves the active device for a user.
+// @Summary Get active device
+// @Tags devices
+// @Produce json
+// @Param userID path string true "User UUID"
+// @Success 200 {object} map[string]interface{} "Active device"
+// @Failure 400 {object} map[string]interface{} "Invalid user ID"
+// @Failure 404 {object} map[string]interface{} "No active device"
+// @Router /api/v1/devices/{userID} [get]
 func (h *DeviceHandler) GetActiveDevice(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	userIDStr := chi.URLParam(r, "userID")
 	userID, err := uuid.Parse(userIDStr)
@@ -174,21 +180,28 @@ func (h *DeviceHandler) GetActiveDevice(w http.ResponseWriter, r *http.Request) 
 
 	device, err := h.deviceService.GetActiveDevice(ctx, userID)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get active device")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
-
 	if device == nil {
-		h.respondWithJSON(w, http.StatusNotFound, errorResponse(nil, "No active device found"))
+		h.respondWithError(w, http.StatusNotFound, customErrors.ErrNotFound, "No active device found")
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(device, "Active device retrieved"))
 }
 
-// UnbindDevice handles device unbinding
+// UnbindDevice unbinds a device from a user.
+// @Summary Unbind device
+// @Tags devices
+// @Param userID path string true "User UUID"
+// @Success 200 {object} map[string]interface{} "Device unbound"
+// @Failure 400 {object} map[string]interface{} "Invalid user ID"
+// @Failure 500 {object} map[string]interface{} "Unbind failed"
+// @Router /api/v1/devices/{userID} [delete]
 func (h *DeviceHandler) UnbindDevice(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	userIDStr := chi.URLParam(r, "userID")
 	userID, err := uuid.Parse(userIDStr)
@@ -196,21 +209,28 @@ func (h *DeviceHandler) UnbindDevice(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
 		return
 	}
-
-	// ✅ EXTRACT IP ADDRESS
 	ipAddress := h.getClientIP(r)
 
 	if err := h.deviceService.UnbindDevice(ctx, userID, ipAddress); err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to unbind device")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Device unbound successfully"))
 }
 
-// GetDeviceHistory retrieves device history
+// GetDeviceHistory retrieves device binding history.
+// @Summary Get device history
+// @Tags devices
+// @Produce json
+// @Param userID path string true "User UUID"
+// @Param limit query int false "Limit" default(100)
+// @Success 200 {object} map[string]interface{} "History list"
+// @Failure 400 {object} map[string]interface{} "Invalid user ID"
+// @Router /api/v1/devices/{userID}/history [get]
 func (h *DeviceHandler) GetDeviceHistory(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	userIDStr := chi.URLParam(r, "userID")
 	userID, err := uuid.Parse(userIDStr)
@@ -218,7 +238,6 @@ func (h *DeviceHandler) GetDeviceHistory(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
 		return
 	}
-
 	limitStr := r.URL.Query().Get("limit")
 	limit := 100
 	if limitStr != "" {
@@ -229,38 +248,54 @@ func (h *DeviceHandler) GetDeviceHistory(w http.ResponseWriter, r *http.Request)
 
 	history, err := h.deviceService.GetDeviceBindingHistory(ctx, userID, limit)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get device history")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(history, "Device history retrieved"))
 }
 
-// GetUsersByDevice finds users by device ID
+// GetUsersByDevice finds users by device ID.
+// @Summary Get users by device
+// @Tags devices
+// @Produce json
+// @Param device_id query string true "Device ID"
+// @Success 200 {object} map[string]interface{} "List of users"
+// @Failure 400 {object} map[string]interface{} "Missing device_id"
+// @Router /api/v1/devices/search [get]
 func (h *DeviceHandler) GetUsersByDevice(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	deviceID := r.URL.Query().Get("device_id")
 	if deviceID == "" {
-		h.respondWithError(w, http.StatusBadRequest, nil, "device_id query parameter required")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "device_id query parameter required")
 		return
 	}
 
 	users, err := h.deviceService.GetUsersByDevice(ctx, deviceID)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get users by device")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(users, "Users retrieved by device"))
 }
 
-// CleanupOrphanedDevices triggers cleanup
+// CleanupOrphanedDevices triggers cleanup of orphaned devices.
+// @Summary Cleanup orphaned devices
+// @Tags devices
+// @Produce json
+// @Param days query int false "Age in days" default(90)
+// @Success 200 {object} map[string]interface{} "Cleanup result"
+// @Failure 500 {object} map[string]interface{} "Cleanup failed"
+// @Router /api/v1/devices/cleanup [post]
 func (h *DeviceHandler) CleanupOrphanedDevices(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	daysStr := r.URL.Query().Get("days")
-	days := 90 // Default 90 days
+	days := 90
 	if daysStr != "" {
 		if parsedDays, err := strconv.Atoi(daysStr); err == nil && parsedDays > 0 {
 			days = parsedDays
@@ -269,57 +304,83 @@ func (h *DeviceHandler) CleanupOrphanedDevices(w http.ResponseWriter, r *http.Re
 
 	count, err := h.deviceService.CleanupOrphanedDevices(ctx, time.Duration(days)*24*time.Hour)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to cleanup orphaned devices")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
-	result := map[string]interface{}{
+	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
 		"cleaned_count": count,
 		"days":          days,
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(result, "Orphaned devices cleaned up"))
+	}, "Orphaned devices cleaned up"))
 }
 
-// HealthCheck checks service health
+// HealthCheck checks device service health.
+// @Summary Device service health
+// @Tags devices
+// @Produce json
+// @Success 200 {object} map[string]interface{} "Service healthy"
+// @Failure 503 {object} map[string]interface{} "Service unhealthy"
+// @Router /api/v1/devices/health [get]
 func (h *DeviceHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
+	ctx := h.injectClientIP(r.Context(), r)
 	if err := h.deviceService.HealthCheck(ctx); err != nil {
-		h.respondWithError(w, http.StatusServiceUnavailable, err, "Service unhealthy")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Service is healthy"))
+	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]string{
+		"status":  "healthy",
+		"service": "device",
+	}, "Service is healthy"))
 }
 
-// GetStats retrieves service statistics
+// GetStats retrieves service statistics.
+// @Summary Get device service stats
+// @Tags devices
+// @Produce json
+// @Success 200 {object} map[string]interface{} "Statistics"
+// @Failure 500 {object} map[string]interface{} "Failed to get stats"
+// @Router /api/v1/devices/stats [get]
 func (h *DeviceHandler) GetStats(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
+	ctx := h.injectClientIP(r.Context(), r)
 	stats, err := h.deviceService.GetServiceStats(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get stats")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(stats, "Stats retrieved"))
 }
 
-// Helper methods (reuse from other handlers)
-
-func (h *DeviceHandler) respondWithJSON(w http.ResponseWriter, statusCode int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(statusCode)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		h.logger.Error("Failed to encode JSON response", util.ErrorField(err))
+// ---------- Error mapping ----------
+func (h *DeviceHandler) mapServiceError(err error) (int, string) {
+	if err == nil {
+		return http.StatusOK, ""
+	}
+	switch {
+	case errors.Is(err, customErrors.ErrNotFound):
+		return http.StatusNotFound, err.Error()
+	case errors.Is(err, customErrors.ErrInvalidInput):
+		return http.StatusBadRequest, err.Error()
+	case errors.Is(err, customErrors.ErrConflict):
+		return http.StatusConflict, err.Error()
+	case errors.Is(err, customErrors.ErrPermissionDenied):
+		return http.StatusForbidden, err.Error()
+	case errors.Is(err, customErrors.ErrUnauthorized):
+		return http.StatusUnauthorized, err.Error()
+	default:
+		return http.StatusInternalServerError, "internal server error"
 	}
 }
 
+// ---------- Response helpers ----------
+func (h *DeviceHandler) respondWithJSON(w http.ResponseWriter, statusCode int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(data)
+}
+
 func (h *DeviceHandler) respondWithError(w http.ResponseWriter, statusCode int, err error, message string) {
-	h.logger.Warn("HTTP error response",
-		util.ErrorField(err),
-		util.Int("status_code", statusCode),
-		util.String("message", message))
 	h.respondWithJSON(w, statusCode, errorResponse(err, message))
 }

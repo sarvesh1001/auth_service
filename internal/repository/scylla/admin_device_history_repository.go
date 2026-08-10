@@ -1,4 +1,3 @@
-// internal/repository/scylla/admin_device_history_repository.go
 package scylla
 
 import (
@@ -6,44 +5,42 @@ import (
 	"fmt"
 	"time"
 
+	apperrors "auth-service/internal/errors"
 	"auth-service/internal/models"
-	"auth-service/internal/util"
 
 	"github.com/gocql/gocql"
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 )
+
 type AdminDeviceHistoryRepository interface {
-    RecordAdminBinding(ctx context.Context, adminID uuid.UUID, deviceID string, sessionID *uuid.UUID, bindToken string, action string) error
-    GetAdminBindingHistory(ctx context.Context, adminID uuid.UUID, limit int) ([]*models.UserActiveDevice, error)
-    GetAdminRecentBindingsByDevice(ctx context.Context, deviceID string, limit int) ([]*models.UserActiveDevice, error)
-    GetAdminBindingsByTimeRange(ctx context.Context, startTime, endTime time.Time, limit int) ([]*models.UserActiveDevice, error)
-    CleanupAdminOldRecords(ctx context.Context, olderThan time.Duration) (int, error)
-    GetAdminStats(ctx context.Context, adminID uuid.UUID) (map[string]interface{}, error)
-    HealthCheck(ctx context.Context) error
+	RecordAdminBinding(ctx context.Context, adminID uuid.UUID, deviceID string, sessionID *uuid.UUID, bindToken string, action string) error
+	GetAdminBindingHistory(ctx context.Context, adminID uuid.UUID, limit int) ([]*models.UserActiveDevice, error)
+	GetAdminRecentBindingsByDevice(ctx context.Context, deviceID string, limit int) ([]*models.UserActiveDevice, error)
+	GetAdminBindingsByTimeRange(ctx context.Context, startTime, endTime time.Time, limit int) ([]*models.UserActiveDevice, error)
+	CleanupAdminOldRecords(ctx context.Context, olderThan time.Duration) (int, error)
+	GetAdminStats(ctx context.Context, adminID uuid.UUID) (map[string]interface{}, error)
+	HealthCheck(ctx context.Context) error
 }
+
 type AdminDeviceHistoryRepositoryImpl struct {
 	client  *ScyllaClient
-	logger  *zap.Logger
 	metrics *RepositoryMetrics
 }
 
-func NewAdminDeviceHistoryRepository(client *ScyllaClient, logger *zap.Logger) *AdminDeviceHistoryRepositoryImpl {
+func NewAdminDeviceHistoryRepository(client *ScyllaClient) *AdminDeviceHistoryRepositoryImpl {
 	return &AdminDeviceHistoryRepositoryImpl{
 		client:  client,
-		logger:  logger,
 		metrics: &RepositoryMetrics{},
 	}
 }
 
-// RecordAdminBinding records an admin device binding event (bind or unbind)
 func (r *AdminDeviceHistoryRepositoryImpl) RecordAdminBinding(
 	ctx context.Context,
 	adminID uuid.UUID,
 	deviceID string,
 	sessionID *uuid.UUID,
 	bindToken string,
-	action string, // "bind" or "unbind"
+	action string,
 ) error {
 	startTime := time.Now()
 	defer func() {
@@ -51,18 +48,18 @@ func (r *AdminDeviceHistoryRepositoryImpl) RecordAdminBinding(
 	}()
 
 	if adminID == uuid.Nil {
-		return fmt.Errorf("invalid admin ID")
+		return apperrors.ErrInvalidInput
 	}
 	if deviceID == "" {
-		return fmt.Errorf("device ID cannot be empty")
+		return apperrors.ErrInvalidInput
 	}
 	if action != "bind" && action != "unbind" {
-		return fmt.Errorf("invalid action: %s", action)
+		return apperrors.ErrInvalidInput
 	}
 
 	now := time.Now().UTC()
 	query := r.client.Session.Query(`
-        INSERT INTO admin_device_binding_history 
+        INSERT INTO admin_device_binding_history
         (admin_id, device_id, session_id, bound_at, bind_token, action)
         VALUES (?, ?, ?, ?, ?, ?)
     `,
@@ -75,35 +72,20 @@ func (r *AdminDeviceHistoryRepositoryImpl) RecordAdminBinding(
 	)
 
 	if err := r.client.ExecuteWithRetry(query.WithContext(ctx), 3); err != nil {
-		r.logger.Error("Failed to record admin device binding",
-			util.ErrorField(err),
-			util.String("admin_id", adminID.String()),
-			util.String("device_id", deviceID),
-			util.String("action", action))
 		return fmt.Errorf("failed to record admin device binding: %w", err)
 	}
-
-	r.logger.Info("Admin device binding recorded",
-		util.String("admin_id", adminID.String()),
-		util.String("device_id", deviceID),
-		util.String("action", action),
-		util.Duration("duration", time.Since(startTime)))
-
 	return nil
 }
 
-// GetAdminBindingHistory retrieves complete binding history for an admin
 func (r *AdminDeviceHistoryRepositoryImpl) GetAdminBindingHistory(
 	ctx context.Context,
 	adminID uuid.UUID,
 	limit int,
 ) ([]*models.UserActiveDevice, error) {
 	startTime := time.Now()
-
 	if adminID == uuid.Nil {
-		return nil, fmt.Errorf("invalid admin ID")
+		return nil, apperrors.ErrInvalidInput
 	}
-
 	if limit <= 0 || limit > 100 {
 		limit = 100
 	}
@@ -145,33 +127,21 @@ func (r *AdminDeviceHistoryRepositoryImpl) GetAdminBindingHistory(
 
 	if err := iter.Close(); err != nil {
 		r.metrics.RecordQuery(time.Since(startTime), false)
-		r.logger.Error("Failed to get admin binding history",
-			util.ErrorField(err),
-			util.String("admin_id", adminID.String()))
 		return nil, fmt.Errorf("failed to get admin binding history: %w", err)
 	}
-
 	r.metrics.RecordQuery(time.Since(startTime), true)
-	r.logger.Info("Retrieved admin binding history",
-		util.String("admin_id", adminID.String()),
-		util.Int("count", len(devices)),
-		util.Duration("duration", time.Since(startTime)))
-
 	return devices, nil
 }
 
-// GetAdminRecentBindingsByDevice finds recent admin bindings for a specific device
 func (r *AdminDeviceHistoryRepositoryImpl) GetAdminRecentBindingsByDevice(
 	ctx context.Context,
 	deviceID string,
 	limit int,
 ) ([]*models.UserActiveDevice, error) {
 	startTime := time.Now()
-
 	if deviceID == "" {
-		return nil, fmt.Errorf("device ID cannot be empty")
+		return nil, apperrors.ErrInvalidInput
 	}
-
 	if limit <= 0 || limit > 50 {
 		limit = 50
 	}
@@ -213,33 +183,21 @@ func (r *AdminDeviceHistoryRepositoryImpl) GetAdminRecentBindingsByDevice(
 
 	if err := iter.Close(); err != nil {
 		r.metrics.RecordQuery(time.Since(startTime), false)
-		r.logger.Error("Failed to get recent bindings by device",
-			util.ErrorField(err),
-			util.String("device_id", deviceID))
 		return nil, fmt.Errorf("failed to get recent bindings by device: %w", err)
 	}
-
 	r.metrics.RecordQuery(time.Since(startTime), true)
-	r.logger.Info("Retrieved recent admin bindings by device",
-		util.String("device_id", deviceID),
-		util.Int("count", len(devices)),
-		util.Duration("duration", time.Since(startTime)))
-
 	return devices, nil
 }
 
-// GetAdminBindingsByTimeRange retrieves admin device bindings within a time range
 func (r *AdminDeviceHistoryRepositoryImpl) GetAdminBindingsByTimeRange(
 	ctx context.Context,
 	startTime, endTime time.Time,
 	limit int,
 ) ([]*models.UserActiveDevice, error) {
 	queryStart := time.Now()
-
 	if startTime.After(endTime) {
-		return nil, fmt.Errorf("start time cannot be after end time")
+		return nil, apperrors.ErrInvalidInput
 	}
-
 	if limit <= 0 || limit > 1000 {
 		limit = 1000
 	}
@@ -281,24 +239,12 @@ func (r *AdminDeviceHistoryRepositoryImpl) GetAdminBindingsByTimeRange(
 
 	if err := iter.Close(); err != nil {
 		r.metrics.RecordQuery(time.Since(queryStart), false)
-		r.logger.Error("Failed to get bindings by time range",
-			util.ErrorField(err),
-			util.Time("start_time", startTime),
-			util.Time("end_time", endTime))
 		return nil, fmt.Errorf("failed to get bindings by time range: %w", err)
 	}
-
 	r.metrics.RecordQuery(time.Since(queryStart), true)
-	r.logger.Info("Retrieved admin bindings by time range",
-		util.Time("start_time", startTime),
-		util.Time("end_time", endTime),
-		util.Int("count", len(devices)),
-		util.Duration("duration", time.Since(queryStart)))
-
 	return devices, nil
 }
 
-// CleanupAdminOldRecords removes admin device binding records older than specified duration
 func (r *AdminDeviceHistoryRepositoryImpl) CleanupAdminOldRecords(
 	ctx context.Context,
 	olderThan time.Duration,
@@ -340,57 +286,43 @@ func (r *AdminDeviceHistoryRepositoryImpl) CleanupAdminOldRecords(
 
 	batchSize := 50
 	deletedCount := 0
-
 	for i := 0; i < len(recordsToDelete); i += batchSize {
 		end := i + batchSize
 		if end > len(recordsToDelete) {
 			end = len(recordsToDelete)
 		}
-
 		batch := r.client.Batch(gocql.LoggedBatch)
 		for j := i; j < end; j++ {
 			record := recordsToDelete[j]
 			batch.Query(`
-                DELETE FROM admin_device_binding_history 
+                DELETE FROM admin_device_binding_history
                 WHERE admin_id = ? AND bound_at = ?
             `, gocql.UUID(record.adminID), record.boundAt)
 		}
-
 		if err := r.client.ExecuteBatch(batch); err != nil {
-			r.logger.Error("Failed to execute cleanup batch",
-				util.ErrorField(err),
-				util.Int("batch_index", i/batchSize))
+			// continue despite errors
 			continue
 		}
-
 		deletedCount += (end - i)
 	}
 
 	r.metrics.RecordQuery(time.Since(startTime), true)
-	r.logger.Info("Admin device history cleanup completed",
-		util.Int("deleted_records", deletedCount),
-		util.Duration("older_than", olderThan),
-		util.Duration("duration", time.Since(startTime)))
-
 	return deletedCount, nil
 }
 
-// GetAdminStats returns statistics about admin device binding history
 func (r *AdminDeviceHistoryRepositoryImpl) GetAdminStats(
 	ctx context.Context,
 	adminID uuid.UUID,
 ) (map[string]interface{}, error) {
 	startTime := time.Now()
-
 	stats := make(map[string]interface{})
 
 	var totalBindings int64
 	query := r.client.Session.Query(`
-        SELECT COUNT(*) 
-        FROM admin_device_binding_history 
+        SELECT COUNT(*)
+        FROM admin_device_binding_history
         WHERE admin_id = ?
     `, gocql.UUID(adminID))
-
 	if err := query.WithContext(ctx).Scan(&totalBindings); err != nil {
 		return nil, fmt.Errorf("failed to get total bindings count: %w", err)
 	}
@@ -399,11 +331,10 @@ func (r *AdminDeviceHistoryRepositoryImpl) GetAdminStats(
 	thirtyDaysAgo := time.Now().AddDate(0, 0, -30)
 	var recentActivity int64
 	query = r.client.Session.Query(`
-        SELECT COUNT(*) 
-        FROM admin_device_binding_history 
+        SELECT COUNT(*)
+        FROM admin_device_binding_history
         WHERE admin_id = ? AND bound_at >= ?
     `, gocql.UUID(adminID), thirtyDaysAgo)
-
 	if err := query.WithContext(ctx).Scan(&recentActivity); err != nil {
 		return nil, fmt.Errorf("failed to get recent activity count: %w", err)
 	}
@@ -411,12 +342,11 @@ func (r *AdminDeviceHistoryRepositoryImpl) GetAdminStats(
 
 	var uniqueDevices int
 	query = r.client.Session.Query(`
-        SELECT DISTINCT device_id 
-        FROM admin_device_binding_history 
+        SELECT DISTINCT device_id
+        FROM admin_device_binding_history
         WHERE admin_id = ?
         ALLOW FILTERING
     `, gocql.UUID(adminID))
-
 	iter := query.WithContext(ctx).Iter()
 	uniqueDevices = 0
 	for iter.Scan() {
@@ -429,12 +359,9 @@ func (r *AdminDeviceHistoryRepositoryImpl) GetAdminStats(
 
 	r.metrics.RecordQuery(time.Since(startTime), true)
 	stats["query_duration_ms"] = time.Since(startTime).Milliseconds()
-
 	return stats, nil
 }
 
-// This method already exists in your code, just ensure it's there
-// HealthCheck verifies admin device history repository connectivity
 func (r *AdminDeviceHistoryRepositoryImpl) HealthCheck(ctx context.Context) error {
 	var count int
 	if err := r.client.Session.Query("SELECT COUNT(*) FROM system.local").

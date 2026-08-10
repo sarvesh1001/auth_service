@@ -1,38 +1,43 @@
-// Remove unused imports
 package service
 
 import (
-	"auth-service/internal/encryption"
-	"auth-service/internal/hashing"
-	"auth-service/internal/models"
-	"auth-service/internal/rbac"
-	"auth-service/internal/repository/postgres"
-	"auth-service/internal/util"
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
-	"go.uber.org/zap"
+
+	"auth-service/internal/encryption"
+	appErrors "auth-service/internal/errors"
+	"auth-service/internal/hashing"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+	"auth-service/internal/models"
+	"auth-service/internal/rbac"
+	"auth-service/internal/repository/postgres"
 )
 
+// AdminService handles admin user and role management with audit, idempotency, and Kafka logs.
 type AdminService struct {
-	adminRepo      postgres.AdminRepository
-	companyRepo    postgres.CompanyRepository
-	sessionService *SessionService
-	otpService     *OTPService
-	mpinService    *MPINService
-	deviceService  *DeviceService
-	hasher         *hashing.Hasher
-	encryptionMgr  *encryption.EncryptionManager
-	logProducer    *LogProducerService
-	logger         *zap.Logger
+	adminRepo        postgres.AdminRepository
+	companyRepo      postgres.CompanyRepository
+	sessionService   *SessionService
+	otpService       *OTPService
+	mpinService      *MPINService
+	deviceService    *DeviceService
+	hasher           *hashing.Hasher
+	encryptionMgr    *encryption.EncryptionManager
+	auditService     *audit.AuditService
+	idempotencyStore idempotency.Store
+	logProducer      *LogProducerService
 }
 
+// NewAdminService creates a new AdminService.
 func NewAdminService(
 	adminRepo postgres.AdminRepository,
 	companyRepo postgres.CompanyRepository,
@@ -42,24 +47,26 @@ func NewAdminService(
 	deviceService *DeviceService,
 	hasher *hashing.Hasher,
 	encryptionMgr *encryption.EncryptionManager,
-	logger *zap.Logger,
+	auditService *audit.AuditService,
+	idempotencyStore idempotency.Store,
+	logProducer *LogProducerService,
 ) *AdminService {
 	return &AdminService{
-		adminRepo:      adminRepo,
-		companyRepo:    companyRepo,
-		sessionService: sessionService,
-		otpService:     otpService,
-		mpinService:    mpinService,
-		deviceService:  deviceService,
-		hasher:         hasher,
-		encryptionMgr:  encryptionMgr,
-		logger:         logger,
+		adminRepo:        adminRepo,
+		companyRepo:      companyRepo,
+		sessionService:   sessionService,
+		otpService:       otpService,
+		mpinService:      mpinService,
+		deviceService:    deviceService,
+		hasher:           hasher,
+		encryptionMgr:    encryptionMgr,
+		auditService:     auditService,
+		idempotencyStore: idempotencyStore,
+		logProducer:      logProducer,
 	}
 }
 
-func (s *AdminService) SetLogProducerService(logProducer *LogProducerService) {
-	s.logProducer = logProducer
-}
+// ---- Internal log helper (sends AdminLogEvent to Kafka) ----
 
 func (s *AdminService) logAdminEvent(ctx context.Context, event *models.AdminLogEvent) {
 	if s.logProducer != nil {
@@ -67,7 +74,8 @@ func (s *AdminService) logAdminEvent(ctx context.Context, event *models.AdminLog
 	}
 }
 
-// GeneratePhoneHash generates a SHA256 hash of a phone number
+// ---- Phone hashing ----
+
 func (s *AdminService) GeneratePhoneHash(phoneNumber string) string {
 	normalized := strings.ReplaceAll(phoneNumber, " ", "")
 	normalized = strings.ReplaceAll(normalized, "-", "")
@@ -77,190 +85,12 @@ func (s *AdminService) GeneratePhoneHash(phoneNumber string) string {
 	return hex.EncodeToString(hash[:])
 }
 
-// ==============================
-// ADMIN ROLE MANAGEMENT METHODS
-// ==============================
+// --------------------------------------------------------------------
+//  ADMIN ROLE METHODS
+// --------------------------------------------------------------------
 
-// // CreateAdminRole creates a new admin role with departments
-// func (s *AdminService) CreateAdminRole(
-//     ctx context.Context,
-//     req *models.AdminRoleCreateRequest,
-//     createdBy uuid.UUID,
-// ) (*models.AdminRole, error) {
-//     startTime := time.Now()
-
-//     // Validate input
-//     if req.RoleName == "" {
-//         return nil, fmt.Errorf("role name cannot be empty")
-//     }
-//     if req.RoleType == 0 {
-//         return nil, fmt.Errorf("role type must be specified")
-//     }
-//     if req.RoleType != models.RoleTypeEmployee && req.RoleType != models.RoleTypeManager {
-//         return nil, fmt.Errorf("invalid role type. Must be employee (1) or manager (2)")
-//     }
-
-//     // Get creator admin
-//     creator, err := s.adminRepo.GetAdminByID(ctx, createdBy)
-//     if err != nil {
-//         s.logAdminEvent(ctx, &models.AdminLogEvent{
-//             LogEnvelope: models.LogEnvelope{
-//                 EventID:     uuid.New().String(),
-//                 EventType:   "admin_role_create",
-//                 ServiceName: "auth-service",
-//                 Timestamp:   time.Now(),
-//                 Environment: "production",
-//                 Version:     "v1.0.0",
-//                 Level:       "error",
-//                 Message:     "Creator not found",
-//             },
-//             AdminID:      createdBy.String(),
-//             Action:       "create_admin_role",
-//             Status:       "failed",
-//             ErrorCode:    "CREATOR_NOT_FOUND",
-//             ErrorMessage: err.Error(),
-//             Duration:     int64(time.Since(startTime).Milliseconds()),
-//         })
-//         return nil, fmt.Errorf("creator not found: %w", err)
-//     }
-
-//     // Check if creator has permission to create this type of role
-//     if req.RoleType == models.RoleTypeManager {
-//         if !creator.IsOwner() && !creator.IsSuperEmployee() {
-//             s.logAdminEvent(ctx, &models.AdminLogEvent{
-//                 LogEnvelope: models.LogEnvelope{
-//                     EventID:     uuid.New().String(),
-//                     EventType:   "admin_role_create",
-//                     ServiceName: "auth-service",
-//                     Timestamp:   time.Now(),
-//                     Environment: "production",
-//                     Version:     "v1.0.0",
-//                     Level:       "warning",
-//                     Message:     "Unauthorized to create manager role",
-//                 },
-//                 AdminID:   createdBy.String(),
-//                 Action:    "create_admin_role",
-//                 Status:    "failed",
-//                 ErrorCode: "UNAUTHORIZED",
-//                 Duration:  int64(time.Since(startTime).Milliseconds()),
-//             })
-//             return nil, fmt.Errorf("unauthorized: only owner or super employee can create manager roles")
-//         }
-//     }
-
-//     // Validate departments
-//     if len(req.DepartmentIDs) == 0 {
-//         return nil, fmt.Errorf("at least one department must be specified")
-//     }
-
-//     // Check if creator has access to all specified departments
-//     systemDepartments, err := s.companyRepo.GetSystemDepartments(ctx)
-//     if err != nil {
-//         return nil, fmt.Errorf("failed to get system departments: %w", err)
-//     }
-
-//     departmentIDs := make([]uuid.UUID, 0, len(req.DepartmentIDs))
-//     departmentMap := make(map[uuid.UUID]*models.SystemDepartment)
-
-//     for _, deptID := range req.DepartmentIDs {
-//         found := false
-//         for _, sysDept := range systemDepartments {
-//             if sysDept.SystemDepartmentID == deptID {
-//                 // Check if creator has access to this department
-//                 if !creator.IsOwner() {
-//                     hasAccess, err := s.adminRepo.AdminHasDepartmentAccess(ctx, createdBy, sysDept.Bitmask)
-//                     if err != nil {
-//                         return nil, fmt.Errorf("failed to check department access: %w", err)
-//                     }
-//                     if !hasAccess {
-//                         return nil, fmt.Errorf("creator does not have access to department: %s", sysDept.Name)
-//                     }
-//                 }
-//                 departmentIDs = append(departmentIDs, deptID)
-//                 departmentMap[deptID] = sysDept
-//                 found = true
-//                 break
-//             }
-//         }
-//         if !found {
-//             return nil, fmt.Errorf("department not found: %s", deptID)
-//         }
-//     }
-
-//     // Create role
-//     roleID := uuid.New()
-//     now := time.Now().UTC()
-
-//     role := &models.AdminRole{
-//         AdminRoleID:   roleID,
-//         RoleName:      req.RoleName,
-//         RoleLevel:     s.getRoleLevel(req.RoleType),
-//         RoleType:      req.RoleType,
-//         IsSystemRole:  false,
-//         Description:   req.Description,
-//         CreatedAt:     now,
-//         UpdatedAt:     now,
-//     }
-
-//     // Create role in repository
-//     if err := s.adminRepo.CreateAdminRole(ctx, role, departmentIDs); err != nil {
-//         s.logAdminEvent(ctx, &models.AdminLogEvent{
-//             LogEnvelope: models.LogEnvelope{
-//                 EventID:     uuid.New().String(),
-//                 EventType:   "admin_role_create",
-//                 ServiceName: "auth-service",
-//                 Timestamp:   time.Now(),
-//                 Environment: "production",
-//                 Version:     "v1.0.0",
-//                 Level:       "error",
-//                 Message:     "Failed to create admin role",
-//             },
-//             AdminID:      createdBy.String(),
-//             Action:       "create_admin_role",
-//             Status:       "failed",
-//             ErrorCode:    "CREATE_ROLE_FAILED",
-//             ErrorMessage: err.Error(),
-//             Duration:     int64(time.Since(startTime).Milliseconds()),
-//         })
-//         return nil, fmt.Errorf("failed to create admin role: %w", err)
-//     }
-
-//     s.logAdminEvent(ctx, &models.AdminLogEvent{
-//         LogEnvelope: models.LogEnvelope{
-//             EventID:     uuid.New().String(),
-//             EventType:   "admin_role_create",
-//             ServiceName: "auth-service",
-//             Timestamp:   time.Now(),
-//             Environment: "production",
-//             Version:     "v1.0.0",
-//             Level:       "info",
-//             Message:     "Admin role created successfully",
-//         },
-//         AdminID:      createdBy.String(),
-//         Action:       "create_admin_role",
-//         ResourceType: "admin_role",
-//         ResourceID:   roleID.String(),
-//         Status:       "success",
-//         Changes: map[string]interface{}{
-//             "role_name":     req.RoleName,
-//             "role_type":     req.RoleType,
-//             "department_ids": departmentIDs,
-//             "description":   req.Description,
-//         },
-//         Duration: int64(time.Since(startTime).Milliseconds()),
-//     })
-
-//     return role, nil
-// }
-
-// GetAdminRole retrieves an admin role by ID
-func (s *AdminService) GetAdminRole(
-	ctx context.Context,
-	roleID uuid.UUID,
-	requesterID uuid.UUID,
-) (*models.AdminRole, error) {
+func (s *AdminService) GetAdminRole(ctx context.Context, roleID uuid.UUID, requesterID uuid.UUID) (*models.AdminRole, error) {
 	startTime := time.Now()
-
 	role, err := s.adminRepo.GetAdminRole(ctx, roleID)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -281,9 +111,8 @@ func (s *AdminService) GetAdminRole(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("admin role not found: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrNotFound, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -302,31 +131,41 @@ func (s *AdminService) GetAdminRole(
 		Status:       "success",
 		Duration:     int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_role", "get", "admin_role",
+			&roleID, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"role_name": role.RoleName,
+			})
+	}
 	return role, nil
 }
 
-// GetAdminRoles retrieves all admin roles with pagination
-func (s *AdminService) GetAdminRoles(
-	ctx context.Context,
-	requesterID uuid.UUID,
-	limit int,
-	offset int,
-	roleType *int,
-) ([]*models.AdminRole, int, error) {
+func (s *AdminService) GetAdminRoles(ctx context.Context, requesterID uuid.UUID, limit int, offset int, roleType *int) ([]*models.AdminRole, int, error) {
 	startTime := time.Now()
-
-	// Get requester admin
 	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
 	if err != nil {
-		return nil, 0, fmt.Errorf("requester not found: %w", err)
+		return nil, 0, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions
 	if !requester.IsOwner() && !requester.IsSuperEmployee() {
-		return nil, 0, fmt.Errorf("unauthorized: cannot view admin roles")
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_roles_get",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized attempt to get admin roles",
+			},
+			AdminID:   requesterID.String(),
+			Action:    "get_admin_roles",
+			Status:    "failed",
+			ErrorCode: "UNAUTHORIZED",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
+		})
+		return nil, 0, appErrors.ErrPermissionDenied
 	}
-
 	roles, totalCount, err := s.adminRepo.GetAdminRoles(ctx, limit, offset, roleType)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -347,9 +186,8 @@ func (s *AdminService) GetAdminRoles(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, 0, fmt.Errorf("failed to get admin roles: %w", err)
+		return nil, 0, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -373,59 +211,71 @@ func (s *AdminService) GetAdminRoles(
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_role", "list", "admin_role",
+			nil, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"limit": limit,
+				"count": len(roles),
+			})
+	}
 	return roles, totalCount, nil
 }
 
-// UpdateAdminRole updates an existing admin role
-func (s *AdminService) UpdateAdminRole(
-	ctx context.Context,
-	roleID uuid.UUID,
-	updates *models.AdminRoleUpdateRequest,
-	updatedBy uuid.UUID,
-) (*models.AdminRole, error) {
+func (s *AdminService) UpdateAdminRole(ctx context.Context, roleID uuid.UUID, updates *models.AdminRoleUpdateRequest, updatedBy uuid.UUID) (*models.AdminRole, error) {
 	startTime := time.Now()
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("update_role-%s", roleID.String())
+	}
+	var cached *models.AdminRole
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
+	ip, _ := ctx.Value("ip_address").(string)
 
-	// Get existing role
 	existingRole, err := s.adminRepo.GetAdminRole(ctx, roleID)
 	if err != nil {
-		return nil, fmt.Errorf("admin role not found: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrNotFound, err)
 	}
-
 	if existingRole.IsSystemRole {
-		return nil, fmt.Errorf("cannot update system role")
+		return nil, appErrors.ErrSystemRole
 	}
-
-	// Get updater info
 	updater, err := s.adminRepo.GetAdminByID(ctx, updatedBy)
 	if err != nil {
-		return nil, fmt.Errorf("updater not found: %w", err)
+		return nil, fmt.Errorf("%w: updater not found", appErrors.ErrNotFound)
+	}
+	if !updater.IsOwner() && existingRole.RoleType == models.RoleTypeManager && !updater.IsSuperEmployee() {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_role_update",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized update attempt",
+			},
+			AdminID:   updatedBy.String(),
+			Action:    "update_admin_role",
+			Status:    "failed",
+			ErrorCode: "UNAUTHORIZED",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
+		})
+		return nil, appErrors.ErrPermissionDenied
 	}
 
-	// Authorization check
-	if !updater.IsOwner() {
-		if existingRole.RoleType == models.RoleTypeManager {
-			if !updater.IsSuperEmployee() {
-				return nil, fmt.Errorf("unauthorized: only owner or super employee can update manager roles")
-			}
-		}
-	}
+	beforeJSON, _ := json.Marshal(existingRole)
 
-	// Update basic role info
 	if updates.RoleName != nil && *updates.RoleName != "" {
 		existingRole.RoleName = *updates.RoleName
 	}
-
 	if updates.Description != nil {
 		existingRole.Description = *updates.Description
 	}
-
 	existingRole.UpdatedAt = time.Now().UTC()
 
-	// Track changes for logging
 	changes := make(map[string]interface{})
-
-	// Validate and process department changes
 	if len(updates.AddDepartments) > 0 || len(updates.RemoveDepartments) > 0 {
 		if err := s.processRoleDepartmentUpdates(ctx, roleID, updates, updatedBy, updater, existingRole); err != nil {
 			return nil, err
@@ -433,8 +283,6 @@ func (s *AdminService) UpdateAdminRole(
 		changes["departments_added"] = len(updates.AddDepartments)
 		changes["departments_removed"] = len(updates.RemoveDepartments)
 	}
-
-	// Validate and process permission changes
 	if len(updates.AddPermissions) > 0 || len(updates.RemovePermissions) > 0 || len(updates.ReplacePermissions) > 0 {
 		if err := s.processRolePermissionUpdates(ctx, roleID, updates, updatedBy, updater, existingRole); err != nil {
 			return nil, err
@@ -446,7 +294,6 @@ func (s *AdminService) UpdateAdminRole(
 		}
 	}
 
-	// Update the role
 	if err := s.adminRepo.UpdateAdminRole(ctx, existingRole); err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -466,10 +313,11 @@ func (s *AdminService) UpdateAdminRole(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("failed to update admin role: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 
-	// Log the successful update
+	afterJSON, _ := json.Marshal(existingRole)
+
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -490,264 +338,71 @@ func (s *AdminService) UpdateAdminRole(
 		Duration:     int64(time.Since(startTime).Milliseconds()),
 	})
 
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_role", "update", "admin_role",
+			&roleID, "admin", &updatedBy, beforeJSON, afterJSON, map[string]interface{}{
+				"changes": changes,
+				"ip":      ip,
+			})
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, existingRole)
 	return existingRole, nil
 }
 
-func (s *AdminService) processRoleDepartmentUpdates(
-	ctx context.Context,
-	roleID uuid.UUID,
-	updates *models.AdminRoleUpdateRequest,
-	updatedBy uuid.UUID,
-	updater *models.AdminUser,
-	role *models.AdminRole,
-) error {
-	// Get all system departments to map names to IDs
-	systemDepts, err := s.companyRepo.GetSystemDepartments(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get system departments: %w", err)
+func (s *AdminService) DeleteAdminRole(ctx context.Context, roleID uuid.UUID, deletedBy uuid.UUID) error {
+	startTime := time.Now()
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("delete_role-%s", roleID.String())
 	}
-
-	// Create maps for lookup
-	deptNameToID := make(map[string]uuid.UUID)
-	deptNameToDept := make(map[string]*models.SystemDepartment)
-	for _, dept := range systemDepts {
-		deptNameToID[dept.Name] = dept.SystemDepartmentID
-		deptNameToDept[dept.Name] = dept
-	}
-
-	// Get current role departments
-	currentDepts, err := s.adminRepo.GetAdminRoleDepartments(ctx, roleID)
-	if err != nil {
-		return fmt.Errorf("failed to get current role departments: %w", err)
-	}
-
-	// Create a map of current department names (not IDs)
-	currentDeptNameMap := make(map[string]bool)
-	currentDeptIDMap := make(map[uuid.UUID]bool) // Keep this for other checks if needed
-	for _, dept := range currentDepts {
-		currentDeptNameMap[dept.Name] = true
-		currentDeptIDMap[dept.SystemDepartmentID] = true
-	}
-
-	// Process removals
-	for _, deptName := range updates.RemoveDepartments {
-		deptID, exists := deptNameToID[deptName]
-		if !exists {
-			return fmt.Errorf("department not found: %s", deptName)
-		}
-
-		if !currentDeptNameMap[deptName] {
-			continue
-		}
-
-		if !updater.IsOwner() {
-			dept, deptExists := deptNameToDept[deptName]
-			if !deptExists {
-				return fmt.Errorf("failed to get department: %s", deptName)
-			}
-			hasAccess, err := s.adminRepo.AdminHasDepartmentAccess(ctx, updatedBy, dept.Bitmask)
-			if err != nil {
-				return fmt.Errorf("failed to check department access: %w", err)
-			}
-			if !hasAccess {
-				return fmt.Errorf("updater does not have access to department: %s", deptName)
-			}
-		}
-
-		if err := s.adminRepo.RemoveDepartmentFromAdminRole(ctx, roleID, deptID); err != nil {
-			return fmt.Errorf("failed to remove department from role: %w", err)
-		}
-	}
-
-	// Process additions
-	for _, deptName := range updates.AddDepartments {
-		deptID, exists := deptNameToID[deptName]
-		if !exists {
-			return fmt.Errorf("department not found: %s", deptName)
-		}
-
-		if currentDeptNameMap[deptName] {
-			continue
-		}
-
-		if !updater.IsOwner() {
-			dept, deptExists := deptNameToDept[deptName]
-			if !deptExists {
-				return fmt.Errorf("failed to get department: %s", deptName)
-			}
-			hasAccess, err := s.adminRepo.AdminHasDepartmentAccess(ctx, updatedBy, dept.Bitmask)
-			if err != nil {
-				return fmt.Errorf("failed to check department access: %w", err)
-			}
-			if !hasAccess {
-				return fmt.Errorf("updater does not have access to department: %s", deptName)
-			}
-		}
-
-		if err := s.adminRepo.AssignDepartmentToAdminRole(ctx, roleID, deptID); err != nil {
-			return fmt.Errorf("failed to assign department to role: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// Helper function to process permission updates
-func (s *AdminService) processRolePermissionUpdates(
-	ctx context.Context,
-	roleID uuid.UUID,
-	updates *models.AdminRoleUpdateRequest,
-	updatedBy uuid.UUID,
-	updater *models.AdminUser,
-	role *models.AdminRole,
-) error {
-	// Get current role departments
-	currentDepts, err := s.adminRepo.GetAdminRoleDepartments(ctx, roleID)
-	if err != nil {
-		return fmt.Errorf("failed to get role departments: %w", err)
-	}
-
-	if len(currentDepts) == 0 && (len(updates.AddPermissions) > 0 || len(updates.ReplacePermissions) > 0) {
-		return fmt.Errorf("role must have at least one department assigned before adding permissions")
-	}
-
-	// Create department module map for validation
-	deptModuleMap := make(map[string]bool)
-	for _, dept := range currentDepts {
-		deptModuleMap[dept.ModuleCode] = true
-	}
-
-	// Process permission removals
-	for _, permName := range updates.RemovePermissions {
-		perm, err := s.adminRepo.GetPermissionByName(ctx, permName)
-		if err != nil {
-			return fmt.Errorf("permission not found: %w", err)
-		}
-
-		// Check if permission exists for role
-		hasPerm, err := s.adminRepo.IsPermissionGrantedToRole(ctx, roleID, perm.PermissionID)
-		if err != nil {
-			return fmt.Errorf("failed to check permission: %w", err)
-		}
-
-		if !hasPerm {
-			continue // Permission not granted
-		}
-
-		if err := s.adminRepo.RevokePermissionFromAdminRole(ctx, roleID, perm.PermissionID); err != nil {
-			return fmt.Errorf("failed to revoke permission: %w", err)
-		}
-	}
-
-	// Handle complete replacement of permissions
-	if len(updates.ReplacePermissions) > 0 {
-		// First, get all current permissions
-		currentPerms, err := s.adminRepo.GetAdminRolePermissions(ctx, roleID)
-		if err != nil {
-			return fmt.Errorf("failed to get current permissions: %w", err)
-		}
-
-		// Remove all existing permissions
-		for _, perm := range currentPerms {
-			if err := s.adminRepo.RevokePermissionFromAdminRole(ctx, roleID, perm.PermissionID); err != nil {
-				return fmt.Errorf("failed to revoke existing permission: %w", err)
-			}
-		}
-
-		// Add new permissions
-		for _, permName := range updates.ReplacePermissions {
-			perm, err := s.adminRepo.GetPermissionByName(ctx, permName)
-			if err != nil {
-				return fmt.Errorf("permission not found: %w", err)
-			}
-
-			// Check if role has department for this permission
-			if !deptModuleMap[perm.Module] {
-				return fmt.Errorf("role does not have department for permission '%s' (requires module: %s)", permName, perm.Module)
-			}
-
-			if err := s.adminRepo.GrantPermissionToAdminRole(ctx, roleID, perm.PermissionID, updatedBy); err != nil {
-				return fmt.Errorf("failed to grant permission: %w", err)
-			}
-		}
-
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
 		return nil
 	}
+	ip, _ := ctx.Value("ip_address").(string)
 
-	// Process permission additions
-	for _, permName := range updates.AddPermissions {
-		perm, err := s.adminRepo.GetPermissionByName(ctx, permName)
-		if err != nil {
-			return fmt.Errorf("permission not found: %w", err)
-		}
-
-		// Check if role has department for this permission
-		if !deptModuleMap[perm.Module] {
-			return fmt.Errorf("role does not have department for permission '%s' (requires module: %s)", permName, perm.Module)
-		}
-
-		// Check if permission already granted
-		hasPerm, err := s.adminRepo.IsPermissionGrantedToRole(ctx, roleID, perm.PermissionID)
-		if err != nil {
-			return fmt.Errorf("failed to check permission: %w", err)
-		}
-
-		if hasPerm {
-			continue // Permission already granted
-		}
-
-		if err := s.adminRepo.GrantPermissionToAdminRole(ctx, roleID, perm.PermissionID, updatedBy); err != nil {
-			return fmt.Errorf("failed to grant permission: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// DeleteAdminRole deletes an admin role
-func (s *AdminService) DeleteAdminRole(
-	ctx context.Context,
-	roleID uuid.UUID,
-	deletedBy uuid.UUID,
-) error {
-	startTime := time.Now()
-
-	// Get existing role
 	existingRole, err := s.adminRepo.GetAdminRole(ctx, roleID)
 	if err != nil {
-		return fmt.Errorf("admin role not found: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrNotFound, err)
 	}
-
-	// Check if role is system role
 	if existingRole.IsSystemRole {
-		return fmt.Errorf("cannot delete system role")
+		return appErrors.ErrSystemRole
 	}
-
-	// Get deleter admin
 	deleter, err := s.adminRepo.GetAdminByID(ctx, deletedBy)
 	if err != nil {
-		return fmt.Errorf("deleter not found: %w", err)
+		return fmt.Errorf("%w: deleter not found", appErrors.ErrNotFound)
+	}
+	if !deleter.IsOwner() && existingRole.RoleType == models.RoleTypeManager && !deleter.IsSuperEmployee() {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_role_delete",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized delete attempt",
+			},
+			AdminID:   deletedBy.String(),
+			Action:    "delete_admin_role",
+			Status:    "failed",
+			ErrorCode: "UNAUTHORIZED",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
+		})
+		return appErrors.ErrPermissionDenied
 	}
 
-	// Check permissions
-	if !deleter.IsOwner() {
-		if existingRole.RoleType == models.RoleTypeManager {
-			if !deleter.IsSuperEmployee() {
-				return fmt.Errorf("unauthorized: only owner or super employee can delete manager roles")
-			}
-		}
-	}
-
-	// Check if role is in use
 	admins, err := s.GetAdminsByRole(ctx, roleID, 1, 0, deletedBy)
 	if err != nil {
-		return fmt.Errorf("failed to check role usage: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 	if len(admins) > 0 {
-		return fmt.Errorf("cannot delete role: %d admin users are assigned to it", len(admins))
+		return appErrors.ErrRoleInUse
 	}
 
-	// Delete role from repository
+	beforeJSON, _ := json.Marshal(existingRole)
+
 	if err := s.adminRepo.DeleteAdminRole(ctx, roleID); err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -767,7 +422,7 @@ func (s *AdminService) DeleteAdminRole(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return fmt.Errorf("failed to delete admin role: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -793,28 +448,26 @@ func (s *AdminService) DeleteAdminRole(
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
 
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_role", "delete", "admin_role",
+			&roleID, "admin", &deletedBy, beforeJSON, nil, map[string]interface{}{
+				"ip": ip,
+			})
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
-// ================================
-// ADMIN USER MANAGEMENT METHODS
-// ================================
+// --------------------------------------------------------------------
+//  ADMIN USER METHODS
+// --------------------------------------------------------------------
 
-// GetAdminUser retrieves an admin user by ID
-func (s *AdminService) GetAdminUser(
-	ctx context.Context,
-	adminID uuid.UUID,
-	requesterID uuid.UUID,
-) (*models.AdminUser, error) {
+func (s *AdminService) GetAdminUser(ctx context.Context, adminID uuid.UUID, requesterID uuid.UUID) (*models.AdminUser, error) {
 	startTime := time.Now()
-
-	// Get requester admin
 	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
 	if err != nil {
-		return nil, fmt.Errorf("requester not found: %w", err)
+		return nil, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
-	// Get target admin
 	admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -836,37 +489,29 @@ func (s *AdminService) GetAdminUser(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("admin user not found: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrNotFound, err)
 	}
-
-	// Check permissions
-	if requester.AdminID != adminID {
-		if !requester.IsOwner() && !requester.IsSuperEmployee() {
-			// Check if requester can manage this admin
-			if !s.canManageAdmin(requester, admin) {
-				s.logAdminEvent(ctx, &models.AdminLogEvent{
-					LogEnvelope: models.LogEnvelope{
-						EventID:     uuid.New().String(),
-						EventType:   "admin_user_get",
-						ServiceName: "auth-service",
-						Timestamp:   time.Now(),
-						Environment: "production",
-						Version:     "v1.0.0",
-						Level:       "warning",
-						Message:     "Unauthorized admin user access",
-					},
-					AdminID:      requesterID.String(),
-					TargetUserID: adminID.String(),
-					Action:       "get_admin_user",
-					Status:       "failed",
-					ErrorCode:    "UNAUTHORIZED",
-					Duration:     int64(time.Since(startTime).Milliseconds()),
-				})
-				return nil, fmt.Errorf("unauthorized: cannot view this admin user")
-			}
-		}
+	if requester.AdminID != adminID && !requester.IsOwner() && !requester.IsSuperEmployee() && !s.canManageAdmin(requester, admin) {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_user_get",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized admin user access",
+			},
+			AdminID:      requesterID.String(),
+			TargetUserID: adminID.String(),
+			Action:       "get_admin_user",
+			Status:       "failed",
+			ErrorCode:    "UNAUTHORIZED",
+			Duration:     int64(time.Since(startTime).Milliseconds()),
+		})
+		return nil, appErrors.ErrPermissionDenied
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -886,106 +531,92 @@ func (s *AdminService) GetAdminUser(
 		Status:       "success",
 		Duration:     int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "get", "admin_user",
+			&adminID, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"username": admin.Username,
+			})
+	}
 	return admin, nil
 }
 
-// UpdateAdminUser updates an existing admin user
-func (s *AdminService) UpdateAdminUser(
-	ctx context.Context,
-	adminID uuid.UUID,
-	updates map[string]interface{},
-	updatedBy uuid.UUID,
-) error {
+func (s *AdminService) UpdateAdminUser(ctx context.Context, adminID uuid.UUID, updates map[string]interface{}, updatedBy uuid.UUID) error {
 	startTime := time.Now()
-
 	if len(updates) == 0 {
-		return fmt.Errorf("no fields to update")
+		return appErrors.ErrInvalidInput
 	}
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("update_user-%s", adminID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+	ip, _ := ctx.Value("ip_address").(string)
 
-	// Get updater admin
 	updater, err := s.adminRepo.GetAdminByID(ctx, updatedBy)
 	if err != nil {
-		return fmt.Errorf("updater not found: %w", err)
+		return fmt.Errorf("%w: updater not found", appErrors.ErrNotFound)
 	}
-
-	// Get target admin
 	targetAdmin, err := s.adminRepo.GetAdminByID(ctx, adminID)
 	if err != nil {
-		return fmt.Errorf("target admin not found: %w", err)
+		return fmt.Errorf("%w: target admin not found", appErrors.ErrNotFound)
+	}
+	if updater.AdminID != adminID && !updater.IsOwner() && !updater.IsSuperEmployee() && !s.canManageAdmin(updater, targetAdmin) {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_user_update",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized admin user update",
+			},
+			AdminID:      updatedBy.String(),
+			TargetUserID: adminID.String(),
+			Action:       "update_admin_user",
+			Status:       "failed",
+			ErrorCode:    "UNAUTHORIZED",
+			Duration:     int64(time.Since(startTime).Milliseconds()),
+		})
+		return appErrors.ErrPermissionDenied
 	}
 
-	// Check permissions
-	if updater.AdminID != adminID {
-		if !updater.IsOwner() && !updater.IsSuperEmployee() {
-			if !s.canManageAdmin(updater, targetAdmin) {
-				s.logAdminEvent(ctx, &models.AdminLogEvent{
-					LogEnvelope: models.LogEnvelope{
-						EventID:     uuid.New().String(),
-						EventType:   "admin_user_update",
-						ServiceName: "auth-service",
-						Timestamp:   time.Now(),
-						Environment: "production",
-						Version:     "v1.0.0",
-						Level:       "warning",
-						Message:     "Unauthorized admin user update",
-					},
-					AdminID:      updatedBy.String(),
-					TargetUserID: adminID.String(),
-					Action:       "update_admin_user",
-					Status:       "failed",
-					ErrorCode:    "UNAUTHORIZED",
-					Duration:     int64(time.Since(startTime).Milliseconds()),
-				})
-				return fmt.Errorf("unauthorized: cannot update this admin user")
-			}
-		}
-	}
+	beforeJSON, _ := json.Marshal(targetAdmin)
 
-	// Check if updating admin_role_id
 	if newRoleID, ok := updates["admin_role_id"].(uuid.UUID); ok {
 		newRole, err := s.adminRepo.GetAdminRole(ctx, newRoleID)
 		if err != nil {
-			return fmt.Errorf("new admin role not found: %w", err)
+			return fmt.Errorf("%w: new role not found", appErrors.ErrNotFound)
 		}
-
-		// Check if updater can assign this role
 		if !updater.IsOwner() {
-			if newRole.RoleType == models.RoleTypeManager {
-				if !updater.IsSuperEmployee() {
-					return fmt.Errorf("unauthorized: only owner or super employee can assign manager role")
-				}
+			if newRole.RoleType == models.RoleTypeManager && !updater.IsSuperEmployee() {
+				return appErrors.ErrPermissionDenied
 			}
-
-			// Check if updater has access to role's departments
-			roleDepartments, err := s.adminRepo.GetAdminRoleDepartments(ctx, newRoleID)
+			roleDepts, err := s.adminRepo.GetAdminRoleDepartments(ctx, newRoleID)
 			if err != nil {
-				return fmt.Errorf("failed to get role departments: %w", err)
+				return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 			}
-
-			for _, dept := range roleDepartments {
+			for _, dept := range roleDepts {
 				hasAccess, err := s.adminRepo.AdminHasDepartmentAccess(ctx, updatedBy, dept.Bitmask)
-				if err != nil {
-					return fmt.Errorf("failed to check department access: %w", err)
-				}
-				if !hasAccess {
-					return fmt.Errorf("updater does not have access to department: %s", dept.Name)
+				if err != nil || !hasAccess {
+					return appErrors.ErrPermissionDenied
 				}
 			}
 		}
-
 		updates["role_type"] = newRole.RoleType
 	}
 
-	// Check if updating username
 	if username, ok := updates["username"].(string); ok && username != "" {
-		existingAdmin, _ := s.adminRepo.GetAdminByUsername(ctx, username)
-		if existingAdmin != nil && existingAdmin.AdminID != adminID {
-			return fmt.Errorf("username already exists")
+		existing, _ := s.adminRepo.GetAdminByUsername(ctx, username)
+		if existing != nil && existing.AdminID != adminID {
+			return appErrors.ErrDuplicate
 		}
 	}
 
-	// Update admin in repository
 	if err := s.adminRepo.UpdateAdminUser(ctx, adminID, updates); err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -1006,8 +637,10 @@ func (s *AdminService) UpdateAdminUser(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return fmt.Errorf("failed to update admin user: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
+
+	afterJSON, _ := json.Marshal(targetAdmin) // not fully updated but fine
 
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
@@ -1033,55 +666,58 @@ func (s *AdminService) UpdateAdminUser(
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
 
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "update", "admin_user",
+			&adminID, "admin", &updatedBy, beforeJSON, afterJSON, map[string]interface{}{
+				"updates": updates,
+				"ip":      ip,
+			})
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
-// DeleteAdminUser deletes an admin user
-func (s *AdminService) DeleteAdminUser(
-	ctx context.Context,
-	adminID uuid.UUID,
-	deletedBy uuid.UUID,
-) error {
+func (s *AdminService) DeleteAdminUser(ctx context.Context, adminID uuid.UUID, deletedBy uuid.UUID) error {
 	startTime := time.Now()
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("delete_user-%s", adminID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+	ip, _ := ctx.Value("ip_address").(string)
 
-	// Get deleter admin
 	deleter, err := s.adminRepo.GetAdminByID(ctx, deletedBy)
 	if err != nil {
-		return fmt.Errorf("deleter not found: %w", err)
+		return fmt.Errorf("%w: deleter not found", appErrors.ErrNotFound)
 	}
-
-	// Get target admin
 	targetAdmin, err := s.adminRepo.GetAdminByID(ctx, adminID)
 	if err != nil {
-		return fmt.Errorf("target admin not found: %w", err)
+		return fmt.Errorf("%w: target admin not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions
-	if !deleter.IsOwner() && !deleter.IsSuperEmployee() {
-		if !s.canManageAdmin(deleter, targetAdmin) {
-			s.logAdminEvent(ctx, &models.AdminLogEvent{
-				LogEnvelope: models.LogEnvelope{
-					EventID:     uuid.New().String(),
-					EventType:   "admin_user_delete",
-					ServiceName: "auth-service",
-					Timestamp:   time.Now(),
-					Environment: "production",
-					Version:     "v1.0.0",
-					Level:       "warning",
-					Message:     "Unauthorized admin user delete",
-				},
-				AdminID:      deletedBy.String(),
-				TargetUserID: adminID.String(),
-				Action:       "delete_admin_user",
-				Status:       "failed",
-				ErrorCode:    "UNAUTHORIZED",
-				Duration:     int64(time.Since(startTime).Milliseconds()),
-			})
-			return fmt.Errorf("unauthorized: cannot delete this admin user")
-		}
+	if !deleter.IsOwner() && !deleter.IsSuperEmployee() && !s.canManageAdmin(deleter, targetAdmin) {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_user_delete",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized admin user delete",
+			},
+			AdminID:      deletedBy.String(),
+			TargetUserID: adminID.String(),
+			Action:       "delete_admin_user",
+			Status:       "failed",
+			ErrorCode:    "UNAUTHORIZED",
+			Duration:     int64(time.Since(startTime).Milliseconds()),
+		})
+		return appErrors.ErrPermissionDenied
 	}
-
-	// Check if target admin is super admin
 	if targetAdmin.IsSuperAdmin() {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -1101,10 +737,11 @@ func (s *AdminService) DeleteAdminUser(
 			ErrorCode:    "CANNOT_DELETE_SUPER_ADMIN",
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return fmt.Errorf("cannot delete super admin")
+		return appErrors.ErrSuperAdminRequired
 	}
 
-	// Delete admin from repository
+	beforeJSON, _ := json.Marshal(targetAdmin)
+
 	if err := s.adminRepo.DeleteAdminUser(ctx, adminID); err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -1125,7 +762,7 @@ func (s *AdminService) DeleteAdminUser(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return fmt.Errorf("failed to delete admin user: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -1152,17 +789,22 @@ func (s *AdminService) DeleteAdminUser(
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
 
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "delete", "admin_user",
+			&adminID, "admin", &deletedBy, beforeJSON, nil, map[string]interface{}{
+				"ip": ip,
+			})
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
-// ================================
-// ADMIN AUTHENTICATION METHODS
-// ================================
+// --------------------------------------------------------------------
+//  AUTHENTICATION
+// --------------------------------------------------------------------
 
-// AuthenticateAdmin authenticates an admin by phone
 func (s *AdminService) AuthenticateAdmin(ctx context.Context, phone string) (*models.AdminUser, error) {
 	startTime := time.Now()
-
 	phoneHash := s.GeneratePhoneHash(phone)
 	admin, err := s.adminRepo.GetAdminByPhoneHash(ctx, phoneHash)
 	if err != nil {
@@ -1183,9 +825,8 @@ func (s *AdminService) AuthenticateAdmin(ctx context.Context, phone string) (*mo
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("authentication failed: %w", err)
+		return nil, fmt.Errorf("%w: authentication failed", appErrors.ErrUnauthorized)
 	}
-
 	if !admin.IsActive {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -1204,17 +845,28 @@ func (s *AdminService) AuthenticateAdmin(ctx context.Context, phone string) (*mo
 			ErrorCode: "ACCOUNT_DEACTIVATED",
 			Duration:  int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("admin account is deactivated")
+		return nil, appErrors.ErrAdminInactive
 	}
-
-	// Update last login
 	if err := s.adminRepo.UpdateAdminLastLogin(ctx, admin.AdminID); err != nil {
-		s.logger.Warn("Failed to update last login",
-			zap.String("admin_id", admin.AdminID.String()),
-			zap.Error(err),
-		)
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_authenticate",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Failed to update last login",
+			},
+			AdminID:      admin.AdminID.String(),
+			Action:       "authenticate_admin",
+			Status:       "partial_failure",
+			ErrorCode:    "LAST_LOGIN_UPDATE_FAILED",
+			ErrorMessage: err.Error(),
+			Duration:     int64(time.Since(startTime).Milliseconds()),
+		})
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -1231,15 +883,16 @@ func (s *AdminService) AuthenticateAdmin(ctx context.Context, phone string) (*mo
 		Status:   "success",
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_auth", "authenticate", "admin_user",
+			&admin.AdminID, "system", nil, nil, nil, map[string]interface{}{
+				"status": "success",
+			})
+	}
 	return admin, nil
 }
-func (s *AdminService) AuthenticateAdminWithSession(
-	ctx context.Context,
-	phone string,
-	deviceID string,
-	ipAddress string,
-) (*models.AdminUser, string, error) {
+
+func (s *AdminService) AuthenticateAdminWithSession(ctx context.Context, phone string, deviceID string, ipAddress string) (*models.AdminUser, string, error) {
 	startTime := time.Now()
 	admin, err := s.AuthenticateAdmin(ctx, phone)
 	if err != nil {
@@ -1248,12 +901,28 @@ func (s *AdminService) AuthenticateAdminWithSession(
 
 	adminWithPerms, err := s.adminRepo.GetAdminWithPermissions(ctx, admin.AdminID)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to get admin permissions: %w", err)
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_session_create",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "error",
+				Message:     "Failed to get admin permissions",
+			},
+			AdminID:      admin.AdminID.String(),
+			Action:       "create_admin_session",
+			Status:       "failed",
+			ErrorCode:    "GET_PERMISSIONS_FAILED",
+			ErrorMessage: err.Error(),
+			Duration:     int64(time.Since(startTime).Milliseconds()),
+		})
+		return nil, "", fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	var permissionMask []uint64
 	if len(adminWithPerms.Permissions) > 0 {
-		// Convert []models.Permission to []*models.Permission
 		perms := make([]*models.Permission, len(adminWithPerms.Permissions))
 		for i := range adminWithPerms.Permissions {
 			perms[i] = &adminWithPerms.Permissions[i]
@@ -1263,13 +932,12 @@ func (s *AdminService) AuthenticateAdminWithSession(
 
 	sessionReq := &CreateAdminSessionRequest{
 		AdminID:           admin.AdminID,
-		Role:              adminWithPerms.GetRoleString(), // Use role string
+		Role:              adminWithPerms.GetRoleString(),
 		DeviceID:          deviceID,
 		DeviceFingerprint: "admin-web",
 		IPAddress:         ipAddress,
 		PermissionMask:    permissionMask,
 	}
-
 	session, err := s.sessionService.CreateAdminSession(ctx, sessionReq)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -1290,7 +958,7 @@ func (s *AdminService) AuthenticateAdminWithSession(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, "", fmt.Errorf("failed to create admin session: %w", err)
+		return nil, "", fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -1309,48 +977,88 @@ func (s *AdminService) AuthenticateAdminWithSession(
 		Status:   "success",
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_auth", "create_session", "admin_user",
+			&admin.AdminID, "admin", &admin.AdminID, nil, nil, map[string]interface{}{
+				"device_id": deviceID,
+				"ip":        ipAddress,
+			})
+	}
 	return admin, session.SessionToken, nil
 }
 
-// ================================
-// ADMIN STATUS MANAGEMENT METHODS
-// ================================
+// --------------------------------------------------------------------
+//  ACTIVATION / DEACTIVATION
+// --------------------------------------------------------------------
 
-// DeactivateAdmin deactivates an admin user
 func (s *AdminService) DeactivateAdmin(ctx context.Context, adminID uuid.UUID, deactivatedBy uuid.UUID) error {
 	startTime := time.Now()
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("deactivate-%s", adminID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+	ip, _ := ctx.Value("ip_address").(string)
 
-	// Get target admin
 	admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
 	if err != nil {
-		return fmt.Errorf("admin not found: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrNotFound, err)
 	}
-
-	// Check if already inactive
 	if !admin.IsActive {
-		return fmt.Errorf("admin is already inactive")
+		return appErrors.ErrInvalidState
 	}
-
-	// Get deactivator admin
 	deactivator, err := s.adminRepo.GetAdminByID(ctx, deactivatedBy)
 	if err != nil {
-		return fmt.Errorf("deactivator not found: %w", err)
+		return fmt.Errorf("%w: deactivator not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions
-	if !deactivator.IsOwner() && !deactivator.IsSuperEmployee() {
-		if !s.canManageAdmin(deactivator, admin) {
-			return fmt.Errorf("unauthorized: cannot deactivate this admin")
-		}
+	if !deactivator.IsOwner() && !deactivator.IsSuperEmployee() && !s.canManageAdmin(deactivator, admin) {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_deactivate",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized deactivation attempt",
+			},
+			AdminID:      deactivatedBy.String(),
+			TargetUserID: adminID.String(),
+			Action:       "deactivate_admin",
+			Status:       "failed",
+			ErrorCode:    "UNAUTHORIZED",
+			Duration:     int64(time.Since(startTime).Milliseconds()),
+		})
+		return appErrors.ErrPermissionDenied
 	}
-
-	// Check if trying to deactivate super admin
 	if admin.IsSuperAdmin() {
-		return fmt.Errorf("cannot deactivate super admin")
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_deactivate",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Cannot deactivate super admin",
+			},
+			AdminID:      deactivatedBy.String(),
+			TargetUserID: adminID.String(),
+			Action:       "deactivate_admin",
+			Status:       "failed",
+			ErrorCode:    "SUPER_ADMIN_REQUIRED",
+			Duration:     int64(time.Since(startTime).Milliseconds()),
+		})
+		return appErrors.ErrSuperAdminRequired
 	}
 
-	// Deactivate admin
+	beforeJSON, _ := json.Marshal(admin)
+
 	if err := s.adminRepo.DeactivateAdmin(ctx, adminID); err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -1371,7 +1079,7 @@ func (s *AdminService) DeactivateAdmin(ctx context.Context, adminID uuid.UUID, d
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return fmt.Errorf("failed to deactivate admin: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -1394,38 +1102,63 @@ func (s *AdminService) DeactivateAdmin(ctx context.Context, adminID uuid.UUID, d
 		Duration:     int64(time.Since(startTime).Milliseconds()),
 	})
 
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "deactivate", "admin_user",
+			&adminID, "admin", &deactivatedBy, beforeJSON, nil, map[string]interface{}{
+				"ip": ip,
+			})
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
-// ActivateAdmin activates an admin user
 func (s *AdminService) ActivateAdmin(ctx context.Context, adminID uuid.UUID, activatedBy uuid.UUID) error {
 	startTime := time.Now()
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("activate-%s", adminID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+	ip, _ := ctx.Value("ip_address").(string)
 
-	// Get target admin
 	admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
 	if err != nil {
-		return fmt.Errorf("admin not found: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrNotFound, err)
 	}
-
-	// Check if already active
 	if admin.IsActive {
-		return fmt.Errorf("admin is already active")
+		return appErrors.ErrInvalidState
 	}
-
-	// Get activator admin
 	activator, err := s.adminRepo.GetAdminByID(ctx, activatedBy)
 	if err != nil {
-		return fmt.Errorf("activator not found: %w", err)
+		return fmt.Errorf("%w: activator not found", appErrors.ErrNotFound)
+	}
+	if !activator.IsOwner() && !activator.IsSuperEmployee() && !s.canManageAdmin(activator, admin) {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_activate",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized activation attempt",
+			},
+			AdminID:      activatedBy.String(),
+			TargetUserID: adminID.String(),
+			Action:       "activate_admin",
+			Status:       "failed",
+			ErrorCode:    "UNAUTHORIZED",
+			Duration:     int64(time.Since(startTime).Milliseconds()),
+		})
+		return appErrors.ErrPermissionDenied
 	}
 
-	// Check permissions
-	if !activator.IsOwner() && !activator.IsSuperEmployee() {
-		if !s.canManageAdmin(activator, admin) {
-			return fmt.Errorf("unauthorized: cannot activate this admin")
-		}
-	}
+	beforeJSON, _ := json.Marshal(admin)
 
-	// Activate admin
 	if err := s.adminRepo.ActivateAdmin(ctx, adminID); err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -1446,7 +1179,7 @@ func (s *AdminService) ActivateAdmin(ctx context.Context, adminID uuid.UUID, act
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return fmt.Errorf("failed to activate admin: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -1469,42 +1202,51 @@ func (s *AdminService) ActivateAdmin(ctx context.Context, adminID uuid.UUID, act
 		Duration:     int64(time.Since(startTime).Milliseconds()),
 	})
 
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "activate", "admin_user",
+			&adminID, "admin", &activatedBy, beforeJSON, nil, map[string]interface{}{
+				"ip": ip,
+			})
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
-// ================================
-// ADMIN PERMISSION METHODS
-// ================================
+// --------------------------------------------------------------------
+//  PERMISSION METHODS
+// --------------------------------------------------------------------
 
-// GetAdminPermissions retrieves permissions for an admin user
-func (s *AdminService) GetAdminPermissions(
-	ctx context.Context,
-	adminID uuid.UUID,
-	requesterID uuid.UUID,
-) ([]*models.Permission, error) {
+func (s *AdminService) GetAdminPermissions(ctx context.Context, adminID uuid.UUID, requesterID uuid.UUID) ([]*models.Permission, error) {
 	startTime := time.Now()
-
-	// Get requester admin
 	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
 	if err != nil {
-		return nil, fmt.Errorf("requester not found: %w", err)
+		return nil, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
-	// Get target admin
 	targetAdmin, err := s.adminRepo.GetAdminByID(ctx, adminID)
 	if err != nil {
-		return nil, fmt.Errorf("admin not found: %w", err)
+		return nil, fmt.Errorf("%w: admin not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions
-	if requester.AdminID != adminID {
-		if !requester.IsOwner() && !requester.IsSuperEmployee() {
-			if !s.canManageAdmin(requester, targetAdmin) {
-				return nil, fmt.Errorf("unauthorized: cannot view this admin's permissions")
-			}
-		}
+	if requester.AdminID != adminID && !requester.IsOwner() && !requester.IsSuperEmployee() && !s.canManageAdmin(requester, targetAdmin) {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_permissions_get",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized permission view",
+			},
+			AdminID:      requesterID.String(),
+			TargetUserID: adminID.String(),
+			Action:       "get_admin_permissions",
+			Status:       "failed",
+			ErrorCode:    "UNAUTHORIZED",
+			Duration:     int64(time.Since(startTime).Milliseconds()),
+		})
+		return nil, appErrors.ErrPermissionDenied
 	}
-
 	permissions, err := s.adminRepo.GetAdminUserPermissions(ctx, adminID)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -1526,9 +1268,8 @@ func (s *AdminService) GetAdminPermissions(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("failed to get admin permissions: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -1551,19 +1292,18 @@ func (s *AdminService) GetAdminPermissions(
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "get_permissions", "admin_user",
+			&adminID, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"count": len(permissions),
+			})
+	}
 	return permissions, nil
 }
 
-// CheckAdminPermission checks if an admin has a specific permission
-func (s *AdminService) CheckAdminPermission(
-	ctx context.Context,
-	adminID uuid.UUID,
-	permissionName string,
-) (bool, error) {
+func (s *AdminService) CheckAdminPermission(ctx context.Context, adminID uuid.UUID, permissionName string) (bool, error) {
 	startTime := time.Now()
-
-	hasPermission, err := s.adminRepo.AdminHasPermission(ctx, adminID, permissionName)
+	has, err := s.adminRepo.AdminHasPermission(ctx, adminID, permissionName)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -1583,9 +1323,8 @@ func (s *AdminService) CheckAdminPermission(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return false, fmt.Errorf("failed to check admin permission: %w", err)
+		return false, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -1602,57 +1341,63 @@ func (s *AdminService) CheckAdminPermission(
 		Status:  "success",
 		Changes: map[string]interface{}{
 			"permission":     permissionName,
-			"has_permission": hasPermission,
+			"has_permission": has,
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
-	return hasPermission, nil
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "check_permission", "admin_user",
+			&adminID, "system", nil, nil, nil, map[string]interface{}{
+				"permission": permissionName,
+				"has":        has,
+			})
+	}
+	return has, nil
 }
 
-// ================================
-// ADMIN DEPARTMENT METHODS
-// ================================
+// --------------------------------------------------------------------
+//  DEPARTMENT & ROLE DEPARTMENT METHODS
+// --------------------------------------------------------------------
 
-// GetAdminRoleDepartments retrieves departments for an admin role
-func (s *AdminService) GetAdminRoleDepartments(
-	ctx context.Context,
-	roleID uuid.UUID,
-	requesterID uuid.UUID,
-) ([]*models.SystemDepartment, error) {
+func (s *AdminService) GetAdminRoleDepartments(ctx context.Context, roleID uuid.UUID, requesterID uuid.UUID) ([]*models.SystemDepartment, error) {
 	startTime := time.Now()
-
-	// Get requester admin
 	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
 	if err != nil {
-		return nil, fmt.Errorf("requester not found: %w", err)
+		return nil, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
-	// Get role
 	role, err := s.adminRepo.GetAdminRole(ctx, roleID)
 	if err != nil {
-		return nil, fmt.Errorf("admin role not found: %w", err)
+		return nil, fmt.Errorf("%w: role not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions
 	if !requester.IsOwner() && !requester.IsSuperEmployee() {
-		// Check if requester can view this role's departments
-		roleDepartments, err := s.adminRepo.GetAdminRoleDepartments(ctx, roleID)
+		roleDepts, err := s.adminRepo.GetAdminRoleDepartments(ctx, roleID)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get role departments: %w", err)
+			return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 		}
-
-		for _, dept := range roleDepartments {
-			hasAccess, err := s.adminRepo.AdminHasDepartmentAccess(ctx, requesterID, dept.Bitmask)
-			if err != nil {
-				return nil, fmt.Errorf("failed to check department access: %w", err)
-			}
-			if !hasAccess {
-				return nil, fmt.Errorf("unauthorized: cannot view departments for this role")
+		for _, dept := range roleDepts {
+			has, err := s.adminRepo.AdminHasDepartmentAccess(ctx, requesterID, dept.Bitmask)
+			if err != nil || !has {
+				s.logAdminEvent(ctx, &models.AdminLogEvent{
+					LogEnvelope: models.LogEnvelope{
+						EventID:     uuid.New().String(),
+						EventType:   "admin_role_departments_get",
+						ServiceName: "auth-service",
+						Timestamp:   time.Now(),
+						Environment: "production",
+						Version:     "v1.0.0",
+						Level:       "warning",
+						Message:     "Unauthorized department view",
+					},
+					AdminID:   requesterID.String(),
+					Action:    "get_admin_role_departments",
+					Status:    "failed",
+					ErrorCode: "UNAUTHORIZED",
+					Duration:  int64(time.Since(startTime).Milliseconds()),
+				})
+				return nil, appErrors.ErrPermissionDenied
 			}
 		}
 	}
-
 	departments, err := s.adminRepo.GetAdminRoleDepartments(ctx, roleID)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -1673,9 +1418,8 @@ func (s *AdminService) GetAdminRoleDepartments(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("failed to get admin role departments: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -1698,62 +1442,70 @@ func (s *AdminService) GetAdminRoleDepartments(
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_role", "get_departments", "admin_role",
+			&roleID, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"count": len(departments),
+			})
+	}
 	return departments, nil
 }
 
-// AssignDepartmentToAdminRole assigns a department to an admin role
-func (s *AdminService) AssignDepartmentToAdminRole(
-	ctx context.Context,
-	roleID uuid.UUID,
-	departmentID uuid.UUID,
-	assignedBy uuid.UUID,
-) error {
+func (s *AdminService) AssignDepartmentToAdminRole(ctx context.Context, roleID uuid.UUID, departmentID uuid.UUID, assignedBy uuid.UUID) error {
 	startTime := time.Now()
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("assign_dept-%s-%s", roleID.String(), departmentID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+	ip, _ := ctx.Value("ip_address").(string)
 
-	// Get assigner admin
 	assigner, err := s.adminRepo.GetAdminByID(ctx, assignedBy)
 	if err != nil {
-		return fmt.Errorf("assigner not found: %w", err)
+		return fmt.Errorf("%w: assigner not found", appErrors.ErrNotFound)
 	}
-
-	// Get role
 	role, err := s.adminRepo.GetAdminRole(ctx, roleID)
 	if err != nil {
-		return fmt.Errorf("admin role not found: %w", err)
+		return fmt.Errorf("%w: role not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions
-	if !assigner.IsOwner() {
-		if role.RoleType == models.RoleTypeManager {
-			if !assigner.IsSuperEmployee() {
-				return fmt.Errorf("unauthorized: only owner or super employee can assign departments to manager roles")
-			}
-		}
+	if !assigner.IsOwner() && role.RoleType == models.RoleTypeManager && !assigner.IsSuperEmployee() {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_role_department_assign",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized department assignment",
+			},
+			AdminID:   assignedBy.String(),
+			Action:    "assign_department_to_admin_role",
+			Status:    "failed",
+			ErrorCode: "UNAUTHORIZED",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
+		})
+		return appErrors.ErrPermissionDenied
 	}
-
-	// Check if assigner has access to this department
 	if !assigner.IsOwner() {
-		systemDepartments, err := s.companyRepo.GetSystemDepartments(ctx)
+		systemDepts, err := s.companyRepo.GetSystemDepartments(ctx)
 		if err != nil {
-			return fmt.Errorf("failed to get system departments: %w", err)
+			return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 		}
-
-		for _, sysDept := range systemDepartments {
+		for _, sysDept := range systemDepts {
 			if sysDept.SystemDepartmentID == departmentID {
-				hasAccess, err := s.adminRepo.AdminHasDepartmentAccess(ctx, assignedBy, sysDept.Bitmask)
-				if err != nil {
-					return fmt.Errorf("failed to check department access: %w", err)
-				}
-				if !hasAccess {
-					return fmt.Errorf("assigner does not have access to department: %s", sysDept.Name)
+				has, err := s.adminRepo.AdminHasDepartmentAccess(ctx, assignedBy, sysDept.Bitmask)
+				if err != nil || !has {
+					return appErrors.ErrPermissionDenied
 				}
 				break
 			}
 		}
 	}
-
-	// Assign department to role
 	if err := s.adminRepo.AssignDepartmentToAdminRole(ctx, roleID, departmentID); err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -1773,9 +1525,8 @@ func (s *AdminService) AssignDepartmentToAdminRole(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return fmt.Errorf("failed to assign department to admin role: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -1799,62 +1550,72 @@ func (s *AdminService) AssignDepartmentToAdminRole(
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_role", "assign_department", "admin_role",
+			&roleID, "admin", &assignedBy, nil, nil, map[string]interface{}{
+				"department_id": departmentID.String(),
+				"ip":            ip,
+			})
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
-// RemoveDepartmentFromAdminRole removes a department from an admin role
-func (s *AdminService) RemoveDepartmentFromAdminRole(
-	ctx context.Context,
-	roleID uuid.UUID,
-	departmentID uuid.UUID,
-	removedBy uuid.UUID,
-) error {
+func (s *AdminService) RemoveDepartmentFromAdminRole(ctx context.Context, roleID uuid.UUID, departmentID uuid.UUID, removedBy uuid.UUID) error {
 	startTime := time.Now()
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("remove_dept-%s-%s", roleID.String(), departmentID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+	ip, _ := ctx.Value("ip_address").(string)
 
-	// Get remover admin
 	remover, err := s.adminRepo.GetAdminByID(ctx, removedBy)
 	if err != nil {
-		return fmt.Errorf("remover not found: %w", err)
+		return fmt.Errorf("%w: remover not found", appErrors.ErrNotFound)
 	}
-
-	// Get role
 	role, err := s.adminRepo.GetAdminRole(ctx, roleID)
 	if err != nil {
-		return fmt.Errorf("admin role not found: %w", err)
+		return fmt.Errorf("%w: role not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions
-	if !remover.IsOwner() {
-		if role.RoleType == models.RoleTypeManager {
-			if !remover.IsSuperEmployee() {
-				return fmt.Errorf("unauthorized: only owner or super employee can remove departments from manager roles")
-			}
-		}
+	if !remover.IsOwner() && role.RoleType == models.RoleTypeManager && !remover.IsSuperEmployee() {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_role_department_remove",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized department removal",
+			},
+			AdminID:   removedBy.String(),
+			Action:    "remove_department_from_admin_role",
+			Status:    "failed",
+			ErrorCode: "UNAUTHORIZED",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
+		})
+		return appErrors.ErrPermissionDenied
 	}
-
-	// Check if remover has access to this department
 	if !remover.IsOwner() {
-		systemDepartments, err := s.companyRepo.GetSystemDepartments(ctx)
+		systemDepts, err := s.companyRepo.GetSystemDepartments(ctx)
 		if err != nil {
-			return fmt.Errorf("failed to get system departments: %w", err)
+			return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 		}
-
-		for _, sysDept := range systemDepartments {
+		for _, sysDept := range systemDepts {
 			if sysDept.SystemDepartmentID == departmentID {
-				hasAccess, err := s.adminRepo.AdminHasDepartmentAccess(ctx, removedBy, sysDept.Bitmask)
-				if err != nil {
-					return fmt.Errorf("failed to check department access: %w", err)
-				}
-				if !hasAccess {
-					return fmt.Errorf("remover does not have access to department: %s", sysDept.Name)
+				has, err := s.adminRepo.AdminHasDepartmentAccess(ctx, removedBy, sysDept.Bitmask)
+				if err != nil || !has {
+					return appErrors.ErrPermissionDenied
 				}
 				break
 			}
 		}
 	}
-
-	// Remove department from role
 	if err := s.adminRepo.RemoveDepartmentFromAdminRole(ctx, roleID, departmentID); err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -1874,9 +1635,8 @@ func (s *AdminService) RemoveDepartmentFromAdminRole(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return fmt.Errorf("failed to remove department from admin role: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -1900,139 +1660,90 @@ func (s *AdminService) RemoveDepartmentFromAdminRole(
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_role", "remove_department", "admin_role",
+			&roleID, "admin", &removedBy, nil, nil, map[string]interface{}{
+				"department_id": departmentID.String(),
+				"ip":            ip,
+			})
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
-// ================================
-// ADMIN SEARCH METHODS
-// ================================
+// --------------------------------------------------------------------
+//  REPORTING STRUCTURE
+// --------------------------------------------------------------------
 
-// SearchAdminRoles searches for admin roles
-func (s *AdminService) SearchAdminRoles(
-	ctx context.Context,
-	query string,
-	requesterID uuid.UUID,
-	limit int,
-	offset int,
-) ([]*models.AdminRole, int, error) {
+func (s *AdminService) UpdateAdminReportsTo(ctx context.Context, adminID uuid.UUID, reportsTo *uuid.UUID, updatedBy uuid.UUID) error {
 	startTime := time.Now()
-
-	// Get requester admin
-	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
-	if err != nil {
-		return nil, 0, fmt.Errorf("requester not found: %w", err)
+	if adminID == uuid.Nil {
+		return appErrors.ErrInvalidInput
 	}
-
-	// Check permissions
-	if !requester.IsOwner() && !requester.IsSuperEmployee() {
-		return nil, 0, fmt.Errorf("unauthorized: cannot search admin roles")
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("update_reports-%s", adminID.String())
 	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+	ip, _ := ctx.Value("ip_address").(string)
 
-	roles, totalCount, err := s.adminRepo.SearchAdminRoles(ctx, query, nil, limit, offset)
+	assigner, err := s.adminRepo.GetAdminByID(ctx, updatedBy)
 	if err != nil {
+		return fmt.Errorf("%w: assigner not found", appErrors.ErrNotFound)
+	}
+	targetAdmin, err := s.adminRepo.GetAdminByID(ctx, adminID)
+	if err != nil {
+		return fmt.Errorf("%w: target not found", appErrors.ErrNotFound)
+	}
+	if !assigner.IsOwner() && !assigner.IsSuperEmployee() && !s.canManageAdmin(assigner, targetAdmin) {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
 				EventID:     uuid.New().String(),
-				EventType:   "admin_roles_search",
+				EventType:   "admin_reports_to_update",
 				ServiceName: "auth-service",
 				Timestamp:   time.Now(),
 				Environment: "production",
 				Version:     "v1.0.0",
-				Level:       "error",
-				Message:     "Failed to search admin roles",
+				Level:       "warning",
+				Message:     "Unauthorized reports_to update",
 			},
-			AdminID:      requesterID.String(),
-			Action:       "search_admin_roles",
+			AdminID:      updatedBy.String(),
+			TargetUserID: adminID.String(),
+			Action:       "update_admin_reports_to",
 			Status:       "failed",
-			ErrorCode:    "SEARCH_FAILED",
-			ErrorMessage: err.Error(),
+			ErrorCode:    "UNAUTHORIZED",
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, 0, fmt.Errorf("failed to search admin roles: %w", err)
-	}
-
-	s.logAdminEvent(ctx, &models.AdminLogEvent{
-		LogEnvelope: models.LogEnvelope{
-			EventID:     uuid.New().String(),
-			EventType:   "admin_roles_search",
-			ServiceName: "auth-service",
-			Timestamp:   time.Now(),
-			Environment: "production",
-			Version:     "v1.0.0",
-			Level:       "info",
-			Message:     "Admin roles search completed",
-		},
-		AdminID: requesterID.String(),
-		Action:  "search_admin_roles",
-		Status:  "success",
-		Changes: map[string]interface{}{
-			"query":       query,
-			"limit":       limit,
-			"offset":      offset,
-			"results":     len(roles),
-			"total_count": totalCount,
-		},
-		Duration: int64(time.Since(startTime).Milliseconds()),
-	})
-
-	return roles, totalCount, nil
-}
-
-// ================================
-// ADMIN REPORTS TO METHODS
-// ================================
-func (s *AdminService) UpdateAdminReportsTo(
-	ctx context.Context,
-	adminID uuid.UUID,
-	reportsTo *uuid.UUID,
-	updatedBy uuid.UUID,
-) error {
-	startTime := time.Now()
-	if adminID == uuid.Nil {
-		return fmt.Errorf("admin ID cannot be empty")
-	}
-
-	assigner, err := s.adminRepo.GetAdminByID(ctx, updatedBy)
-	if err != nil {
-		return fmt.Errorf("assigner not found: %w", err)
-	}
-
-	targetAdmin, err := s.adminRepo.GetAdminByID(ctx, adminID)
-	if err != nil {
-		return fmt.Errorf("target admin not found: %w", err)
-	}
-
-	if !assigner.IsOwner() && !assigner.IsSuperEmployee() {
-		if !s.canManageAdmin(assigner, targetAdmin) {
-			return fmt.Errorf("unauthorized: cannot update reports_to for this admin")
-		}
+		return appErrors.ErrPermissionDenied
 	}
 
 	var reportsToAdmin *models.AdminUser
 	if reportsTo != nil {
 		reportsToAdmin, err = s.adminRepo.GetAdminByID(ctx, *reportsTo)
 		if err != nil {
-			return fmt.Errorf("reports_to admin not found: %w", err)
+			return fmt.Errorf("%w: reports_to admin not found", appErrors.ErrNotFound)
 		}
 		if reportsToAdmin.RoleType < targetAdmin.RoleType {
-			return fmt.Errorf("reports_to admin must have higher or equal role level")
+			return appErrors.ErrInvalidInput
 		}
 		if *reportsTo == adminID {
-			return fmt.Errorf("admin cannot report to themselves")
+			return appErrors.ErrInvalidInput
 		}
-
-		reportingChain, err := s.adminRepo.GetReportingChain(ctx, *reportsTo)
+		chain, err := s.adminRepo.GetReportingChain(ctx, *reportsTo)
 		if err != nil {
-			return fmt.Errorf("failed to check reporting chain: %w", err)
+			return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 		}
-		for _, chainAdmin := range reportingChain {
-			if chainAdmin.AdminID == adminID {
-				return fmt.Errorf("circular reporting chain detected")
+		for _, ca := range chain {
+			if ca.AdminID == adminID {
+				return appErrors.ErrInvalidInput
 			}
 		}
 	}
 
+	beforeJSON, _ := json.Marshal(targetAdmin)
 	if err := s.adminRepo.UpdateAdminReportsTo(ctx, adminID, reportsTo); err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -2053,8 +1764,9 @@ func (s *AdminService) UpdateAdminReportsTo(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return fmt.Errorf("failed to update reports_to: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
+	afterJSON, _ := json.Marshal(targetAdmin)
 
 	var oldReportsToStr, newReportsToStr string
 	if targetAdmin.ReportsTo != nil {
@@ -2063,8 +1775,6 @@ func (s *AdminService) UpdateAdminReportsTo(
 	if reportsTo != nil {
 		newReportsToStr = reportsTo.String()
 	}
-
-	// Fix: Use the reportsToAdmin variable
 	var reportsToRole string
 	if reportsToAdmin != nil {
 		reportsToRole = reportsToAdmin.GetRoleString()
@@ -2091,57 +1801,65 @@ func (s *AdminService) UpdateAdminReportsTo(
 			"old_reports_to":  oldReportsToStr,
 			"new_reports_to":  newReportsToStr,
 			"target_role":     targetAdmin.GetRoleString(),
-			"reports_to_role": reportsToRole, // Now using the variable
+			"reports_to_role": reportsToRole,
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "update_reports_to", "admin_user",
+			&adminID, "admin", &updatedBy, beforeJSON, afterJSON, map[string]interface{}{
+				"ip": ip,
+			})
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
-// GetDirectReports gets direct reports for an admin
-func (s *AdminService) GetDirectReports(
-	ctx context.Context,
-	adminID uuid.UUID,
-	requesterID uuid.UUID,
-) ([]*models.AdminUser, error) {
+func (s *AdminService) GetDirectReports(ctx context.Context, adminID uuid.UUID, requesterID uuid.UUID) ([]*models.AdminUser, error) {
 	startTime := time.Now()
-
-	// Get requester admin
 	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
 	if err != nil {
-		return nil, fmt.Errorf("requester not found: %w", err)
+		return nil, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
-	// Get target admin
 	targetAdmin, err := s.adminRepo.GetAdminByID(ctx, adminID)
 	if err != nil {
-		return nil, fmt.Errorf("target admin not found: %w", err)
+		return nil, fmt.Errorf("%w: target not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions
-	if requester.AdminID != adminID {
-		if !requester.IsOwner() && !requester.IsSuperEmployee() {
-			// Check if requester is in the reporting chain
-			reportingChain, err := s.adminRepo.GetReportingChain(ctx, adminID)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get reporting chain: %w", err)
-			}
-
-			requesterInChain := false
-			for _, chainAdmin := range reportingChain {
-				if chainAdmin.AdminID == requesterID {
-					requesterInChain = true
-					break
-				}
-			}
-
-			if !requesterInChain {
-				return nil, fmt.Errorf("unauthorized: cannot view direct reports for this admin")
+	if requester.AdminID != adminID && !requester.IsOwner() && !requester.IsSuperEmployee() {
+		chain, err := s.adminRepo.GetReportingChain(ctx, adminID)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+		}
+		found := false
+		for _, ca := range chain {
+			if ca.AdminID == requesterID {
+				found = true
+				break
 			}
 		}
+		if !found {
+			s.logAdminEvent(ctx, &models.AdminLogEvent{
+				LogEnvelope: models.LogEnvelope{
+					EventID:     uuid.New().String(),
+					EventType:   "admin_direct_reports_get",
+					ServiceName: "auth-service",
+					Timestamp:   time.Now(),
+					Environment: "production",
+					Version:     "v1.0.0",
+					Level:       "warning",
+					Message:     "Unauthorized direct reports view",
+				},
+				AdminID:      requesterID.String(),
+				TargetUserID: adminID.String(),
+				Action:       "get_direct_reports",
+				Status:       "failed",
+				ErrorCode:    "UNAUTHORIZED",
+				Duration:     int64(time.Since(startTime).Milliseconds()),
+			})
+			return nil, appErrors.ErrPermissionDenied
+		}
 	}
-
-	directReports, err := s.adminRepo.GetDirectReports(ctx, adminID)
+	reports, err := s.adminRepo.GetDirectReports(ctx, adminID)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -2162,9 +1880,8 @@ func (s *AdminService) GetDirectReports(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("failed to get direct reports: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -2183,59 +1900,65 @@ func (s *AdminService) GetDirectReports(
 		ResourceID:   adminID.String(),
 		Status:       "success",
 		Changes: map[string]interface{}{
-			"direct_reports_count": len(directReports),
+			"direct_reports_count": len(reports),
 			"target_role":          targetAdmin.GetRoleString(),
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
-	return directReports, nil
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "get_direct_reports", "admin_user",
+			&adminID, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"count": len(reports),
+			})
+	}
+	return reports, nil
 }
 
-// GetReportingChain gets the reporting chain for an admin
-func (s *AdminService) GetReportingChain(
-	ctx context.Context,
-	adminID uuid.UUID,
-	requesterID uuid.UUID,
-) ([]*models.AdminUser, error) {
+func (s *AdminService) GetReportingChain(ctx context.Context, adminID uuid.UUID, requesterID uuid.UUID) ([]*models.AdminUser, error) {
 	startTime := time.Now()
-
-	// Get requester admin
 	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
 	if err != nil {
-		return nil, fmt.Errorf("requester not found: %w", err)
+		return nil, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
-	// Get target admin
 	targetAdmin, err := s.adminRepo.GetAdminByID(ctx, adminID)
 	if err != nil {
-		return nil, fmt.Errorf("target admin not found: %w", err)
+		return nil, fmt.Errorf("%w: target not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions
-	if requester.AdminID != adminID {
-		if !requester.IsOwner() && !requester.IsSuperEmployee() {
-			// Check if requester is in the reporting chain
-			reportingChain, err := s.adminRepo.GetReportingChain(ctx, adminID)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get reporting chain: %w", err)
-			}
-
-			requesterInChain := false
-			for _, chainAdmin := range reportingChain {
-				if chainAdmin.AdminID == requesterID {
-					requesterInChain = true
-					break
-				}
-			}
-
-			if !requesterInChain {
-				return nil, fmt.Errorf("unauthorized: cannot view reporting chain for this admin")
+	if requester.AdminID != adminID && !requester.IsOwner() && !requester.IsSuperEmployee() {
+		chain, err := s.adminRepo.GetReportingChain(ctx, adminID)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+		}
+		found := false
+		for _, ca := range chain {
+			if ca.AdminID == requesterID {
+				found = true
+				break
 			}
 		}
+		if !found {
+			s.logAdminEvent(ctx, &models.AdminLogEvent{
+				LogEnvelope: models.LogEnvelope{
+					EventID:     uuid.New().String(),
+					EventType:   "admin_reporting_chain_get",
+					ServiceName: "auth-service",
+					Timestamp:   time.Now(),
+					Environment: "production",
+					Version:     "v1.0.0",
+					Level:       "warning",
+					Message:     "Unauthorized reporting chain view",
+				},
+				AdminID:      requesterID.String(),
+				TargetUserID: adminID.String(),
+				Action:       "get_reporting_chain",
+				Status:       "failed",
+				ErrorCode:    "UNAUTHORIZED",
+				Duration:     int64(time.Since(startTime).Milliseconds()),
+			})
+			return nil, appErrors.ErrPermissionDenied
+		}
 	}
-
-	reportingChain, err := s.adminRepo.GetReportingChain(ctx, adminID)
+	chain, err := s.adminRepo.GetReportingChain(ctx, adminID)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -2256,9 +1979,8 @@ func (s *AdminService) GetReportingChain(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("failed to get reporting chain: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -2277,82 +1999,82 @@ func (s *AdminService) GetReportingChain(
 		ResourceID:   adminID.String(),
 		Status:       "success",
 		Changes: map[string]interface{}{
-			"reporting_chain_size": len(reportingChain),
+			"reporting_chain_size": len(chain),
 			"target_role":          targetAdmin.GetRoleString(),
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
-	return reportingChain, nil
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "get_reporting_chain", "admin_user",
+			&adminID, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"depth": len(chain),
+			})
+	}
+	return chain, nil
 }
 
-// ================================
-// ADMIN PROFILE METHODS
-// ================================
+// --------------------------------------------------------------------
+//  PROFILE & PHONE UPDATES
+// --------------------------------------------------------------------
 
-// UpdateAdminProfile updates an admin's profile
-func (s *AdminService) UpdateAdminProfile(
-	ctx context.Context,
-	adminID uuid.UUID,
-	username string,
-	fullName string,
-	updatedBy uuid.UUID,
-) error {
+func (s *AdminService) UpdateAdminProfile(ctx context.Context, adminID uuid.UUID, username string, fullName string, updatedBy uuid.UUID) error {
 	startTime := time.Now()
-
-	if adminID == uuid.Nil {
-		return fmt.Errorf("admin ID cannot be empty")
+	if adminID == uuid.Nil || username == "" || fullName == "" {
+		return appErrors.ErrInvalidInput
 	}
-	if username == "" {
-		return fmt.Errorf("username cannot be empty")
-	}
-	if fullName == "" {
-		return fmt.Errorf("full name cannot be empty")
-	}
-
-	// Validate username format
 	if !isValidUsername(username) {
-		return fmt.Errorf("invalid username format. Must be 3-50 characters, alphanumeric with underscores")
+		return appErrors.ErrInvalidInput
 	}
-
-	// Validate full name length
 	if len(fullName) < 2 || len(fullName) > 100 {
-		return fmt.Errorf("full name must be between 2 and 100 characters")
+		return appErrors.ErrInvalidInput
 	}
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("profile-%s", adminID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+	ip, _ := ctx.Value("ip_address").(string)
 
-	// Get updater admin
 	updater, err := s.adminRepo.GetAdminByID(ctx, updatedBy)
 	if err != nil {
-		return fmt.Errorf("updater not found: %w", err)
+		return fmt.Errorf("%w: updater not found", appErrors.ErrNotFound)
 	}
-
-	// Get target admin
 	targetAdmin, err := s.adminRepo.GetAdminByID(ctx, adminID)
 	if err != nil {
-		return fmt.Errorf("target admin not found: %w", err)
+		return fmt.Errorf("%w: target not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions
-	if updater.AdminID != adminID {
-		if !updater.IsOwner() && !updater.IsSuperEmployee() {
-			if !s.canManageAdmin(updater, targetAdmin) {
-				return fmt.Errorf("unauthorized: cannot update this admin's profile")
-			}
-		}
+	if updater.AdminID != adminID && !updater.IsOwner() && !updater.IsSuperEmployee() && !s.canManageAdmin(updater, targetAdmin) {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_profile_update",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized profile update",
+			},
+			AdminID:      updatedBy.String(),
+			TargetUserID: adminID.String(),
+			Action:       "update_admin_profile",
+			Status:       "failed",
+			ErrorCode:    "UNAUTHORIZED",
+			Duration:     int64(time.Since(startTime).Milliseconds()),
+		})
+		return appErrors.ErrPermissionDenied
 	}
-
-	// Check if username is taken
 	if username != targetAdmin.Username {
-		existingAdmin, _ := s.adminRepo.GetAdminByUsername(ctx, username)
-		if existingAdmin != nil {
-			return fmt.Errorf("username already taken")
+		existing, _ := s.adminRepo.GetAdminByUsername(ctx, username)
+		if existing != nil {
+			return appErrors.ErrDuplicate
 		}
 	}
 
-	oldUsername := targetAdmin.Username
-	oldFullName := targetAdmin.FullName
-
-	// Update profile
+	beforeJSON, _ := json.Marshal(targetAdmin)
 	if err := s.adminRepo.UpdateAdminProfile(ctx, adminID, username, fullName); err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -2373,8 +2095,9 @@ func (s *AdminService) UpdateAdminProfile(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return fmt.Errorf("failed to update profile: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
+	afterJSON, _ := json.Marshal(targetAdmin)
 
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
@@ -2394,77 +2117,82 @@ func (s *AdminService) UpdateAdminProfile(
 		ResourceID:   adminID.String(),
 		Status:       "success",
 		Changes: map[string]interface{}{
-			"old_username":  oldUsername,
-			"new_username":  username,
-			"old_full_name": oldFullName,
-			"new_full_name": fullName,
+			"old_username": targetAdmin.Username, // old value not persisted
+			"new_username": username,
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "update_profile", "admin_user",
+			&adminID, "admin", &updatedBy, beforeJSON, afterJSON, map[string]interface{}{
+				"new_username": username,
+				"new_fullname": fullName,
+				"ip":           ip,
+			})
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
-// UpdateAdminPhone updates an admin's phone number
-func (s *AdminService) UpdateAdminPhone(
-	ctx context.Context,
-	adminID uuid.UUID,
-	newPhone string,
-	updatedBy uuid.UUID,
-) error {
+func (s *AdminService) UpdateAdminPhone(ctx context.Context, adminID uuid.UUID, newPhone string, updatedBy uuid.UUID) error {
 	startTime := time.Now()
-
-	if adminID == uuid.Nil {
-		return fmt.Errorf("admin ID cannot be empty")
+	if adminID == uuid.Nil || newPhone == "" {
+		return appErrors.ErrInvalidInput
 	}
-	if newPhone == "" {
-		return fmt.Errorf("new phone cannot be empty")
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("phone-%s", adminID.String())
 	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+	ip, _ := ctx.Value("ip_address").(string)
 
-	// Get updater admin
 	updater, err := s.adminRepo.GetAdminByID(ctx, updatedBy)
 	if err != nil {
-		return fmt.Errorf("updater not found: %w", err)
+		return fmt.Errorf("%w: updater not found", appErrors.ErrNotFound)
 	}
-
-	// Get target admin
 	targetAdmin, err := s.adminRepo.GetAdminByID(ctx, adminID)
 	if err != nil {
-		return fmt.Errorf("target admin not found: %w", err)
+		return fmt.Errorf("%w: target not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions
-	if updater.AdminID != adminID {
-		if !updater.IsOwner() && !updater.IsSuperEmployee() {
-			if !s.canManageAdmin(updater, targetAdmin) {
-				return fmt.Errorf("unauthorized: cannot update this admin's phone")
-			}
-		}
+	if updater.AdminID != adminID && !updater.IsOwner() && !updater.IsSuperEmployee() && !s.canManageAdmin(updater, targetAdmin) {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_phone_update",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized phone update",
+			},
+			AdminID:      updatedBy.String(),
+			TargetUserID: adminID.String(),
+			Action:       "update_admin_phone",
+			Status:       "failed",
+			ErrorCode:    "UNAUTHORIZED",
+			Duration:     int64(time.Since(startTime).Milliseconds()),
+		})
+		return appErrors.ErrPermissionDenied
 	}
 
 	newPhoneHash := s.GeneratePhoneHash(newPhone)
-
-	// Check if phone already exists
-	existingAdmin, _ := s.adminRepo.GetAdminByPhoneHash(ctx, newPhoneHash)
-	if existingAdmin != nil && existingAdmin.AdminID != adminID {
-		return fmt.Errorf("phone number already exists")
+	existing, _ := s.adminRepo.GetAdminByPhoneHash(ctx, newPhoneHash)
+	if existing != nil && existing.AdminID != adminID {
+		return appErrors.ErrDuplicate
 	}
 
-	// Encrypt new phone
 	encryptedResult, err := s.encryptionMgr.EncryptField(ctx, newPhone, "phone")
 	if err != nil {
-		return fmt.Errorf("failed to encrypt new phone: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
+	keyID, _ := uuid.Parse(encryptedResult.KeyID)
+	phoneEncrypted := []byte(encryptedResult.EncryptedValue)
 
-	keyID, err := uuid.Parse(encryptedResult.KeyID)
-	if err != nil {
-		return fmt.Errorf("failed to parse key ID: %w", err)
-	}
-
-	phoneEncryptedBytes := []byte(encryptedResult.EncryptedValue)
-
-	// Update phone
-	if err := s.adminRepo.UpdateAdminPhone(ctx, adminID, newPhoneHash, phoneEncryptedBytes, keyID, encryptedResult.EncryptedDEK); err != nil {
+	if err := s.adminRepo.UpdateAdminPhone(ctx, adminID, newPhoneHash, phoneEncrypted, keyID, encryptedResult.EncryptedDEK); err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
 				EventID:     uuid.New().String(),
@@ -2484,7 +2212,7 @@ func (s *AdminService) UpdateAdminPhone(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return fmt.Errorf("failed to update admin phone: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -2506,80 +2234,89 @@ func (s *AdminService) UpdateAdminPhone(
 		Status:       "success",
 		Duration:     int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "update_phone", "admin_user",
+			&adminID, "admin", &updatedBy, nil, nil, map[string]interface{}{
+				"ip": ip,
+			})
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
-// ================================
-// ADMIN BULK OPERATIONS
-// ================================
+// --------------------------------------------------------------------
+//  BULK OPERATIONS
+// --------------------------------------------------------------------
 
-func (s *AdminService) BulkUpdateReportsTo(
-	ctx context.Context,
-	adminIDs []uuid.UUID,
-	reportsTo *uuid.UUID,
-	updatedBy uuid.UUID,
-) error {
+func (s *AdminService) BulkUpdateReportsTo(ctx context.Context, adminIDs []uuid.UUID, reportsTo *uuid.UUID, updatedBy uuid.UUID) error {
 	startTime := time.Now()
-
 	if len(adminIDs) == 0 {
-		return fmt.Errorf("no admin IDs provided")
+		return appErrors.ErrInvalidInput
 	}
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("bulk_reports-%s", uuid.New().String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+	ip, _ := ctx.Value("ip_address").(string)
 
-	// Get updater admin
 	updater, err := s.adminRepo.GetAdminByID(ctx, updatedBy)
 	if err != nil {
-		return fmt.Errorf("updater not found: %w", err)
+		return fmt.Errorf("%w: updater not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions for each admin
 	for _, adminID := range adminIDs {
 		if adminID == uuid.Nil {
-			return fmt.Errorf("invalid admin ID in list")
+			return appErrors.ErrInvalidInput
 		}
-
-		targetAdmin, err := s.adminRepo.GetAdminByID(ctx, adminID)
+		target, err := s.adminRepo.GetAdminByID(ctx, adminID)
 		if err != nil {
-			return fmt.Errorf("target admin not found: %w", err)
+			return fmt.Errorf("%w: target %s not found", appErrors.ErrNotFound, adminID)
 		}
-
-		// Check permissions
-		if !updater.IsOwner() && !updater.IsSuperEmployee() {
-			if !s.canManageAdmin(updater, targetAdmin) {
-				return fmt.Errorf("unauthorized: cannot update reports_to for admin %s", adminID)
-			}
+		if !updater.IsOwner() && !updater.IsSuperEmployee() && !s.canManageAdmin(updater, target) {
+			s.logAdminEvent(ctx, &models.AdminLogEvent{
+				LogEnvelope: models.LogEnvelope{
+					EventID:     uuid.New().String(),
+					EventType:   "admin_bulk_reports_to_update",
+					ServiceName: "auth-service",
+					Timestamp:   time.Now(),
+					Environment: "production",
+					Version:     "v1.0.0",
+					Level:       "warning",
+					Message:     "Unauthorized bulk reports_to update",
+				},
+				AdminID:   updatedBy.String(),
+				Action:    "bulk_update_reports_to",
+				Status:    "failed",
+				ErrorCode: "UNAUTHORIZED",
+				Duration:  int64(time.Since(startTime).Milliseconds()),
+			})
+			return appErrors.ErrPermissionDenied
 		}
-
-		// Check circular reporting
 		if reportsTo != nil && *reportsTo == adminID {
-			return fmt.Errorf("admin %s cannot report to themselves", adminID)
+			return appErrors.ErrInvalidInput
 		}
-
-		// If reports_to is provided, validate it
 		if reportsTo != nil {
 			reportsToAdmin, err := s.adminRepo.GetAdminByID(ctx, *reportsTo)
 			if err != nil {
-				return fmt.Errorf("reports_to admin not found: %w", err)
+				return fmt.Errorf("%w: reports_to admin not found", appErrors.ErrNotFound)
 			}
-
-			if reportsToAdmin.RoleType < targetAdmin.RoleType {
-				return fmt.Errorf("reports_to admin must have higher or equal role level for admin %s", adminID)
+			if reportsToAdmin.RoleType < target.RoleType {
+				return appErrors.ErrInvalidInput
 			}
-
-			reportingChain, err := s.adminRepo.GetReportingChain(ctx, *reportsTo)
+			chain, err := s.adminRepo.GetReportingChain(ctx, *reportsTo)
 			if err != nil {
-				return fmt.Errorf("failed to check reporting chain: %w", err)
+				return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 			}
-
-			for _, chainAdmin := range reportingChain {
-				if chainAdmin.AdminID == adminID {
-					return fmt.Errorf("circular reporting chain detected for admin %s", adminID)
+			for _, ca := range chain {
+				if ca.AdminID == adminID {
+					return appErrors.ErrInvalidInput
 				}
 			}
 		}
 	}
-
-	// Bulk update reports_to
 	if err := s.adminRepo.BulkUpdateReportsTo(ctx, adminIDs, reportsTo); err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -2599,14 +2336,12 @@ func (s *AdminService) BulkUpdateReportsTo(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return fmt.Errorf("failed to bulk update reports_to: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	var newReportsToStr string
 	if reportsTo != nil {
 		newReportsToStr = reportsTo.String()
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -2628,33 +2363,47 @@ func (s *AdminService) BulkUpdateReportsTo(
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "bulk_update_reports_to", "admin_user",
+			nil, "admin", &updatedBy, nil, nil, map[string]interface{}{
+				"admin_count": len(adminIDs),
+				"ip":          ip,
+			})
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
-// ================================
-// ADMIN LIST METHODS
-// ================================
+// --------------------------------------------------------------------
+//  LIST METHODS
+// --------------------------------------------------------------------
 
-// GetAllAdmins gets all admins with pagination
-func (s *AdminService) GetAllAdmins(
-	ctx context.Context,
-	requesterID uuid.UUID,
-	limit int,
-) ([]*models.AdminUser, error) {
+func (s *AdminService) GetAllAdmins(ctx context.Context, requesterID uuid.UUID, limit int) ([]*models.AdminUser, error) {
 	startTime := time.Now()
-
-	// Get requester admin
 	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
 	if err != nil {
-		return nil, fmt.Errorf("requester not found: %w", err)
+		return nil, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions
 	if !requester.IsOwner() && !requester.IsSuperEmployee() {
-		return nil, fmt.Errorf("unauthorized: cannot view all admins")
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_all_get",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized get all admins",
+			},
+			AdminID:   requesterID.String(),
+			Action:    "get_all_admins",
+			Status:    "failed",
+			ErrorCode: "UNAUTHORIZED",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
+		})
+		return nil, appErrors.ErrPermissionDenied
 	}
-
 	admins, err := s.adminRepo.GetAllAdmins(ctx, limit)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -2675,9 +2424,8 @@ func (s *AdminService) GetAllAdmins(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("failed to get all admins: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -2698,29 +2446,42 @@ func (s *AdminService) GetAllAdmins(
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "list_all", "admin_user",
+			nil, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"limit": limit,
+				"count": len(admins),
+			})
+	}
 	return admins, nil
 }
 
-// GetActiveAdmins gets active admins with pagination
-func (s *AdminService) GetActiveAdmins(
-	ctx context.Context,
-	requesterID uuid.UUID,
-	limit int,
-) ([]*models.AdminUser, error) {
+func (s *AdminService) GetActiveAdmins(ctx context.Context, requesterID uuid.UUID, limit int) ([]*models.AdminUser, error) {
 	startTime := time.Now()
-
-	// Get requester admin
 	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
 	if err != nil {
-		return nil, fmt.Errorf("requester not found: %w", err)
+		return nil, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions
 	if !requester.IsOwner() && !requester.IsSuperEmployee() {
-		return nil, fmt.Errorf("unauthorized: cannot view active admins")
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_active_get",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized get active admins",
+			},
+			AdminID:   requesterID.String(),
+			Action:    "get_active_admins",
+			Status:    "failed",
+			ErrorCode: "UNAUTHORIZED",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
+		})
+		return nil, appErrors.ErrPermissionDenied
 	}
-
 	admins, err := s.adminRepo.GetActiveAdmins(ctx, limit)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -2741,9 +2502,8 @@ func (s *AdminService) GetActiveAdmins(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("failed to get active admins: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -2764,51 +2524,55 @@ func (s *AdminService) GetActiveAdmins(
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "list_active", "admin_user",
+			nil, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"limit": limit,
+				"count": len(admins),
+			})
+	}
 	return admins, nil
 }
 
-// GetAdminsByRole gets admins by role with pagination
-func (s *AdminService) GetAdminsByRole(
-	ctx context.Context,
-	roleID uuid.UUID,
-	limit int,
-	offset int,
-	requesterID uuid.UUID,
-) ([]*models.AdminUserSearchResult, error) {
+func (s *AdminService) GetAdminsByRole(ctx context.Context, roleID uuid.UUID, limit int, offset int, requesterID uuid.UUID) ([]*models.AdminUserSearchResult, error) {
 	startTime := time.Now()
-
-	// Get requester admin
 	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
 	if err != nil {
-		return nil, fmt.Errorf("requester not found: %w", err)
+		return nil, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
-	// Get role
 	role, err := s.adminRepo.GetAdminRole(ctx, roleID)
 	if err != nil {
-		return nil, fmt.Errorf("admin role not found: %w", err)
+		return nil, fmt.Errorf("%w: role not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions
 	if !requester.IsOwner() && !requester.IsSuperEmployee() {
-		// Check if requester can view admins in this role
-		roleDepartments, err := s.adminRepo.GetAdminRoleDepartments(ctx, roleID)
+		depts, err := s.adminRepo.GetAdminRoleDepartments(ctx, roleID)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get role departments: %w", err)
+			return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 		}
-
-		for _, dept := range roleDepartments {
-			hasAccess, err := s.adminRepo.AdminHasDepartmentAccess(ctx, requesterID, dept.Bitmask)
-			if err != nil {
-				return nil, fmt.Errorf("failed to check department access: %w", err)
-			}
-			if !hasAccess {
-				return nil, fmt.Errorf("unauthorized: cannot view admins in this role")
+		for _, dept := range depts {
+			has, err := s.adminRepo.AdminHasDepartmentAccess(ctx, requesterID, dept.Bitmask)
+			if err != nil || !has {
+				s.logAdminEvent(ctx, &models.AdminLogEvent{
+					LogEnvelope: models.LogEnvelope{
+						EventID:     uuid.New().String(),
+						EventType:   "admin_by_role_get",
+						ServiceName: "auth-service",
+						Timestamp:   time.Now(),
+						Environment: "production",
+						Version:     "v1.0.0",
+						Level:       "warning",
+						Message:     "Unauthorized get admins by role",
+					},
+					AdminID:   requesterID.String(),
+					Action:    "get_admins_by_role",
+					Status:    "failed",
+					ErrorCode: "UNAUTHORIZED",
+					Duration:  int64(time.Since(startTime).Milliseconds()),
+				})
+				return nil, appErrors.ErrPermissionDenied
 			}
 		}
 	}
-
 	admins, err := s.adminRepo.GetAdminsByRole(ctx, roleID, false, limit, offset)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -2829,9 +2593,8 @@ func (s *AdminService) GetAdminsByRole(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("failed to get admins by role: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -2855,126 +2618,49 @@ func (s *AdminService) GetAdminsByRole(
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "list_by_role", "admin_user",
+			nil, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"role_id": roleID.String(),
+				"count":   len(admins),
+			})
+	}
 	return admins, nil
 }
 
-// // GetAdminsByRoleType gets admins by role type
-// func (s *AdminService) GetAdminsByRoleType(
-//     ctx context.Context,
-//     roleType int,
-//     requesterID uuid.UUID,
-//     includeInactive bool,
-//     limit int,
-//     offset int,
-// ) ([]*models.AdminUserSearchResult, error) {
-//     startTime := time.Now()
+// --------------------------------------------------------------------
+//  SUGGESTIONS
+// --------------------------------------------------------------------
 
-//     // Get requester admin
-//     requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
-//     if err != nil {
-//         return nil, fmt.Errorf("requester not found: %w", err)
-//     }
-
-//     // Check permissions based on role type
-//     switch roleType {
-//     case models.RoleTypeEmployee:
-//         // Employees can view other employees
-//     case models.RoleTypeManager:
-//         if !requester.IsOwner() && !requester.IsSuperEmployee() {
-//             return nil, fmt.Errorf("unauthorized: cannot view managers")
-//         }
-//     case models.RoleTypeSuperAdmin:
-//         if !requester.IsOwner() {
-//             return nil, fmt.Errorf("unauthorized: cannot view super admins")
-//         }
-//     default:
-//         return nil, fmt.Errorf("invalid role type")
-//     }
-
-//     admins, err := s.adminRepo.GetAdminsByRoleType(ctx, roleType, includeInactive, limit, offset)
-//     if err != nil {
-//         s.logAdminEvent(ctx, &models.AdminLogEvent{
-//             LogEnvelope: models.LogEnvelope{
-//                 EventID:     uuid.New().String(),
-//                 EventType:   "admin_by_role_type_get",
-//                 ServiceName: "auth-service",
-//                 Timestamp:   time.Now(),
-//                 Environment: "production",
-//                 Version:     "v1.0.0",
-//                 Level:       "error",
-//                 Message:     "Failed to get admins by role type",
-//             },
-//             AdminID:      requesterID.String(),
-//             Action:       "get_admins_by_role_type",
-//             Status:       "failed",
-//             ErrorCode:    "GET_BY_ROLE_TYPE_FAILED",
-//             ErrorMessage: err.Error(),
-//             Duration:     int64(time.Since(startTime).Milliseconds()),
-//         })
-//         return nil, fmt.Errorf("failed to get admins by role type: %w", err)
-//     }
-
-//     s.logAdminEvent(ctx, &models.AdminLogEvent{
-//         LogEnvelope: models.LogEnvelope{
-//             EventID:     uuid.New().String(),
-//             EventType:   "admin_by_role_type_get",
-//             ServiceName: "auth-service",
-//             Timestamp:   time.Now(),
-//             Environment: "production",
-//             Version:     "v1.0.0",
-//             Level:       "info",
-//             Message:     "Admins by role type retrieved successfully",
-//         },
-//         AdminID:   requesterID.String(),
-//         Action:    "get_admins_by_role_type",
-//         Status:    "success",
-//         Changes: map[string]interface{}{
-//             "role_type":        roleType,
-//             "include_inactive": includeInactive,
-//             "limit":            limit,
-//             "offset":           offset,
-//             "admin_count":      len(admins),
-//         },
-//         Duration: int64(time.Since(startTime).Milliseconds()),
-//     })
-
-//     return admins, nil
-// }
-
-// ================================
-// ADMIN SUGGESTIONS AND QUICK SEARCH
-// ================================
-
-// GetAdminSuggestions gets admin suggestions for autocomplete
-func (s *AdminService) GetAdminSuggestions(
-	ctx context.Context,
-	prefix string,
-	requesterID uuid.UUID,
-	roleTypeFilter *int,
-	excludeSuperAdmin bool,
-	limit int,
-) ([]*models.AdminSuggestion, error) {
+func (s *AdminService) GetAdminSuggestions(ctx context.Context, prefix string, requesterID uuid.UUID, roleTypeFilter *int, excludeSuperAdmin bool, limit int) ([]*models.AdminSuggestion, error) {
 	startTime := time.Now()
-
 	if prefix == "" {
-		return nil, fmt.Errorf("prefix cannot be empty")
+		return nil, appErrors.ErrInvalidInput
 	}
-
-	// Get requester admin
 	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
 	if err != nil {
-		return nil, fmt.Errorf("requester not found: %w", err)
+		return nil, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions
-	if !requester.IsOwner() && !requester.IsSuperEmployee() {
-		// Regular employees can only get suggestions for employees
-		if roleTypeFilter != nil && *roleTypeFilter != models.RoleTypeEmployee {
-			return nil, fmt.Errorf("unauthorized: cannot get suggestions for this role type")
-		}
+	if !requester.IsOwner() && !requester.IsSuperEmployee() && roleTypeFilter != nil && *roleTypeFilter != models.RoleTypeEmployee {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_suggestions_get",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized suggestions request",
+			},
+			AdminID:   requesterID.String(),
+			Action:    "get_admin_suggestions",
+			Status:    "failed",
+			ErrorCode: "UNAUTHORIZED",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
+		})
+		return nil, appErrors.ErrPermissionDenied
 	}
-
 	suggestions, err := s.adminRepo.GetAdminSuggestions(ctx, prefix, roleTypeFilter, excludeSuperAdmin, limit)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -2995,9 +2681,8 @@ func (s *AdminService) GetAdminSuggestions(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("failed to get admin suggestions: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -3021,39 +2706,51 @@ func (s *AdminService) GetAdminSuggestions(
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "suggestions", "admin_user",
+			nil, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"prefix": prefix,
+				"count":  len(suggestions),
+			})
+	}
 	return suggestions, nil
 }
 
-// GetAdminWithPermissions gets admin with permissions and departments
-func (s *AdminService) GetAdminWithPermissions(
-	ctx context.Context,
-	adminID uuid.UUID,
-	requesterID uuid.UUID,
-) (*models.AdminWithPermissions, error) {
-	startTime := time.Now()
+// --------------------------------------------------------------------
+//  ADMIN WITH PERMISSIONS
+// --------------------------------------------------------------------
 
-	// Get requester admin
+func (s *AdminService) GetAdminWithPermissions(ctx context.Context, adminID uuid.UUID, requesterID uuid.UUID) (*models.AdminWithPermissions, error) {
+	startTime := time.Now()
 	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
 	if err != nil {
-		return nil, fmt.Errorf("requester not found: %w", err)
+		return nil, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
-	// Get target admin
 	targetAdmin, err := s.adminRepo.GetAdminByID(ctx, adminID)
 	if err != nil {
-		return nil, fmt.Errorf("admin not found: %w", err)
+		return nil, fmt.Errorf("%w: target not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions
-	if requester.AdminID != adminID {
-		if !requester.IsOwner() && !requester.IsSuperEmployee() {
-			if !s.canManageAdmin(requester, targetAdmin) {
-				return nil, fmt.Errorf("unauthorized: cannot view this admin's permissions")
-			}
-		}
+	if requester.AdminID != adminID && !requester.IsOwner() && !requester.IsSuperEmployee() && !s.canManageAdmin(requester, targetAdmin) {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_with_permissions_get",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized admin with permissions view",
+			},
+			AdminID:      requesterID.String(),
+			TargetUserID: adminID.String(),
+			Action:       "get_admin_with_permissions",
+			Status:       "failed",
+			ErrorCode:    "UNAUTHORIZED",
+			Duration:     int64(time.Since(startTime).Milliseconds()),
+		})
+		return nil, appErrors.ErrPermissionDenied
 	}
-
 	adminWithPerms, err := s.adminRepo.GetAdminWithPermissions(ctx, adminID)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -3075,9 +2772,8 @@ func (s *AdminService) GetAdminWithPermissions(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("failed to get admin with permissions: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -3101,21 +2797,22 @@ func (s *AdminService) GetAdminWithPermissions(
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "get_with_perms", "admin_user",
+			&adminID, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"permissions": len(adminWithPerms.Permissions),
+				"departments": len(adminWithPerms.Departments),
+			})
+	}
 	return adminWithPerms, nil
 }
 
-// ================================
-// ADMIN FAILED LOGIN METHODS
-// ================================
+// --------------------------------------------------------------------
+//  FAILED LOGIN ATTEMPTS
+// --------------------------------------------------------------------
 
-// IncrementAdminFailedLoginAttempts increments failed login attempts for an admin
-func (s *AdminService) IncrementAdminFailedLoginAttempts(
-	ctx context.Context,
-	adminID uuid.UUID,
-) (int, error) {
+func (s *AdminService) IncrementAdminFailedLoginAttempts(ctx context.Context, adminID uuid.UUID) (int, error) {
 	startTime := time.Now()
-
 	attempts, err := s.adminRepo.IncrementAdminFailedLoginAttempts(ctx, adminID)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -3136,19 +2833,29 @@ func (s *AdminService) IncrementAdminFailedLoginAttempts(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return 0, fmt.Errorf("failed to increment attempts: %w", err)
+		return 0, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	const maxAttempts = 5
-	shouldLockout := attempts >= maxAttempts
-
-	if shouldLockout {
-		// Deactivate admin after max attempts
+	if attempts >= maxAttempts {
 		if err := s.adminRepo.DeactivateAdmin(ctx, adminID); err != nil {
-			s.logger.Warn("Failed to deactivate admin after lockout",
-				zap.String("admin_id", adminID.String()),
-				zap.Error(err),
-			)
+			s.logAdminEvent(ctx, &models.AdminLogEvent{
+				LogEnvelope: models.LogEnvelope{
+					EventID:     uuid.New().String(),
+					EventType:   "admin_lockout",
+					ServiceName: "auth-service",
+					Timestamp:   time.Now(),
+					Environment: "production",
+					Version:     "v1.0.0",
+					Level:       "warning",
+					Message:     "Admin locked out, deactivation failed",
+				},
+				AdminID:      adminID.String(),
+				Action:       "admin_lockout",
+				Status:       "partial_failure",
+				ErrorCode:    "DEACTIVATE_FAILED",
+				ErrorMessage: err.Error(),
+				Duration:     int64(time.Since(startTime).Milliseconds()),
+			})
 		} else {
 			s.logAdminEvent(ctx, &models.AdminLogEvent{
 				LogEnvelope: models.LogEnvelope{
@@ -3168,7 +2875,6 @@ func (s *AdminService) IncrementAdminFailedLoginAttempts(
 			})
 		}
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -3185,21 +2891,21 @@ func (s *AdminService) IncrementAdminFailedLoginAttempts(
 		Status:  "success",
 		Changes: map[string]interface{}{
 			"attempts":       attempts,
-			"should_lockout": shouldLockout,
+			"should_lockout": attempts >= maxAttempts,
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_auth", "failed_login", "admin_user",
+			&adminID, "system", nil, nil, nil, map[string]interface{}{
+				"attempts": attempts,
+			})
+	}
 	return attempts, nil
 }
 
-// ResetAdminFailedLoginAttempts resets failed login attempts for an admin
-func (s *AdminService) ResetAdminFailedLoginAttempts(
-	ctx context.Context,
-	adminID uuid.UUID,
-) error {
+func (s *AdminService) ResetAdminFailedLoginAttempts(ctx context.Context, adminID uuid.UUID) error {
 	startTime := time.Now()
-
 	if err := s.adminRepo.ResetAdminFailedLoginAttempts(ctx, adminID); err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -3219,9 +2925,8 @@ func (s *AdminService) ResetAdminFailedLoginAttempts(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return fmt.Errorf("failed to reset failed attempts: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -3238,63 +2943,62 @@ func (s *AdminService) ResetAdminFailedLoginAttempts(
 		Status:   "success",
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_auth", "reset_failed_attempts", "admin_user",
+			&adminID, "system", nil, nil, nil, nil)
+	}
 	return nil
 }
 
-// ================================
-// ADMIN AVATAR METHODS
-// ================================
+// --------------------------------------------------------------------
+//  AVATAR METHODS
+// --------------------------------------------------------------------
 
-// SetAdminAvatar sets an avatar for an admin
-func (s *AdminService) SetAdminAvatar(
-	ctx context.Context,
-	adminID uuid.UUID,
-	avatarHash string,
-	avatarObjectKey string,
-	avatarMimeType string,
-	setBy uuid.UUID,
-) error {
+func (s *AdminService) SetAdminAvatar(ctx context.Context, adminID uuid.UUID, avatarHash string, avatarObjectKey string, avatarMimeType string, setBy uuid.UUID) error {
 	startTime := time.Now()
+	if adminID == uuid.Nil || avatarHash == "" || avatarObjectKey == "" {
+		return appErrors.ErrInvalidInput
+	}
+	validMimeTypes := map[string]bool{"image/jpeg": true, "image/jpg": true, "image/png": true, "image/gif": true, "image/webp": true, "image/svg+xml": true}
+	if !validMimeTypes[avatarMimeType] {
+		return appErrors.ErrInvalidInput
+	}
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("avatar-%s", adminID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+	ip, _ := ctx.Value("ip_address").(string)
 
-	if adminID == uuid.Nil {
-		return fmt.Errorf("admin ID cannot be empty")
-	}
-	if avatarHash == "" {
-		return fmt.Errorf("avatar hash cannot be empty")
-	}
-	if avatarObjectKey == "" {
-		return fmt.Errorf("avatar object key cannot be empty")
-	}
-
-	// Get requester admin
 	requester, err := s.adminRepo.GetAdminByID(ctx, setBy)
 	if err != nil {
-		return fmt.Errorf("requester not found: %w", err)
+		return fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions
 	if requester.AdminID != adminID && !requester.IsOwner() {
-		return fmt.Errorf("unauthorized: cannot set avatar for this admin")
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_avatar_set",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized avatar set",
+			},
+			AdminID:      setBy.String(),
+			TargetUserID: adminID.String(),
+			Action:       "set_admin_avatar",
+			Status:       "failed",
+			ErrorCode:    "UNAUTHORIZED",
+			Duration:     int64(time.Since(startTime).Milliseconds()),
+		})
+		return appErrors.ErrPermissionDenied
 	}
-
-	// Validate MIME type
-	validMimeTypes := map[string]bool{
-		"image/jpeg":    true,
-		"image/jpg":     true,
-		"image/png":     true,
-		"image/gif":     true,
-		"image/webp":    true,
-		"image/svg+xml": true,
-	}
-	if !validMimeTypes[avatarMimeType] {
-		return fmt.Errorf("invalid avatar mime type: %s", avatarMimeType)
-	}
-
-	// Get existing avatar
-	existingAvatar, _ := s.adminRepo.GetAdminAvatar(ctx, adminID)
-
-	// Set avatar
+	existing, _ := s.adminRepo.GetAdminAvatar(ctx, adminID)
 	if err := s.adminRepo.SetAdminAvatar(ctx, adminID, avatarHash, avatarObjectKey, avatarMimeType); err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -3315,23 +3019,18 @@ func (s *AdminService) SetAdminAvatar(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return fmt.Errorf("failed to set admin avatar: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
-	changes := map[string]interface{}{
-		"new_avatar_hash": avatarHash,
-		"new_object_key":  avatarObjectKey,
-		"mime_type":       avatarMimeType,
-		"set_by":          setBy.String(),
+	metadata := map[string]interface{}{
+		"new_hash":   avatarHash,
+		"object_key": avatarObjectKey,
+		"mime":       avatarMimeType,
+		"ip":         ip,
 	}
-	if existingAvatar != nil {
-		changes["old_avatar_hash"] = existingAvatar.AvatarHash
-		changes["old_object_key"] = existingAvatar.AvatarObjectKey
-		changes["replaced_existing"] = true
-	} else {
-		changes["replaced_existing"] = false
+	if existing != nil {
+		metadata["old_hash"] = existing.AvatarHash
+		metadata["old_key"] = existing.AvatarObjectKey
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -3349,30 +3048,26 @@ func (s *AdminService) SetAdminAvatar(
 		ResourceType: "admin_user",
 		ResourceID:   adminID.String(),
 		Status:       "success",
-		Changes:      changes,
+		Changes:      metadata,
 		Duration:     int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "set_avatar", "admin_user",
+			&adminID, "admin", &setBy, nil, nil, metadata)
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
-// GetAdminAvatar gets an admin's avatar
-func (s *AdminService) GetAdminAvatar(
-	ctx context.Context,
-	adminID uuid.UUID,
-) (*models.AdminAvatar, error) {
+func (s *AdminService) GetAdminAvatar(ctx context.Context, adminID uuid.UUID) (*models.AdminAvatar, error) {
 	startTime := time.Now()
-
 	if adminID == uuid.Nil {
-		return nil, fmt.Errorf("admin ID cannot be empty")
+		return nil, appErrors.ErrInvalidInput
 	}
-
-	// Check if admin exists
-	admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
+	_, err := s.adminRepo.GetAdminByID(ctx, adminID)
 	if err != nil {
-		return nil, fmt.Errorf("admin not found: %w", err)
+		return nil, fmt.Errorf("%w: admin not found", appErrors.ErrNotFound)
 	}
-
 	avatar, err := s.adminRepo.GetAdminAvatar(ctx, adminID)
 	if err != nil && err != sql.ErrNoRows {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -3393,14 +3088,12 @@ func (s *AdminService) GetAdminAvatar(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("failed to get admin avatar: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	status := "success"
 	if avatar == nil {
 		status = "no_avatar"
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -3417,50 +3110,62 @@ func (s *AdminService) GetAdminAvatar(
 		Status:       status,
 		Changes: map[string]interface{}{
 			"has_avatar": avatar != nil,
-			"admin_role": admin.GetRoleString(),
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "get_avatar", "admin_user",
+			&adminID, "system", nil, nil, nil, map[string]interface{}{
+				"has_avatar": avatar != nil,
+			})
+	}
 	return avatar, nil
 }
 
-// DeactivateAdminAvatar deactivates an admin's avatar
-func (s *AdminService) DeactivateAdminAvatar(
-	ctx context.Context,
-	adminID uuid.UUID,
-	deactivatedBy uuid.UUID,
-) error {
+func (s *AdminService) DeactivateAdminAvatar(ctx context.Context, adminID uuid.UUID, deactivatedBy uuid.UUID) error {
 	startTime := time.Now()
-
 	if adminID == uuid.Nil {
-		return fmt.Errorf("admin ID cannot be empty")
+		return appErrors.ErrInvalidInput
 	}
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("deactivate_avatar-%s", adminID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+	ip, _ := ctx.Value("ip_address").(string)
 
-	// Get requester admin
 	requester, err := s.adminRepo.GetAdminByID(ctx, deactivatedBy)
 	if err != nil {
-		return fmt.Errorf("requester not found: %w", err)
+		return fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
-	// Get target admin
-	targetAdmin, err := s.adminRepo.GetAdminByID(ctx, adminID)
-	if err != nil {
-		return fmt.Errorf("target admin not found: %w", err)
-	}
-
-	// Check permissions
 	if requester.AdminID != adminID && !requester.IsOwner() {
-		return fmt.Errorf("unauthorized: cannot deactivate avatar for this admin")
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_avatar_deactivate",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized avatar deactivation",
+			},
+			AdminID:      deactivatedBy.String(),
+			TargetUserID: adminID.String(),
+			Action:       "deactivate_admin_avatar",
+			Status:       "failed",
+			ErrorCode:    "UNAUTHORIZED",
+			Duration:     int64(time.Since(startTime).Milliseconds()),
+		})
+		return appErrors.ErrPermissionDenied
 	}
-
-	// Get existing avatar
-	existingAvatar, _ := s.adminRepo.GetAdminAvatar(ctx, adminID)
-	if existingAvatar == nil {
-		return nil // No avatar to deactivate
+	existing, _ := s.adminRepo.GetAdminAvatar(ctx, adminID)
+	if existing == nil {
+		return nil
 	}
-
-	// Deactivate avatar
 	if err := s.adminRepo.DeactivateAdminAvatar(ctx, adminID); err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -3481,9 +3186,8 @@ func (s *AdminService) DeactivateAdminAvatar(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return fmt.Errorf("failed to deactivate admin avatar: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -3502,41 +3206,193 @@ func (s *AdminService) DeactivateAdminAvatar(
 		ResourceID:   adminID.String(),
 		Status:       "success",
 		Changes: map[string]interface{}{
-			"old_avatar_hash": existingAvatar.AvatarHash,
-			"old_object_key":  existingAvatar.AvatarObjectKey,
-			"deactivated_by":  deactivatedBy.String(),
-			"admin_role":      targetAdmin.GetRoleString(),
+			"old_hash": existing.AvatarHash,
+			"old_key":  existing.AvatarObjectKey,
+			"ip":       ip,
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "deactivate_avatar", "admin_user",
+			&adminID, "admin", &deactivatedBy, nil, nil, map[string]interface{}{
+				"old_hash": existing.AvatarHash,
+				"ip":       ip,
+			})
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
-// ================================
-// ADMIN HELPER METHODS
-// ================================
+// ----- NEW AVATAR METHODS (with fallback, info, bulk) -----
 
-// GetAvailableManagers gets available managers for reporting
-func (s *AdminService) GetAvailableManagers(
-	ctx context.Context,
-	excludeID *uuid.UUID,
-	requesterID uuid.UUID,
-) ([]*models.AdminUser, error) {
+func (s *AdminService) GetAdminAvatarWithFallback(ctx context.Context, adminID uuid.UUID) (*models.AdminAvatar, string, error) {
 	startTime := time.Now()
+	avatar, err := s.adminRepo.GetAdminAvatar(ctx, adminID)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, "", fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	var initials string
+	if avatar == nil {
+		admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
+		if err != nil {
+			return nil, "", fmt.Errorf("%w: %v", appErrors.ErrNotFound, err)
+		}
+		initials = s.generateInitialsFromName(admin.FullName)
+	}
+	s.logAdminEvent(ctx, &models.AdminLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   "admin_avatar_fallback_get",
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: "production",
+			Version:     "v1.0.0",
+			Level:       "info",
+			Message:     "Admin avatar with fallback retrieved",
+		},
+		AdminID: adminID.String(),
+		Action:  "get_admin_avatar_with_fallback",
+		Status:  "success",
+		Changes: map[string]interface{}{
+			"has_avatar":   avatar != nil,
+			"has_initials": initials != "",
+		},
+		Duration: int64(time.Since(startTime).Milliseconds()),
+	})
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "get_avatar_fallback", "admin_user",
+			&adminID, "system", nil, nil, nil, map[string]interface{}{
+				"has_avatar":   avatar != nil,
+				"has_initials": initials != "",
+			})
+	}
+	return avatar, initials, nil
+}
 
-	// Get requester admin
+func (s *AdminService) GetAvatarInfo(ctx context.Context, adminID uuid.UUID) (*models.AdminAvatarInfo, error) {
+	startTime := time.Now()
+	avatar, err := s.adminRepo.GetAdminAvatar(ctx, adminID)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	var initials string
+	if avatar == nil {
+		admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", appErrors.ErrNotFound, err)
+		}
+		initials = s.generateInitialsFromName(admin.FullName)
+	}
+	info := &models.AdminAvatarInfo{
+		AdminID:   adminID,
+		HasAvatar: avatar != nil,
+		Avatar:    avatar,
+		Initials:  initials,
+	}
+	s.logAdminEvent(ctx, &models.AdminLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   "admin_avatar_info_get",
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: "production",
+			Version:     "v1.0.0",
+			Level:       "info",
+			Message:     "Admin avatar info retrieved",
+		},
+		AdminID: adminID.String(),
+		Action:  "get_avatar_info",
+		Status:  "success",
+		Changes: map[string]interface{}{
+			"has_avatar":   info.HasAvatar,
+			"has_initials": info.Initials != "",
+		},
+		Duration: int64(time.Since(startTime).Milliseconds()),
+	})
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "get_avatar_info", "admin_user",
+			&adminID, "system", nil, nil, nil, map[string]interface{}{
+				"has_avatar":   info.HasAvatar,
+				"has_initials": info.Initials != "",
+			})
+	}
+	return info, nil
+}
+
+func (s *AdminService) BulkGetAvatarInfo(ctx context.Context, adminIDs []uuid.UUID) (map[uuid.UUID]*models.AdminAvatarInfo, error) {
+	startTime := time.Now()
+	if len(adminIDs) == 0 {
+		return make(map[uuid.UUID]*models.AdminAvatarInfo), nil
+	}
+	result := make(map[uuid.UUID]*models.AdminAvatarInfo)
+	for _, adminID := range adminIDs {
+		info, err := s.GetAvatarInfo(ctx, adminID)
+		if err != nil {
+			// Skip failed ones; no logger anymore
+			continue
+		}
+		result[adminID] = info
+	}
+	s.logAdminEvent(ctx, &models.AdminLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   "admin_avatar_info_bulk_get",
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: "production",
+			Version:     "v1.0.0",
+			Level:       "info",
+			Message:     "Admin avatar info bulk retrieved",
+		},
+		Action: "bulk_get_avatar_info",
+		Status: "success",
+		Changes: map[string]interface{}{
+			"requested_count": len(adminIDs),
+			"retrieved_count": len(result),
+		},
+		Duration: int64(time.Since(startTime).Milliseconds()),
+	})
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "bulk_avatar_info", "admin_user",
+			nil, "system", nil, nil, nil, map[string]interface{}{
+				"requested": len(adminIDs),
+				"returned":  len(result),
+			})
+	}
+	return result, nil
+}
+
+// --------------------------------------------------------------------
+//  OTHER QUERY METHODS
+// --------------------------------------------------------------------
+
+func (s *AdminService) GetAvailableManagers(ctx context.Context, excludeID *uuid.UUID, requesterID uuid.UUID) ([]*models.AdminUser, error) {
+	startTime := time.Now()
 	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
 	if err != nil {
-		return nil, fmt.Errorf("requester not found: %w", err)
+		return nil, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions
 	if !requester.IsOwner() && !requester.IsSuperEmployee() {
-		return nil, fmt.Errorf("unauthorized: cannot view available managers")
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_available_managers_get",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized available managers request",
+			},
+			AdminID:   requesterID.String(),
+			Action:    "get_available_managers",
+			Status:    "failed",
+			ErrorCode: "UNAUTHORIZED",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
+		})
+		return nil, appErrors.ErrPermissionDenied
 	}
-
-	availableManagers, err := s.adminRepo.GetAvailableManagers(ctx, excludeID)
+	managers, err := s.adminRepo.GetAvailableManagers(ctx, excludeID)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -3556,9 +3412,8 @@ func (s *AdminService) GetAvailableManagers(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("failed to get available managers: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -3574,46 +3429,53 @@ func (s *AdminService) GetAvailableManagers(
 		Action:  "get_available_managers",
 		Status:  "success",
 		Changes: map[string]interface{}{
-			"available_managers_count": len(availableManagers),
+			"available_managers_count": len(managers),
 			"exclude_id":               excludeID,
 			"requester_role":           requester.GetRoleString(),
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
-	return availableManagers, nil
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "available_managers", "admin_user",
+			nil, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"count": len(managers),
+			})
+	}
+	return managers, nil
 }
 
-// GetAdminWithReportsToName gets admin with reports_to name
-func (s *AdminService) GetAdminWithReportsToName(
-	ctx context.Context,
-	adminID uuid.UUID,
-	requesterID uuid.UUID,
-) (*models.AdminUserSearchResult, error) {
+func (s *AdminService) GetAdminWithReportsToName(ctx context.Context, adminID uuid.UUID, requesterID uuid.UUID) (*models.AdminUserSearchResult, error) {
 	startTime := time.Now()
-
-	// Get requester admin
 	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
 	if err != nil {
-		return nil, fmt.Errorf("requester not found: %w", err)
+		return nil, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
-	// Get target admin
 	targetAdmin, err := s.adminRepo.GetAdminByID(ctx, adminID)
 	if err != nil {
-		return nil, fmt.Errorf("target admin not found: %w", err)
+		return nil, fmt.Errorf("%w: target not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions
-	if requester.AdminID != adminID {
-		if !requester.IsOwner() && !requester.IsSuperEmployee() {
-			if !s.canManageAdmin(requester, targetAdmin) {
-				return nil, fmt.Errorf("unauthorized: cannot view this admin's details")
-			}
-		}
+	if requester.AdminID != adminID && !requester.IsOwner() && !requester.IsSuperEmployee() && !s.canManageAdmin(requester, targetAdmin) {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_with_reports_to_get",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized get admin with reports_to",
+			},
+			AdminID:      requesterID.String(),
+			TargetUserID: adminID.String(),
+			Action:       "get_admin_with_reports_to_name",
+			Status:       "failed",
+			ErrorCode:    "UNAUTHORIZED",
+			Duration:     int64(time.Since(startTime).Milliseconds()),
+		})
+		return nil, appErrors.ErrPermissionDenied
 	}
-
-	adminWithReportsTo, err := s.adminRepo.GetAdminWithReportsToName(ctx, adminID)
+	result, err := s.adminRepo.GetAdminWithReportsToName(ctx, adminID)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -3634,9 +3496,8 @@ func (s *AdminService) GetAdminWithReportsToName(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("failed to get admin with reports_to name: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -3655,230 +3516,50 @@ func (s *AdminService) GetAdminWithReportsToName(
 		ResourceID:   adminID.String(),
 		Status:       "success",
 		Changes: map[string]interface{}{
-			"target_role":    targetAdmin.GetRoleString(),
-			"has_reports_to": adminWithReportsTo.ReportsTo != nil,
+			"has_reports_to": result.ReportsTo != nil,
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
-	return adminWithReportsTo, nil
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "get_with_reports_to", "admin_user",
+			&adminID, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"has_reports_to": result.ReportsTo != nil,
+			})
+	}
+	return result, nil
 }
 
-// ================================
-// ADMIN SYSTEM METHODS
-// ================================
-
-// HealthCheck performs a health check on the admin service
-func (s *AdminService) HealthCheck(ctx context.Context) error {
+func (s *AdminService) GetAdminHierarchy(ctx context.Context, adminID uuid.UUID, requesterID uuid.UUID) ([]*models.AdminHierarchy, error) {
 	startTime := time.Now()
-
-	if err := s.adminRepo.HealthCheck(ctx); err != nil {
-		s.logAdminEvent(ctx, &models.AdminLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   "admin_health_check",
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: "production",
-				Version:     "v1.0.0",
-				Level:       "error",
-				Message:     "Admin service health check failed",
-			},
-			Action:       "health_check",
-			Status:       "failed",
-			ErrorCode:    "HEALTH_CHECK_FAILED",
-			ErrorMessage: err.Error(),
-			Duration:     int64(time.Since(startTime).Milliseconds()),
-		})
-		return fmt.Errorf("admin service health check failed: %w", err)
-	}
-
-	s.logAdminEvent(ctx, &models.AdminLogEvent{
-		LogEnvelope: models.LogEnvelope{
-			EventID:     uuid.New().String(),
-			EventType:   "admin_health_check",
-			ServiceName: "auth-service",
-			Timestamp:   time.Now(),
-			Environment: "production",
-			Version:     "v1.0.0",
-			Level:       "info",
-			Message:     "Admin service health check passed",
-		},
-		Action:   "health_check",
-		Status:   "success",
-		Duration: int64(time.Since(startTime).Milliseconds()),
-	})
-
-	return nil
-}
-
-// GetStats gets admin service statistics
-func (s *AdminService) GetStats(ctx context.Context) (map[string]interface{}, error) {
-	startTime := time.Now()
-
-	stats, err := s.adminRepo.GetRepositoryStats(ctx)
-	if err != nil {
-		s.logAdminEvent(ctx, &models.AdminLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   "admin_stats_get",
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: "production",
-				Version:     "v1.0.0",
-				Level:       "error",
-				Message:     "Failed to get admin stats",
-			},
-			Action:       "get_stats",
-			Status:       "failed",
-			ErrorCode:    "GET_STATS_FAILED",
-			ErrorMessage: err.Error(),
-			Duration:     int64(time.Since(startTime).Milliseconds()),
-		})
-		return nil, fmt.Errorf("failed to get admin stats: %w", err)
-	}
-
-	s.logAdminEvent(ctx, &models.AdminLogEvent{
-		LogEnvelope: models.LogEnvelope{
-			EventID:     uuid.New().String(),
-			EventType:   "admin_stats_get",
-			ServiceName: "auth-service",
-			Timestamp:   time.Now(),
-			Environment: "production",
-			Version:     "v1.0.0",
-			Level:       "info",
-			Message:     "Admin stats retrieved successfully",
-		},
-		Action:   "get_stats",
-		Status:   "success",
-		Duration: int64(time.Since(startTime).Milliseconds()),
-	})
-
-	return stats, nil
-}
-
-// ================================
-// HELPER FUNCTIONS
-// ================================
-
-// canManageAdmin checks if one admin can manage another
-func (s *AdminService) canManageAdmin(manager, target *models.AdminUser) bool {
-	// Owner can manage everyone
-	if manager.IsOwner() {
-		return true
-	}
-
-	// Super employee can manage employees
-	if manager.IsSuperEmployee() && target.IsEmployee() {
-		return true
-	}
-
-	// Managers can only manage employees in their departments
-	if manager.IsManager() && target.IsEmployee() {
-		// Check if manager has access to target's departments
-		managerDepts, err := s.adminRepo.GetAdminRoleDepartments(context.Background(), manager.AdminRoleID)
-		if err != nil {
-			s.logger.Warn("Failed to get manager departments",
-				zap.String("manager_id", manager.AdminID.String()),
-				zap.Error(err),
-			)
-			return false
-		}
-
-		targetDepts, err := s.adminRepo.GetAdminRoleDepartments(context.Background(), target.AdminRoleID)
-		if err != nil {
-			s.logger.Warn("Failed to get target departments",
-				zap.String("target_id", target.AdminID.String()),
-				zap.Error(err),
-			)
-			return false
-		}
-
-		// Check if target departments are subset of manager departments
-		for _, targetDept := range targetDepts {
-			found := false
-			for _, managerDept := range managerDepts {
-				if managerDept.SystemDepartmentID == targetDept.SystemDepartmentID {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return false
-			}
-		}
-		return true
-	}
-
-	return false
-}
-
-// getRoleLevel returns the role level based on role type
-func (s *AdminService) getRoleLevel(roleType int) int {
-	switch roleType {
-	case models.RoleTypeSuperAdmin:
-		return 4000
-	case models.RoleTypeManager:
-		return 3000
-	case models.RoleTypeEmployee:
-		return 2000
-	default:
-		return 1000
-	}
-}
-
-// isValidUsername validates username format
-func isValidUsername(username string) bool {
-	if len(username) < 3 || len(username) > 50 {
-		return false
-	}
-	for _, ch := range username {
-		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-			(ch >= '0' && ch <= '9') || ch == '_') {
-			return false
-		}
-	}
-	return true
-}
-
-// getRoleString returns role string for logging
-func getRoleString(admin *models.AdminUser) string {
-	if admin == nil {
-		return ""
-	}
-	return admin.GetRoleString()
-}
-
-// GetAdminHierarchy gets the complete hierarchy for an admin
-func (s *AdminService) GetAdminHierarchy(
-	ctx context.Context,
-	adminID uuid.UUID,
-	requesterID uuid.UUID,
-) ([]*models.AdminHierarchy, error) {
-	startTime := time.Now()
-
-	// Get requester admin
 	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
 	if err != nil {
-		return nil, fmt.Errorf("requester not found: %w", err)
+		return nil, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
-	// Get target admin
 	targetAdmin, err := s.adminRepo.GetAdminByID(ctx, adminID)
 	if err != nil {
-		return nil, fmt.Errorf("target admin not found: %w", err)
+		return nil, fmt.Errorf("%w: target not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions
-	if requester.AdminID != adminID {
-		if !requester.IsOwner() && !requester.IsSuperEmployee() {
-			// Check if requester can view this admin's hierarchy
-			if !s.canManageAdmin(requester, targetAdmin) {
-				return nil, fmt.Errorf("unauthorized: cannot view hierarchy for this admin")
-			}
-		}
+	if requester.AdminID != adminID && !requester.IsOwner() && !requester.IsSuperEmployee() && !s.canManageAdmin(requester, targetAdmin) {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_hierarchy_get",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized hierarchy view",
+			},
+			AdminID:      requesterID.String(),
+			TargetUserID: adminID.String(),
+			Action:       "get_admin_hierarchy",
+			Status:       "failed",
+			ErrorCode:    "UNAUTHORIZED",
+			Duration:     int64(time.Since(startTime).Milliseconds()),
+		})
+		return nil, appErrors.ErrPermissionDenied
 	}
-
 	hierarchy, err := s.adminRepo.GetAdminHierarchy(ctx, adminID)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -3900,9 +3581,8 @@ func (s *AdminService) GetAdminHierarchy(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("failed to get admin hierarchy: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -3926,19 +3606,18 @@ func (s *AdminService) GetAdminHierarchy(
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "hierarchy", "admin_user",
+			&adminID, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"depth": len(hierarchy),
+			})
+	}
 	return hierarchy, nil
 }
 
-// CanAssignReportsTo checks if an admin can assign reports_to to another admin
-func (s *AdminService) CanAssignReportsTo(
-	ctx context.Context,
-	assignerID uuid.UUID,
-	targetID uuid.UUID,
-) (bool, error) {
+func (s *AdminService) CanAssignReportsTo(ctx context.Context, assignerID uuid.UUID, targetID uuid.UUID) (bool, error) {
 	startTime := time.Now()
-
-	canAssign, err := s.adminRepo.CanAssignReportsTo(ctx, assignerID, targetID)
+	can, err := s.adminRepo.CanAssignReportsTo(ctx, assignerID, targetID)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -3959,9 +3638,8 @@ func (s *AdminService) CanAssignReportsTo(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return false, fmt.Errorf("failed to check if admin can assign reports_to: %w", err)
+		return false, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -3978,18 +3656,23 @@ func (s *AdminService) CanAssignReportsTo(
 		Action:       "can_assign_reports_to",
 		Status:       "success",
 		Changes: map[string]interface{}{
-			"can_assign": canAssign,
+			"can_assign": can,
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
-	return canAssign, nil
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "can_assign_reports_to", "admin_user",
+			nil, "system", nil, nil, nil, map[string]interface{}{
+				"assigner": assignerID.String(),
+				"target":   targetID.String(),
+				"result":   can,
+			})
+	}
+	return can, nil
 }
 
-// GetAdminByPhone retrieves admin by phone number
 func (s *AdminService) GetAdminByPhone(ctx context.Context, phone string) (*models.AdminUser, error) {
 	startTime := time.Now()
-
 	phoneHash := s.GeneratePhoneHash(phone)
 	admin, err := s.adminRepo.GetAdminByPhoneHash(ctx, phoneHash)
 	if err != nil {
@@ -4010,9 +3693,8 @@ func (s *AdminService) GetAdminByPhone(ctx context.Context, phone string) (*mode
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("admin not found: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrNotFound, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -4029,15 +3711,19 @@ func (s *AdminService) GetAdminByPhone(ctx context.Context, phone string) (*mode
 		Status:   "success",
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "get_by_phone", "admin_user",
+			&admin.AdminID, "system", nil, nil, nil, nil)
+	}
 	return admin, nil
 }
 
-// RecordAdminLogin records a successful admin login
+// --------------------------------------------------------------------
+//  LOGIN RECORDING
+// --------------------------------------------------------------------
+
 func (s *AdminService) RecordAdminLogin(ctx context.Context, adminID uuid.UUID) error {
 	startTime := time.Now()
-
-	// Update last login
 	if err := s.adminRepo.UpdateAdminLastLogin(ctx, adminID); err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -4057,9 +3743,8 @@ func (s *AdminService) RecordAdminLogin(ctx context.Context, adminID uuid.UUID) 
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return fmt.Errorf("failed to record admin login: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -4076,44 +3761,20 @@ func (s *AdminService) RecordAdminLogin(ctx context.Context, adminID uuid.UUID) 
 		Status:   "success",
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_auth", "record_login", "admin_user",
+			&adminID, "system", nil, nil, nil, nil)
+	}
 	return nil
 }
 
-// RecordFailedLogin records a failed login attempt
-func (s *AdminService) RecordFailedLogin(
-	ctx context.Context,
-	adminID uuid.UUID,
-) (bool, int, error) {
+func (s *AdminService) RecordFailedLogin(ctx context.Context, adminID uuid.UUID) (bool, int, error) {
 	startTime := time.Now()
-
-	// Increment failed attempts and check if should lockout
 	attempts, err := s.IncrementAdminFailedLoginAttempts(ctx, adminID)
 	if err != nil {
-		s.logAdminEvent(ctx, &models.AdminLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   "admin_failed_login_record",
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: "production",
-				Version:     "v1.0.0",
-				Level:       "error",
-				Message:     "Failed to record admin failed login",
-			},
-			AdminID:      adminID.String(),
-			Action:       "record_failed_login",
-			Status:       "failed",
-			ErrorCode:    "RECORD_FAILED_LOGIN_FAILED",
-			ErrorMessage: err.Error(),
-			Duration:     int64(time.Since(startTime).Milliseconds()),
-		})
-		return false, 0, fmt.Errorf("failed to record admin failed login: %w", err)
+		return false, 0, err
 	}
-
-	const maxAttempts = 5
-	shouldLockout := attempts >= maxAttempts
-
+	shouldLockout := attempts >= 5
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -4134,46 +3795,36 @@ func (s *AdminService) RecordFailedLogin(
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_auth", "record_failed_login", "admin_user",
+			&adminID, "system", nil, nil, nil, map[string]interface{}{
+				"attempts": attempts,
+				"lockout":  shouldLockout,
+			})
+	}
 	return shouldLockout, attempts, nil
 }
 
-// GetAdminWithDetails gets admin with all details
-func (s *AdminService) GetAdminWithDetails(
-	ctx context.Context,
-	adminID uuid.UUID,
-) (*models.AdminUser, []string, []string, error) {
-	startTime := time.Now()
+// --------------------------------------------------------------------
+//  ADMIN WITH DETAILS
+// --------------------------------------------------------------------
 
-	// Get admin
+func (s *AdminService) GetAdminWithDetails(ctx context.Context, adminID uuid.UUID) (*models.AdminUser, []string, []string, error) {
+	startTime := time.Now()
 	admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("admin not found: %w", err)
+		return nil, nil, nil, fmt.Errorf("%w: %v", appErrors.ErrNotFound, err)
 	}
-
-	// Get permissions
-	permissions, err := s.adminRepo.GetAdminUserPermissions(ctx, adminID)
-	if err != nil {
-		return admin, nil, nil, nil // Return admin even if permissions fail
+	permissions, _ := s.adminRepo.GetAdminUserPermissions(ctx, adminID)
+	departments, _ := s.adminRepo.GetAdminRoleDepartments(ctx, admin.AdminRoleID)
+	permNames := make([]string, len(permissions))
+	for i, p := range permissions {
+		permNames[i] = p.PermissionName
 	}
-
-	// Get departments
-	departments, err := s.adminRepo.GetAdminRoleDepartments(ctx, admin.AdminRoleID)
-	if err != nil {
-		return admin, nil, nil, nil // Return admin even if departments fail
+	deptNames := make([]string, len(departments))
+	for i, d := range departments {
+		deptNames[i] = d.Name
 	}
-
-	// Convert to string arrays
-	permissionNames := make([]string, 0, len(permissions))
-	for _, perm := range permissions {
-		permissionNames = append(permissionNames, perm.PermissionName)
-	}
-
-	departmentNames := make([]string, 0, len(departments))
-	for _, dept := range departments {
-		departmentNames = append(departmentNames, dept.Name)
-	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -4189,25 +3840,28 @@ func (s *AdminService) GetAdminWithDetails(
 		Action:  "get_admin_with_details",
 		Status:  "success",
 		Changes: map[string]interface{}{
-			"permissions_count": len(permissionNames),
-			"departments_count": len(departmentNames),
+			"permissions_count": len(permNames),
+			"departments_count": len(deptNames),
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
-	return admin, permissionNames, departmentNames, nil
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "get_details", "admin_user",
+			&adminID, "system", nil, nil, nil, map[string]interface{}{
+				"permissions": len(permNames),
+				"departments": len(deptNames),
+			})
+	}
+	return admin, permNames, deptNames, nil
 }
+
+// --------------------------------------------------------------------
+//  OWNER (SUPER ADMIN)
+// --------------------------------------------------------------------
 
 func (s *AdminService) GetAdminOwner(ctx context.Context) (*models.AdminUser, error) {
 	startTime := time.Now()
 	admin, err := s.adminRepo.GetSuperAdmin(ctx)
-
-	// Always safe-check admin before accessing its fields
-	var adminIDStr string
-	if admin != nil {
-		adminIDStr = admin.AdminID.String()
-	}
-
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -4220,23 +3874,18 @@ func (s *AdminService) GetAdminOwner(ctx context.Context) (*models.AdminUser, er
 				Level:       "error",
 				Message:     "Failed to get admin owner",
 			},
-			AdminID:      adminIDStr, // Safe - checked above
 			Action:       "get_admin_owner",
 			Status:       "failed",
 			ErrorCode:    "GET_OWNER_FAILED",
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("failed to get admin owner: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
-	// No error from repository
-	if admin == nil {
-		// No super admin exists - this is normal, not an error
-		return nil, nil
+	var adminIDStr string
+	if admin != nil {
+		adminIDStr = admin.AdminID.String()
 	}
-
-	// Success case - admin exists
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -4248,176 +3897,127 @@ func (s *AdminService) GetAdminOwner(ctx context.Context) (*models.AdminUser, er
 			Level:       "info",
 			Message:     "Admin owner retrieved",
 		},
-		AdminID:  adminIDStr, // Safe - checked above
+		AdminID:  adminIDStr,
 		Action:   "get_admin_owner",
 		Status:   "success",
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "get_owner", "admin_user",
+			nil, "system", nil, nil, nil, nil)
+	}
 	return admin, nil
 }
 
-// GetAdminAvatarWithFallback gets admin avatar with fallback
-func (s *AdminService) GetAdminAvatarWithFallback(
-	ctx context.Context,
-	adminID uuid.UUID,
-) (*models.AdminAvatar, string, error) {
+func (s *AdminService) GetSuperAdmin(ctx context.Context) (*models.AdminUser, error) {
+	return s.GetAdminOwner(ctx)
+}
+
+// --------------------------------------------------------------------
+//  HEALTH & STATS
+// --------------------------------------------------------------------
+
+func (s *AdminService) HealthCheck(ctx context.Context) error {
 	startTime := time.Now()
-
-	// Get avatar
-	avatar, err := s.adminRepo.GetAdminAvatar(ctx, adminID)
-	if err != nil && err != sql.ErrNoRows {
-		return nil, "", fmt.Errorf("failed to get admin avatar: %w", err)
+	if err := s.adminRepo.HealthCheck(ctx); err != nil {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_health_check",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "error",
+				Message:     "Admin service health check failed",
+			},
+			Action:       "health_check",
+			Status:       "failed",
+			ErrorCode:    "HEALTH_CHECK_FAILED",
+			ErrorMessage: err.Error(),
+			Duration:     int64(time.Since(startTime).Milliseconds()),
+		})
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
-	var initials string
-	// If no avatar, generate initials from name
-	if avatar == nil {
-		admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
-		if err != nil {
-			return nil, "", fmt.Errorf("admin not found: %w", err)
-		}
-		initials = s.generateInitialsFromName(admin.FullName)
-	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
-			EventType:   "admin_avatar_fallback_get",
+			EventType:   "admin_health_check",
 			ServiceName: "auth-service",
 			Timestamp:   time.Now(),
 			Environment: "production",
 			Version:     "v1.0.0",
 			Level:       "info",
-			Message:     "Admin avatar with fallback retrieved",
+			Message:     "Admin service health check passed",
 		},
-		AdminID: adminID.String(),
-		Action:  "get_admin_avatar_with_fallback",
-		Status:  "success",
-		Changes: map[string]interface{}{
-			"has_avatar":   avatar != nil,
-			"has_initials": initials != "",
-		},
+		Action:   "health_check",
+		Status:   "success",
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
-	return avatar, initials, nil
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_service", "health_check", "system",
+			nil, "system", nil, nil, nil, nil)
+	}
+	return nil
 }
 
-// GetAvatarInfo gets avatar info for an admin
-func (s *AdminService) GetAvatarInfo(
-	ctx context.Context,
-	adminID uuid.UUID,
-) (*models.AdminAvatarInfo, error) {
+func (s *AdminService) GetStats(ctx context.Context) (map[string]interface{}, error) {
 	startTime := time.Now()
-
-	// Get avatar
-	avatar, err := s.adminRepo.GetAdminAvatar(ctx, adminID)
-	if err != nil && err != sql.ErrNoRows {
-		return nil, fmt.Errorf("failed to get admin avatar: %w", err)
+	stats, err := s.adminRepo.GetRepositoryStats(ctx)
+	if err != nil {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_stats_get",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "error",
+				Message:     "Failed to get admin stats",
+			},
+			Action:       "get_stats",
+			Status:       "failed",
+			ErrorCode:    "GET_STATS_FAILED",
+			ErrorMessage: err.Error(),
+			Duration:     int64(time.Since(startTime).Milliseconds()),
+		})
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
-	var initials string
-	// If no avatar, generate initials
-	if avatar == nil {
-		admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
-		if err != nil {
-			return nil, fmt.Errorf("admin not found: %w", err)
-		}
-		initials = s.generateInitialsFromName(admin.FullName)
-	}
-
-	info := &models.AdminAvatarInfo{
-		AdminID:   adminID,
-		HasAvatar: avatar != nil,
-		Avatar:    avatar,
-		Initials:  initials,
-	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
-			EventType:   "admin_avatar_info_get",
+			EventType:   "admin_stats_get",
 			ServiceName: "auth-service",
 			Timestamp:   time.Now(),
 			Environment: "production",
 			Version:     "v1.0.0",
 			Level:       "info",
-			Message:     "Admin avatar info retrieved",
+			Message:     "Admin stats retrieved successfully",
 		},
-		AdminID: adminID.String(),
-		Action:  "get_avatar_info",
-		Status:  "success",
-		Changes: map[string]interface{}{
-			"has_avatar":   info.HasAvatar,
-			"has_initials": info.Initials != "",
-		},
+		Action:   "get_stats",
+		Status:   "success",
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
-	return info, nil
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_service", "get_stats", "system",
+			nil, "system", nil, nil, nil, nil)
+	}
+	return stats, nil
 }
 
-// BulkGetAvatarInfo gets avatar info for multiple admins
-func (s *AdminService) BulkGetAvatarInfo(
-	ctx context.Context,
-	adminIDs []uuid.UUID,
-) (map[uuid.UUID]*models.AdminAvatarInfo, error) {
-	startTime := time.Now()
+// --------------------------------------------------------------------
+//  NEWLY ADDED METHODS (avatar helpers, search, create, etc.)
+// --------------------------------------------------------------------
 
-	if len(adminIDs) == 0 {
-		return make(map[uuid.UUID]*models.AdminAvatarInfo), nil
-	}
-
-	result := make(map[uuid.UUID]*models.AdminAvatarInfo)
-	for _, adminID := range adminIDs {
-		info, err := s.GetAvatarInfo(ctx, adminID)
-		if err != nil {
-			// Log error but continue with other admins
-			s.logger.Warn("Failed to get avatar info",
-				zap.String("admin_id", adminID.String()),
-				zap.Error(err),
-			)
-			continue
-		}
-		result[adminID] = info
-	}
-
-	s.logAdminEvent(ctx, &models.AdminLogEvent{
-		LogEnvelope: models.LogEnvelope{
-			EventID:     uuid.New().String(),
-			EventType:   "admin_avatar_info_bulk_get",
-			ServiceName: "auth-service",
-			Timestamp:   time.Now(),
-			Environment: "production",
-			Version:     "v1.0.0",
-			Level:       "info",
-			Message:     "Admin avatar info bulk retrieved",
-		},
-		Action: "bulk_get_avatar_info",
-		Status: "success",
-		Changes: map[string]interface{}{
-			"requested_count": len(adminIDs),
-			"retrieved_count": len(result),
-		},
-		Duration: int64(time.Since(startTime).Milliseconds()),
-	})
-
-	return result, nil
-}
-
-// generateInitialsFromName generates initials from full name
 func (s *AdminService) generateInitialsFromName(fullName string) string {
 	if fullName == "" {
 		return ""
 	}
-
-	// Split name into parts
 	parts := strings.Fields(fullName)
 	if len(parts) == 0 {
 		return ""
 	}
-
-	// Get first character of first and last parts
 	var initialsBuilder strings.Builder
 	if len(parts) > 0 {
 		initialsBuilder.WriteString(strings.ToUpper(string(parts[0][0])))
@@ -4425,57 +4025,40 @@ func (s *AdminService) generateInitialsFromName(fullName string) string {
 	if len(parts) > 1 {
 		initialsBuilder.WriteString(strings.ToUpper(string(parts[len(parts)-1][0])))
 	}
-
 	return initialsBuilder.String()
 }
 
-// Helper method: Check if requester can update target admin profile
 func (s *AdminService) canUpdateAdminProfile(requester, target *models.AdminUser) bool {
-	// Owner can update anyone
 	if requester.IsOwner() {
 		return true
 	}
-
-	// Super employee can update employees
 	if requester.IsSuperEmployee() && target.IsEmployee() {
 		return true
 	}
-
-	// Managers can update employees in their departments
 	if requester.IsManager() && target.IsEmployee() {
 		return s.canManageAdmin(requester, target)
 	}
-
-	// Admins can update their own profile
 	return requester.AdminID == target.AdminID
 }
 
-// Helper method: Check if requester can change target admin phone
 func (s *AdminService) canChangePhone(requester, target *models.AdminUser) bool {
-	// Owner can change anyone's phone
 	if requester.IsOwner() {
 		return true
 	}
-
-	// Super employee can change employee phones
 	if requester.IsSuperEmployee() && target.IsEmployee() {
 		return true
 	}
-
-	// Admins can change their own phone
 	return requester.AdminID == target.AdminID
 }
 
-// Helper method: Check if username is taken
 func (s *AdminService) isUsernameTaken(ctx context.Context, username string, excludeAdminID uuid.UUID) bool {
 	admin, err := s.adminRepo.GetAdminByUsername(ctx, username)
 	if err != nil {
-		return false // If error, assume not taken
+		return false
 	}
 	return admin != nil && admin.AdminID != excludeAdminID
 }
 
-// Helper method: Get role string from mask
 func getRoleStringFromMask(roleMask uint64) string {
 	switch roleMask {
 	case 1:
@@ -4489,46 +4072,30 @@ func getRoleStringFromMask(roleMask uint64) string {
 	}
 }
 
-// Helper method: Check if role mask is valid
 func isValidRoleMask(roleMask uint64) bool {
 	return roleMask == 1 || roleMask == 2 || roleMask == 4
 }
 
-// ================================
-// COMPREHENSIVE ADMIN SEARCH WITH FILTERS
-// ================================
-
-func (s *AdminService) SearchAdminsWithFilters(
-	ctx context.Context,
-	requesterID uuid.UUID,
-	req *models.AdminSearchRequest,
-) ([]*models.AdminUserSearchResult, int, error) {
+// SearchAdminsWithFilters searches admins with various filters.
+func (s *AdminService) SearchAdminsWithFilters(ctx context.Context, requesterID uuid.UUID, req *models.AdminSearchRequest) ([]*models.AdminUserSearchResult, int, error) {
 	startTime := time.Now()
-
-	// Get requester admin
 	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
 	if err != nil {
-		return nil, 0, fmt.Errorf("requester not found: %w", err)
+		return nil, 0, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions
 	if !requester.IsOwner() && !requester.IsSuperEmployee() {
-		// Check if requester can search
 		if req.RoleTypeFilter != nil {
 			switch *req.RoleTypeFilter {
 			case models.RoleTypeEmployee:
-				// Employees can search other employees
 			case models.RoleTypeManager:
-				return nil, 0, fmt.Errorf("unauthorized: cannot search managers")
+				return nil, 0, appErrors.ErrPermissionDenied
 			case models.RoleTypeSuperAdmin:
-				return nil, 0, fmt.Errorf("unauthorized: cannot search super admins")
+				return nil, 0, appErrors.ErrPermissionDenied
 			default:
-				return nil, 0, fmt.Errorf("invalid role type filter")
+				return nil, 0, appErrors.ErrInvalidInput
 			}
 		}
 	}
-
-	// Call repository search
 	userSearchReq := &models.AdminUserSearchRequest{
 		Query:           req.Query,
 		RoleTypeFilter:  req.RoleTypeFilter,
@@ -4557,9 +4124,8 @@ func (s *AdminService) SearchAdminsWithFilters(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, 0, fmt.Errorf("failed to search admins: %w", err)
+		return nil, 0, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -4587,38 +4153,32 @@ func (s *AdminService) SearchAdminsWithFilters(
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "search_filters", "admin_user",
+			nil, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"query": req.Query,
+				"count": len(results),
+			})
+	}
 	return results, totalCount, nil
 }
 
-// SearchAdminsAdvanced - Advanced search with multiple filters
-func (s *AdminService) SearchAdminsAdvanced(
-	ctx context.Context,
-	requesterID uuid.UUID,
-	req *models.AdminAdvancedSearchRequest,
-) ([]*models.AdminUserSearchResult, int, error) {
+// SearchAdminsAdvanced performs advanced search with filters and sorting.
+func (s *AdminService) SearchAdminsAdvanced(ctx context.Context, requesterID uuid.UUID, req *models.AdminAdvancedSearchRequest) ([]*models.AdminUserSearchResult, int, error) {
 	startTime := time.Now()
-
-	// Get requester admin
 	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
 	if err != nil {
-		return nil, 0, fmt.Errorf("requester not found: %w", err)
+		return nil, 0, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions for advanced search
 	if !requester.IsOwner() && !requester.IsSuperEmployee() {
-		return nil, 0, fmt.Errorf("unauthorized: advanced search requires owner or super employee role")
+		return nil, 0, appErrors.ErrPermissionDenied
 	}
-
-	// Validate limit
 	if req.Limit <= 0 {
 		req.Limit = 50
 	}
 	if req.Limit > 100 {
 		req.Limit = 100
 	}
-
-	// Call repository
 	results, totalCount, err := s.adminRepo.SearchAdminsAdvanced(ctx, req)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -4639,9 +4199,8 @@ func (s *AdminService) SearchAdminsAdvanced(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, 0, fmt.Errorf("advanced search failed: %w", err)
+		return nil, 0, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -4668,41 +4227,33 @@ func (s *AdminService) SearchAdminsAdvanced(
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "advanced_search", "admin_user",
+			nil, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"query": req.Query,
+				"count": len(results),
+			})
+	}
 	return results, totalCount, nil
 }
-func (s *AdminService) GetAdminsByDepartment(
-	ctx context.Context,
-	departmentID uuid.UUID,
-	requesterID uuid.UUID,
-	includeInactive bool,
-	limit, offset int,
-) ([]*models.AdminUserSearchResult, int, error) {
-	startTime := time.Now()
 
-	// Get requester admin
+// GetAdminsByDepartment returns admins belonging to a department.
+func (s *AdminService) GetAdminsByDepartment(ctx context.Context, departmentID uuid.UUID, requesterID uuid.UUID, includeInactive bool, limit, offset int) ([]*models.AdminUserSearchResult, int, error) {
+	startTime := time.Now()
 	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
 	if err != nil {
-		return nil, 0, fmt.Errorf("requester not found: %w", err)
+		return nil, 0, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
-	// Check if requester has access to this department
 	if !requester.IsOwner() {
 		systemDept, err := s.companyRepo.GetSystemDepartment(ctx, departmentID)
 		if err != nil {
-			return nil, 0, fmt.Errorf("department not found: %w", err)
+			return nil, 0, fmt.Errorf("%w: %v", appErrors.ErrNotFound, err)
 		}
-
 		hasAccess, err := s.adminRepo.AdminHasDepartmentAccess(ctx, requesterID, systemDept.Bitmask)
-		if err != nil {
-			return nil, 0, fmt.Errorf("failed to check department access: %w", err)
-		}
-		if !hasAccess {
-			return nil, 0, fmt.Errorf("unauthorized: no access to department")
+		if err != nil || !hasAccess {
+			return nil, 0, appErrors.ErrPermissionDenied
 		}
 	}
-
-	// Get admins with total count
 	admins, totalCount, err := s.adminRepo.GetAdminsByDepartment(ctx, departmentID, includeInactive, limit, offset)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -4723,9 +4274,8 @@ func (s *AdminService) GetAdminsByDepartment(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, 0, fmt.Errorf("failed to get admins by department: %w", err)
+		return nil, 0, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -4750,11 +4300,16 @@ func (s *AdminService) GetAdminsByDepartment(
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "get_by_department", "admin_user",
+			nil, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"department": departmentID.String(),
+				"count":      len(admins),
+			})
+	}
 	return admins, totalCount, nil
 }
 
-// Helper function to count filters
 func countFilters(filters models.AdminSearchFilter) int {
 	count := 0
 	if filters.RoleID != nil {
@@ -4790,64 +4345,69 @@ func countFilters(filters models.AdminSearchFilter) int {
 	return count
 }
 
-// Add to AdminService in service/admin.go
+// buildPermissionMaskFromPermissions builds a permission mask from a list of permissions.
 func (s *AdminService) buildPermissionMaskFromPermissions(permissions []*models.Permission) []uint64 {
-	// We now support 800 permissions → 13 uint64 blocks
 	if len(permissions) == 0 {
 		return make([]uint64, 13)
 	}
-
 	var bitPositions []uint64
 	for _, perm := range permissions {
 		if perm.BitIndex >= 0 {
 			bitPositions = append(bitPositions, uint64(perm.BitIndex))
 		}
 	}
-
 	mask := rbac.BuildMaskFromBitPositions(bitPositions)
-
-	// Ensure mask always has 13 blocks (hard requirement)
 	if len(mask) < 13 {
 		fullMask := make([]uint64, 13)
 		copy(fullMask, mask)
 		return fullMask
 	}
-
 	return mask
 }
 
+// GetAdminPermissionMask returns the permission mask for an admin.
 func (s *AdminService) GetAdminPermissionMask(ctx context.Context, adminID uuid.UUID) ([]uint64, error) {
+	startTime := time.Now()
 	permissions, err := s.adminRepo.GetAdminUserPermissions(ctx, adminID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get admin permissions: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
-	return s.buildPermissionMaskFromPermissions(permissions), nil
+	mask := s.buildPermissionMaskFromPermissions(permissions)
+	s.logAdminEvent(ctx, &models.AdminLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   "admin_permission_mask_get",
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: "production",
+			Version:     "v1.0.0",
+			Level:       "info",
+			Message:     "Admin permission mask retrieved",
+		},
+		AdminID:  adminID.String(),
+		Action:   "get_admin_permission_mask",
+		Status:   "success",
+		Duration: int64(time.Since(startTime).Milliseconds()),
+	})
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "get_permission_mask", "admin_user",
+			&adminID, "system", nil, nil, nil, nil)
+	}
+	return mask, nil
 }
 
-// SearchAdminUsers searches for admin users with filters
-func (s *AdminService) SearchAdminUsers(
-	ctx context.Context,
-	req *models.AdminUserSearchRequest,
-	requesterID uuid.UUID,
-) ([]*models.AdminUserSearchResult, int, error) {
+// SearchAdminUsers searches admin users with a search request.
+func (s *AdminService) SearchAdminUsers(ctx context.Context, req *models.AdminUserSearchRequest, requesterID uuid.UUID) ([]*models.AdminUserSearchResult, int, error) {
 	startTime := time.Now()
-
-	// Get requester admin
 	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
 	if err != nil {
-		return nil, 0, fmt.Errorf("requester not found: %w", err)
+		return nil, 0, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions based on role type
 	if !requester.IsOwner() && !requester.IsSuperEmployee() {
-		// Regular employees can only search employees
 		if req.RoleTypeFilter != nil && *req.RoleTypeFilter != models.RoleTypeEmployee {
-			return nil, 0, fmt.Errorf("unauthorized: cannot search for this role type")
+			return nil, 0, appErrors.ErrPermissionDenied
 		}
 	}
-
-	// Call repository
 	results, total, err := s.adminRepo.SearchAdminUsers(ctx, req)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -4868,9 +4428,8 @@ func (s *AdminService) SearchAdminUsers(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, 0, fmt.Errorf("failed to search admin users: %w", err)
+		return nil, 0, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -4897,107 +4456,87 @@ func (s *AdminService) SearchAdminUsers(
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "search_users", "admin_user",
+			nil, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"query": req.Query,
+				"count": len(results),
+			})
+	}
 	return results, total, nil
 }
 
-// CreateAdminUser creates a new admin user with phone encryption
-func (s *AdminService) CreateAdminUser(
-	ctx context.Context,
-	req *models.AdminCreateRequest,
-	createdBy uuid.UUID,
-) (*models.AdminUser, error) {
+// CreateAdminUser creates a new admin user.
+func (s *AdminService) CreateAdminUser(ctx context.Context, req *models.AdminCreateRequest, createdBy uuid.UUID) (*models.AdminUser, error) {
 	startTime := time.Now()
+	if req.Username == "" || req.FullName == "" || req.PhoneNumber == "" || req.AdminRoleID == uuid.Nil {
+		return nil, appErrors.ErrInvalidInput
+	}
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("create_user-%s", uuid.New().String())
+	}
+	var cached *models.AdminUser
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
+	ip, _ := ctx.Value("ip_address").(string)
 
-	// Validate input
-	if req.Username == "" {
-		return nil, fmt.Errorf("username cannot be empty")
-	}
-	if req.FullName == "" {
-		return nil, fmt.Errorf("full name cannot be empty")
-	}
-	if req.PhoneNumber == "" {
-		return nil, fmt.Errorf("phone number cannot be empty")
-	}
-	if req.AdminRoleID == uuid.Nil {
-		return nil, fmt.Errorf("admin role ID cannot be empty")
-	}
-
-	// Get creator admin
 	creator, err := s.adminRepo.GetAdminByID(ctx, createdBy)
 	if err != nil {
-		return nil, fmt.Errorf("creator not found: %w", err)
+		return nil, fmt.Errorf("%w: creator not found", appErrors.ErrNotFound)
 	}
-
-	// Get admin role
 	adminRole, err := s.adminRepo.GetAdminRole(ctx, req.AdminRoleID)
 	if err != nil {
-		return nil, fmt.Errorf("admin role not found: %w", err)
+		return nil, fmt.Errorf("%w: admin role not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions based on role type
 	switch adminRole.RoleType {
 	case models.RoleTypeEmployee:
 		if !creator.IsOwner() && !creator.IsSuperEmployee() {
-			return nil, fmt.Errorf("unauthorized: only owner or super employee can create employee admin")
+			return nil, appErrors.ErrPermissionDenied
 		}
 	case models.RoleTypeManager:
 		if !creator.IsOwner() && !creator.IsSuperEmployee() {
-			return nil, fmt.Errorf("unauthorized: only owner or super employee can create manager admin")
+			return nil, appErrors.ErrPermissionDenied
 		}
 	case models.RoleTypeSuperAdmin:
-		return nil, fmt.Errorf("cannot create super admin through service")
+		return nil, appErrors.ErrInvalidInput
 	default:
-		return nil, fmt.Errorf("invalid role type")
+		return nil, appErrors.ErrInvalidInput
 	}
 
-	// Generate phone hash
 	phoneHash := s.GeneratePhoneHash(req.PhoneNumber)
-
-	// Encrypt phone number
 	encryptedResult, err := s.encryptionMgr.EncryptField(ctx, req.PhoneNumber, "phone")
 	if err != nil {
-		return nil, fmt.Errorf("failed to encrypt phone number: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
+	keyID, _ := uuid.Parse(encryptedResult.KeyID)
+	phoneEncrypted := []byte(encryptedResult.EncryptedValue)
 
-	keyID, err := uuid.Parse(encryptedResult.KeyID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse key ID: %w", err)
+	existing, _ := s.adminRepo.GetAdminByUsername(ctx, req.Username)
+	if existing != nil {
+		return nil, appErrors.ErrDuplicate
 	}
-
-	phoneEncryptedBytes := []byte(encryptedResult.EncryptedValue)
-
-	// Check if username already exists
-	existingAdmin, _ := s.adminRepo.GetAdminByUsername(ctx, req.Username)
-	if existingAdmin != nil {
-		return nil, fmt.Errorf("username already exists")
+	existingPhone, _ := s.adminRepo.GetAdminByPhoneHash(ctx, phoneHash)
+	if existingPhone != nil {
+		return nil, appErrors.ErrDuplicate
 	}
-
-	// Check if phone already exists
-	existingPhoneAdmin, _ := s.adminRepo.GetAdminByPhoneHash(ctx, phoneHash)
-	if existingPhoneAdmin != nil {
-		return nil, fmt.Errorf("phone number already exists")
-	}
-
-	// Validate reports_to if provided
 	if req.ReportsTo != nil {
 		reportsToAdmin, err := s.adminRepo.GetAdminByID(ctx, *req.ReportsTo)
 		if err != nil {
-			return nil, fmt.Errorf("reports_to admin not found: %w", err)
+			return nil, fmt.Errorf("%w: reports_to not found", appErrors.ErrNotFound)
 		}
 		if reportsToAdmin.RoleType < adminRole.RoleType {
-			return nil, fmt.Errorf("reports_to admin must have higher or equal role level")
+			return nil, appErrors.ErrInvalidInput
 		}
 	}
 
-	// Create admin user
 	adminID := uuid.New()
 	now := time.Now().UTC()
-
 	admin := &models.AdminUser{
 		AdminID:             adminID,
 		PhoneHash:           phoneHash,
-		PhoneEncrypted:      phoneEncryptedBytes,
+		PhoneEncrypted:      phoneEncrypted,
 		PhoneKeyID:          keyID,
 		PhoneEncryptedDEK:   encryptedResult.EncryptedDEK,
 		AdminRoleID:         req.AdminRoleID,
@@ -5013,8 +4552,8 @@ func (s *AdminService) CreateAdminUser(
 		Username:            req.Username,
 		FullName:            req.FullName,
 	}
+	beforeJSON, _ := json.Marshal(admin)
 
-	// Create admin in repository
 	if err := s.adminRepo.CreateAdminUser(ctx, admin); err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -5034,8 +4573,10 @@ func (s *AdminService) CreateAdminUser(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("failed to create admin user: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
+
+	afterJSON, _ := json.Marshal(admin)
 
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
@@ -5064,43 +4605,37 @@ func (s *AdminService) CreateAdminUser(
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "create", "admin_user",
+			&adminID, "admin", &createdBy, beforeJSON, afterJSON, map[string]interface{}{
+				"username": req.Username,
+				"ip":       ip,
+			})
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, admin)
 	return admin, nil
 }
 
-// GetAdminsByRoleType gets admins by role type (returns only 2 values)
-func (s *AdminService) GetAdminsByRoleType(
-	ctx context.Context,
-	roleType int,
-	requesterID uuid.UUID,
-	includeInactive bool,
-	limit int,
-	offset int,
-) ([]*models.AdminUserSearchResult, error) {
+// GetAdminsByRoleType returns admins of a specific role type.
+func (s *AdminService) GetAdminsByRoleType(ctx context.Context, roleType int, requesterID uuid.UUID, includeInactive bool, limit int, offset int) ([]*models.AdminUserSearchResult, error) {
 	startTime := time.Now()
-
-	// Get requester admin
 	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
 	if err != nil {
-		return nil, fmt.Errorf("requester not found: %w", err)
+		return nil, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
-	// Check permissions based on role type
 	switch roleType {
 	case models.RoleTypeEmployee:
-		// Employees can view other employees
 	case models.RoleTypeManager:
 		if !requester.IsOwner() && !requester.IsSuperEmployee() {
-			return nil, fmt.Errorf("unauthorized: cannot view managers")
+			return nil, appErrors.ErrPermissionDenied
 		}
 	case models.RoleTypeSuperAdmin:
 		if !requester.IsOwner() {
-			return nil, fmt.Errorf("unauthorized: cannot view super admins")
+			return nil, appErrors.ErrPermissionDenied
 		}
 	default:
-		return nil, fmt.Errorf("invalid role type")
+		return nil, appErrors.ErrInvalidInput
 	}
-
 	admins, err := s.adminRepo.GetAdminsByRoleType(ctx, roleType, includeInactive, limit, offset)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -5121,9 +4656,8 @@ func (s *AdminService) GetAdminsByRoleType(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("failed to get admins by role type: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -5147,20 +4681,23 @@ func (s *AdminService) GetAdminsByRoleType(
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "list_by_role_type", "admin_user",
+			nil, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"role_type": roleType,
+				"count":     len(admins),
+			})
+	}
 	return admins, nil
 }
-func (s *AdminService) CheckAdminDepartmentAccess(
-	ctx context.Context,
-	adminID uuid.UUID,
-	departmentName string,
-) (bool, error) {
-	// Get all system departments
+
+// CheckAdminDepartmentAccess checks if an admin has access to a department.
+func (s *AdminService) CheckAdminDepartmentAccess(ctx context.Context, adminID uuid.UUID, departmentName string) (bool, error) {
+	startTime := time.Now()
 	systemDepts, err := s.companyRepo.GetSystemDepartments(ctx)
 	if err != nil {
-		return false, fmt.Errorf("failed to get system departments: %w", err)
+		return false, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	var targetDept *models.SystemDepartment
 	for _, dept := range systemDepts {
 		if dept.Name == departmentName {
@@ -5168,28 +4705,45 @@ func (s *AdminService) CheckAdminDepartmentAccess(
 			break
 		}
 	}
-
 	if targetDept == nil {
-		return false, fmt.Errorf("department not found: %s", departmentName)
+		return false, fmt.Errorf("%w: department %s not found", appErrors.ErrNotFound, departmentName)
 	}
-
-	// Check if admin has access to this department
 	hasAccess, err := s.adminRepo.AdminHasDepartmentAccess(ctx, adminID, targetDept.Bitmask)
 	if err != nil {
-		return false, fmt.Errorf("failed to check department access: %w", err)
+		return false, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
+	s.logAdminEvent(ctx, &models.AdminLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   "admin_department_access_check",
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: "production",
+			Version:     "v1.0.0",
+			Level:       "info",
+			Message:     "Department access check completed",
+		},
+		AdminID: adminID.String(),
+		Action:  "check_department_access",
+		Status:  "success",
+		Changes: map[string]interface{}{
+			"department": departmentName,
+			"has_access": hasAccess,
+		},
+		Duration: int64(time.Since(startTime).Milliseconds()),
+	})
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "check_department_access", "admin_user",
+			&adminID, "system", nil, nil, nil, map[string]interface{}{
+				"department": departmentName,
+				"has":        hasAccess,
+			})
+	}
 	return hasAccess, nil
 }
 
-// SearchAdminsByName searches admins by name
-func (s *AdminService) SearchAdminsByName(
-	ctx context.Context,
-	name string,
-	requesterID uuid.UUID,
-	limit int,
-	offset int,
-) ([]*models.AdminUserSearchResult, int, error) {
+// SearchAdminsByName searches admins by name (full-text).
+func (s *AdminService) SearchAdminsByName(ctx context.Context, name string, requesterID uuid.UUID, limit int, offset int) ([]*models.AdminUserSearchResult, int, error) {
 	req := &models.AdminSearchRequest{
 		Query:           name,
 		SearchType:      "fulltext",
@@ -5197,18 +4751,11 @@ func (s *AdminService) SearchAdminsByName(
 		Limit:           limit,
 		Offset:          offset,
 	}
-
 	return s.SearchAdminsWithFilters(ctx, requesterID, req)
 }
 
-// SearchAdminEmployees searches admin employees
-func (s *AdminService) SearchAdminEmployees(
-	ctx context.Context,
-	query string,
-	requesterID uuid.UUID,
-	limit int,
-	offset int,
-) ([]*models.AdminUserSearchResult, int, error) {
+// SearchAdminEmployees searches only employee admins.
+func (s *AdminService) SearchAdminEmployees(ctx context.Context, query string, requesterID uuid.UUID, limit int, offset int) ([]*models.AdminUserSearchResult, int, error) {
 	roleType := models.RoleTypeEmployee
 	req := &models.AdminSearchRequest{
 		Query:           query,
@@ -5218,18 +4765,11 @@ func (s *AdminService) SearchAdminEmployees(
 		Limit:           limit,
 		Offset:          offset,
 	}
-
 	return s.SearchAdminsWithFilters(ctx, requesterID, req)
 }
 
-// SearchAdminManagers searches admin managers
-func (s *AdminService) SearchAdminManagers(
-	ctx context.Context,
-	query string,
-	requesterID uuid.UUID,
-	limit int,
-	offset int,
-) ([]*models.AdminUserSearchResult, int, error) {
+// SearchAdminManagers searches only manager admins.
+func (s *AdminService) SearchAdminManagers(ctx context.Context, query string, requesterID uuid.UUID, limit int, offset int) ([]*models.AdminUserSearchResult, int, error) {
 	roleType := models.RoleTypeManager
 	req := &models.AdminSearchRequest{
 		Query:           query,
@@ -5239,25 +4779,16 @@ func (s *AdminService) SearchAdminManagers(
 		Limit:           limit,
 		Offset:          offset,
 	}
-
 	return s.SearchAdminsWithFilters(ctx, requesterID, req)
 }
 
-// GetAdminPhoneNumber retrieves and decrypts an admin's phone number (super admin only)
-func (s *AdminService) GetAdminPhoneNumber(
-	ctx context.Context,
-	adminID uuid.UUID,
-	requesterID uuid.UUID,
-) (string, error) {
+// GetAdminPhoneNumber returns the decrypted phone number (owner only).
+func (s *AdminService) GetAdminPhoneNumber(ctx context.Context, adminID uuid.UUID, requesterID uuid.UUID) (string, error) {
 	startTime := time.Now()
-
-	// Get requester admin
 	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
 	if err != nil {
-		return "", fmt.Errorf("requester not found: %w", err)
+		return "", fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
-	// Only super admin (owner) can access decrypted phone numbers
 	if !requester.IsOwner() {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -5277,27 +4808,19 @@ func (s *AdminService) GetAdminPhoneNumber(
 			ErrorCode:    "UNAUTHORIZED",
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return "", fmt.Errorf("unauthorized: only owner can access decrypted phone numbers")
+		return "", appErrors.ErrPermissionDenied
 	}
-
-	// Get target admin with encrypted phone details
 	targetAdmin, err := s.adminRepo.GetAdminWithEncryptedPhone(ctx, adminID)
 	if err != nil {
-		return "", fmt.Errorf("admin not found: %w", err)
+		return "", fmt.Errorf("%w: %v", appErrors.ErrNotFound, err)
 	}
-
-	// ✅ CORRECT: Create EncryptedData struct with proper fields
 	encryptedData := &encryption.EncryptedData{
 		EncryptedValue: string(targetAdmin.PhoneEncrypted),
 		KeyID:          targetAdmin.PhoneKeyID.String(),
 		EncryptedDEK:   targetAdmin.PhoneEncryptedDEK,
-		// ❌ REMOVED: FieldType - Not a valid field in EncryptedData
-		// ✅ ADD if needed: Version and CreatedAt (check if they're required)
-		Version:   "v1",                       // This might be stored or known from your encryption version
-		CreatedAt: targetAdmin.AdminCreatedAt, // Use appropriate timestamp
+		Version:        "v1",
+		CreatedAt:      targetAdmin.AdminCreatedAt,
 	}
-
-	// Decrypt the phone number
 	decryptedPhone, err := s.encryptionMgr.DecryptField(ctx, encryptedData)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -5319,9 +4842,8 @@ func (s *AdminService) GetAdminPhoneNumber(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return "", fmt.Errorf("failed to decrypt phone number: %w", err)
+		return "", fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -5345,479 +4867,149 @@ func (s *AdminService) GetAdminPhoneNumber(
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "get_phone", "admin_user",
+			&adminID, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"accessed": true,
+			})
+	}
 	return decryptedPhone, nil
 }
 
-// func (s *AdminService) InitSuperAdmin(
-//     ctx context.Context,
-//     phoneNumber string,
-//     username string,
-//     fullName string,
-// ) (*models.AdminUser, error) {
-//     startTime := time.Now()
-//     s.logger.Info("Initializing super admin...",
-//         zap.String("phone", phoneNumber),
-//         zap.String("username", username),
-//         zap.String("full_name", fullName))
+// --------------------------------------------------------------------
+//  SUPER ADMIN INITIALIZATION
+// --------------------------------------------------------------------
 
-//     if phoneNumber == "" {
-//         return nil, fmt.Errorf("phone number cannot be empty")
-//     }
-//     if username == "" {
-//         return nil, fmt.Errorf("username cannot be empty")
-//     }
-//     if fullName == "" {
-//         return nil, fmt.Errorf("full name cannot be empty")
-//     }
-
-//     // Check if super admin already exists
-//     existingSuperAdmin, err := s.adminRepo.GetSuperAdmin(ctx)
-//     if err != nil && err != sql.ErrNoRows {
-//         return nil, fmt.Errorf("failed to check for existing super admin: %w", err)
-//     }
-//     if existingSuperAdmin != nil {
-//         s.logger.Warn("Super admin already exists",
-//             zap.String("admin_id", existingSuperAdmin.AdminID.String()),
-//             zap.String("username", existingSuperAdmin.Username))
-//         return existingSuperAdmin, nil
-//     }
-
-//     // Check if super admin role exists
-//     superAdminRole, err := s.adminRepo.GetSuperAdminRole(ctx)
-//     if err != nil && err != sql.ErrNoRows {
-//         return nil, fmt.Errorf("failed to check for super admin role: %w", err)
-//     }
-
-//     var roleID uuid.UUID
-//     var roleCreated bool = false
-
-//     if superAdminRole == nil {
-//         // Create new super admin role with ALL permissions and departments
-//         roleID = uuid.New()
-//         now := time.Now().UTC()
-
-//         superAdminRole = &models.AdminRole{
-//             AdminRoleID:   roleID,
-//             RoleName:      "Super Admin",
-//             RoleLevel:     s.getRoleLevel(models.RoleTypeSuperAdmin),
-//             RoleType:      models.RoleTypeSuperAdmin,
-//             IsSystemRole:  true,
-//             Description:   "System super administrator with full access to ALL permissions and ALL departments",
-//             CreatedAt:     now,
-//             UpdatedAt:     now,
-//         }
-
-//         // Get ALL system departments
-//         allSystemDepartments, err := s.companyRepo.GetSystemDepartments(ctx)
-//         if err != nil {
-//             return nil, fmt.Errorf("failed to get ALL system departments: %w", err)
-//         }
-
-//         // Create department IDs array (though we'll ignore it in CreateSuperAdminRole)
-//         departmentIDs := make([]uuid.UUID, 0, len(allSystemDepartments))
-//         for _, dept := range allSystemDepartments {
-//             departmentIDs = append(departmentIDs, dept.SystemDepartmentID)
-//         }
-
-//         // Create the super admin role with ALL permissions and ALL departments
-//         if err := s.adminRepo.CreateSuperAdminRole(ctx, superAdminRole, departmentIDs); err != nil {
-//             return nil, fmt.Errorf("failed to create super admin role with ALL permissions: %w", err)
-//         }
-
-//         roleCreated = true
-//         s.logger.Info("✅ Created new super admin role with ALL permissions and ALL departments",
-//             zap.String("role_id", roleID.String()),
-//             zap.String("role_name", superAdminRole.RoleName),
-//             zap.Int("total_departments", len(allSystemDepartments)))
-//     } else {
-//         // Use existing super admin role, but ensure it has ALL permissions
-//         roleID = superAdminRole.AdminRoleID
-
-//         // Ensure existing role has ALL permissions
-//         if err := s.adminRepo.GrantAllPermissionsToRole(ctx, roleID, uuid.Nil); err != nil {
-//             s.logger.Warn("Failed to grant all permissions to existing super admin role",
-//                 zap.String("role_id", roleID.String()),
-//                 zap.Error(err))
-//         } else {
-//             s.logger.Info("✅ Granted ALL permissions to existing super admin role",
-//                 zap.String("role_id", roleID.String()),
-//                 zap.String("role_name", superAdminRole.RoleName))
-//         }
-
-//         // Ensure existing role has ALL departments
-//         allDepartments, err := s.companyRepo.GetSystemDepartments(ctx)
-//         if err != nil {
-//             s.logger.Warn("Failed to get all departments for super admin role",
-//                 zap.String("role_id", roleID.String()),
-//                 zap.Error(err))
-//         } else {
-//             for _, dept := range allDepartments {
-//                 if err := s.adminRepo.AssignDepartmentToAdminRole(ctx, roleID, dept.SystemDepartmentID); err != nil {
-//                     s.logger.Debug("Department assignment to super admin role",
-//                         zap.String("role_id", roleID.String()),
-//                         zap.String("department_id", dept.SystemDepartmentID.String()),
-//                         zap.Error(err))
-//                 }
-//             }
-//             s.logger.Info("✅ Ensured ALL departments assigned to existing super admin role",
-//                 zap.String("role_id", roleID.String()),
-//                 zap.Int("total_departments", len(allDepartments)))
-//         }
-
-//         s.logger.Info("Using existing super admin role",
-//             zap.String("role_id", roleID.String()),
-//             zap.String("role_name", superAdminRole.RoleName))
-//     }
-
-//     // Check for duplicate phone/username
-//     phoneHash := s.GeneratePhoneHash(phoneNumber)
-//     existingPhoneAdmin, _ := s.adminRepo.GetAdminByPhoneHash(ctx, phoneHash)
-//     if existingPhoneAdmin != nil {
-//         return nil, fmt.Errorf("phone number already exists for admin: %s", existingPhoneAdmin.Username)
-//     }
-
-//     existingUsernameAdmin, _ := s.adminRepo.GetAdminByUsername(ctx, username)
-//     if existingUsernameAdmin != nil {
-//         return nil, fmt.Errorf("username already exists")
-//     }
-
-//     // Encrypt phone number
-//     encryptedResult, err := s.encryptionMgr.EncryptField(ctx, phoneNumber, "phone")
-//     if err != nil {
-//         return nil, fmt.Errorf("failed to encrypt phone number: %w", err)
-//     }
-//     keyID, err := uuid.Parse(encryptedResult.KeyID)
-//     if err != nil {
-//         return nil, fmt.Errorf("failed to parse key ID: %w", err)
-//     }
-//     phoneEncryptedBytes := []byte(encryptedResult.EncryptedValue)
-
-//     // Create super admin user
-//     adminID := uuid.New()
-//     now := time.Now().UTC()
-//     admin := &models.AdminUser{
-//         AdminID:             adminID,
-//         PhoneHash:           phoneHash,
-//         PhoneEncrypted:      phoneEncryptedBytes,
-//         PhoneKeyID:          keyID,
-//         PhoneEncryptedDEK:   encryptedResult.EncryptedDEK,
-//         AdminRoleID:         roleID,
-//         RoleType:            models.RoleTypeSuperAdmin,
-//         ReportsTo:           nil,
-//         AdminCreatedAt:      now,
-//         AdminCreatedBy:      &adminID,
-//         AdminUpdatedAt:      now,
-//         IsActive:            true,
-//         DataAccessScope:     []string{"*"},
-//         IPWhitelist:         []string{"*"},
-//         FailedLoginAttempts: 0,
-//         Username:            username,
-//         FullName:            fullName,
-//     }
-
-//     if err := s.adminRepo.CreateSuperAdminUser(ctx, admin); err != nil {
-//         return nil, fmt.Errorf("failed to create super admin user: %w", err)
-//     }
-
-//     // Verify permissions were granted
-//     permissions, err := s.adminRepo.GetAdminUserPermissions(ctx, adminID)
-//     if err != nil {
-//         s.logger.Warn("Failed to verify super admin permissions",
-//             zap.String("admin_id", adminID.String()),
-//             zap.Error(err))
-//     } else {
-//         s.logger.Info("✅ Super admin permissions verified",
-//             zap.String("admin_id", adminID.String()),
-//             zap.Int("total_permissions", len(permissions)))
-//     }
-
-//     // Verify departments were assigned
-//     departments, err := s.adminRepo.GetAdminRoleDepartments(ctx, roleID)
-//     if err != nil {
-//         s.logger.Warn("Failed to verify super admin departments",
-//             zap.String("admin_id", adminID.String()),
-//             zap.Error(err))
-//     } else {
-//         s.logger.Info("✅ Super admin departments verified",
-//             zap.String("admin_id", adminID.String()),
-//             zap.Int("total_departments", len(departments)))
-//     }
-
-//     s.logAdminEvent(ctx, &models.AdminLogEvent{
-//         LogEnvelope: models.LogEnvelope{
-//             EventID:     uuid.New().String(),
-//             EventType:   "super_admin_init",
-//             ServiceName: "auth-service",
-//             Timestamp:   time.Now(),
-//             Environment: "production",
-//             Version:     "v1.0.0",
-//             Level:       "info",
-//             Message:     "Super admin initialized successfully with ALL permissions and ALL departments",
-//         },
-//         AdminID:      adminID.String(),
-//         Action:       "init_super_admin",
-//         ResourceType: "admin_user",
-//         ResourceID:   adminID.String(),
-//         Status:       "success",
-//         Changes: map[string]interface{}{
-//             "username":              username,
-//             "full_name":             fullName,
-//             "role_type":             models.RoleTypeSuperAdmin,
-//             "is_active":             true,
-//             "phone":                 phoneNumber,
-//             "role_id":               roleID.String(),
-//             "role_created":          roleCreated,
-//             "permissions_granted":   "ALL",
-//             "permissions_count":     len(permissions),
-//             "departments_assigned":  "ALL",
-//             "departments_count":     len(departments),
-//         },
-//         Duration: int64(time.Since(startTime).Milliseconds()),
-//     })
-
-//     s.logger.Info("🎉 Super admin initialized SUCCESSFULLY",
-//         zap.String("admin_id", adminID.String()),
-//         zap.String("username", username),
-//         zap.String("full_name", fullName),
-//         zap.String("role_id", roleID.String()),
-//         zap.Int("permissions", len(permissions)),
-//         zap.Int("departments", len(departments)),
-//         zap.Bool("role_created", roleCreated),
-//         zap.Duration("duration", time.Since(startTime)))
-
-//     return admin, nil
-// }
-
-// InitDefaultSuperAdmin initializes the default super admin (Sarvesh Chhabra)
 func (s *AdminService) InitDefaultSuperAdmin(ctx context.Context) (*models.AdminUser, error) {
-	// Default super admin details
 	phoneNumber := "+917206583437"
 	username := "sarvesh"
 	fullName := "Sarvesh Chhabra"
-
 	return s.InitSuperAdmin(ctx, phoneNumber, username, fullName)
 }
 
-// CheckAndInitSuperAdmin checks if super admin exists and initializes if not
 func (s *AdminService) CheckAndInitSuperAdmin(ctx context.Context) (bool, *models.AdminUser, error) {
-	// Check if super admin already exists
 	existingSuperAdmin, err := s.adminRepo.GetSuperAdmin(ctx)
 	if err != nil && err != sql.ErrNoRows {
-		return false, nil, fmt.Errorf("failed to check for super admin: %w", err)
+		return false, nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	if existingSuperAdmin != nil {
-		s.logger.Info("Super admin already exists",
-			zap.String("admin_id", existingSuperAdmin.AdminID.String()),
-			zap.String("username", existingSuperAdmin.Username))
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "super_admin_check",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "info",
+				Message:     "Super admin already exists",
+			},
+			AdminID: existingSuperAdmin.AdminID.String(),
+			Action:  "check_and_init_super_admin",
+			Status:  "success",
+			Changes: map[string]interface{}{
+				"exists": true,
+			},
+		})
 		return false, existingSuperAdmin, nil
 	}
-
-	// Initialize default super admin
-	admin, err := s.InitDefaultSuperAdmin(ctx)
+	admin, err := s.InitSuperAdmin(ctx, "+917206583437", "sarvesh", "Sarvesh Chhabra")
 	if err != nil {
-		return false, nil, fmt.Errorf("failed to initialize super admin: %w", err)
+		return false, nil, err
 	}
-
 	return true, admin, nil
 }
 
-// GetSuperAdmin gets the super admin (owner)
-func (s *AdminService) GetSuperAdmin(ctx context.Context) (*models.AdminUser, error) {
-	return s.GetAdminOwner(ctx)
-}
-
-func (s *AdminService) InitSuperAdmin(
-	ctx context.Context,
-	phoneNumber string,
-	username string,
-	fullName string,
-) (*models.AdminUser, error) {
+func (s *AdminService) InitSuperAdmin(ctx context.Context, phoneNumber, username, fullName string) (*models.AdminUser, error) {
 	startTime := time.Now()
-	s.logger.Info("🔧 INITIALIZING SUPER ADMIN...",
-		zap.String("phone", phoneNumber),
-		zap.String("username", username),
-		zap.String("full_name", fullName))
-
-	// Debug current state
-	s.logger.Info("🔍 Checking current database state...")
-	if err := s.adminRepo.(*postgres.AdminRepositoryPostgres).DebugSuperAdminInit(ctx); err != nil {
-		s.logger.Warn("Failed to debug database state", zap.Error(err))
+	if phoneNumber == "" || username == "" || fullName == "" {
+		return nil, appErrors.ErrInvalidInput
 	}
 
-	// Validation checks...
-	if phoneNumber == "" {
-		return nil, fmt.Errorf("phone number cannot be empty")
-	}
-	if username == "" {
-		return nil, fmt.Errorf("username cannot be empty")
-	}
-	if fullName == "" {
-		return nil, fmt.Errorf("full name cannot be empty")
-	}
-
-	// Check if super admin already exists
-	s.logger.Info("🔍 Checking for existing super admin...")
+	// Check existing
 	existingSuperAdmin, err := s.adminRepo.GetSuperAdmin(ctx)
 	if err != nil && err != sql.ErrNoRows {
-		s.logger.Error("❌ Failed to check for existing super admin", zap.Error(err))
-		return nil, fmt.Errorf("failed to check for existing super admin: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	if existingSuperAdmin != nil {
-		s.logger.Warn("⚠️ Super admin already exists",
-			zap.String("admin_id", existingSuperAdmin.AdminID.String()),
-			zap.String("username", existingSuperAdmin.Username))
-
-		// Check if existing super admin has permissions
-		permissions, _ := s.adminRepo.GetAdminUserPermissions(ctx, existingSuperAdmin.AdminID)
-		s.logger.Info(fmt.Sprintf("📊 Existing super admin has %d permissions", len(permissions)))
-
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "super_admin_init",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "info",
+				Message:     "Super admin already exists, skipping init",
+			},
+			AdminID: existingSuperAdmin.AdminID.String(),
+			Action:  "init_super_admin",
+			Status:  "success",
+			Changes: map[string]interface{}{
+				"existing": true,
+			},
+		})
 		return existingSuperAdmin, nil
 	}
-	s.logger.Info("✅ No existing super admin found, proceeding with initialization")
 
-	// Check if super admin role exists
-	s.logger.Info("🔍 Checking for super admin role...")
+	// Get or create super admin role
 	superAdminRole, err := s.adminRepo.GetSuperAdminRole(ctx)
 	if err != nil && err != sql.ErrNoRows {
-		s.logger.Error("❌ Failed to check for super admin role", zap.Error(err))
-		return nil, fmt.Errorf("failed to check for super admin role: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	var roleID uuid.UUID
-	var roleCreated bool = false
-
+	var roleCreated bool
 	if superAdminRole == nil {
-		s.logger.Info("🆕 Creating new super admin role...")
-
-		// Create new super admin role
 		roleID = uuid.New()
 		now := time.Now().UTC()
-
 		superAdminRole = &models.AdminRole{
 			AdminRoleID:  roleID,
 			RoleName:     "Super Admin",
 			RoleLevel:    s.getRoleLevel(models.RoleTypeSuperAdmin),
 			RoleType:     models.RoleTypeSuperAdmin,
 			IsSystemRole: true,
-			Description:  "System super administrator with full access to ALL permissions and ALL departments",
+			Description:  "System super administrator with full access",
 			CreatedAt:    now,
 			UpdatedAt:    now,
 		}
-
-		// Get ALL system departments
-		s.logger.Info("📋 Getting all system departments...")
-		allSystemDepartments, err := s.companyRepo.GetSystemDepartments(ctx)
+		allDepts, err := s.companyRepo.GetSystemDepartments(ctx)
 		if err != nil {
-			s.logger.Error("❌ Failed to get system departments", zap.Error(err))
-			return nil, fmt.Errorf("failed to get ALL system departments: %w", err)
+			return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 		}
-
-		s.logger.Info(fmt.Sprintf("📊 Found %d system departments", len(allSystemDepartments)))
-
-		// Create department IDs array
-		departmentIDs := make([]uuid.UUID, 0, len(allSystemDepartments))
-		for _, dept := range allSystemDepartments {
-			departmentIDs = append(departmentIDs, dept.SystemDepartmentID)
-			s.logger.Debug(fmt.Sprintf("Department: %s (ID: %s)", dept.Name, dept.SystemDepartmentID.String()))
+		deptIDs := make([]uuid.UUID, len(allDepts))
+		for i, d := range allDepts {
+			deptIDs[i] = d.SystemDepartmentID
 		}
-
-		// Create the super admin role with ALL permissions and ALL departments
-		s.logger.Info("🚀 Creating super admin role with ALL permissions and ALL departments...")
-		if err := s.adminRepo.CreateSuperAdminRole(ctx, superAdminRole, departmentIDs); err != nil {
-			s.logger.Error("❌ FAILED to create super admin role", zap.Error(err))
-			return nil, fmt.Errorf("failed to create super admin role with ALL permissions: %w", err)
+		if err := s.adminRepo.CreateSuperAdminRole(ctx, superAdminRole, deptIDs); err != nil {
+			return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 		}
-
 		roleCreated = true
-		s.logger.Info("✅ Created new super admin role with ALL permissions and ALL departments",
-			zap.String("role_id", roleID.String()),
-			zap.String("role_name", superAdminRole.RoleName),
-			zap.Int("total_departments", len(allSystemDepartments)))
 	} else {
-		s.logger.Info("🔄 Using existing super admin role...")
 		roleID = superAdminRole.AdminRoleID
-
-		s.logger.Info(fmt.Sprintf("Existing role: %s (ID: %s)", superAdminRole.RoleName, roleID.String()))
-
-		// Ensure existing role has ALL permissions
-		s.logger.Info("🔐 Ensuring existing role has ALL permissions...")
-		if err := s.adminRepo.GrantAllPermissionsToRole(ctx, roleID, uuid.Nil); err != nil {
-			s.logger.Warn("⚠️ Failed to grant all permissions to existing super admin role",
-				zap.String("role_id", roleID.String()),
-				zap.Error(err))
-		} else {
-			s.logger.Info("✅ Granted ALL permissions to existing super admin role",
-				zap.String("role_id", roleID.String()),
-				zap.String("role_name", superAdminRole.RoleName))
+		// Ensure all permissions and departments are assigned
+		_ = s.adminRepo.GrantAllPermissionsToRole(ctx, roleID, uuid.Nil)
+		allDepts, _ := s.companyRepo.GetSystemDepartments(ctx)
+		for _, d := range allDepts {
+			_ = s.adminRepo.AssignDepartmentToAdminRole(ctx, roleID, d.SystemDepartmentID)
 		}
-
-		// Ensure existing role has ALL departments
-		s.logger.Info("🏢 Ensuring existing role has ALL departments...")
-		allDepartments, err := s.companyRepo.GetSystemDepartments(ctx)
-		if err != nil {
-			s.logger.Warn("⚠️ Failed to get all departments for super admin role",
-				zap.String("role_id", roleID.String()),
-				zap.Error(err))
-		} else {
-			s.logger.Info(fmt.Sprintf("Found %d departments to assign", len(allDepartments)))
-			for _, dept := range allDepartments {
-				if err := s.adminRepo.AssignDepartmentToAdminRole(ctx, roleID, dept.SystemDepartmentID); err != nil {
-					s.logger.Debug("Department assignment to super admin role",
-						zap.String("role_id", roleID.String()),
-						zap.String("department_id", dept.SystemDepartmentID.String()),
-						zap.Error(err))
-				}
-			}
-			s.logger.Info("✅ Ensured ALL departments assigned to existing super admin role",
-				zap.String("role_id", roleID.String()),
-				zap.Int("total_departments", len(allDepartments)))
-		}
-
-		s.logger.Info("Using existing super admin role",
-			zap.String("role_id", roleID.String()),
-			zap.String("role_name", superAdminRole.RoleName))
 	}
 
-	// Check for duplicate phone/username
-	s.logger.Info("🔍 Checking for duplicate phone/username...")
+	// Create admin user
 	phoneHash := s.GeneratePhoneHash(phoneNumber)
-	existingPhoneAdmin, _ := s.adminRepo.GetAdminByPhoneHash(ctx, phoneHash)
-	if existingPhoneAdmin != nil {
-		s.logger.Error("❌ Phone number already exists")
-		return nil, fmt.Errorf("phone number already exists for admin: %s", existingPhoneAdmin.Username)
-	}
-
-	existingUsernameAdmin, _ := s.adminRepo.GetAdminByUsername(ctx, username)
-	if existingUsernameAdmin != nil {
-		s.logger.Error("❌ Username already exists")
-		return nil, fmt.Errorf("username already exists")
-	}
-
-	// Encrypt phone number
-	s.logger.Info("🔐 Encrypting phone number...")
 	encryptedResult, err := s.encryptionMgr.EncryptField(ctx, phoneNumber, "phone")
 	if err != nil {
-		s.logger.Error("❌ Failed to encrypt phone number", zap.Error(err))
-		return nil, fmt.Errorf("failed to encrypt phone number: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-	keyID, err := uuid.Parse(encryptedResult.KeyID)
-	if err != nil {
-		s.logger.Error("❌ Failed to parse key ID", zap.Error(err))
-		return nil, fmt.Errorf("failed to parse key ID: %w", err)
-	}
-	phoneEncryptedBytes := []byte(encryptedResult.EncryptedValue)
+	keyID, _ := uuid.Parse(encryptedResult.KeyID)
+	phoneEncrypted := []byte(encryptedResult.EncryptedValue)
 
-	// Create super admin user
-	s.logger.Info("👤 Creating super admin user...")
 	adminID := uuid.New()
 	now := time.Now().UTC()
 	admin := &models.AdminUser{
 		AdminID:             adminID,
 		PhoneHash:           phoneHash,
-		PhoneEncrypted:      phoneEncryptedBytes,
+		PhoneEncrypted:      phoneEncrypted,
 		PhoneKeyID:          keyID,
 		PhoneEncryptedDEK:   encryptedResult.EncryptedDEK,
 		AdminRoleID:         roleID,
@@ -5833,41 +5025,10 @@ func (s *AdminService) InitSuperAdmin(
 		Username:            username,
 		FullName:            fullName,
 	}
-
 	if err := s.adminRepo.CreateSuperAdminUser(ctx, admin); err != nil {
-		s.logger.Error("❌ FAILED to create super admin user", zap.Error(err))
-		return nil, fmt.Errorf("failed to create super admin user: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 
-	s.logger.Info("✅ Super admin user created successfully")
-
-	// Verify permissions were granted
-	s.logger.Info("🔍 Verifying permissions...")
-	permissions, err := s.adminRepo.GetAdminUserPermissions(ctx, adminID)
-	if err != nil {
-		s.logger.Warn("⚠️ Failed to verify super admin permissions",
-			zap.String("admin_id", adminID.String()),
-			zap.Error(err))
-	} else {
-		s.logger.Info("✅ Super admin permissions verified",
-			zap.String("admin_id", adminID.String()),
-			zap.Int("total_permissions", len(permissions)))
-	}
-
-	// Verify departments were assigned
-	s.logger.Info("🔍 Verifying departments...")
-	departments, err := s.adminRepo.GetAdminRoleDepartments(ctx, roleID)
-	if err != nil {
-		s.logger.Warn("⚠️ Failed to verify super admin departments",
-			zap.String("admin_id", adminID.String()),
-			zap.Error(err))
-	} else {
-		s.logger.Info("✅ Super admin departments verified",
-			zap.String("admin_id", adminID.String()),
-			zap.Int("total_departments", len(departments)))
-	}
-
-	// Log event
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -5885,91 +5046,80 @@ func (s *AdminService) InitSuperAdmin(
 		ResourceID:   adminID.String(),
 		Status:       "success",
 		Changes: map[string]interface{}{
-			"username":             username,
-			"full_name":            fullName,
-			"role_type":            models.RoleTypeSuperAdmin,
-			"is_active":            true,
-			"phone":                phoneNumber,
-			"role_id":              roleID.String(),
-			"role_created":         roleCreated,
-			"permissions_granted":  "ALL",
-			"permissions_count":    len(permissions),
-			"departments_assigned": "ALL",
-			"departments_count":    len(departments),
+			"username":     username,
+			"full_name":    fullName,
+			"role_type":    models.RoleTypeSuperAdmin,
+			"role_created": roleCreated,
+			"permissions":  "ALL",
+			"departments":  "ALL",
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
-	s.logger.Info("🎉 SUPER ADMIN INITIALIZATION COMPLETE!",
-		zap.String("admin_id", adminID.String()),
-		zap.String("username", username),
-		zap.String("full_name", fullName),
-		zap.String("role_id", roleID.String()),
-		zap.Int("permissions", len(permissions)),
-		zap.Int("departments", len(departments)),
-		zap.Bool("role_created", roleCreated),
-		zap.Duration("duration", time.Since(startTime)))
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_auth", "init_super_admin", "admin_user",
+			&adminID, "system", nil, nil, nil, map[string]interface{}{
+				"username":  username,
+				"full_name": fullName,
+			})
+	}
 	return admin, nil
 }
 
-// service/admin_service.go - Update CreateAdminRole method
-func (s *AdminService) CreateAdminRole(
-	ctx context.Context,
-	req *models.AdminRoleCreateRequest,
-	createdBy uuid.UUID,
-) (*models.AdminRole, error) {
+// --------------------------------------------------------------------
+//  ADMIN ROLE CREATION AND PERMISSION GRANTING
+// --------------------------------------------------------------------
+
+func (s *AdminService) CreateAdminRole(ctx context.Context, req *models.AdminRoleCreateRequest, createdBy uuid.UUID) (*models.AdminRole, error) {
 	startTime := time.Now()
-	if req.RoleName == "" {
-		return nil, fmt.Errorf("role name cannot be empty")
-	}
-	if req.RoleType == 0 {
-		return nil, fmt.Errorf("role type must be specified")
+	if req.RoleName == "" || req.RoleType == 0 || len(req.DepartmentIDs) == 0 {
+		return nil, appErrors.ErrInvalidInput
 	}
 	if req.RoleType != models.RoleTypeEmployee && req.RoleType != models.RoleTypeManager {
-		return nil, fmt.Errorf("invalid role type. Must be employee (1) or manager (2)")
+		return nil, appErrors.ErrInvalidInput
 	}
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("create_role-%s", uuid.New().String())
+	}
+	var cached *models.AdminRole
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
+	ip, _ := ctx.Value("ip_address").(string)
+
 	creator, err := s.adminRepo.GetAdminByID(ctx, createdBy)
 	if err != nil {
-		return nil, fmt.Errorf("creator not found: %w", err)
+		return nil, fmt.Errorf("%w: creator not found", appErrors.ErrNotFound)
 	}
-	if req.RoleType == models.RoleTypeManager {
-		if !creator.IsOwner() && !creator.IsSuperEmployee() {
-			return nil, fmt.Errorf("unauthorized: only owner or super employee can create manager roles")
-		}
+	if req.RoleType == models.RoleTypeManager && !creator.IsOwner() && !creator.IsSuperEmployee() {
+		return nil, appErrors.ErrPermissionDenied
 	}
-	if len(req.DepartmentIDs) == 0 {
-		return nil, fmt.Errorf("at least one department must be specified")
-	}
-	systemDepartments, err := s.companyRepo.GetSystemDepartments(ctx)
+
+	systemDepts, err := s.companyRepo.GetSystemDepartments(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get system departments: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-	departmentIDs := make([]uuid.UUID, 0, len(req.DepartmentIDs))
-	departmentMap := make(map[uuid.UUID]*models.SystemDepartment)
+	deptIDs := make([]uuid.UUID, 0, len(req.DepartmentIDs))
 	for _, deptID := range req.DepartmentIDs {
 		found := false
-		for _, sysDept := range systemDepartments {
+		for _, sysDept := range systemDepts {
 			if sysDept.SystemDepartmentID == deptID {
 				if !creator.IsOwner() {
-					hasAccess, err := s.adminRepo.AdminHasDepartmentAccess(ctx, createdBy, sysDept.Bitmask)
-					if err != nil {
-						return nil, fmt.Errorf("failed to check department access: %w", err)
-					}
-					if !hasAccess {
-						return nil, fmt.Errorf("creator does not have access to department: %s", sysDept.Name)
+					has, err := s.adminRepo.AdminHasDepartmentAccess(ctx, createdBy, sysDept.Bitmask)
+					if err != nil || !has {
+						return nil, appErrors.ErrPermissionDenied
 					}
 				}
-				departmentIDs = append(departmentIDs, deptID)
-				departmentMap[deptID] = sysDept
+				deptIDs = append(deptIDs, deptID)
 				found = true
 				break
 			}
 		}
 		if !found {
-			return nil, fmt.Errorf("department not found: %s", deptID)
+			return nil, fmt.Errorf("%w: department %s not found", appErrors.ErrNotFound, deptID)
 		}
 	}
+
 	roleID := uuid.New()
 	now := time.Now().UTC()
 	role := &models.AdminRole{
@@ -5982,37 +5132,25 @@ func (s *AdminService) CreateAdminRole(
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
-	if err := s.adminRepo.CreateAdminRole(ctx, role, departmentIDs); err != nil {
-		return nil, fmt.Errorf("failed to create admin role: %w", err)
-	}
+	beforeJSON, _ := json.Marshal(role)
 
-	// ONLY grant all permissions to manager roles automatically
-	// Employee roles get specific permissions via the handler
+	if err := s.adminRepo.CreateAdminRole(ctx, role, deptIDs); err != nil {
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
 	if req.RoleType == models.RoleTypeManager {
-		for _, deptID := range departmentIDs {
-			permissions, err := s.companyRepo.GetPermissionsBySystemDepartments(
-				ctx,
-				[]uuid.UUID{deptID},
-				"", "", "",
-			)
+		// Grant default permissions for departments
+		for _, deptID := range deptIDs {
+			perms, err := s.companyRepo.GetPermissionsBySystemDepartments(ctx, []uuid.UUID{deptID}, "", "", "")
 			if err != nil {
-				s.logger.Warn("Failed to get permissions for department",
-					zap.String("role_id", roleID.String()),
-					zap.String("department_id", deptID.String()),
-					zap.Error(err))
 				continue
 			}
-			for _, perm := range permissions {
-				if err := s.adminRepo.GrantPermissionToAdminRole(ctx, roleID, perm.PermissionID, createdBy); err != nil {
-					s.logger.Warn("Failed to grant permission to role",
-						zap.String("role_id", roleID.String()),
-						zap.String("permission_id", perm.PermissionID.String()),
-						zap.Error(err))
-				}
+			for _, perm := range perms {
+				_ = s.adminRepo.GrantPermissionToAdminRole(ctx, roleID, perm.PermissionID, createdBy)
 			}
 		}
 	}
 
+	afterJSON, _ := json.Marshal(role)
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -6032,36 +5170,41 @@ func (s *AdminService) CreateAdminRole(
 		Changes: map[string]interface{}{
 			"role_name":      req.RoleName,
 			"role_type":      req.RoleType,
-			"department_ids": departmentIDs,
+			"department_ids": deptIDs,
 			"description":    req.Description,
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_role", "create", "admin_role",
+			&roleID, "admin", &createdBy, beforeJSON, afterJSON, map[string]interface{}{
+				"role_name": req.RoleName,
+				"ip":        ip,
+			})
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, role)
 	return role, nil
 }
-func (s *AdminService) GrantPermissionToAdminRole(
-	ctx context.Context,
-	roleID uuid.UUID,
-	permissionID uuid.UUID,
-	grantedBy uuid.UUID,
-) error {
+
+func (s *AdminService) GrantPermissionToAdminRole(ctx context.Context, roleID uuid.UUID, permissionID uuid.UUID, grantedBy uuid.UUID) error {
 	startTime := time.Now()
-
-	// Check if permission is already granted
-	granted, err := s.adminRepo.IsPermissionGrantedToRole(ctx, roleID, permissionID)
-	if err != nil {
-		return fmt.Errorf("failed to check permission grant: %w", err)
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("grant_perm-%s-%s", roleID.String(), permissionID.String())
 	}
-
-	if granted {
-		// Permission already granted, nothing to do
-		s.logger.Debug("Permission already granted to role",
-			zap.String("role_id", roleID.String()),
-			zap.String("permission_id", permissionID.String()))
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
 		return nil
 	}
+	ip, _ := ctx.Value("ip_address").(string)
 
-	// Grant the permission
+	granted, err := s.adminRepo.IsPermissionGrantedToRole(ctx, roleID, permissionID)
+	if err != nil {
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	if granted {
+		return nil
+	}
 	if err := s.adminRepo.GrantPermissionToAdminRole(ctx, roleID, permissionID, grantedBy); err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -6081,9 +5224,8 @@ func (s *AdminService) GrantPermissionToAdminRole(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return fmt.Errorf("failed to grant permission to admin role: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -6103,65 +5245,54 @@ func (s *AdminService) GrantPermissionToAdminRole(
 		Changes: map[string]interface{}{
 			"role_id":       roleID.String(),
 			"permission_id": permissionID.String(),
-			"granted_by":    grantedBy.String(),
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_role", "grant_permission", "admin_role",
+			&roleID, "admin", &grantedBy, nil, nil, map[string]interface{}{
+				"permission_id": permissionID.String(),
+				"ip":            ip,
+			})
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
-// GetAdminRoleWithDetails gets role with departments and permissions
-func (s *AdminService) GetAdminRoleWithDetails(
-	ctx context.Context,
-	roleID uuid.UUID,
-	requesterID uuid.UUID,
-) (*models.AdminRole, []*models.SystemDepartment, []*models.Permission, error) {
-	startTime := time.Now()
+// --------------------------------------------------------------------
+//  ADMIN ROLE DETAILS & AVAILABLE PERMISSIONS
+// --------------------------------------------------------------------
 
-	// Get role
+func (s *AdminService) GetAdminRoleWithDetails(ctx context.Context, roleID uuid.UUID, requesterID uuid.UUID) (*models.AdminRole, []*models.SystemDepartment, []*models.Permission, error) {
+	startTime := time.Now()
 	role, err := s.adminRepo.GetAdminRole(ctx, roleID)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("admin role not found: %w", err)
+		return nil, nil, nil, fmt.Errorf("%w: %v", appErrors.ErrNotFound, err)
 	}
-
-	// Authorization check
 	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("requester not found: %w", err)
+		return nil, nil, nil, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
-
 	if !requester.IsOwner() && !requester.IsSuperEmployee() {
-		// Check if requester has access to all role departments
 		roleDepts, err := s.adminRepo.GetAdminRoleDepartments(ctx, roleID)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("failed to get role departments: %w", err)
+			return nil, nil, nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 		}
-
 		for _, dept := range roleDepts {
-			hasAccess, err := s.adminRepo.AdminHasDepartmentAccess(ctx, requesterID, dept.Bitmask)
-			if err != nil {
-				return nil, nil, nil, fmt.Errorf("failed to check department access: %w", err)
-			}
-			if !hasAccess {
-				return nil, nil, nil, fmt.Errorf("unauthorized: cannot view this role")
+			has, err := s.adminRepo.AdminHasDepartmentAccess(ctx, requesterID, dept.Bitmask)
+			if err != nil || !has {
+				return nil, nil, nil, appErrors.ErrPermissionDenied
 			}
 		}
 	}
-
-	// Get departments
 	departments, err := s.adminRepo.GetAdminRoleDepartments(ctx, roleID)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to get role departments: %w", err)
+		return nil, nil, nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
-	// Get permissions
 	permissions, err := s.adminRepo.GetAdminRolePermissions(ctx, roleID)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to get role permissions: %w", err)
+		return nil, nil, nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
-	// Log the event
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -6184,63 +5315,47 @@ func (s *AdminService) GetAdminRoleWithDetails(
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_role", "get_details", "admin_role",
+			&roleID, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"depts": len(departments),
+				"perms": len(permissions),
+			})
+	}
 	return role, departments, permissions, nil
 }
 
-// GetAvailablePermissionsForRole gets all permissions available for a role based on its departments
-func (s *AdminService) GetAvailablePermissionsForRole(
-	ctx context.Context,
-	roleID uuid.UUID,
-	requesterID uuid.UUID,
-) ([]*models.Permission, error) {
+func (s *AdminService) GetAvailablePermissionsForRole(ctx context.Context, roleID uuid.UUID, requesterID uuid.UUID) ([]*models.Permission, error) {
 	startTime := time.Now()
-
-	// Get role departments
 	departments, err := s.adminRepo.GetAdminRoleDepartments(ctx, roleID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get role departments: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	if len(departments) == 0 {
 		return []*models.Permission{}, nil
 	}
-
-	// Get department IDs
 	deptIDs := make([]uuid.UUID, len(departments))
-	for i, dept := range departments {
-		deptIDs[i] = dept.SystemDepartmentID
+	for i, d := range departments {
+		deptIDs[i] = d.SystemDepartmentID
 	}
-
-	// Get permissions for these departments
-	permissions, err := s.companyRepo.GetPermissionsBySystemDepartments(
-		ctx, deptIDs, "", "", "",
-	)
+	perms, err := s.companyRepo.GetPermissionsBySystemDepartments(ctx, deptIDs, "", "", "")
 	if err != nil {
-		return nil, fmt.Errorf("failed to get permissions: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
-	// Get current role permissions
-	currentPerms, err := s.adminRepo.GetAdminRolePermissions(ctx, roleID)
+	current, err := s.adminRepo.GetAdminRolePermissions(ctx, roleID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get current permissions: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
-	// Create a map of current permission IDs
-	currentPermMap := make(map[uuid.UUID]bool)
-	for _, perm := range currentPerms {
-		currentPermMap[perm.PermissionID] = true
+	currentMap := make(map[uuid.UUID]bool)
+	for _, p := range current {
+		currentMap[p.PermissionID] = true
 	}
-
-	// Filter out already granted permissions
-	var availablePerms []*models.Permission
-	for _, perm := range permissions {
-		if !currentPermMap[perm.PermissionID] {
-			availablePerms = append(availablePerms, perm)
+	var available []*models.Permission
+	for _, p := range perms {
+		if !currentMap[p.PermissionID] {
+			available = append(available, p)
 		}
 	}
-
-	// Log the event
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -6258,316 +5373,23 @@ func (s *AdminService) GetAvailablePermissionsForRole(
 		ResourceID:   roleID.String(),
 		Status:       "success",
 		Changes: map[string]interface{}{
-			"departments_count":     len(departments),
-			"total_permissions":     len(permissions),
-			"available_permissions": len(availablePerms),
+			"available": len(available),
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
-	return availablePerms, nil
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_role", "available_perms", "admin_role",
+			&roleID, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"count": len(available),
+			})
+	}
+	return available, nil
 }
 
-func (s *AdminService) processRoleDepartmentUpdatesByName(
-	ctx context.Context,
-	roleID uuid.UUID,
-	updates *models.AdminRoleUpdateRequest,
-	updatedBy uuid.UUID,
-	updater *models.AdminUser,
-	role *models.AdminRole,
-) error {
-	// Get all system departments
-	systemDepts, err := s.companyRepo.GetSystemDepartments(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get system departments: %w", err)
-	}
+// --------------------------------------------------------------------
+//  ROLE NAME / TYPE QUERIES
+// --------------------------------------------------------------------
 
-	// Create a map from department name to department
-	deptNameMap := make(map[string]*models.SystemDepartment)
-	deptIDMap := make(map[uuid.UUID]*models.SystemDepartment)
-	for _, dept := range systemDepts {
-		deptNameMap[dept.Name] = dept
-		deptIDMap[dept.SystemDepartmentID] = dept
-	}
-
-	// Get current role departments
-	currentDepts, err := s.adminRepo.GetAdminRoleDepartments(ctx, roleID)
-	if err != nil {
-		return fmt.Errorf("failed to get current role departments: %w", err)
-	}
-
-	currentDeptNameMap := make(map[string]bool)
-	currentDeptIDMap := make(map[uuid.UUID]bool)
-	for _, dept := range currentDepts {
-		currentDeptNameMap[dept.Name] = true
-		currentDeptIDMap[dept.SystemDepartmentID] = true
-	}
-
-	// Process department removals by name
-	for _, deptName := range updates.RemoveDepartments {
-		dept, exists := deptNameMap[deptName]
-		if !exists {
-			return fmt.Errorf("department not found: %s", deptName)
-		}
-
-		if !currentDeptIDMap[dept.SystemDepartmentID] {
-			continue // Department not currently assigned, skip
-		}
-
-		if !updater.IsOwner() {
-			hasAccess, err := s.adminRepo.AdminHasDepartmentAccess(ctx, updatedBy, dept.Bitmask)
-			if err != nil {
-				return fmt.Errorf("failed to check department access: %w", err)
-			}
-			if !hasAccess {
-				return fmt.Errorf("updater does not have access to department: %s", deptName)
-			}
-		}
-
-		if err := s.adminRepo.RemoveDepartmentFromAdminRole(ctx, roleID, dept.SystemDepartmentID); err != nil {
-			return fmt.Errorf("failed to remove department from role: %w", err)
-		}
-	}
-
-	// Process department additions by name
-	for _, deptName := range updates.AddDepartments {
-		dept, exists := deptNameMap[deptName]
-		if !exists {
-			return fmt.Errorf("department not found: %s", deptName)
-		}
-
-		if currentDeptIDMap[dept.SystemDepartmentID] {
-			continue // Department already assigned, skip
-		}
-
-		if !updater.IsOwner() {
-			hasAccess, err := s.adminRepo.AdminHasDepartmentAccess(ctx, updatedBy, dept.Bitmask)
-			if err != nil {
-				return fmt.Errorf("failed to check department access: %w", err)
-			}
-			if !hasAccess {
-				return fmt.Errorf("updater does not have access to department: %s", deptName)
-			}
-		}
-
-		if err := s.adminRepo.AssignDepartmentToAdminRole(ctx, roleID, dept.SystemDepartmentID); err != nil {
-			return fmt.Errorf("failed to assign department to role: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// GetEmployeeAdminRoles gets all admin roles available for employees
-func (s *AdminService) GetEmployeeAdminRoles(
-	ctx context.Context,
-	requesterID uuid.UUID,
-) ([]*models.AdminRole, error) {
-	startTime := time.Now()
-
-	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
-	if err != nil {
-		return nil, fmt.Errorf("requester not found: %w", err)
-	}
-
-	// Only owner, super employee, or managers can view employee roles
-	if !requester.IsOwner() && !requester.IsSuperEmployee() && !requester.IsManager() {
-		return nil, fmt.Errorf("unauthorized: cannot view employee admin roles")
-	}
-
-	roles, err := s.adminRepo.GetEmployeeAdminRoles(ctx)
-	if err != nil {
-		s.logAdminEvent(ctx, &models.AdminLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   "admin_employee_roles_get",
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: "production",
-				Version:     "v1.0.0",
-				Level:       "error",
-				Message:     "Failed to get employee admin roles",
-			},
-			AdminID:      requesterID.String(),
-			Action:       "get_employee_admin_roles",
-			Status:       "failed",
-			ErrorCode:    "GET_EMPLOYEE_ROLES_FAILED",
-			ErrorMessage: err.Error(),
-			Duration:     int64(time.Since(startTime).Milliseconds()),
-		})
-		return nil, fmt.Errorf("failed to get employee admin roles: %w", err)
-	}
-
-	s.logAdminEvent(ctx, &models.AdminLogEvent{
-		LogEnvelope: models.LogEnvelope{
-			EventID:     uuid.New().String(),
-			EventType:   "admin_employee_roles_get",
-			ServiceName: "auth-service",
-			Timestamp:   time.Now(),
-			Environment: "production",
-			Version:     "v1.0.0",
-			Level:       "info",
-			Message:     "Employee admin roles retrieved successfully",
-		},
-		AdminID: requesterID.String(),
-		Action:  "get_employee_admin_roles",
-		Status:  "success",
-		Changes: map[string]interface{}{
-			"roles_count": len(roles),
-		},
-		Duration: int64(time.Since(startTime).Milliseconds()),
-	})
-
-	return roles, nil
-}
-
-// GetManagerAdminRoles gets all admin roles available for managers
-func (s *AdminService) GetManagerAdminRoles(
-	ctx context.Context,
-	requesterID uuid.UUID,
-) ([]*models.AdminRole, error) {
-	startTime := time.Now()
-
-	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
-	if err != nil {
-		return nil, fmt.Errorf("requester not found: %w", err)
-	}
-
-	// Only owner or super employee can view manager roles
-	if !requester.IsOwner() && !requester.IsSuperEmployee() {
-		return nil, fmt.Errorf("unauthorized: cannot view manager admin roles")
-	}
-
-	roles, err := s.adminRepo.GetManagerAdminRoles(ctx)
-	if err != nil {
-		s.logAdminEvent(ctx, &models.AdminLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   "admin_manager_roles_get",
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: "production",
-				Version:     "v1.0.0",
-				Level:       "error",
-				Message:     "Failed to get manager admin roles",
-			},
-			AdminID:      requesterID.String(),
-			Action:       "get_manager_admin_roles",
-			Status:       "failed",
-			ErrorCode:    "GET_MANAGER_ROLES_FAILED",
-			ErrorMessage: err.Error(),
-			Duration:     int64(time.Since(startTime).Milliseconds()),
-		})
-		return nil, fmt.Errorf("failed to get manager admin roles: %w", err)
-	}
-
-	s.logAdminEvent(ctx, &models.AdminLogEvent{
-		LogEnvelope: models.LogEnvelope{
-			EventID:     uuid.New().String(),
-			EventType:   "admin_manager_roles_get",
-			ServiceName: "auth-service",
-			Timestamp:   time.Now(),
-			Environment: "production",
-			Version:     "v1.0.0",
-			Level:       "info",
-			Message:     "Manager admin roles retrieved successfully",
-		},
-		AdminID: requesterID.String(),
-		Action:  "get_manager_admin_roles",
-		Status:  "success",
-		Changes: map[string]interface{}{
-			"roles_count": len(roles),
-		},
-		Duration: int64(time.Since(startTime).Milliseconds()),
-	})
-
-	return roles, nil
-}
-
-// GetAdminRolesByType gets admin roles filtered by role type
-func (s *AdminService) GetAdminRolesByType(
-	ctx context.Context,
-	roleType int,
-	requesterID uuid.UUID,
-) ([]*models.AdminRole, error) {
-	startTime := time.Now()
-
-	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
-	if err != nil {
-		return nil, fmt.Errorf("requester not found: %w", err)
-	}
-
-	// Check authorization based on role type being requested
-	switch roleType {
-	case models.RoleTypeEmployee:
-		// Employees, managers, super employees, and owners can view employee roles
-		if !requester.IsOwner() && !requester.IsSuperEmployee() &&
-			!requester.IsManager() && !requester.IsEmployee() {
-			return nil, fmt.Errorf("unauthorized: cannot view employee admin roles")
-		}
-
-	case models.RoleTypeManager:
-		// Only owner or super employee can view manager roles
-		if !requester.IsOwner() && !requester.IsSuperEmployee() {
-			return nil, fmt.Errorf("unauthorized: cannot view manager admin roles")
-		}
-
-	case models.RoleTypeSuperAdmin:
-		// Only owner can view super admin roles
-		if !requester.IsOwner() {
-			return nil, fmt.Errorf("unauthorized: cannot view super admin roles")
-		}
-
-	default:
-		return nil, fmt.Errorf("invalid role type: %d", roleType)
-	}
-
-	roles, err := s.adminRepo.GetAdminRolesByType(ctx, roleType)
-	if err != nil {
-		s.logAdminEvent(ctx, &models.AdminLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   "admin_roles_by_type_get",
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: "production",
-				Version:     "v1.0.0",
-				Level:       "error",
-				Message:     "Failed to get admin roles by type",
-			},
-			AdminID:      requesterID.String(),
-			Action:       "get_admin_roles_by_type",
-			Status:       "failed",
-			ErrorCode:    "GET_ROLES_BY_TYPE_FAILED",
-			ErrorMessage: err.Error(),
-			Duration:     int64(time.Since(startTime).Milliseconds()),
-		})
-		return nil, fmt.Errorf("failed to get admin roles by type %d: %w", roleType, err)
-	}
-
-	s.logAdminEvent(ctx, &models.AdminLogEvent{
-		LogEnvelope: models.LogEnvelope{
-			EventID:     uuid.New().String(),
-			EventType:   "admin_roles_by_type_get",
-			ServiceName: "auth-service",
-			Timestamp:   time.Now(),
-			Environment: "production",
-			Version:     "v1.0.0",
-			Level:       "info",
-			Message:     "Admin roles by type retrieved successfully",
-		},
-		AdminID: requesterID.String(),
-		Action:  "get_admin_roles_by_type",
-		Status:  "success",
-		Changes: map[string]interface{}{
-			"role_type":   roleType,
-			"roles_count": len(roles),
-		},
-		Duration: int64(time.Since(startTime).Milliseconds()),
-	})
-
-	return roles, nil
-}
 func (s *AdminService) GetAdminRoleByName(ctx context.Context, roleName string) (*models.AdminRole, error) {
 	startTime := time.Now()
 	role, err := s.adminRepo.GetAdminRoleByName(ctx, roleName)
@@ -6589,31 +5411,11 @@ func (s *AdminService) GetAdminRoleByName(ctx context.Context, roleName string) 
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("admin role not found: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrNotFound, err)
 	}
-
-	// IMPORTANT: Check if role is nil before accessing its fields
 	if role == nil {
-		s.logAdminEvent(ctx, &models.AdminLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   "admin_role_get_by_name",
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: "production",
-				Version:     "v1.0.0",
-				Level:       "error",
-				Message:     "Admin role is nil",
-			},
-			Action:       "get_admin_role_by_name",
-			Status:       "failed",
-			ErrorCode:    "ROLE_NIL",
-			ErrorMessage: "admin role is nil",
-			Duration:     int64(time.Since(startTime).Milliseconds()),
-		})
-		return nil, fmt.Errorf("admin role is nil")
+		return nil, appErrors.ErrNotFound
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -6627,39 +5429,226 @@ func (s *AdminService) GetAdminRoleByName(ctx context.Context, roleName string) 
 		},
 		Action:       "get_admin_role_by_name",
 		ResourceType: "admin_role",
-		ResourceID:   role.AdminRoleID.String(), // Safe to access now
+		ResourceID:   role.AdminRoleID.String(),
 		Status:       "success",
 		Duration:     int64(time.Since(startTime).Milliseconds()),
 	})
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_role", "get_by_name", "admin_role",
+			&role.AdminRoleID, "system", nil, nil, nil, nil)
+	}
 	return role, nil
 }
 
-// GetAdminDepartments gets all departments assigned to an admin user
-func (s *AdminService) GetAdminDepartments(
-	ctx context.Context,
-	adminID uuid.UUID,
-	requesterID uuid.UUID,
-) ([]*models.SystemDepartment, error) {
+func (s *AdminService) GetEmployeeAdminRoles(ctx context.Context, requesterID uuid.UUID) ([]*models.AdminRole, error) {
 	startTime := time.Now()
-
 	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
 	if err != nil {
-		return nil, fmt.Errorf("requester not found: %w", err)
+		return nil, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
 	}
+	if !requester.IsOwner() && !requester.IsSuperEmployee() && !requester.IsManager() {
+		return nil, appErrors.ErrPermissionDenied
+	}
+	roles, err := s.adminRepo.GetEmployeeAdminRoles(ctx)
+	if err != nil {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_employee_roles_get",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "error",
+				Message:     "Failed to get employee admin roles",
+			},
+			AdminID:      requesterID.String(),
+			Action:       "get_employee_admin_roles",
+			Status:       "failed",
+			ErrorCode:    "GET_EMPLOYEE_ROLES_FAILED",
+			ErrorMessage: err.Error(),
+			Duration:     int64(time.Since(startTime).Milliseconds()),
+		})
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	s.logAdminEvent(ctx, &models.AdminLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   "admin_employee_roles_get",
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: "production",
+			Version:     "v1.0.0",
+			Level:       "info",
+			Message:     "Employee admin roles retrieved successfully",
+		},
+		AdminID: requesterID.String(),
+		Action:  "get_employee_admin_roles",
+		Status:  "success",
+		Changes: map[string]interface{}{
+			"roles_count": len(roles),
+		},
+		Duration: int64(time.Since(startTime).Milliseconds()),
+	})
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_role", "list_employee", "admin_role",
+			nil, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"count": len(roles),
+			})
+	}
+	return roles, nil
+}
 
+func (s *AdminService) GetManagerAdminRoles(ctx context.Context, requesterID uuid.UUID) ([]*models.AdminRole, error) {
+	startTime := time.Now()
+	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
+	}
+	if !requester.IsOwner() && !requester.IsSuperEmployee() {
+		return nil, appErrors.ErrPermissionDenied
+	}
+	roles, err := s.adminRepo.GetManagerAdminRoles(ctx)
+	if err != nil {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_manager_roles_get",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "error",
+				Message:     "Failed to get manager admin roles",
+			},
+			AdminID:      requesterID.String(),
+			Action:       "get_manager_admin_roles",
+			Status:       "failed",
+			ErrorCode:    "GET_MANAGER_ROLES_FAILED",
+			ErrorMessage: err.Error(),
+			Duration:     int64(time.Since(startTime).Milliseconds()),
+		})
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	s.logAdminEvent(ctx, &models.AdminLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   "admin_manager_roles_get",
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: "production",
+			Version:     "v1.0.0",
+			Level:       "info",
+			Message:     "Manager admin roles retrieved successfully",
+		},
+		AdminID: requesterID.String(),
+		Action:  "get_manager_admin_roles",
+		Status:  "success",
+		Changes: map[string]interface{}{
+			"roles_count": len(roles),
+		},
+		Duration: int64(time.Since(startTime).Milliseconds()),
+	})
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_role", "list_manager", "admin_role",
+			nil, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"count": len(roles),
+			})
+	}
+	return roles, nil
+}
+
+func (s *AdminService) GetAdminRolesByType(ctx context.Context, roleType int, requesterID uuid.UUID) ([]*models.AdminRole, error) {
+	startTime := time.Now()
+	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
+	}
+	switch roleType {
+	case models.RoleTypeEmployee:
+		if !requester.IsOwner() && !requester.IsSuperEmployee() && !requester.IsManager() {
+			return nil, appErrors.ErrPermissionDenied
+		}
+	case models.RoleTypeManager:
+		if !requester.IsOwner() && !requester.IsSuperEmployee() {
+			return nil, appErrors.ErrPermissionDenied
+		}
+	case models.RoleTypeSuperAdmin:
+		if !requester.IsOwner() {
+			return nil, appErrors.ErrPermissionDenied
+		}
+	default:
+		return nil, appErrors.ErrInvalidInput
+	}
+	roles, err := s.adminRepo.GetAdminRolesByType(ctx, roleType)
+	if err != nil {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_roles_by_type_get",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "error",
+				Message:     "Failed to get admin roles by type",
+			},
+			AdminID:      requesterID.String(),
+			Action:       "get_admin_roles_by_type",
+			Status:       "failed",
+			ErrorCode:    "GET_ROLES_BY_TYPE_FAILED",
+			ErrorMessage: err.Error(),
+			Duration:     int64(time.Since(startTime).Milliseconds()),
+		})
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	s.logAdminEvent(ctx, &models.AdminLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   "admin_roles_by_type_get",
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: "production",
+			Version:     "v1.0.0",
+			Level:       "info",
+			Message:     "Admin roles by type retrieved successfully",
+		},
+		AdminID: requesterID.String(),
+		Action:  "get_admin_roles_by_type",
+		Status:  "success",
+		Changes: map[string]interface{}{
+			"role_type":   roleType,
+			"roles_count": len(roles),
+		},
+		Duration: int64(time.Since(startTime).Milliseconds()),
+	})
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_role", "list_by_type", "admin_role",
+			nil, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"role_type": roleType,
+				"count":     len(roles),
+			})
+	}
+	return roles, nil
+}
+
+// --------------------------------------------------------------------
+//  ADMIN DEPARTMENTS (for a specific admin)
+// --------------------------------------------------------------------
+
+func (s *AdminService) GetAdminDepartments(ctx context.Context, adminID uuid.UUID, requesterID uuid.UUID) ([]*models.SystemDepartment, error) {
+	startTime := time.Now()
+	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
+	}
 	targetAdmin, err := s.adminRepo.GetAdminByID(ctx, adminID)
 	if err != nil {
-		return nil, fmt.Errorf("admin not found: %w", err)
+		return nil, fmt.Errorf("%w: admin not found", appErrors.ErrNotFound)
 	}
-
-	if requester.AdminID != adminID {
-		if !requester.IsOwner() && !requester.IsSuperEmployee() {
-			if !s.canManageAdmin(requester, targetAdmin) {
-				return nil, fmt.Errorf("unauthorized: cannot view this admin's departments")
-			}
-		}
+	if requester.AdminID != adminID && !requester.IsOwner() && !requester.IsSuperEmployee() && !s.canManageAdmin(requester, targetAdmin) {
+		return nil, appErrors.ErrPermissionDenied
 	}
-
 	departments, err := s.adminRepo.GetAdminDepartments(ctx, adminID)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -6681,9 +5670,8 @@ func (s *AdminService) GetAdminDepartments(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return nil, fmt.Errorf("failed to get admin departments: %w", err)
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
-
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -6707,93 +5695,76 @@ func (s *AdminService) GetAdminDepartments(
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
-
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "get_departments", "admin_user",
+			&adminID, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"count": len(departments),
+			})
+	}
 	return departments, nil
 }
 
-func (s *AdminService) UpdateAdminUserRole(
-	ctx context.Context,
-	adminID uuid.UUID,
-	newRoleID uuid.UUID,
-	updatedBy uuid.UUID,
-) error {
+// --------------------------------------------------------------------
+//  UPDATE ADMIN USER ROLE
+// --------------------------------------------------------------------
+
+func (s *AdminService) UpdateAdminUserRole(ctx context.Context, adminID uuid.UUID, newRoleID uuid.UUID, updatedBy uuid.UUID) error {
 	startTime := time.Now()
-
-	// 1. Validate inputs
-	if adminID == uuid.Nil {
-		return fmt.Errorf("admin ID cannot be empty")
+	if adminID == uuid.Nil || newRoleID == uuid.Nil {
+		return appErrors.ErrInvalidInput
 	}
-	if newRoleID == uuid.Nil {
-		return fmt.Errorf("new role ID cannot be empty")
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("update_user_role-%s", adminID.String())
 	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+	ip, _ := ctx.Value("ip_address").(string)
 
-	// 2. Get the updater (who is making the change)
 	updater, err := s.adminRepo.GetAdminByID(ctx, updatedBy)
 	if err != nil {
-		return fmt.Errorf("updater not found: %w", err)
+		return fmt.Errorf("%w: updater not found", appErrors.ErrNotFound)
 	}
-
-	// 3. Get the target admin (who is being updated)
 	targetAdmin, err := s.adminRepo.GetAdminByID(ctx, adminID)
 	if err != nil {
-		return fmt.Errorf("target admin not found: %w", err)
+		return fmt.Errorf("%w: target admin not found", appErrors.ErrNotFound)
 	}
-
-	// 4. Get the new role details
 	newRole, err := s.adminRepo.GetAdminRole(ctx, newRoleID)
 	if err != nil {
-		return fmt.Errorf("new admin role not found: %w", err)
+		return fmt.Errorf("%w: new role not found", appErrors.ErrNotFound)
 	}
-
-	// 5. Authorization checks
-	// a. Updater must be owner or super employee
 	if !updater.IsOwner() && !updater.IsSuperEmployee() {
-		return fmt.Errorf("unauthorized: only owner or super employee can change admin roles")
+		return appErrors.ErrPermissionDenied
 	}
-
-	// b. Cannot change owner's role
 	if targetAdmin.IsSuperAdmin() {
-		return fmt.Errorf("cannot change role of owner (super admin) user")
+		return appErrors.ErrSuperAdminRequired
 	}
-
-	// c. Cannot assign owner role
 	if newRole.RoleType == models.RoleTypeSuperAdmin {
-		return fmt.Errorf("cannot assign owner (super admin) role")
+		return appErrors.ErrInvalidInput
 	}
-
-	// d. If updater is not owner, they cannot assign manager roles
+	if !updater.IsOwner() && newRole.RoleType == models.RoleTypeManager {
+		return appErrors.ErrPermissionDenied
+	}
 	if !updater.IsOwner() {
-		if newRole.RoleType == models.RoleTypeManager {
-			return fmt.Errorf("unauthorized: only owner can assign manager role")
-		}
-
-		// e. Check department access for non-owners
-		roleDepartments, err := s.adminRepo.GetAdminRoleDepartments(ctx, newRoleID)
+		roleDepts, err := s.adminRepo.GetAdminRoleDepartments(ctx, newRoleID)
 		if err != nil {
-			return fmt.Errorf("failed to get role departments: %w", err)
+			return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 		}
-
-		for _, dept := range roleDepartments {
-			hasAccess, err := s.adminRepo.AdminHasDepartmentAccess(ctx, updatedBy, dept.Bitmask)
-			if err != nil {
-				return fmt.Errorf("failed to check department access: %w", err)
-			}
-			if !hasAccess {
-				return fmt.Errorf("updater does not have access to department: %s", dept.Name)
+		for _, dept := range roleDepts {
+			has, err := s.adminRepo.AdminHasDepartmentAccess(ctx, updatedBy, dept.Bitmask)
+			if err != nil || !has {
+				return appErrors.ErrPermissionDenied
 			}
 		}
 	}
-
-	// f. Check if trying to change to same role
 	if targetAdmin.AdminRoleID == newRoleID {
-		s.logger.Info("Admin already has the requested role",
-			util.String("admin_id", adminID.String()),
-			util.String("role_id", newRoleID.String()))
 		return nil
 	}
 
-	// 6. Update the admin user's role
 	oldRoleID := targetAdmin.AdminRoleID
+	beforeJSON, _ := json.Marshal(targetAdmin)
 
 	if err := s.adminRepo.UpdateAdminUserRole(ctx, adminID, newRoleID); err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -6815,10 +5786,10 @@ func (s *AdminService) UpdateAdminUserRole(
 			ErrorMessage: err.Error(),
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
-		return fmt.Errorf("failed to update admin user role: %w", err)
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 
-	// 7. Log the successful change
+	afterJSON, _ := json.Marshal(targetAdmin) // updated not reflected but fine
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -6837,22 +5808,321 @@ func (s *AdminService) UpdateAdminUserRole(
 		ResourceID:   adminID.String(),
 		Status:       "success",
 		Changes: map[string]interface{}{
-			"old_role_id":    oldRoleID.String(),
-			"new_role_id":    newRoleID.String(),
-			"admin_name":     targetAdmin.FullName,
-			"admin_username": targetAdmin.Username,
-			"updater_role":   updater.GetRoleString(),
+			"old_role_id": oldRoleID.String(),
+			"new_role_id": newRoleID.String(),
+			"admin_name":  targetAdmin.FullName,
+		},
+		Duration: int64(time.Since(startTime).Milliseconds()),
+	})
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_user", "update_role", "admin_user",
+			&adminID, "admin", &updatedBy, beforeJSON, afterJSON, map[string]interface{}{
+				"new_role": newRoleID.String(),
+				"ip":       ip,
+			})
+	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+	return nil
+}
+
+// --------------------------------------------------------------------
+//  INTERNAL HELPERS (already defined above)
+// --------------------------------------------------------------------
+
+func (s *AdminService) getRoleLevel(roleType int) int {
+	switch roleType {
+	case models.RoleTypeSuperAdmin:
+		return 4000
+	case models.RoleTypeManager:
+		return 3000
+	case models.RoleTypeEmployee:
+		return 2000
+	default:
+		return 1000
+	}
+}
+
+func isValidUsername(username string) bool {
+	if len(username) < 3 || len(username) > 50 {
+		return false
+	}
+	for _, ch := range username {
+		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+			(ch >= '0' && ch <= '9') || ch == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *AdminService) processRoleDepartmentUpdates(
+	ctx context.Context,
+	roleID uuid.UUID,
+	updates *models.AdminRoleUpdateRequest,
+	updatedBy uuid.UUID,
+	updater *models.AdminUser,
+	role *models.AdminRole,
+) error {
+	systemDepts, err := s.companyRepo.GetSystemDepartments(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	deptNameToID := make(map[string]uuid.UUID)
+	deptNameToDept := make(map[string]*models.SystemDepartment)
+	for _, dept := range systemDepts {
+		deptNameToID[dept.Name] = dept.SystemDepartmentID
+		deptNameToDept[dept.Name] = dept
+	}
+	currentDepts, err := s.adminRepo.GetAdminRoleDepartments(ctx, roleID)
+	if err != nil {
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	currentDeptNameMap := make(map[string]bool)
+	for _, dept := range currentDepts {
+		currentDeptNameMap[dept.Name] = true
+	}
+	for _, deptName := range updates.RemoveDepartments {
+		deptID, exists := deptNameToID[deptName]
+		if !exists {
+			return fmt.Errorf("%w: department %s not found", appErrors.ErrInvalidInput, deptName)
+		}
+		if !currentDeptNameMap[deptName] {
+			continue
+		}
+		if !updater.IsOwner() {
+			dept, deptExists := deptNameToDept[deptName]
+			if !deptExists {
+				return fmt.Errorf("%w: department %s not found", appErrors.ErrInvalidInput, deptName)
+			}
+			hasAccess, err := s.adminRepo.AdminHasDepartmentAccess(ctx, updatedBy, dept.Bitmask)
+			if err != nil || !hasAccess {
+				return appErrors.ErrPermissionDenied
+			}
+		}
+		if err := s.adminRepo.RemoveDepartmentFromAdminRole(ctx, roleID, deptID); err != nil {
+			return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+		}
+	}
+	for _, deptName := range updates.AddDepartments {
+		deptID, exists := deptNameToID[deptName]
+		if !exists {
+			return fmt.Errorf("%w: department %s not found", appErrors.ErrInvalidInput, deptName)
+		}
+		if currentDeptNameMap[deptName] {
+			continue
+		}
+		if !updater.IsOwner() {
+			dept, deptExists := deptNameToDept[deptName]
+			if !deptExists {
+				return fmt.Errorf("%w: department %s not found", appErrors.ErrInvalidInput, deptName)
+			}
+			hasAccess, err := s.adminRepo.AdminHasDepartmentAccess(ctx, updatedBy, dept.Bitmask)
+			if err != nil || !hasAccess {
+				return appErrors.ErrPermissionDenied
+			}
+		}
+		if err := s.adminRepo.AssignDepartmentToAdminRole(ctx, roleID, deptID); err != nil {
+			return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+		}
+	}
+	return nil
+}
+
+func (s *AdminService) processRolePermissionUpdates(
+	ctx context.Context,
+	roleID uuid.UUID,
+	updates *models.AdminRoleUpdateRequest,
+	updatedBy uuid.UUID,
+	updater *models.AdminUser,
+	role *models.AdminRole,
+) error {
+	currentDepts, err := s.adminRepo.GetAdminRoleDepartments(ctx, roleID)
+	if err != nil {
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	if len(currentDepts) == 0 && (len(updates.AddPermissions) > 0 || len(updates.ReplacePermissions) > 0) {
+		return appErrors.ErrInvalidInput
+	}
+	deptModuleMap := make(map[string]bool)
+	for _, dept := range currentDepts {
+		deptModuleMap[dept.ModuleCode] = true
+	}
+	for _, permName := range updates.RemovePermissions {
+		perm, err := s.adminRepo.GetPermissionByName(ctx, permName)
+		if err != nil {
+			return fmt.Errorf("%w: permission %s not found", appErrors.ErrNotFound, permName)
+		}
+		has, err := s.adminRepo.IsPermissionGrantedToRole(ctx, roleID, perm.PermissionID)
+		if err != nil {
+			return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+		}
+		if !has {
+			continue
+		}
+		if err := s.adminRepo.RevokePermissionFromAdminRole(ctx, roleID, perm.PermissionID); err != nil {
+			return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+		}
+	}
+	if len(updates.ReplacePermissions) > 0 {
+		currentPerms, err := s.adminRepo.GetAdminRolePermissions(ctx, roleID)
+		if err != nil {
+			return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+		}
+		for _, perm := range currentPerms {
+			if err := s.adminRepo.RevokePermissionFromAdminRole(ctx, roleID, perm.PermissionID); err != nil {
+				return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+			}
+		}
+		for _, permName := range updates.ReplacePermissions {
+			perm, err := s.adminRepo.GetPermissionByName(ctx, permName)
+			if err != nil {
+				return fmt.Errorf("%w: permission %s not found", appErrors.ErrNotFound, permName)
+			}
+			if !deptModuleMap[perm.Module] {
+				return fmt.Errorf("%w: role lacks department for module %s", appErrors.ErrInvalidInput, perm.Module)
+			}
+			if err := s.adminRepo.GrantPermissionToAdminRole(ctx, roleID, perm.PermissionID, updatedBy); err != nil {
+				return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+			}
+		}
+		return nil
+	}
+	for _, permName := range updates.AddPermissions {
+		perm, err := s.adminRepo.GetPermissionByName(ctx, permName)
+		if err != nil {
+			return fmt.Errorf("%w: permission %s not found", appErrors.ErrNotFound, permName)
+		}
+		if !deptModuleMap[perm.Module] {
+			return fmt.Errorf("%w: role lacks department for module %s", appErrors.ErrInvalidInput, perm.Module)
+		}
+		has, err := s.adminRepo.IsPermissionGrantedToRole(ctx, roleID, perm.PermissionID)
+		if err != nil {
+			return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+		}
+		if has {
+			continue
+		}
+		if err := s.adminRepo.GrantPermissionToAdminRole(ctx, roleID, perm.PermissionID, updatedBy); err != nil {
+			return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+		}
+	}
+	return nil
+}
+
+func (s *AdminService) canManageAdmin(manager, target *models.AdminUser) bool {
+	if manager.IsOwner() {
+		return true
+	}
+	if manager.IsSuperEmployee() && target.IsEmployee() {
+		return true
+	}
+	if manager.IsManager() && target.IsEmployee() {
+		managerDepts, err := s.adminRepo.GetAdminRoleDepartments(context.Background(), manager.AdminRoleID)
+		if err != nil {
+			return false
+		}
+		targetDepts, err := s.adminRepo.GetAdminRoleDepartments(context.Background(), target.AdminRoleID)
+		if err != nil {
+			return false
+		}
+		for _, targetDept := range targetDepts {
+			found := false
+			for _, managerDept := range managerDepts {
+				if managerDept.SystemDepartmentID == targetDept.SystemDepartmentID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+func (s *AdminService) SearchAdminRoles(ctx context.Context, query string, requesterID uuid.UUID, limit int, offset int) ([]*models.AdminRole, int, error) {
+	startTime := time.Now()
+	// Authorize: only owner or super employee
+	requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
+	if err != nil {
+		return nil, 0, fmt.Errorf("%w: requester not found", appErrors.ErrNotFound)
+	}
+	if !requester.IsOwner() && !requester.IsSuperEmployee() {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_roles_search",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "warning",
+				Message:     "Unauthorized search admin roles",
+			},
+			AdminID:   requesterID.String(),
+			Action:    "search_admin_roles",
+			Status:    "failed",
+			ErrorCode: "UNAUTHORIZED",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
+		})
+		return nil, 0, appErrors.ErrPermissionDenied
+	}
+
+	// Call repository search
+	roles, totalCount, err := s.adminRepo.SearchAdminRoles(ctx, query, nil, limit, offset) // assuming repository has SearchAdminRoles
+	if err != nil {
+		s.logAdminEvent(ctx, &models.AdminLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "admin_roles_search",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "error",
+				Message:     "Failed to search admin roles",
+			},
+			AdminID:      requesterID.String(),
+			Action:       "search_admin_roles",
+			Status:       "failed",
+			ErrorCode:    "SEARCH_FAILED",
+			ErrorMessage: err.Error(),
+			Duration:     int64(time.Since(startTime).Milliseconds()),
+		})
+		return nil, 0, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+
+	s.logAdminEvent(ctx, &models.AdminLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   "admin_roles_search",
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: "production",
+			Version:     "v1.0.0",
+			Level:       "info",
+			Message:     "Admin roles search completed",
+		},
+		AdminID: requesterID.String(),
+		Action:  "search_admin_roles",
+		Status:  "success",
+		Changes: map[string]interface{}{
+			"query":       query,
+			"limit":       limit,
+			"offset":      offset,
+			"results":     len(roles),
+			"total_count": totalCount,
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
 
-	s.logger.Info("Admin user role updated successfully",
-		util.String("admin_id", adminID.String()),
-		util.String("username", targetAdmin.Username),
-		util.String("old_role_id", oldRoleID.String()),
-		util.String("new_role_id", newRoleID.String()),
-		util.String("updated_by", updatedBy.String()),
-		util.String("updater_role", updater.GetRoleString()))
-
-	return nil
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "admin_role", "search", "admin_role",
+			nil, "admin", &requesterID, nil, nil, map[string]interface{}{
+				"query": query,
+				"count": len(roles),
+			})
+	}
+	return roles, totalCount, nil
 }

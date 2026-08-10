@@ -230,4 +230,5 @@ type AdminRepository interface {
 	GetAdminRoleByName(ctx context.Context, roleName string) (*models.AdminRole, error)
 	GetAdminDepartments(ctx context.Context, adminID uuid.UUID) ([]*models.SystemDepartment, error)
 	UpdateAdminUserRole(ctx context.Context, adminID, newRoleID uuid.UUID) error
+	GetAdminOnlyPermissions(ctx context.Context) ([]*models.Permission, error)
 }

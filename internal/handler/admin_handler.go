@@ -11,15 +11,21 @@ import (
 	"strings"
 	"time"
 
+	"auth-service/internal/contextkeys"
+
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	customErrors "auth-service/internal/errors"
 	"auth-service/internal/models"
 	"auth-service/internal/service"
 	"auth-service/internal/util"
 )
 
+// Context keys for injection
+
+// AdminHandler handles HTTP requests for admin management, authentication, and RBAC.
 type AdminHandler struct {
 	adminService   *service.AdminService
 	companyService *service.CompanyService
@@ -29,9 +35,9 @@ type AdminHandler struct {
 	deviceService  *service.AdminDeviceService
 	sessionService *service.SessionService
 	jwtService     *service.JWTService
-	logger         *zap.Logger
 }
 
+// NewAdminHandler creates a new AdminHandler.
 func NewAdminHandler(
 	adminService *service.AdminService,
 	companyService *service.CompanyService,
@@ -41,7 +47,6 @@ func NewAdminHandler(
 	deviceService *service.AdminDeviceService,
 	sessionService *service.SessionService,
 	jwtService *service.JWTService,
-	logger *zap.Logger,
 ) *AdminHandler {
 	return &AdminHandler{
 		adminService:   adminService,
@@ -52,138 +57,145 @@ func NewAdminHandler(
 		deviceService:  deviceService,
 		sessionService: sessionService,
 		jwtService:     jwtService,
-		logger:         logger,
 	}
 }
 
-func (h *AdminHandler) RegisterRoutes(router chi.Router) {
-	// Admin authentication routes
-	router.Route("/admin-auth", func(r chi.Router) {
-		r.Post("/login/initiate", h.InitiateAdminLogin)
-		r.Post("/login/verify-otp", h.VerifyAdminOTPLogin)
-		r.Post("/login/verify-mpin", h.VerifyAdminMPINLogin)
-		r.Post("/mpin/setup", h.SetupAdminMPIN)
-		r.Post("/mpin/change", h.ChangeAdminMPIN)
-		r.Post("/mpin/forgot", h.ForgotAdminMPIN)
-		r.Post("/mpin/forgot/verify", h.VerifyForgotAdminMPIN)
-		r.Post("/refresh", h.RefreshAdminTokens)
-		r.Post("/logout", h.LogoutAdmin)
-		r.Get("/health", h.HealthCheck)
-	})
+// ---------- Helper functions for context injection ----------
 
-	// Admin management routes (protected)
-	router.Route("/admin", func(r chi.Router) {
-		// Role Management
-		r.Post("/roles", h.CreateAdminRole)
-		r.Post("/employee", h.CreateEmployeeRole) // NEW
-		r.Post("/manager", h.CreateManagerRole)   // NEW
-		r.Get("/roles", h.GetAdminRoles)
-		r.Get("/roles/{roleID}", h.GetAdminRole)
-		r.Put("/roles/{roleID}", h.UpdateAdminRole)
-		r.Delete("/roles/{roleID}", h.DeleteAdminRole)
-
-		// Admin User Management
-		r.Post("/users", h.CreateAdminUser)
-		r.Get("/users", h.ListAdmins)
-		r.Get("/users/{adminID}", h.GetAdminUser)
-		r.Put("/users/{adminID}", h.UpdateAdminUser)
-		r.Delete("/users/{adminID}", h.DeleteAdminUser)
-
-		// Admin Profile Management
-		r.Put("/users/{adminID}/profile", h.UpdateAdminProfile)
-		r.Put("/users/{adminID}/phone", h.ChangeAdminPhone)
-		r.Put("/users/{adminID}/reports-to", h.UpdateAdminReportsTo)
-
-		// Department Management
-		// r.Put("/users/{adminID}/departments", h.UpdateAdminDepartments)
-
-		// Permission Management
-		r.Get("/users/{adminID}/permissions", h.GetAdminPermissions)
-		// r.Post("/users/{adminID}/permissions/grant", h.GrantPermissionToAdmin)
-		// r.Post("/users/{adminID}/permissions/revoke", h.RevokePermissionFromAdmin)
-		// r.Post("/users/{adminID}/permissions/batch", h.BatchUpdatePermissions)
-
-		// Status Management
-		r.Post("/users/{adminID}/activate", h.ActivateAdmin)
-		r.Post("/users/{adminID}/deactivate", h.DeactivateAdmin)
-
-		// Avatar Management
-		r.Post("/users/{adminID}/avatar", h.SetAdminAvatar)
-		r.Get("/users/{adminID}/avatar", h.GetAdminAvatar)
-		r.Delete("/users/{adminID}/avatar", h.DeactivateAdminAvatar)
-		r.Get("/users/{adminID}/avatar/with-fallback", h.GetAdminAvatarWithFallback)
-
-		// Hierarchy Management
-		r.Get("/users/{adminID}/direct-reports", h.GetDirectReports)
-		r.Get("/users/{adminID}/reporting-chain", h.GetReportingChain)
-		r.Get("/users/{adminID}/hierarchy", h.GetAdminHierarchy)
-
-		// Search Routes
-		h.RegisterSearchRoutes(r)
-	})
-
-	// Company Management Routes (maintain existing)
-	router.Route("/companies", func(r chi.Router) {
-		r.Post("/", h.CreateCompany)
-		r.Get("/", h.GetRecentCompanies)
-		r.Get("/search", h.SearchCompanies)
-		r.Get("/suggestions", h.GetCompanySuggestions)
-		r.Get("/analytics/search", h.GetCompanySearchAnalytics)
-		r.Post("/search/benchmark", h.BenchmarkCompanySearch)
-
-		// Company by ID routes
-		r.Route("/{companyID}", func(r chi.Router) {
-			r.Get("/", h.GetCompany)
-			r.Get("/stats", h.GetCompanyStats)
-			r.Get("/employees", h.GetCompanyEmployees)
-			r.Get("/departments", h.GetCompanyDepartments)
-			r.Get("/hierarchy", h.GetCompanyHierarchy)
-			r.Get("/rbac-stats", h.GetCompanyRBACStats)
-			r.Get("/roles", h.GetCompanyRoles)
-			r.Put("/subscription", h.UpdateSubscription)
-			r.Post("/subscription/extend", h.ExtendSubscription)
-			r.Post("/deactivate", h.DeactivateCompany)
-			r.Post("/reactivate", h.ReactivateCompany)
-		})
-
-		// Company by status/tier
-		r.Get("/status/{status}", h.GetCompaniesByStatus)
-		r.Get("/tier/{tier}", h.GetCompaniesByTier)
-		r.Get("/expiring", h.GetCompaniesWithExpiringSubscription)
-
-		// Owner-specific company search
-		r.Get("/owner/{ownerID}/search", h.SearchCompaniesByOwner)
-	})
-
-	// User Management Routes (maintain existing)
-	router.Route("/users", func(r chi.Router) {
-		r.Get("/search/advanced", h.SearchUsersAdvanced)
-		r.Get("/search/username", h.SearchUsersByUsername)
-		r.Get("/search/full-name", h.SearchUsersByFullName)
-		r.Get("/suggestions", h.GetUserSuggestions)
-		r.Get("/kyc/{status}", h.ListUsersByKYCStatus)
-		r.Get("/recently-active", h.GetRecentlyActiveUsers)
-		r.Get("/banned", h.GetBannedUsers)
-
-		// User by ID routes
-		r.Route("/{userID}", func(r chi.Router) {
-			r.Put("/", h.UpdateUser)
-			r.Put("/kyc", h.UpdateUserKYC)
-			r.Post("/ban", h.BanUser)
-			r.Post("/unban", h.UnbanUser)
-		})
-	})
-
-	// System Management
-	router.Route("/system", func(r chi.Router) {
-		r.Get("/departments", h.GetSystemDepartments)
-		r.Get("/permissions", h.GetAllPermissions)
-		r.Get("/permissions/module/{module}", h.GetPermissionsByModule)
-	})
+func (h *AdminHandler) getIdempotencyKey(r *http.Request) string {
+	return r.Header.Get("Idempotency-Key")
 }
 
-// ==================== Admin Authentication Methods ====================
+// injectIdempotencyKey adds the idempotency key to the request context.
+func (h *AdminHandler) injectIdempotencyKey(ctx context.Context, r *http.Request) context.Context {
+	key := h.getIdempotencyKey(r)
+	if key != "" {
+		// Use the shared context key type
+		return context.WithValue(ctx, "idempotency_key", key) // plain string
+	}
+	return ctx
+}
 
+// injectClientIP adds the client IP to the request context.
+func (h *AdminHandler) injectClientIP(ctx context.Context, r *http.Request) context.Context {
+	ip := h.getClientIP(r)
+	return context.WithValue(ctx, contextkeys.ClientIP, ip)
+}
+
+// ---------- Error mapping ----------
+
+// mapServiceError maps custom error types to HTTP status codes and messages.
+func (h *AdminHandler) mapServiceError(err error) (int, string) {
+	if err == nil {
+		return http.StatusOK, ""
+	}
+
+	switch {
+	case errors.Is(err, customErrors.ErrNotFound):
+		return http.StatusNotFound, err.Error()
+	case errors.Is(err, customErrors.ErrInvalidInput):
+		return http.StatusBadRequest, err.Error()
+	case errors.Is(err, customErrors.ErrDuplicate):
+		return http.StatusConflict, err.Error()
+	case errors.Is(err, customErrors.ErrConflict):
+		return http.StatusConflict, err.Error()
+	case errors.Is(err, customErrors.ErrPermissionDenied):
+		return http.StatusForbidden, err.Error()
+	case errors.Is(err, customErrors.ErrUnauthorized):
+		return http.StatusUnauthorized, err.Error()
+	case errors.Is(err, customErrors.ErrInternal):
+		return http.StatusInternalServerError, "internal server error"
+
+	// Device errors
+	case errors.Is(err, customErrors.ErrDeviceNotFound),
+		errors.Is(err, customErrors.ErrDeviceAlreadyBound),
+		errors.Is(err, customErrors.ErrDeviceNotTrusted),
+		errors.Is(err, customErrors.ErrDeviceBlocked),
+		errors.Is(err, customErrors.ErrInvalidDeviceID),
+		errors.Is(err, customErrors.ErrBindingTokenMismatch),
+		errors.Is(err, customErrors.ErrDeviceBindingExpired),
+		errors.Is(err, customErrors.ErrDeviceAlreadyActive),
+		errors.Is(err, customErrors.ErrDeviceNotActive),
+		errors.Is(err, customErrors.ErrTooManyDevices),
+		errors.Is(err, customErrors.ErrDeviceVerificationFailed):
+		// all device errors are client-facing, map to appropriate status
+		if errors.Is(err, customErrors.ErrDeviceNotFound) {
+			return http.StatusNotFound, err.Error()
+		}
+		if errors.Is(err, customErrors.ErrDeviceAlreadyBound) ||
+			errors.Is(err, customErrors.ErrDeviceAlreadyActive) ||
+			errors.Is(err, customErrors.ErrTooManyDevices) {
+			return http.StatusConflict, err.Error()
+		}
+		if errors.Is(err, customErrors.ErrDeviceNotTrusted) ||
+			errors.Is(err, customErrors.ErrDeviceBlocked) {
+			return http.StatusForbidden, err.Error()
+		}
+		if errors.Is(err, customErrors.ErrInvalidDeviceID) ||
+			errors.Is(err, customErrors.ErrBindingTokenMismatch) ||
+			errors.Is(err, customErrors.ErrDeviceBindingExpired) ||
+			errors.Is(err, customErrors.ErrDeviceVerificationFailed) {
+			return http.StatusBadRequest, err.Error()
+		}
+		return http.StatusBadRequest, err.Error()
+
+	// MPIN errors
+	case errors.Is(err, customErrors.ErrAdminMPINNotFound):
+		return http.StatusNotFound, err.Error()
+	case errors.Is(err, customErrors.ErrAdminMPINInvalid):
+		return http.StatusUnauthorized, err.Error()
+	case errors.Is(err, customErrors.ErrAdminMPINLocked):
+		return http.StatusLocked, err.Error()
+	case errors.Is(err, customErrors.ErrAdminMPINAlreadyExists):
+		return http.StatusConflict, err.Error()
+	case errors.Is(err, customErrors.ErrAdminMPINTooWeak):
+		return http.StatusBadRequest, err.Error()
+	case errors.Is(err, customErrors.ErrAdminMPINRateLimitExceeded),
+		errors.Is(err, customErrors.ErrAdminMPINAttemptsExceeded):
+		return http.StatusTooManyRequests, err.Error()
+
+	// OTP errors
+	case errors.Is(err, customErrors.ErrOTPRateLimitExceeded),
+		errors.Is(err, customErrors.ErrOTPAttemptsExceeded),
+		errors.Is(err, customErrors.ErrDailyQuotaExceeded):
+		return http.StatusTooManyRequests, err.Error()
+	case errors.Is(err, customErrors.ErrOTPNotFound):
+		return http.StatusNotFound, err.Error()
+	case errors.Is(err, customErrors.ErrOTPInvalid),
+		errors.Is(err, customErrors.ErrOTPExpired),
+		errors.Is(err, customErrors.ErrOTPReplayAttempt):
+		return http.StatusBadRequest, err.Error()
+	case errors.Is(err, customErrors.ErrOTPAlreadyVerified):
+		return http.StatusConflict, err.Error()
+	case errors.Is(err, customErrors.ErrOTPBlocked):
+		return http.StatusForbidden, err.Error()
+	case errors.Is(err, customErrors.ErrPhoneNotRegistered):
+		return http.StatusNotFound, err.Error()
+	case errors.Is(err, customErrors.ErrSecurityCheckFailed):
+		return http.StatusForbidden, err.Error()
+
+	// Admin/user errors
+	case errors.Is(err, customErrors.ErrInvalidState),
+		errors.Is(err, customErrors.ErrInvalidStatus),
+		errors.Is(err, customErrors.ErrInvalidTransition):
+		return http.StatusBadRequest, err.Error()
+	case errors.Is(err, customErrors.ErrAdminInactive):
+		return http.StatusForbidden, err.Error()
+	case errors.Is(err, customErrors.ErrRoleInUse):
+		return http.StatusConflict, err.Error()
+	case errors.Is(err, customErrors.ErrSystemRole):
+		return http.StatusForbidden, err.Error()
+	case errors.Is(err, customErrors.ErrSuperAdminRequired):
+		return http.StatusForbidden, err.Error()
+
+	default:
+		return http.StatusInternalServerError, "internal server error"
+	}
+}
+
+// ---------- Login flows ----------
+
+// LoginFlowResponse represents the response for login initiation.
 type LoginFlowResponse struct {
 	UserExists    bool   `json:"user_exists"`
 	HasMPIN       bool   `json:"has_mpin"`
@@ -194,16 +206,24 @@ type LoginFlowResponse struct {
 	UserID        string `json:"user_id,omitempty"`
 }
 
+// InitiateAdminLogin handles the first step of admin login.
+// @Summary Initiate admin login
+// @Description Determines the login flow based on admin existence, MPIN status, and device trust.
+// @Tags admin-auth
+// @Accept json
+// @Produce json
+// @Param body body object true "Login initiation request" example({"phone_number":"+917206583437","device_id":"test-device-001","device_fingerprint":"test-fingerprint-v1"})
+// @Success 200 {object} map[string]interface{} "Login flow determined"
+// @Failure 400 {object} map[string]interface{} "Invalid request"
+// @Router /api/v1/admin-auth/login/initiate [post]
 func (h *AdminHandler) InitiateAdminLogin(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	var req struct {
 		PhoneNumber       string `json:"phone_number" validate:"required"`
 		DeviceID          string `json:"device_id" validate:"required"`
 		DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
@@ -212,6 +232,12 @@ func (h *AdminHandler) InitiateAdminLogin(w http.ResponseWriter, r *http.Request
 	req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
 	req.DeviceID = util.SanitizeInput(req.DeviceID)
 	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
+
+	// Extract client IP from context (injected by injectClientIP)
+	ip, _ := ctx.Value("ip_address").(string)
+	if ip == "" {
+		ip = r.RemoteAddr // fallback
+	}
 
 	admin, err := h.adminService.GetAdminByPhone(ctx, req.PhoneNumber)
 	adminExists := err == nil && admin != nil
@@ -237,7 +263,24 @@ func (h *AdminHandler) InitiateAdminLogin(w http.ResponseWriter, r *http.Request
 
 	response.HasMPIN = mpinStatus.Exists
 	response.MPINLocked = mpinStatus.IsLocked
-	deviceTrusted, _ := h.deviceService.IsDeviceTrusted(ctx, admin.AdminID, req.DeviceID)
+
+	// ✅ CORRECT: Use the admin‑specific trust check
+	deviceTrusted, _, err := h.mpinService.CheckAdminDeviceTrust(
+		ctx,
+		admin.AdminID,
+		req.DeviceID,
+		ip, // IP from context
+		req.DeviceFingerprint,
+	)
+	if err != nil {
+		// Log error but treat as untrusted for safety
+		zap.L().Warn("Failed to check admin device trust",
+			zap.String("admin_id", admin.AdminID.String()),
+			zap.String("device_id", req.DeviceID),
+			zap.Error(err),
+		)
+		deviceTrusted = false
+	}
 
 	if !mpinStatus.Exists {
 		response.FlowState = "existing_user_otp"
@@ -256,15 +299,22 @@ func (h *AdminHandler) InitiateAdminLogin(w http.ResponseWriter, r *http.Request
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admin login flow determined"))
-	h.logger.Info("Admin login initiation completed",
-		util.String("phone", req.PhoneNumber),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// VerifyAdminOTPLogin verifies OTP and binds device.
+// @Summary Verify admin OTP login
+// @Description Verifies OTP for admin login and binds the device.
+// @Tags admin-auth
+// @Accept json
+// @Produce json
+// @Param body body object true "OTP verification request" example({"phone_number":"+917206583437","otp":"123456","device_id":"test-device-001","device_fingerprint":"test-fingerprint-v1"})
+// @Success 200 {object} map[string]interface{} "OTP verified, device trusted"
+// @Failure 400 {object} map[string]interface{} "Invalid request"
+// @Failure 401 {object} map[string]interface{} "Authentication failed"
+// @Failure 429 {object} map[string]interface{} "Rate limit or quota exceeded"
+// @Router /api/v1/admin-auth/login/verify-otp [post]
 func (h *AdminHandler) VerifyAdminOTPLogin(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	var req struct {
 		PhoneNumber       string `json:"phone_number" validate:"required"`
@@ -272,7 +322,6 @@ func (h *AdminHandler) VerifyAdminOTPLogin(w http.ResponseWriter, r *http.Reques
 		DeviceID          string `json:"device_id" validate:"required"`
 		DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request")
 		return
@@ -295,20 +344,19 @@ func (h *AdminHandler) VerifyAdminOTPLogin(w http.ResponseWriter, r *http.Reques
 
 	otpResponse, err := h.otpService.VerifyOTP(ctx, &otpVerifyReq)
 	if err != nil {
-		h.handleOTPError(w, err)
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
-
 	if !otpResponse.Success {
-		h.respondWithError(w, http.StatusUnauthorized,
-			errors.New("AUTHENTICATION_FAILED"),
-			"Authentication failed")
+		h.respondWithError(w, http.StatusUnauthorized, customErrors.ErrOTPInvalid, "Authentication failed")
 		return
 	}
 
 	admin, err := h.adminService.GetAdminByPhone(ctx, req.PhoneNumber)
 	if err != nil {
-		h.respondWithError(w, http.StatusNotFound, err, "Authentication failed")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -319,15 +367,13 @@ func (h *AdminHandler) VerifyAdminOTPLogin(w http.ResponseWriter, r *http.Reques
 		IPAddress:         h.getClientIP(r),
 		UserAgent:         r.UserAgent(),
 	}
-
 	if _, err := h.deviceService.BindDevice(ctx, deviceReq); err != nil {
-		h.logger.Warn("Failed to update device trust for admin", util.ErrorField(err))
+		// non-critical, continue
+		_ = err
 	}
 
 	if mpinStatus, err := h.mpinService.GetAdminMPINStatus(ctx, admin.AdminID); err == nil && mpinStatus.IsLocked {
-		if err := h.mpinService.UnlockAdminMPIN(ctx, admin.AdminID); err != nil {
-			h.logger.Warn("Failed to unlock MPIN after OTP verification", util.ErrorField(err))
-		}
+		_ = h.mpinService.UnlockAdminMPIN(ctx, admin.AdminID)
 	}
 
 	dailyUsed := otpResponse.QuotaUsed
@@ -345,135 +391,38 @@ func (h *AdminHandler) VerifyAdminOTPLogin(w http.ResponseWriter, r *http.Reques
 		},
 		"message": "OTP verification successful. Device is now trusted.",
 	}, "Admin device setup successful"))
-
-	h.logger.Info("Admin OTP verification completed",
-		util.String("admin_id", admin.AdminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// func (h *AdminHandler) VerifyAdminMPINLogin(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
-// 	startTime := time.Now()
+const MaxPermissionBits = 800
 
-// 	var req struct {
-// 		AdminID           string `json:"admin_id" validate:"required"`
-// 		MPIN              string `json:"mpin" validate:"required"`
-// 		DeviceID          string `json:"device_id" validate:"required"`
-// 		DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
-// 	}
-
-// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-// 		return
-// 	}
-
-// 	req.MPIN = util.SanitizeInput(req.MPIN)
-// 	req.DeviceID = util.SanitizeInput(req.DeviceID)
-// 	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
-
-// 	adminID, err := uuid.Parse(req.AdminID)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
-// 		return
-// 	}
-
-// 	deviceTrusted, err := h.deviceService.IsDeviceTrusted(ctx, adminID, req.DeviceID)
-// 	if err != nil || !deviceTrusted {
-// 		h.respondWithError(w, http.StatusForbidden,
-// 			errors.New("UNTRUSTED_DEVICE: Device not trusted for MPIN login"),
-// 			"MPIN login not allowed on this device")
-// 		return
-// 	}
-
-// 	ipAddress := h.getClientIP(r)
-// 	if ipAddress == "" {
-// 		ipAddress = "0.0.0.0"
-// 	}
-
-// 	mpinVerifyReq := &service.AdminMPINVerifyRequest{
-// 		AdminID:           adminID,
-// 		MPIN:              req.MPIN,
-// 		DeviceID:          req.DeviceID,
-// 		DeviceFingerprint: req.DeviceFingerprint,
-// 		IPAddress:         ipAddress,
-// 		UserAgent:         r.UserAgent(),
-// 	}
-
-// 	mpinResult, err := h.mpinService.VerifyAdminMPIN(ctx, mpinVerifyReq)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusUnauthorized, err, "MPIN verification failed")
-// 		return
-// 	}
-
-// 	if !mpinResult.Verified {
-// 		h.respondWithError(w, http.StatusUnauthorized,
-// 			fmt.Errorf("MPIN_VERIFICATION_FAILED: %s", mpinResult.Message),
-// 			"MPIN verification failed")
-// 		return
-// 	}
-
-// 	admin, err := h.adminService.GetAdmin(ctx, adminID)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get admin details")
-// 		return
-// 	}
-
-// 	tokenReq := &service.IssueTokenPairRequest{
-// 		UserID:         admin.AdminID.String(),
-// 		Role:           admin.GetRoleString(),
-// 		DeviceID:       req.DeviceID,
-// 		SessionType:    "admin",
-// 		IPAddress:      ipAddress,
-// 		AdminRoleMask:  admin.AdminRoleMask,
-// 		PermissionMask: admin.AdminPermissionMask,
-// 	}
-
-// 	tokens, err := h.sessionService.IssueTokenPair(ctx, tokenReq)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to issue JWT tokens")
-// 		return
-// 	}
-
-// 	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
-// 		"tokens": tokens,
-// 		"admin": map[string]interface{}{
-// 			"admin_id":         admin.AdminID.String(),
-// 			"role_mask":        admin.AdminRoleMask,
-// 			"permission_mask":  admin.AdminPermissionMask,
-// 			"role_string":      admin.GetRoleString(),
-// 			"permission_names": admin.GetPermissionNames(),
-// 		},
-// 		"message": "Admin MPIN login successful",
-// 	}, "Admin login successful"))
-
-//		h.logger.Info("Admin MPIN login completed",
-//			util.String("admin_id", adminID.String()),
-//			util.Duration("duration", time.Since(startTime)),
-//		)
-//	}
-const MaxPermissionBits = 800 // or fetch from DB at startup
-
-// Helper to create empty mask of required length
 func newEmptyPermissionMask() []uint64 {
-	segments := (MaxPermissionBits + 63) / 64 // ceil(800/64) = 13
+	segments := (MaxPermissionBits + 63) / 64
 	return make([]uint64, segments)
 }
 
-// Helper to create full mask (all bits set) of required length
 func newFullPermissionMask() []uint64 {
 	segments := (MaxPermissionBits + 63) / 64
 	mask := make([]uint64, segments)
 	for i := 0; i < segments; i++ {
 		mask[i] = ^uint64(0)
 	}
-	// Optionally clear trailing bits beyond MaxPermissionBits
 	return mask
 }
 
+// VerifyAdminMPINLogin handles MPIN-based login.
+// @Summary Verify admin MPIN login
+// @Description Authenticates admin using MPIN and issues JWT tokens.
+// @Tags admin-auth
+// @Accept json
+// @Produce json
+// @Param body body object true "MPIN login request" example({"phone_number":"+917206583437","mpin":"123456","device_id":"test-device-001","device_fingerprint":"test-fingerprint-v1"})
+// @Success 200 {object} map[string]interface{} "Login successful, returns tokens and admin data"
+// @Failure 400 {object} map[string]interface{} "Invalid request"
+// @Failure 401 {object} map[string]interface{} "MPIN verification failed"
+// @Failure 404 {object} map[string]interface{} "Admin not found"
+// @Router /api/v1/admin-auth/login/verify-mpin [post]
 func (h *AdminHandler) VerifyAdminMPINLogin(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	var req struct {
 		PhoneNumber       string `json:"phone_number" validate:"required"`
@@ -482,26 +431,23 @@ func (h *AdminHandler) VerifyAdminMPINLogin(w http.ResponseWriter, r *http.Reque
 		DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
 		UserAgent         string `json:"user_agent"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
 
-	// Sanitize inputs
 	req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
 	req.MPIN = util.SanitizeInput(req.MPIN)
 	req.DeviceID = util.SanitizeInput(req.DeviceID)
 	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
 
-	// Get admin by phone
 	admin, err := h.adminService.GetAdminByPhone(ctx, req.PhoneNumber)
 	if err != nil {
-		h.respondWithError(w, http.StatusNotFound, err, "Admin not found")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
-	// Verify MPIN
 	mpinVerifyReq := &service.AdminMPINVerifyRequest{
 		AdminID:           admin.AdminID,
 		MPIN:              req.MPIN,
@@ -513,17 +459,13 @@ func (h *AdminHandler) VerifyAdminMPINLogin(w http.ResponseWriter, r *http.Reque
 
 	mpinResult, err := h.mpinService.VerifyAdminMPIN(ctx, mpinVerifyReq)
 	if err != nil || !mpinResult.Verified {
-		h.respondWithError(w, http.StatusUnauthorized, err, "MPIN verification failed")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
-	// Get admin permission mask
 	permissionMask, err := h.adminService.GetAdminPermissionMask(ctx, admin.AdminID)
 	if err != nil {
-		h.logger.Warn("Failed to get admin permission mask, using default",
-			util.String("admin_id", admin.AdminID.String()),
-			util.ErrorField(err))
-		// Use full access as fallback for super admin
 		if admin.IsSuperAdmin() {
 			permissionMask = newFullPermissionMask()
 		} else {
@@ -531,21 +473,9 @@ func (h *AdminHandler) VerifyAdminMPINLogin(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	// Record successful login
-	if err := h.adminService.RecordAdminLogin(ctx, admin.AdminID); err != nil {
-		h.logger.Warn("Failed to record admin login",
-			util.String("admin_id", admin.AdminID.String()),
-			util.ErrorField(err))
-	}
+	_ = h.adminService.RecordAdminLogin(ctx, admin.AdminID)
+	_ = h.adminService.ResetAdminFailedLoginAttempts(ctx, admin.AdminID)
 
-	// Reset failed login attempts
-	if err := h.adminService.ResetAdminFailedLoginAttempts(ctx, admin.AdminID); err != nil {
-		h.logger.Warn("Failed to reset admin failed attempts",
-			util.String("admin_id", admin.AdminID.String()),
-			util.ErrorField(err))
-	}
-
-	// Issue JWT tokens (not session token)
 	tokenReq := &service.IssueTokenPairRequest{
 		UserID:         admin.AdminID.String(),
 		Role:           admin.GetRoleString(),
@@ -553,24 +483,20 @@ func (h *AdminHandler) VerifyAdminMPINLogin(w http.ResponseWriter, r *http.Reque
 		SessionType:    "admin",
 		IPAddress:      h.getClientIP(r),
 		PermissionMask: permissionMask,
-		CompanyID:      "", // Empty for admin sessions
+		CompanyID:      "",
 	}
-
 	tokens, err := h.sessionService.IssueTokenPair(ctx, tokenReq)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to issue JWT tokens")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
-	// Get admin with more details
 	adminWithPerms, err := h.adminService.GetAdminWithPermissions(ctx, admin.AdminID, admin.AdminID)
 	if err != nil {
-		h.logger.Warn("Failed to get admin permissions",
-			util.String("admin_id", admin.AdminID.String()),
-			util.ErrorField(err))
+		// continue without extra permissions
 	}
 
-	// Build response
 	responseData := map[string]interface{}{
 		"tokens": tokens,
 		"admin": map[string]interface{}{
@@ -584,36 +510,35 @@ func (h *AdminHandler) VerifyAdminMPINLogin(w http.ResponseWriter, r *http.Reque
 		"message": "Admin MPIN login successful",
 	}
 
-	// Add permissions if available
 	if adminWithPerms != nil {
 		permissionNames := make([]string, 0, len(adminWithPerms.Permissions))
 		for _, perm := range adminWithPerms.Permissions {
 			permissionNames = append(permissionNames, perm.PermissionName)
 		}
-
 		departmentNames := make([]string, 0, len(adminWithPerms.Departments))
 		for _, dept := range adminWithPerms.Departments {
 			departmentNames = append(departmentNames, dept.Name)
 		}
-
 		responseData["admin"].(map[string]interface{})["permissions"] = permissionNames
 		responseData["admin"].(map[string]interface{})["departments"] = departmentNames
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(responseData, "Admin login successful"))
-
-	h.logger.Info("Admin MPIN login completed with JWT tokens",
-		util.String("admin_id", admin.AdminID.String()),
-		util.String("device_id", req.DeviceID),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// ==================== MPIN Management Methods ====================
-
+// SetupAdminMPIN sets up MPIN for an admin.
+// @Summary Setup admin MPIN
+// @Description Creates an MPIN for the admin after successful OTP verification.
+// @Tags admin-auth
+// @Accept json
+// @Produce json
+// @Param body body object true "MPIN setup request" example({"admin_id":"...","mpin":"123456","device_id":"test-device-001"})
+// @Success 201 {object} map[string]interface{} "MPIN setup successful"
+// @Failure 400 {object} map[string]interface{} "Invalid request"
+// @Failure 500 {object} map[string]interface{} "Internal error"
+// @Router /api/v1/admin-auth/mpin/setup [post]
 func (h *AdminHandler) SetupAdminMPIN(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	var req struct {
 		AdminID           string `json:"admin_id" validate:"required"`
@@ -621,7 +546,6 @@ func (h *AdminHandler) SetupAdminMPIN(w http.ResponseWriter, r *http.Request) {
 		DeviceID          string `json:"device_id" validate:"required"`
 		DeviceFingerprint string `json:"device_fingerprint"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
@@ -647,20 +571,27 @@ func (h *AdminHandler) SetupAdminMPIN(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.mpinService.SetupAdminMPIN(ctx, mpinReq); err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to setup MPIN")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusCreated, successResponse(nil, "Admin MPIN setup successful"))
-	h.logger.Info("Admin MPIN setup completed",
-		util.String("admin_id", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// ChangeAdminMPIN changes an admin's MPIN.
+// @Summary Change admin MPIN
+// @Description Updates MPIN after verifying current MPIN.
+// @Tags admin-auth
+// @Accept json
+// @Produce json
+// @Param body body object true "MPIN change request" example({"admin_id":"...","current_mpin":"123456","new_mpin":"654321","device_id":"test-device-001"})
+// @Success 200 {object} map[string]interface{} "MPIN changed"
+// @Failure 400 {object} map[string]interface{} "Invalid request"
+// @Failure 500 {object} map[string]interface{} "Internal error"
+// @Router /api/v1/admin-auth/mpin/change [post]
 func (h *AdminHandler) ChangeAdminMPIN(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	var req struct {
 		AdminID           string `json:"admin_id" validate:"required"`
@@ -669,7 +600,6 @@ func (h *AdminHandler) ChangeAdminMPIN(w http.ResponseWriter, r *http.Request) {
 		DeviceID          string `json:"device_id" validate:"required"`
 		DeviceFingerprint string `json:"device_fingerprint"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
@@ -697,27 +627,33 @@ func (h *AdminHandler) ChangeAdminMPIN(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.mpinService.ChangeAdminMPIN(ctx, mpinReq); err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to change MPIN")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Admin MPIN change successful"))
-	h.logger.Info("Admin MPIN changed successfully",
-		util.String("admin_id", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// ForgotAdminMPIN initiates the forgot MPIN flow.
+// @Summary Forgot admin MPIN
+// @Description Sends OTP to admin's phone for MPIN reset.
+// @Tags admin-auth
+// @Accept json
+// @Produce json
+// @Param body body object true "Forgot MPIN request" example({"phone_number":"+917206583437","device_id":"test-device-001"})
+// @Success 200 {object} map[string]interface{} "Forgot MPIN initiated"
+// @Failure 400 {object} map[string]interface{} "Invalid request"
+// @Failure 404 {object} map[string]interface{} "Phone not registered"
+// @Router /api/v1/admin-auth/mpin/forgot [post]
 func (h *AdminHandler) ForgotAdminMPIN(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	var req struct {
 		PhoneNumber       string `json:"phone_number" validate:"required"`
 		DeviceID          string `json:"device_id" validate:"required"`
 		DeviceFingerprint string `json:"device_fingerprint"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
@@ -729,35 +665,41 @@ func (h *AdminHandler) ForgotAdminMPIN(w http.ResponseWriter, r *http.Request) {
 
 	admin, err := h.adminService.GetAdminByPhone(ctx, req.PhoneNumber)
 	if err != nil || admin == nil {
-		h.respondWithError(w, http.StatusNotFound, fmt.Errorf("phone not registered"), "Phone not registered")
+		h.respondWithError(w, http.StatusNotFound, customErrors.ErrPhoneNotRegistered, "Phone not registered")
 		return
 	}
 
-	clientIP := h.getClientIP(r)
 	forgotReq := &service.AdminMPINForgotRequest{
 		AdminID:           admin.AdminID,
 		PhoneNumber:       req.PhoneNumber,
 		DeviceID:          req.DeviceID,
 		DeviceFingerprint: req.DeviceFingerprint,
-		IPAddress:         clientIP,
+		IPAddress:         h.getClientIP(r),
 		UserAgent:         r.UserAgent(),
 	}
 
 	if err := h.mpinService.ForgotAdminMPIN(ctx, forgotReq); err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to initiate forgot MPIN process")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Forgot MPIN initiated"))
-	h.logger.Info("ForgotAdminMPIN initiated",
-		util.String("admin_id", admin.AdminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// VerifyForgotAdminMPIN verifies OTP and resets MPIN.
+// @Summary Verify forgot admin MPIN
+// @Description Verifies OTP and sets a new MPIN.
+// @Tags admin-auth
+// @Accept json
+// @Produce json
+// @Param body body object true "Reset MPIN request" example({"phone_number":"+917206583437","device_id":"test-device-001","new_mpin":"654321","otp_code":"123456"})
+// @Success 200 {object} map[string]interface{} "MPIN reset successful"
+// @Failure 400 {object} map[string]interface{} "Invalid request"
+// @Failure 404 {object} map[string]interface{} "Phone not registered"
+// @Router /api/v1/admin-auth/mpin/forgot/verify [post]
 func (h *AdminHandler) VerifyForgotAdminMPIN(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	var req struct {
 		PhoneNumber       string `json:"phone_number" validate:"required"`
@@ -766,7 +708,6 @@ func (h *AdminHandler) VerifyForgotAdminMPIN(w http.ResponseWriter, r *http.Requ
 		OTPCode           string `json:"otp_code" validate:"required,len=6"`
 		DeviceFingerprint string `json:"device_fingerprint"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
@@ -780,11 +721,10 @@ func (h *AdminHandler) VerifyForgotAdminMPIN(w http.ResponseWriter, r *http.Requ
 
 	admin, err := h.adminService.GetAdminByPhone(ctx, req.PhoneNumber)
 	if err != nil || admin == nil {
-		h.respondWithError(w, http.StatusNotFound, fmt.Errorf("phone not registered"), "Phone not registered")
+		h.respondWithError(w, http.StatusNotFound, customErrors.ErrPhoneNotRegistered, "Phone not registered")
 		return
 	}
 
-	clientIP := h.getClientIP(r)
 	forgotReq := &service.AdminMPINForgotWithOTPRequest{
 		AdminID:           admin.AdminID,
 		PhoneNumber:       req.PhoneNumber,
@@ -792,27 +732,35 @@ func (h *AdminHandler) VerifyForgotAdminMPIN(w http.ResponseWriter, r *http.Requ
 		NewMPIN:           req.NewMPIN,
 		OTPCode:           req.OTPCode,
 		DeviceFingerprint: req.DeviceFingerprint,
-		IPAddress:         clientIP,
+		IPAddress:         h.getClientIP(r),
 		UserAgent:         r.UserAgent(),
 	}
 
 	if err := h.mpinService.VerifyForgotAdminMPINOTP(ctx, forgotReq); err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to reset MPIN")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Admin MPIN reset successful"))
-	h.logger.Info("Admin MPIN reset via forgot flow",
-		util.String("admin_id", admin.AdminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// ==================== Admin Role Management Methods ====================
+// ---------- Admin Role CRUD ----------
 
+// CreateAdminRole creates a new admin role.
+// @Summary Create admin role
+// @Description Creates a new admin role with specified permissions.
+// @Tags admin-roles
+// @Accept json
+// @Produce json
+// @Param body body models.AdminRoleCreateRequest true "Role details"
+// @Success 201 {object} map[string]interface{} "Role created"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Failure 409 {object} map[string]interface{} "Role name already exists"
+// @Router /api/v1/admin/roles [post]
 func (h *AdminHandler) CreateAdminRole(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -826,32 +774,32 @@ func (h *AdminHandler) CreateAdminRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate role type
 	if req.RoleType != models.RoleTypeEmployee && req.RoleType != models.RoleTypeManager {
-		h.respondWithError(w, http.StatusBadRequest,
-			fmt.Errorf("invalid role type"),
-			"Role type must be 1 (employee) or 2 (manager)")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Role type must be 1 (employee) or 2 (manager)")
 		return
 	}
 
 	role, err := h.adminService.CreateAdminRole(ctx, &req, requesterID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to create admin role")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusCreated, successResponse(role, "Admin role created successfully"))
-	h.logger.Info("Admin role created",
-		util.String("role_id", role.AdminRoleID.String()),
-		util.String("created_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// GetAdminRole retrieves a specific admin role.
+// @Summary Get admin role by ID
+// @Tags admin-roles
+// @Produce json
+// @Param roleID path string true "Role UUID"
+// @Success 200 {object} map[string]interface{} "Role details"
+// @Failure 400 {object} map[string]interface{} "Invalid role ID"
+// @Failure 404 {object} map[string]interface{} "Role not found"
+// @Router /api/v1/admin/roles/{roleID} [get]
 func (h *AdminHandler) GetAdminRole(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -868,21 +816,26 @@ func (h *AdminHandler) GetAdminRole(w http.ResponseWriter, r *http.Request) {
 
 	role, err := h.adminService.GetAdminRole(ctx, roleID, requesterID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get admin role")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(role, "Admin role retrieved successfully"))
-	h.logger.Debug("Admin role retrieved",
-		util.String("role_id", roleID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// GetAdminRoles lists admin roles with pagination and filtering.
+// @Summary List admin roles
+// @Tags admin-roles
+// @Produce json
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Param role_type query int false "Filter by role type (1=employee, 2=manager)"
+// @Success 200 {object} map[string]interface{} "List of roles with metadata"
+// @Failure 400 {object} map[string]interface{} "Invalid parameters"
+// @Router /api/v1/admin/roles [get]
 func (h *AdminHandler) GetAdminRoles(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -903,8 +856,8 @@ func (h *AdminHandler) GetAdminRoles(w http.ResponseWriter, r *http.Request) {
 
 	roles, total, err := h.adminService.GetAdminRoles(ctx, requesterID, limit, offset, roleType)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get admin roles")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -917,49 +870,64 @@ func (h *AdminHandler) GetAdminRoles(w http.ResponseWriter, r *http.Request) {
 			"count":  len(roles),
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admin roles retrieved successfully"))
-	h.logger.Debug("Admin roles retrieved",
-		util.Int("count", len(roles)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
+
+// UpdateAdminRole updates an existing admin role.
+// @Summary Update admin role
+// @Tags admin-roles
+// @Accept json
+// @Produce json
+// @Param roleID path string true "Role UUID"
+// @Param body body models.AdminRoleUpdateRequest true "Update fields"
+// @Success 200 {object} map[string]interface{} "Updated role"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Failure 404 {object} map[string]interface{} "Role not found"
+// @Router /api/v1/admin/roles/{roleID} [put]
 func (h *AdminHandler) UpdateAdminRole(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
+
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
 		return
 	}
+
 	roleIDStr := chi.URLParam(r, "roleID")
 	roleID, err := uuid.Parse(roleIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid role ID")
 		return
 	}
+
 	var updates models.AdminRoleUpdateRequest
 	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
+
 	role, err := h.adminService.UpdateAdminRole(ctx, roleID, &updates, requesterID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to update admin role")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
+
 	h.respondWithJSON(w, http.StatusOK, successResponse(role, "Admin role updated successfully"))
-	h.logger.Info("Admin role updated",
-		util.String("role_id", roleID.String()),
-		util.String("updated_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// DeleteAdminRole deletes an admin role.
+// @Summary Delete admin role
+// @Tags admin-roles
+// @Param roleID path string true "Role UUID"
+// @Success 200 {object} map[string]interface{} "Role deleted"
+// @Failure 400 {object} map[string]interface{} "Invalid role ID"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Failure 409 {object} map[string]interface{} "Role in use"
+// @Router /api/v1/admin/roles/{roleID} [delete]
 func (h *AdminHandler) DeleteAdminRole(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -975,23 +943,28 @@ func (h *AdminHandler) DeleteAdminRole(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.adminService.DeleteAdminRole(ctx, roleID, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to delete admin role")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Admin role deleted successfully"))
-	h.logger.Info("Admin role deleted",
-		util.String("role_id", roleID.String()),
-		util.String("deleted_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// ==================== Admin User Management Methods ====================
+// ---------- Admin User CRUD ----------
+
+// CreateAdminUser creates a new admin user.
+// @Summary Create admin user
+// @Tags admin-users
+// @Accept json
+// @Produce json
+// @Param body body models.AdminCreateRequest true "Admin details"
+// @Success 201 {object} map[string]interface{} "Admin created"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins [post]
 func (h *AdminHandler) CreateAdminUser(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -1005,24 +978,27 @@ func (h *AdminHandler) CreateAdminUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Service will handle phone encryption and hashing
 	admin, err := h.adminService.CreateAdminUser(ctx, &req, requesterID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to create admin user")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusCreated, successResponse(admin, "Admin user created successfully"))
-	h.logger.Info("Admin user created",
-		util.String("admin_id", admin.AdminID.String()),
-		util.String("created_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
+
+// GetAdminUser retrieves a specific admin user.
+// @Summary Get admin user
+// @Tags admin-users
+// @Produce json
+// @Param adminID path string true "Admin UUID"
+// @Success 200 {object} map[string]interface{} "Admin details"
+// @Failure 400 {object} map[string]interface{} "Invalid admin ID"
+// @Failure 404 {object} map[string]interface{} "Admin not found"
+// @Router /api/v1/admin/admins/{adminID} [get]
 func (h *AdminHandler) GetAdminUser(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -1039,21 +1015,27 @@ func (h *AdminHandler) GetAdminUser(w http.ResponseWriter, r *http.Request) {
 
 	admin, err := h.adminService.GetAdminUser(ctx, adminID, requesterID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get admin user")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(admin, "Admin user retrieved successfully"))
-	h.logger.Debug("Admin user retrieved",
-		util.String("admin_id", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// UpdateAdminUser updates an admin user.
+// @Summary Update admin user
+// @Tags admin-users
+// @Accept json
+// @Produce json
+// @Param adminID path string true "Admin UUID"
+// @Param body body map[string]interface{} true "Update fields"
+// @Success 200 {object} map[string]interface{} "Admin updated"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID} [put]
 func (h *AdminHandler) UpdateAdminUser(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -1075,22 +1057,24 @@ func (h *AdminHandler) UpdateAdminUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.adminService.UpdateAdminUser(ctx, adminID, updates, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to update admin user")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Admin user updated successfully"))
-	h.logger.Info("Admin user updated",
-		util.String("admin_id", adminID.String()),
-		util.String("updated_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// DeleteAdminUser deletes an admin user.
+// @Summary Delete admin user
+// @Tags admin-users
+// @Param adminID path string true "Admin UUID"
+// @Success 200 {object} map[string]interface{} "Admin deleted"
+// @Failure 400 {object} map[string]interface{} "Invalid admin ID"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID} [delete]
 func (h *AdminHandler) DeleteAdminUser(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -1106,23 +1090,27 @@ func (h *AdminHandler) DeleteAdminUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.adminService.DeleteAdminUser(ctx, adminID, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to delete admin user")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Admin user deleted successfully"))
-	h.logger.Info("Admin user deleted",
-		util.String("admin_id", adminID.String()),
-		util.String("deleted_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// ==================== Admin Profile Management ====================
+// UpdateAdminProfile updates admin's profile (username, full_name).
+// @Summary Update admin profile
+// @Tags admin-users
+// @Accept json
+// @Produce json
+// @Param adminID path string true "Admin UUID"
+// @Param body body models.AdminProfileUpdateRequest true "Profile fields"
+// @Success 200 {object} map[string]interface{} "Profile updated"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID}/profile [put]
 func (h *AdminHandler) UpdateAdminProfile(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -1143,7 +1131,6 @@ func (h *AdminHandler) UpdateAdminProfile(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Create updates map for service method
 	updates := make(map[string]interface{})
 	if req.Username != "" {
 		updates["username"] = req.Username
@@ -1151,30 +1138,33 @@ func (h *AdminHandler) UpdateAdminProfile(w http.ResponseWriter, r *http.Request
 	if req.FullName != "" {
 		updates["full_name"] = req.FullName
 	}
-
 	if len(updates) == 0 {
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("NO_FIELDS_TO_UPDATE"),
-			"At least one field (username or full_name) must be provided")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "At least one field (username or full_name) must be provided")
 		return
 	}
 
-	// Use UpdateAdminUser instead of separate methods
 	if err := h.adminService.UpdateAdminUser(ctx, adminID, updates, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to update admin profile")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Admin profile updated successfully"))
-	h.logger.Info("Admin profile updated",
-		util.String("admin_id", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
+
+// ChangeAdminPhone changes the admin's phone number.
+// @Summary Change admin phone
+// @Tags admin-users
+// @Accept json
+// @Produce json
+// @Param adminID path string true "Admin UUID"
+// @Param body body object true "New phone" example({"new_phone":"+919876543210"})
+// @Success 200 {object} map[string]interface{} "Phone updated"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID}/phone [put]
 func (h *AdminHandler) ChangeAdminPhone(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -1192,28 +1182,33 @@ func (h *AdminHandler) ChangeAdminPhone(w http.ResponseWriter, r *http.Request) 
 	var req struct {
 		NewPhone string `json:"new_phone" validate:"required,phone"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
 
 	if err := h.adminService.UpdateAdminPhone(ctx, adminID, req.NewPhone, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to change admin phone")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Admin phone updated successfully"))
-	h.logger.Info("Admin phone changed",
-		util.String("admin_id", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// UpdateAdminReportsTo updates the reporting manager for an admin.
+// @Summary Update admin reports_to
+// @Tags admin-users
+// @Accept json
+// @Produce json
+// @Param adminID path string true "Admin UUID"
+// @Param body body object true "Reports to" example({"reports_to":"some-uuid"})
+// @Success 200 {object} map[string]interface{} "Reports_to updated"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID}/reports-to [put]
 func (h *AdminHandler) UpdateAdminReportsTo(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -1231,7 +1226,6 @@ func (h *AdminHandler) UpdateAdminReportsTo(w http.ResponseWriter, r *http.Reque
 	var req struct {
 		ReportsTo *string `json:"reports_to,omitempty"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
@@ -1248,25 +1242,27 @@ func (h *AdminHandler) UpdateAdminReportsTo(w http.ResponseWriter, r *http.Reque
 	}
 
 	if err := h.adminService.UpdateAdminReportsTo(ctx, adminID, reportsToUUID, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to update admin reports_to")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Admin reports_to updated successfully"))
-	h.logger.Info("Admin reports_to updated",
-		util.String("admin_id", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// ==================== Department Management ====================
+// ---------- Admin Permissions ----------
 
-// ==================== Permission Management ====================
-
+// GetAdminPermissions retrieves all permissions for an admin.
+// @Summary Get admin permissions
+// @Tags admin-permissions
+// @Produce json
+// @Param adminID path string true "Admin UUID"
+// @Success 200 {object} map[string]interface{} "List of permissions"
+// @Failure 400 {object} map[string]interface{} "Invalid admin ID"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID}/permissions [get]
 func (h *AdminHandler) GetAdminPermissions(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -1283,23 +1279,25 @@ func (h *AdminHandler) GetAdminPermissions(w http.ResponseWriter, r *http.Reques
 
 	permissions, err := h.adminService.GetAdminPermissions(ctx, adminID, requesterID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get admin permissions")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(permissions, "Admin permissions retrieved successfully"))
-	h.logger.Debug("Admin permissions retrieved",
-		util.String("admin_id", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// ==================== Status Management ====================
-
+// ActivateAdmin activates an admin user.
+// @Summary Activate admin
+// @Tags admin-users
+// @Post
+// @Param adminID path string true "Admin UUID"
+// @Success 200 {object} map[string]interface{} "Admin activated"
+// @Failure 400 {object} map[string]interface{} "Invalid admin ID"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID}/activate [post]
 func (h *AdminHandler) ActivateAdmin(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -1315,21 +1313,25 @@ func (h *AdminHandler) ActivateAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.adminService.ActivateAdmin(ctx, adminID, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to activate admin")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Admin activated successfully"))
-	h.logger.Info("Admin activated",
-		util.String("admin_id", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// DeactivateAdmin deactivates an admin user.
+// @Summary Deactivate admin
+// @Tags admin-users
+// @Post
+// @Param adminID path string true "Admin UUID"
+// @Success 200 {object} map[string]interface{} "Admin deactivated"
+// @Failure 400 {object} map[string]interface{} "Invalid admin ID"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID}/deactivate [post]
 func (h *AdminHandler) DeactivateAdmin(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -1345,23 +1347,29 @@ func (h *AdminHandler) DeactivateAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.adminService.DeactivateAdmin(ctx, adminID, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to deactivate admin")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Admin deactivated successfully"))
-	h.logger.Info("Admin deactivated",
-		util.String("admin_id", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// ==================== Avatar Management ====================
+// ---------- Admin Avatar ----------
 
+// SetAdminAvatar sets the avatar for an admin.
+// @Summary Set admin avatar
+// @Tags admin-avatar
+// @Accept json
+// @Produce json
+// @Param adminID path string true "Admin UUID"
+// @Param body body object true "Avatar data" example({"avatar_hash":"...","avatar_object_key":"...","avatar_mime_type":"image/jpeg"})
+// @Success 200 {object} map[string]interface{} "Avatar set"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID}/avatar [post]
 func (h *AdminHandler) SetAdminAvatar(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -1381,28 +1389,31 @@ func (h *AdminHandler) SetAdminAvatar(w http.ResponseWriter, r *http.Request) {
 		AvatarObjectKey string `json:"avatar_object_key" validate:"required"`
 		AvatarMimeType  string `json:"avatar_mime_type" validate:"required,oneof=image/jpeg image/jpg image/png image/gif image/webp image/svg+xml"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
 
 	if err := h.adminService.SetAdminAvatar(ctx, adminID, req.AvatarHash, req.AvatarObjectKey, req.AvatarMimeType, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to set admin avatar")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Admin avatar set successfully"))
-	h.logger.Info("Admin avatar set",
-		util.String("admin_id", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// GetAdminAvatar retrieves the admin's avatar.
+// @Summary Get admin avatar
+// @Tags admin-avatar
+// @Produce json
+// @Param adminID path string true "Admin UUID"
+// @Success 200 {object} map[string]interface{} "Avatar details"
+// @Failure 400 {object} map[string]interface{} "Invalid admin ID"
+// @Failure 404 {object} map[string]interface{} "Avatar not found"
+// @Router /api/v1/admin/admins/{adminID}/avatar [get]
 func (h *AdminHandler) GetAdminAvatar(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	adminIDStr := chi.URLParam(r, "adminID")
 	adminID, err := uuid.Parse(adminIDStr)
@@ -1413,21 +1424,24 @@ func (h *AdminHandler) GetAdminAvatar(w http.ResponseWriter, r *http.Request) {
 
 	avatar, err := h.adminService.GetAdminAvatar(ctx, adminID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get admin avatar")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(avatar, "Admin avatar retrieved successfully"))
-	h.logger.Debug("Admin avatar retrieved",
-		util.String("admin_id", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// DeactivateAdminAvatar removes the admin's avatar.
+// @Summary Deactivate admin avatar
+// @Tags admin-avatar
+// @Param adminID path string true "Admin UUID"
+// @Success 200 {object} map[string]interface{} "Avatar removed"
+// @Failure 400 {object} map[string]interface{} "Invalid admin ID"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID}/avatar [delete]
 func (h *AdminHandler) DeactivateAdminAvatar(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -1443,354 +1457,15 @@ func (h *AdminHandler) DeactivateAdminAvatar(w http.ResponseWriter, r *http.Requ
 	}
 
 	if err := h.adminService.DeactivateAdminAvatar(ctx, adminID, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to deactivate admin avatar")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Admin avatar deactivated successfully"))
-	h.logger.Info("Admin avatar deactivated",
-		util.String("admin_id", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-func (h *AdminHandler) GetAdminAvatarWithFallback(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
-
-	adminIDStr := chi.URLParam(r, "adminID")
-	adminID, err := uuid.Parse(adminIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
-		return
-	}
-
-	avatar, initials, err := h.adminService.GetAdminAvatarWithFallback(ctx, adminID)
-	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get admin avatar with fallback")
-		return
-	}
-
-	response := map[string]interface{}{
-		"avatar":     avatar,
-		"initials":   initials,
-		"has_avatar": avatar != nil,
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admin avatar with fallback retrieved successfully"))
-	h.logger.Debug("Admin avatar with fallback retrieved",
-		util.String("admin_id", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
-
-// ==================== Hierarchy Management ====================
-
-func (h *AdminHandler) GetDirectReports(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
-
-	requesterID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-		return
-	}
-
-	adminIDStr := chi.URLParam(r, "adminID")
-	adminID, err := uuid.Parse(adminIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
-		return
-	}
-
-	directReports, err := h.adminService.GetDirectReports(ctx, adminID, requesterID)
-	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get direct reports")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(directReports, "Direct reports retrieved successfully"))
-	h.logger.Debug("Direct reports retrieved",
-		util.String("admin_id", adminID.String()),
-		util.Int("count", len(directReports)),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
-
-func (h *AdminHandler) GetReportingChain(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
-
-	requesterID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-		return
-	}
-
-	adminIDStr := chi.URLParam(r, "adminID")
-	adminID, err := uuid.Parse(adminIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
-		return
-	}
-
-	reportingChain, err := h.adminService.GetReportingChain(ctx, adminID, requesterID)
-	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get reporting chain")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(reportingChain, "Reporting chain retrieved successfully"))
-	h.logger.Debug("Reporting chain retrieved",
-		util.String("admin_id", adminID.String()),
-		util.Int("levels", len(reportingChain)),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
-
-func (h *AdminHandler) GetAdminHierarchy(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
-
-	requesterID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-		return
-	}
-
-	adminIDStr := chi.URLParam(r, "adminID")
-	adminID, err := uuid.Parse(adminIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
-		return
-	}
-
-	hierarchy, err := h.adminService.GetAdminHierarchy(ctx, adminID, requesterID)
-	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get admin hierarchy")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(hierarchy, "Admin hierarchy retrieved successfully"))
-	h.logger.Debug("Admin hierarchy retrieved",
-		util.String("admin_id", adminID.String()),
-		util.Int("levels", len(hierarchy)),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
-
-// ==================== Search Routes Registration ====================
-
-func (h *AdminHandler) RegisterSearchRoutes(router chi.Router) {
-	router.Route("/search", func(r chi.Router) {
-		// Admin search
-		r.Get("/admins", h.SearchAdmins)
-		r.Get("/admins/advanced", h.SearchAdminsAdvanced)
-		r.Get("/admins/name", h.SearchAdminsByName)
-		r.Get("/admins/employees", h.SearchAdminEmployees)
-		r.Get("/admins/managers", h.SearchAdminManagers)
-		r.Get("/admins/suggestions", h.GetAdminSuggestions)
-		r.Get("/admins/analytics", h.GetAdminSearchAnalytics)
-
-		// Role-based search
-		// r.Get("/admins/role/{roleMask}", h.SearchAdminsByRoleAndName)
-
-		// Role search
-		r.Get("/roles", h.SearchAdminRoles)
-	})
-}
-
-// ==================== Admin Search Methods ====================
-
-func (h *AdminHandler) GetAdminSuggestions(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
-
-	requesterID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-		return
-	}
-
-	prefix := r.URL.Query().Get("prefix")
-	if prefix == "" {
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("PREFIX_REQUIRED"),
-			"Prefix is required for suggestions")
-		return
-	}
-
-	limit := h.getIntQueryParam(r, "limit", 10)
-	excludeOwner := h.getBoolQueryParam(r, "exclude_owner", false)
-
-	var roleTypeFilter *int
-	if roleTypeStr := r.URL.Query().Get("role_type"); roleTypeStr != "" {
-		rt, err := strconv.Atoi(roleTypeStr)
-		if err == nil {
-			roleTypeFilter = &rt
-		}
-	}
-
-	suggestions, err := h.adminService.GetAdminSuggestions(ctx, prefix, requesterID, roleTypeFilter, excludeOwner, limit)
-	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get admin suggestions")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(suggestions, "Admin suggestions retrieved successfully"))
-	h.logger.Debug("Admin suggestions retrieved",
-		util.String("prefix", prefix),
-		util.Int("suggestions", len(suggestions)),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
-
-func (h *AdminHandler) GetAdminSearchAnalytics(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
-
-	// Check authentication but don't use the ID
-	if _, err := h.getRequesterAdminID(r); err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-		return
-	}
-
-	stats, err := h.adminService.GetStats(ctx)
-	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get admin search analytics")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(stats, "Admin search analytics retrieved successfully"))
-	h.logger.Debug("Admin search analytics retrieved",
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
-
-func (h *AdminHandler) SearchAdminRoles(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
-
-	requesterID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-		return
-	}
-
-	query := r.URL.Query().Get("q")
-	if query == "" {
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("QUERY_REQUIRED"),
-			"Search query is required")
-		return
-	}
-
-	limit := h.getIntQueryParam(r, "limit", 50)
-	offset := h.getIntQueryParam(r, "offset", 0)
-
-	roles, total, err := h.adminService.SearchAdminRoles(ctx, query, requesterID, limit, offset)
-	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to search admin roles")
-		return
-	}
-
-	response := map[string]interface{}{
-		"roles": roles,
-		"meta": map[string]interface{}{
-			"total":  total,
-			"limit":  limit,
-			"offset": offset,
-			"count":  len(roles),
-		},
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admin roles search completed successfully"))
-	h.logger.Info("Admin roles search executed",
-		util.String("requester_id", requesterID.String()),
-		util.String("query", query),
-		util.Int("results", len(roles)),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
-
-// func (h *AdminHandler) ListAdmins(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
-// 	startTime := time.Now()
-
-// 	requesterID, err := h.getRequesterAdminID(r)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-// 		return
-// 	}
-
-// 	limit := h.getIntQueryParam(r, "limit", 50)
-// 	offset := h.getIntQueryParam(r, "offset", 0)
-
-// 	// Create search request with proper type
-// 	req := &models.AdminSearchRequest{
-// 		Query:           "", // Empty query to get all
-// 		SearchType:      "fulltext",
-// 		Limit:           limit,
-// 		Offset:          offset,
-// 		IncludeInactive: h.getBoolQueryParam(r, "include_inactive", false),
-// 	}
-
-// 	if roleTypeStr := r.URL.Query().Get("role_type"); roleTypeStr != "" {
-// 		roleType, err := strconv.Atoi(roleTypeStr)
-// 		if err == nil {
-// 			req.RoleTypeFilter = &roleType
-// 		}
-// 	}
-
-// 	// Use SearchAdminsWithFilters instead of SearchAdminUsers
-// 	results, total, err := h.adminService.SearchAdminsWithFilters(ctx, requesterID, req)
-// 	if err != nil {
-// 		statusCode := h.getStatusCode(err)
-// 		h.respondWithError(w, statusCode, err, "Failed to list admins")
-// 		return
-// 	}
-
-// 	response := map[string]interface{}{
-// 		"admins": results,
-// 		"meta": map[string]interface{}{
-// 			"total":  total,
-// 			"limit":  limit,
-// 			"offset": offset,
-// 			"count":  len(results),
-// 		},
-// 	}
-
-// 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admins listed successfully"))
-// 	h.logger.Debug("Admins listed",
-// 		util.Int("count", len(results)),
-// 		util.Duration("duration", time.Since(startTime)),
-// 	)
-// }
-
-// ==================== Helper Methods ====================
-
-func (h *AdminHandler) getRequesterAdminID(r *http.Request) (uuid.UUID, error) {
-	userID, ok := r.Context().Value("user_id").(string)
-	if !ok || userID == "" {
-		return uuid.Nil, errors.New("user ID not found in request context")
-	}
-	return uuid.Parse(userID)
-}
-
-func (h *AdminHandler) getRequesterAdminRoleMask(r *http.Request) (uint64, error) {
-	if roleMask, ok := r.Context().Value("admin_role_mask").(uint64); ok && roleMask != 0 {
-		return roleMask, nil
-	}
-	return 0, errors.New("admin role mask not found in context")
-}
+// ---------- Helper methods ----------
 
 func (h *AdminHandler) hasMPIN(ctx context.Context, adminID uuid.UUID) bool {
 	status, err := h.mpinService.GetAdminMPINStatus(ctx, adminID)
@@ -1798,30 +1473,6 @@ func (h *AdminHandler) hasMPIN(ctx context.Context, adminID uuid.UUID) bool {
 		return false
 	}
 	return status != nil && status.Exists
-}
-
-func (h *AdminHandler) handleOTPError(w http.ResponseWriter, err error) {
-	var otpErr *service.OTPError
-	if errors.As(err, &otpErr) {
-		switch otpErr.Code {
-		case "RATE_LIMIT_EXCEEDED":
-			h.respondWithError(w, http.StatusTooManyRequests, err, "Too many attempts. Please try again later.")
-		case "DAILY_QUOTA_EXCEEDED":
-			h.respondWithError(w, http.StatusTooManyRequests, err, "Daily OTP limit exceeded")
-		case "ACCOUNT_LOCKED":
-			h.respondWithError(w, http.StatusLocked, err, "Account temporarily locked")
-		case "RESEND_COOLDOWN":
-			h.respondWithError(w, http.StatusTooManyRequests, err, "Please wait before requesting a new OTP")
-		case "REPLAY_ATTEMPT":
-			h.respondWithError(w, http.StatusBadRequest, err, "Invalid OTP")
-		case "PHONE_NOT_REGISTERED":
-			h.respondWithError(w, http.StatusNotFound, err, "Phone number not registered")
-		default:
-			h.respondWithError(w, http.StatusUnauthorized, err, "Authentication failed")
-		}
-	} else {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Authentication failed")
-	}
 }
 
 func (h *AdminHandler) getIntQueryParam(r *http.Request, key string, defaultValue int) int {
@@ -1842,100 +1493,6 @@ func (h *AdminHandler) getBoolQueryParam(r *http.Request, key string, defaultVal
 		return defaultValue
 	}
 	return strings.ToLower(value) == "true"
-}
-
-func (h *AdminHandler) getStatusCode(err error) int {
-	if err == nil {
-		return http.StatusOK
-	}
-
-	errMsg := err.Error()
-
-	// Check for duplicate role constraint violation (PostgreSQL error)
-	if strings.Contains(errMsg, "duplicate key value violates unique constraint") &&
-		strings.Contains(errMsg, "admin_roles_role_name_key") {
-		return http.StatusConflict
-	}
-
-	// Check for other duplicate key violations
-	if strings.Contains(errMsg, "duplicate key") ||
-		strings.Contains(errMsg, "violates unique constraint") {
-		return http.StatusConflict
-	}
-
-	// Check for custom "already exists" errors
-	if strings.Contains(errMsg, "already exists") ||
-		strings.Contains(errMsg, "already taken") ||
-		strings.Contains(errMsg, "already in use") {
-		return http.StatusConflict
-	}
-
-	// Check for not found errors
-	if strings.Contains(errMsg, "not found") ||
-		strings.Contains(errMsg, "does not exist") ||
-		strings.Contains(errMsg, "no such") {
-		return http.StatusNotFound
-	}
-
-	// Check for authentication/authorization errors
-	if strings.Contains(errMsg, "unauthorized") ||
-		strings.Contains(errMsg, "Unauthorized") ||
-		strings.Contains(errMsg, "forbidden") ||
-		strings.Contains(errMsg, "Forbidden") {
-		return http.StatusForbidden
-	}
-
-	// Check for permission errors
-	if strings.Contains(errMsg, "permission") ||
-		strings.Contains(errMsg, "Permission") ||
-		strings.Contains(errMsg, "cannot access") ||
-		strings.Contains(errMsg, "cannot view") ||
-		strings.Contains(errMsg, "cannot update") ||
-		strings.Contains(errMsg, "cannot delete") {
-		return http.StatusForbidden
-	}
-
-	// Check for validation errors
-	if strings.Contains(errMsg, "invalid") ||
-		strings.Contains(errMsg, "Invalid") ||
-		strings.Contains(errMsg, "cannot be empty") ||
-		strings.Contains(errMsg, "required") ||
-		strings.Contains(errMsg, "must be") ||
-		strings.Contains(errMsg, "should be") ||
-		strings.Contains(errMsg, "expected") {
-		return http.StatusBadRequest
-	}
-
-	// Check for rate limiting/throttling
-	if strings.Contains(errMsg, "rate limit") ||
-		strings.Contains(errMsg, "too many requests") ||
-		strings.Contains(errMsg, "throttled") {
-		return http.StatusTooManyRequests
-	}
-
-	// Check for service unavailable/maintenance
-	if strings.Contains(errMsg, "service unavailable") ||
-		strings.Contains(errMsg, "maintenance") ||
-		strings.Contains(errMsg, "temporarily") {
-		return http.StatusServiceUnavailable
-	}
-
-	// Check for not implemented
-	if strings.Contains(errMsg, "not implemented") ||
-		strings.Contains(errMsg, "not supported") {
-		return http.StatusNotImplemented
-	}
-
-	// Check for database connection errors
-	if strings.Contains(errMsg, "connection refused") ||
-		strings.Contains(errMsg, "database") ||
-		strings.Contains(errMsg, "sql:") ||
-		strings.Contains(errMsg, "pq:") {
-		return http.StatusInternalServerError
-	}
-
-	// Default to internal server error
-	return http.StatusInternalServerError
 }
 
 func (h *AdminHandler) getClientIP(r *http.Request) string {
@@ -1962,161 +1519,383 @@ func (h *AdminHandler) getClientIP(r *http.Request) string {
 func (h *AdminHandler) respondWithJSON(w http.ResponseWriter, statusCode int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		h.logger.Error("Failed to encode JSON response", util.ErrorField(err))
-	}
+	_ = json.NewEncoder(w).Encode(data)
 }
 
 func (h *AdminHandler) respondWithError(w http.ResponseWriter, statusCode int, err error, message string) {
-	h.logger.Warn("Admin HTTP error response",
-		util.ErrorField(err),
-		util.Int("status_code", statusCode),
-		util.String("message", message),
-	)
 	h.respondWithJSON(w, statusCode, errorResponse(err, message))
 }
 
-// ==================== Company Management Methods (Maintained from original) ====================
-// type CreateCompanyRequest struct {
-// 	CompanyName        string `json:"company_name" validate:"required"`
-// 	OwnerPhone         string `json:"owner_phone" validate:"required"`
-// 	OwnerUsername      string `json:"owner_username" validate:"required,min=3,max=100,alphanum"`
-// 	OwnerFullName      string `json:"owner_full_name" validate:"required,max=255"`
-// 	OwnerPositionTitle string `json:"owner_position_title" validate:"required,max=255"`
-// 	SubscriptionTier   string `json:"subscription_tier" validate:"required,oneof=basic premium enterprise"`
-// 	MaxEmployees       int    `json:"max_employees" validate:"required,min=1,max=2000"`
+// ============================
+// AVATAR & HIERARCHY HANDLERS
+// ============================
 
-// 	// ✅ NEW (matches service + repo)
-// 	MaxDepartments int `json:"max_departments" validate:"required,min=1,max=100"`
+// GetAdminAvatarWithFallback retrieves admin avatar with initials fallback.
+// @Summary Get admin avatar with fallback
+// @Tags admin-avatar
+// @Produce json
+// @Param adminID path string true "Admin UUID"
+// @Success 200 {object} map[string]interface{} "Avatar and initials"
+// @Failure 400 {object} map[string]interface{} "Invalid admin ID"
+// @Failure 404 {object} map[string]interface{} "Admin not found"
+// @Router /api/v1/admin/admins/{adminID}/avatar/with-fallback [get]
+func (h *AdminHandler) GetAdminAvatarWithFallback(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
 
-// 	DataRegion         string   `json:"data_region" validate:"required"`
-// 	SubscriptionMonths int      `json:"subscription_months" validate:"required,min=1,max=36"`
-// 	SubscriptionDays   int      `json:"subscription_days" validate:"min=0,max=30"`
-// 	Departments        []string `json:"departments"`
-// }
+	adminIDStr := chi.URLParam(r, "adminID")
+	adminID, err := uuid.Parse(adminIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+		return
+	}
 
-// func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
-// 	startTime := time.Now()
+	avatar, initials, err := h.adminService.GetAdminAvatarWithFallback(ctx, adminID)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
 
-// 	adminID, err := h.getRequesterAdminID(r)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
-// 		return
-// 	}
+	response := map[string]interface{}{
+		"avatar":     avatar,
+		"initials":   initials,
+		"has_avatar": avatar != nil,
+	}
+	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admin avatar with fallback retrieved successfully"))
+}
 
-// 	var req CreateCompanyRequest
-// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-// 		return
-// 	}
+// GetDirectReports retrieves direct reports of an admin.
+// @Summary Get direct reports
+// @Tags admin-hierarchy
+// @Produce json
+// @Param adminID path string true "Admin UUID"
+// @Success 200 {object} map[string]interface{} "List of direct reports"
+// @Failure 400 {object} map[string]interface{} "Invalid admin ID"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID}/direct-reports [get]
+func (h *AdminHandler) GetDirectReports(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
 
-// 	// Manual validation
-// 	if err := validateCreateCompanyRequest(req); err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, err, "Validation failed")
-// 		return
-// 	}
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
 
-// 	companyReq := service.CreateCompanyRequest{
-// 		CompanyName:        req.CompanyName,
-// 		OwnerPhone:         req.OwnerPhone,
-// 		OwnerUsername:      req.OwnerUsername,
-// 		OwnerFullName:      req.OwnerFullName,
-// 		OwnerPositionTitle: req.OwnerPositionTitle,
-// 		SubscriptionTier:   req.SubscriptionTier,
-// 		MaxEmployees:       req.MaxEmployees,
-// 		MaxDepartments:     req.MaxDepartments, // ✅ NEW
-// 		DataRegion:         req.DataRegion,
-// 		SubscriptionMonths: req.SubscriptionMonths,
-// 		SubscriptionDays:   req.SubscriptionDays,
-// 		Departments:        req.Departments,
-// 	}
+	adminIDStr := chi.URLParam(r, "adminID")
+	adminID, err := uuid.Parse(adminIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+		return
+	}
 
-// 	company, err := h.companyService.CreateCompany(ctx, &companyReq, adminID)
-// 	if err != nil {
-// 		if strings.Contains(err.Error(), "already exists") {
-// 			h.respondWithError(w, http.StatusConflict, err, "Company already exists for this owner")
-// 			return
-// 		}
-// 		h.respondWithError(w, h.getStatusCode(err), err, "Failed to create company")
-// 		return
-// 	}
+	directReports, err := h.adminService.GetDirectReports(ctx, adminID, requesterID)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
 
-// 	response := map[string]interface{}{
-// 		"success": true,
-// 		"message": "Company created successfully with RBAC setup",
-// 		"data": map[string]interface{}{
-// 			"company_id":        company.CompanyID.String(),
-// 			"company_name":      company.CompanyName,
-// 			"owner_phone":       req.OwnerPhone,
-// 			"owner_user_id":     company.OwnerUserID.String(),
-// 			"subscription_tier": company.SubscriptionTier,
-// 			"max_departments":   company.MaxDepartments,
-// 			"departments":       len(req.Departments) + 1, // incl. Administration
-// 			"created_at":        company.CreatedAt,
-// 		},
-// 	}
+	h.respondWithJSON(w, http.StatusOK, successResponse(directReports, "Direct reports retrieved successfully"))
+}
 
-// 	h.respondWithJSON(w, http.StatusCreated, response)
+// GetReportingChain retrieves the reporting chain (upward) for an admin.
+// @Summary Get reporting chain
+// @Tags admin-hierarchy
+// @Produce json
+// @Param adminID path string true "Admin UUID"
+// @Success 200 {object} map[string]interface{} "Reporting chain list"
+// @Failure 400 {object} map[string]interface{} "Invalid admin ID"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID}/reporting-chain [get]
+func (h *AdminHandler) GetReportingChain(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
 
-// 	h.logger.Info("Company created by admin",
-// 		util.String("company_id", company.CompanyID.String()),
-// 		util.String("company_name", company.CompanyName),
-// 		util.Int("max_departments", req.MaxDepartments),
-// 		util.String("created_by", adminID.String()),
-// 		util.Duration("duration", time.Since(startTime)),
-// 	)
-// }
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
 
-// Helper function for manual validation
+	adminIDStr := chi.URLParam(r, "adminID")
+	adminID, err := uuid.Parse(adminIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+		return
+	}
+
+	reportingChain, err := h.adminService.GetReportingChain(ctx, adminID, requesterID)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(reportingChain, "Reporting chain retrieved successfully"))
+}
+
+// GetAdminHierarchy retrieves the full hierarchy (both up and down) for an admin.
+// @Summary Get admin hierarchy
+// @Tags admin-hierarchy
+// @Produce json
+// @Param adminID path string true "Admin UUID"
+// @Success 200 {object} map[string]interface{} "Full hierarchy tree"
+// @Failure 400 {object} map[string]interface{} "Invalid admin ID"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID}/hierarchy [get]
+func (h *AdminHandler) GetAdminHierarchy(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	adminIDStr := chi.URLParam(r, "adminID")
+	adminID, err := uuid.Parse(adminIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+		return
+	}
+
+	hierarchy, err := h.adminService.GetAdminHierarchy(ctx, adminID, requesterID)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(hierarchy, "Admin hierarchy retrieved successfully"))
+}
+
+// ============================
+// SEARCH ROUTE REGISTRATION
+// ============================
+
+// RegisterSearchRoutes registers all search-related admin endpoints.
+// @Tags admin-search
+func (h *AdminHandler) RegisterSearchRoutes(router chi.Router) {
+	router.Route("/search", func(r chi.Router) {
+		r.Get("/admins", h.SearchAdmins)
+		r.Get("/admins/advanced", h.SearchAdminsAdvanced)
+		r.Get("/admins/name", h.SearchAdminsByName)
+		r.Get("/admins/employees", h.SearchAdminEmployees)
+		r.Get("/admins/managers", h.SearchAdminManagers)
+		r.Get("/admins/suggestions", h.GetAdminSuggestions)
+		r.Get("/admins/analytics", h.GetAdminSearchAnalytics)
+		r.Get("/roles", h.SearchAdminRoles)
+	})
+}
+
+// ============================
+// SEARCH HANDLERS
+// ============================
+
+// GetAdminSuggestions returns admin suggestions based on a prefix.
+// @Summary Get admin suggestions
+// @Tags admin-search
+// @Produce json
+// @Param prefix query string true "Search prefix"
+// @Param limit query int false "Max results" default(10)
+// @Param exclude_owner query bool false "Exclude owner admins"
+// @Param role_type query int false "Filter by role type"
+// @Success 200 {object} map[string]interface{} "List of suggestions"
+// @Failure 400 {object} map[string]interface{} "Missing prefix"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/search/suggestions [get]
+func (h *AdminHandler) GetAdminSuggestions(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	prefix := r.URL.Query().Get("prefix")
+	if prefix == "" {
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Prefix is required for suggestions")
+		return
+	}
+
+	limit := h.getIntQueryParam(r, "limit", 10)
+	excludeOwner := h.getBoolQueryParam(r, "exclude_owner", false)
+
+	var roleTypeFilter *int
+	if roleTypeStr := r.URL.Query().Get("role_type"); roleTypeStr != "" {
+		rt, err := strconv.Atoi(roleTypeStr)
+		if err == nil {
+			roleTypeFilter = &rt
+		}
+	}
+
+	suggestions, err := h.adminService.GetAdminSuggestions(ctx, prefix, requesterID, roleTypeFilter, excludeOwner, limit)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(suggestions, "Admin suggestions retrieved successfully"))
+}
+
+// GetAdminSearchAnalytics returns search analytics for admin search.
+// @Summary Get admin search analytics
+// @Tags admin-search
+// @Produce json
+// @Success 200 {object} map[string]interface{} "Search analytics"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/search/analytics [get]
+func (h *AdminHandler) GetAdminSearchAnalytics(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
+
+	if _, err := h.getRequesterAdminID(r); err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	stats, err := h.adminService.GetStats(ctx)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(stats, "Admin search analytics retrieved successfully"))
+}
+
+// SearchAdminRoles searches admin roles by query.
+// @Summary Search admin roles
+// @Tags admin-search
+// @Produce json
+// @Param q query string true "Search query"
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "Search results with metadata"
+// @Failure 400 {object} map[string]interface{} "Missing query"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/roles/search [get]
+func (h *AdminHandler) SearchAdminRoles(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	query := r.URL.Query().Get("q")
+	if query == "" {
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Search query is required")
+		return
+	}
+
+	limit := h.getIntQueryParam(r, "limit", 50)
+	offset := h.getIntQueryParam(r, "offset", 0)
+
+	roles, total, err := h.adminService.SearchAdminRoles(ctx, query, requesterID, limit, offset)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	response := map[string]interface{}{
+		"roles": roles,
+		"meta": map[string]interface{}{
+			"total":  total,
+			"limit":  limit,
+			"offset": offset,
+			"count":  len(roles),
+		},
+	}
+	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admin roles search completed successfully"))
+}
+
+// ============================
+// HELPER METHODS (kept as is)
+// ============================
+
+// getRequesterAdminID extracts the admin ID from the request context.
+func (h *AdminHandler) getRequesterAdminID(r *http.Request) (uuid.UUID, error) {
+	userID, ok := r.Context().Value("user_id").(string)
+	if !ok || userID == "" {
+		return uuid.Nil, customErrors.ErrUnauthorized
+	}
+	return uuid.Parse(userID)
+}
+
+// hasMPIN checks if an admin has an MPIN set.
+
+// handleOTPError handles OTP-specific errors (unchanged).
+func (h *AdminHandler) handleOTPError(w http.ResponseWriter, err error) {
+	var otpErr *service.OTPError
+	if errors.As(err, &otpErr) {
+		switch otpErr.Code {
+		case "RATE_LIMIT_EXCEEDED":
+			h.respondWithError(w, http.StatusTooManyRequests, err, "Too many attempts. Please try again later.")
+		case "DAILY_QUOTA_EXCEEDED":
+			h.respondWithError(w, http.StatusTooManyRequests, err, "Daily OTP limit exceeded")
+		case "ACCOUNT_LOCKED":
+			h.respondWithError(w, http.StatusLocked, err, "Account temporarily locked")
+		case "RESEND_COOLDOWN":
+			h.respondWithError(w, http.StatusTooManyRequests, err, "Please wait before requesting a new OTP")
+		case "REPLAY_ATTEMPT":
+			h.respondWithError(w, http.StatusBadRequest, err, "Invalid OTP")
+		case "PHONE_NOT_REGISTERED":
+			h.respondWithError(w, http.StatusNotFound, err, "Phone number not registered")
+		default:
+			h.respondWithError(w, http.StatusUnauthorized, err, "Authentication failed")
+		}
+	} else {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Authentication failed")
+	}
+}
+
+// ============================
+// COMPANY HANDLERS
+// ============================
+
+// validateCreateCompanyRequest validates company creation input.
 func validateCreateCompanyRequest(req CreateCompanyRequest) error {
-
+	// (unchanged, keep as is)
 	if strings.TrimSpace(req.CompanyName) == "" {
 		return fmt.Errorf("company_name is required")
 	}
-
 	if strings.TrimSpace(req.OwnerPhone) == "" {
 		return fmt.Errorf("owner_phone is required")
 	}
-
 	if strings.TrimSpace(req.OwnerUsername) == "" {
 		return fmt.Errorf("owner_username is required")
 	}
 	if len(req.OwnerUsername) < 3 || len(req.OwnerUsername) > 100 {
 		return fmt.Errorf("owner_username must be between 3 and 100 characters")
 	}
-
 	if strings.TrimSpace(req.OwnerFullName) == "" {
 		return fmt.Errorf("owner_full_name is required")
 	}
 	if len(req.OwnerFullName) > 255 {
 		return fmt.Errorf("owner_full_name must be at most 255 characters")
 	}
-
 	if strings.TrimSpace(req.OwnerPositionTitle) == "" {
 		return fmt.Errorf("owner_position_title is required")
 	}
 	if len(req.OwnerPositionTitle) > 255 {
 		return fmt.Errorf("owner_position_title must be at most 255 characters")
 	}
-
 	validTiers := map[string]bool{
 		"basic": true, "premium": true, "enterprise": true,
 	}
 	if !validTiers[req.SubscriptionTier] {
 		return fmt.Errorf("subscription_tier must be one of: basic, premium, enterprise")
 	}
-
 	if req.MaxEmployees < 1 || req.MaxEmployees > 2000 {
 		return fmt.Errorf("max_employees must be between 1 and 2000")
 	}
-
-	// ✅ NEW: max_departments validation
 	if req.MaxDepartments < 1 || req.MaxDepartments > 100 {
 		return fmt.Errorf("max_departments must be between 1 and 100")
 	}
-
-	// +1 for default Administration department
 	totalDepartments := len(req.Departments) + 1
 	if totalDepartments > req.MaxDepartments {
 		return fmt.Errorf(
@@ -2125,25 +1904,29 @@ func validateCreateCompanyRequest(req CreateCompanyRequest) error {
 			req.MaxDepartments,
 		)
 	}
-
 	if strings.TrimSpace(req.DataRegion) == "" {
 		return fmt.Errorf("data_region is required")
 	}
-
 	if req.SubscriptionMonths < 1 || req.SubscriptionMonths > 36 {
 		return fmt.Errorf("subscription_months must be between 1 and 36")
 	}
-
 	if req.SubscriptionDays < 0 || req.SubscriptionDays > 30 {
 		return fmt.Errorf("subscription_days must be between 0 and 30")
 	}
-
 	return nil
 }
 
+// GetCompany retrieves a company by ID.
+// @Summary Get company by ID
+// @Tags admin-companies
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Success 200 {object} map[string]interface{} "Company details"
+// @Failure 400 {object} map[string]interface{} "Invalid company ID"
+// @Failure 404 {object} map[string]interface{} "Company not found"
+// @Router /api/v1/admin/companies/{companyID} [get]
 func (h *AdminHandler) GetCompany(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -2154,25 +1937,30 @@ func (h *AdminHandler) GetCompany(w http.ResponseWriter, r *http.Request) {
 
 	company, err := h.companyService.GetCompany(ctx, companyID)
 	if err != nil {
-		h.respondWithError(w, http.StatusNotFound, err, "Company not found")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(company, "Company details retrieved"))
-	h.logger.Debug("Company retrieved",
-		util.String("company_id", companyID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// GetRecentCompanies lists recent companies.
+// @Summary List recent companies
+// @Tags admin-companies
+// @Produce json
+// @Param limit query int false "Page size" default(50)
+// @Success 200 {object} map[string]interface{} "List of companies with metadata"
+// @Failure 400 {object} map[string]interface{} "Invalid parameters"
+// @Router /api/v1/admin/companies [get]
 func (h *AdminHandler) GetRecentCompanies(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	limit := h.getIntQueryParam(r, "limit", 50)
 	companies, total, err := h.companyService.ListCompanies(ctx, limit, 0)
 	if err != nil {
-		h.respondWithError(w, h.getStatusCode(err), err, "Failed to get recent companies")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -2184,19 +1972,29 @@ func (h *AdminHandler) GetRecentCompanies(w http.ResponseWriter, r *http.Request
 			"limit": limit,
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Recent companies retrieved"))
-	h.logger.Debug("Recent companies retrieved",
-		util.Int("count", len(companies)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// SearchCompanies searches companies by query with filters.
+// @Summary Search companies
+// @Tags admin-companies
+// @Produce json
+// @Param q query string true "Search query"
+// @Param limit query int false "Page size" default(20)
+// @Param offset query int false "Offset" default(0)
+// @Param search_type query string false "Search type (all, name, etc.)" default(all)
+// @Param sort_by query string false "Sort field" default(relevance)
+// @Param tier query string false "Filter by tier"
+// @Param status query string false "Filter by status"
+// @Param region query string false "Filter by region"
+// @Success 200 {object} map[string]interface{} "Search results with metadata"
+// @Failure 400 {object} map[string]interface{} "Missing query"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/companies/search [get]
 func (h *AdminHandler) SearchCompanies(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
-	adminID, err := h.getRequesterAdminID(r)
+	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
 		return
@@ -2204,18 +2002,17 @@ func (h *AdminHandler) SearchCompanies(w http.ResponseWriter, r *http.Request) {
 
 	query := r.URL.Query().Get("q")
 	if query == "" {
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("QUERY_REQUIRED"), "Search query is required")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Search query is required")
 		return
 	}
 
 	limit := h.getIntQueryParam(r, "limit", 20)
 	offset := h.getIntQueryParam(r, "offset", 0)
+
 	searchType := r.URL.Query().Get("search_type")
 	if searchType == "" {
 		searchType = "all"
 	}
-
 	sortBy := r.URL.Query().Get("sort_by")
 	if sortBy == "" {
 		sortBy = "relevance"
@@ -2242,27 +2039,30 @@ func (h *AdminHandler) SearchCompanies(w http.ResponseWriter, r *http.Request) {
 		SortBy:     sortBy,
 		SortOrder:  "desc",
 	}
-
 	searchResp, err := h.companyService.SearchCompanies(ctx, searchReq)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to search companies")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(searchResp, "Company search completed"))
-	h.logger.Info("Company search executed",
-		util.String("admin_id", adminID.String()),
-		util.String("query", query),
-		util.Int("results", len(searchResp.Companies)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// GetCompanySuggestions returns company name suggestions based on prefix.
+// @Summary Get company suggestions
+// @Tags admin-companies
+// @Produce json
+// @Param prefix query string true "Prefix"
+// @Param limit query int false "Max results" default(10)
+// @Success 200 {object} map[string]interface{} "List of suggestions"
+// @Failure 400 {object} map[string]interface{} "Missing prefix"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/companies/suggestions [get]
 func (h *AdminHandler) GetCompanySuggestions(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
-	adminID, err := h.getRequesterAdminID(r)
+	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
 		return
@@ -2270,31 +2070,32 @@ func (h *AdminHandler) GetCompanySuggestions(w http.ResponseWriter, r *http.Requ
 
 	prefix := r.URL.Query().Get("prefix")
 	if prefix == "" {
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("PREFIX_REQUIRED"), "Prefix is required for suggestions")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Prefix is required for suggestions")
 		return
 	}
 
 	limit := h.getIntQueryParam(r, "limit", 10)
 	suggestions, err := h.companyService.GetCompanySuggestions(ctx, prefix, limit)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get suggestions")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(suggestions, "Company suggestions retrieved"))
-	h.logger.Debug("Company suggestions retrieved",
-		util.String("admin_id", adminID.String()),
-		util.Int("suggestions", len(suggestions)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// GetCompanySearchAnalytics returns analytics for company search.
+// @Summary Get company search analytics
+// @Tags admin-companies
+// @Produce json
+// @Success 200 {object} map[string]interface{} "Search analytics"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/companies/analytics/search [get]
 func (h *AdminHandler) GetCompanySearchAnalytics(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
-	adminID, err := h.getRequesterAdminID(r)
+	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
 		return
@@ -2302,22 +2103,28 @@ func (h *AdminHandler) GetCompanySearchAnalytics(w http.ResponseWriter, r *http.
 
 	analytics, err := h.companyService.GetCompanySearchAnalytics(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get search analytics")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(analytics, "Company search analytics retrieved"))
-	h.logger.Info("Company search analytics retrieved",
-		util.String("admin_id", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// BenchmarkCompanySearch runs a benchmark test for company search.
+// @Summary Benchmark company search
+// @Tags admin-companies
+// @Accept json
+// @Produce json
+// @Param body body object false "Test queries and iterations" example({"test_queries":["tech","solution"],"iterations":10})
+// @Success 200 {object} map[string]interface{} "Benchmark results"
+// @Failure 400 {object} map[string]interface{} "Invalid request"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/companies/search/benchmark [post]
 func (h *AdminHandler) BenchmarkCompanySearch(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
-	adminID, err := h.getRequesterAdminID(r)
+	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
 		return
@@ -2327,7 +2134,6 @@ func (h *AdminHandler) BenchmarkCompanySearch(w http.ResponseWriter, r *http.Req
 		TestQueries []string `json:"test_queries"`
 		Iterations  int      `json:"iterations" validate:"min=1,max=100"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
@@ -2339,30 +2145,37 @@ func (h *AdminHandler) BenchmarkCompanySearch(w http.ResponseWriter, r *http.Req
 			"innov", "corp", "group", "limited",
 		}
 	}
-
 	if req.Iterations == 0 {
 		req.Iterations = 10
 	}
 
 	results, err := h.companyService.BenchmarkCompanySearch(ctx, req.TestQueries, req.Iterations)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to run search benchmark")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(results, "Search benchmark completed"))
-	h.logger.Info("Company search benchmark executed",
-		util.String("admin_id", adminID.String()),
-		util.Int("iterations", req.Iterations),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// SearchCompaniesByOwner searches companies owned by a specific user.
+// @Summary Search companies by owner
+// @Tags admin-companies
+// @Produce json
+// @Param ownerID path string true "Owner UUID"
+// @Param q query string true "Search query"
+// @Param limit query int false "Page size" default(20)
+// @Param offset query int false "Offset" default(0)
+// @Param active query bool false "Filter by active status"
+// @Success 200 {object} map[string]interface{} "Search results"
+// @Failure 400 {object} map[string]interface{} "Invalid parameters"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/companies/owner/{ownerID}/search [get]
 func (h *AdminHandler) SearchCompaniesByOwner(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
-	adminID, err := h.getRequesterAdminID(r)
+	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
 		return
@@ -2377,8 +2190,7 @@ func (h *AdminHandler) SearchCompaniesByOwner(w http.ResponseWriter, r *http.Req
 
 	query := r.URL.Query().Get("q")
 	if query == "" {
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("QUERY_REQUIRED"), "Search query is required")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Search query is required")
 		return
 	}
 
@@ -2393,22 +2205,26 @@ func (h *AdminHandler) SearchCompaniesByOwner(w http.ResponseWriter, r *http.Req
 
 	searchResp, err := h.companyService.SearchCompaniesByOwner(ctx, ownerID, query, isActive, limit, offset)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to search owner companies")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(searchResp, "Owner company search completed"))
-	h.logger.Info("Owner company search executed",
-		util.String("admin_id", adminID.String()),
-		util.String("owner_id", ownerID.String()),
-		util.Int("results", len(searchResp.Companies)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// GetCompanyEmployees lists employees of a company.
+// @Summary List company employees
+// @Tags admin-companies
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "Employees with metadata"
+// @Failure 400 {object} map[string]interface{} "Invalid company ID"
+// @Router /api/v1/admin/companies/{companyID}/employees [get]
 func (h *AdminHandler) GetCompanyEmployees(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -2422,7 +2238,8 @@ func (h *AdminHandler) GetCompanyEmployees(w http.ResponseWriter, r *http.Reques
 
 	employees, total, err := h.companyService.ListEmployees(ctx, companyID, limit, offset)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to list employees")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -2436,18 +2253,21 @@ func (h *AdminHandler) GetCompanyEmployees(w http.ResponseWriter, r *http.Reques
 			"offset":     offset,
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Employees retrieved successfully"))
-	h.logger.Debug("Company employees listed",
-		util.String("company_id", companyID.String()),
-		util.Int("count", len(employees)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// GetCompanyDepartments lists departments of a company.
+// @Summary List company departments
+// @Tags admin-companies
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "Departments with metadata"
+// @Failure 400 {object} map[string]interface{} "Invalid company ID"
+// @Router /api/v1/admin/companies/{companyID}/departments [get]
 func (h *AdminHandler) GetCompanyDepartments(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -2461,7 +2281,8 @@ func (h *AdminHandler) GetCompanyDepartments(w http.ResponseWriter, r *http.Requ
 
 	departments, total, err := h.companyService.GetDepartmentsByCompany(ctx, companyID, limit, offset)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get company departments")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -2475,18 +2296,19 @@ func (h *AdminHandler) GetCompanyDepartments(w http.ResponseWriter, r *http.Requ
 			"offset":     offset,
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Company departments retrieved successfully"))
-	h.logger.Info("Company departments retrieved",
-		util.String("company_id", companyID.String()),
-		util.Int("count", len(departments)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// GetCompanyStats returns statistics for a company.
+// @Summary Get company statistics
+// @Tags admin-companies
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Success 200 {object} map[string]interface{} "Company stats"
+// @Failure 400 {object} map[string]interface{} "Invalid company ID"
+// @Router /api/v1/admin/companies/{companyID}/stats [get]
 func (h *AdminHandler) GetCompanyStats(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -2497,20 +2319,27 @@ func (h *AdminHandler) GetCompanyStats(w http.ResponseWriter, r *http.Request) {
 
 	stats, err := h.companyService.GetCompanyStats(ctx, companyID)
 	if err != nil {
-		h.respondWithError(w, h.getStatusCode(err), err, "Failed to get company stats")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(stats, "Company statistics retrieved successfully"))
-	h.logger.Debug("Company stats retrieved",
-		util.String("company_id", companyID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// UpdateSubscription updates a company's subscription.
+// @Summary Update company subscription
+// @Tags admin-companies
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param body body object true "Subscription details" example({"tier":"premium","status":"active","max_employees":500})
+// @Success 200 {object} map[string]interface{} "Subscription updated"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/companies/{companyID}/subscription [put]
 func (h *AdminHandler) UpdateSubscription(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	adminID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -2530,28 +2359,33 @@ func (h *AdminHandler) UpdateSubscription(w http.ResponseWriter, r *http.Request
 		Status       string `json:"status" validate:"required,oneof=active inactive pending ended"`
 		MaxEmployees int    `json:"max_employees" validate:"required,min=1,max=2000"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
 
 	if err := h.companyService.UpdateSubscription(ctx, companyID, req.Tier, req.Status, req.MaxEmployees, adminID); err != nil {
-		h.respondWithError(w, h.getStatusCode(err), err, "Failed to update subscription")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Subscription updated successfully"))
-	h.logger.Info("Company subscription updated",
-		util.String("company_id", companyID.String()),
-		util.String("updated_by", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// ExtendSubscription extends a company's subscription duration.
+// @Summary Extend subscription
+// @Tags admin-companies
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param body body object true "Extension details" example({"additional_months":3,"additional_days":0})
+// @Success 200 {object} map[string]interface{} "Subscription extended"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/companies/{companyID}/subscription/extend [post]
 func (h *AdminHandler) ExtendSubscription(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	adminID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -2570,35 +2404,37 @@ func (h *AdminHandler) ExtendSubscription(w http.ResponseWriter, r *http.Request
 		AdditionalMonths int `json:"additional_months" validate:"min=0,max=36"`
 		AdditionalDays   int `json:"additional_days" validate:"min=0,max=30"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
-
 	if req.AdditionalMonths == 0 && req.AdditionalDays == 0 {
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("either additional_months or additional_days must be provided"),
-			"Either additional_months or additional_days must be provided")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Either additional_months or additional_days must be provided")
 		return
 	}
 
 	if err := h.companyService.ExtendSubscription(ctx, companyID, req.AdditionalMonths, req.AdditionalDays, adminID); err != nil {
-		h.respondWithError(w, h.getStatusCode(err), err, "Failed to extend subscription")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Subscription extended successfully"))
-	h.logger.Info("Company subscription extended",
-		util.String("company_id", companyID.String()),
-		util.String("extended_by", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// DeactivateCompany deactivates a company.
+// @Summary Deactivate company
+// @Tags admin-companies
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param body body object true "Deactivation reason" example({"reason":"Violation of terms"})
+// @Success 200 {object} map[string]interface{} "Company deactivated"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/companies/{companyID}/deactivate [post]
 func (h *AdminHandler) DeactivateCompany(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	adminID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -2616,28 +2452,30 @@ func (h *AdminHandler) DeactivateCompany(w http.ResponseWriter, r *http.Request)
 	var req struct {
 		Reason string `json:"reason" validate:"required"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
 
 	if err := h.companyService.DeactivateCompany(ctx, companyID, req.Reason, adminID); err != nil {
-		h.respondWithError(w, h.getStatusCode(err), err, "Failed to deactivate company")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Company deactivated successfully"))
-	h.logger.Info("Company deactivated",
-		util.String("company_id", companyID.String()),
-		util.String("deactivated_by", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// ReactivateCompany reactivates a previously deactivated company.
+// @Summary Reactivate company
+// @Tags admin-companies
+// @Param companyID path string true "Company UUID"
+// @Success 200 {object} map[string]interface{} "Company reactivated"
+// @Failure 400 {object} map[string]interface{} "Invalid company ID"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/companies/{companyID}/reactivate [post]
 func (h *AdminHandler) ReactivateCompany(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	adminID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -2653,25 +2491,30 @@ func (h *AdminHandler) ReactivateCompany(w http.ResponseWriter, r *http.Request)
 	}
 
 	if err := h.companyService.ReactivateCompany(ctx, companyID, adminID); err != nil {
-		h.respondWithError(w, h.getStatusCode(err), err, "Failed to reactivate company")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Company reactivated successfully"))
-	h.logger.Info("Company reactivated",
-		util.String("company_id", companyID.String()),
-		util.String("reactivated_by", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// GetCompaniesByStatus lists companies filtered by status.
+// @Summary Get companies by status
+// @Tags admin-companies
+// @Produce json
+// @Param status path string true "Status (active/inactive)"
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "Companies with metadata"
+// @Failure 400 {object} map[string]interface{} "Invalid status"
+// @Router /api/v1/admin/companies/status/{status} [get]
 func (h *AdminHandler) GetCompaniesByStatus(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	status := chi.URLParam(r, "status")
 	if status == "" {
-		h.respondWithError(w, http.StatusBadRequest, errors.New("status required"), "Status is required")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Status is required")
 		return
 	}
 
@@ -2688,7 +2531,8 @@ func (h *AdminHandler) GetCompaniesByStatus(w http.ResponseWriter, r *http.Reque
 	case "inactive":
 		allCompanies, _, err := h.companyService.ListCompanies(ctx, 1000, 0)
 		if err != nil {
-			h.respondWithError(w, h.getStatusCode(err), err, "Failed to get companies")
+			statusCode, msg := h.mapServiceError(err)
+			h.respondWithError(w, statusCode, err, msg)
 			return
 		}
 		var inactiveCompanies []*models.Company
@@ -2708,12 +2552,12 @@ func (h *AdminHandler) GetCompaniesByStatus(w http.ResponseWriter, r *http.Reque
 		companies = inactiveCompanies[start:end]
 		total = len(inactiveCompanies)
 	default:
-		h.respondWithError(w, http.StatusBadRequest, errors.New("invalid status"), "Status must be active or inactive")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Status must be active or inactive")
 		return
 	}
-
 	if err != nil {
-		h.respondWithError(w, h.getStatusCode(err), err, "Failed to get companies by status")
+		statusCode, msg := h.mapServiceError(err)
+		h.respondWithError(w, statusCode, err, msg)
 		return
 	}
 
@@ -2727,22 +2571,25 @@ func (h *AdminHandler) GetCompaniesByStatus(w http.ResponseWriter, r *http.Reque
 			"offset": offset,
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Companies retrieved by status"))
-	h.logger.Debug("Companies retrieved by status",
-		util.String("status", status),
-		util.Int("count", len(companies)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// GetCompaniesByTier lists companies by subscription tier.
+// @Summary Get companies by tier
+// @Tags admin-companies
+// @Produce json
+// @Param tier path string true "Subscription tier (basic/premium/enterprise)"
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "Companies with metadata"
+// @Failure 400 {object} map[string]interface{} "Invalid tier"
+// @Router /api/v1/admin/companies/tier/{tier} [get]
 func (h *AdminHandler) GetCompaniesByTier(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	tier := chi.URLParam(r, "tier")
 	if tier == "" {
-		h.respondWithError(w, http.StatusBadRequest, errors.New("tier required"), "Subscription tier is required")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Subscription tier is required")
 		return
 	}
 
@@ -2751,7 +2598,8 @@ func (h *AdminHandler) GetCompaniesByTier(w http.ResponseWriter, r *http.Request
 
 	companies, total, err := h.companyService.ListCompaniesByTier(ctx, tier, limit, offset)
 	if err != nil {
-		h.respondWithError(w, h.getStatusCode(err), err, "Failed to get companies by tier")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -2765,31 +2613,32 @@ func (h *AdminHandler) GetCompaniesByTier(w http.ResponseWriter, r *http.Request
 			"offset": offset,
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Companies retrieved by tier"))
-	h.logger.Debug("Companies retrieved by tier",
-		util.String("tier", tier),
-		util.Int("count", len(companies)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// GetCompaniesWithExpiringSubscription lists companies with subscriptions expiring within a given number of days.
+// @Summary Get companies with expiring subscriptions
+// @Tags admin-companies
+// @Produce json
+// @Param days query int false "Days threshold" default(30)
+// @Param limit query int false "Page size" default(50)
+// @Success 200 {object} map[string]interface{} "Companies with expiring subscriptions"
+// @Failure 400 {object} map[string]interface{} "Invalid days parameter"
+// @Router /api/v1/admin/companies/expiring [get]
 func (h *AdminHandler) GetCompaniesWithExpiringSubscription(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	days := h.getIntQueryParam(r, "days", 30)
 	if days <= 0 || days > 365 {
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("invalid days parameter"),
-			"Days must be between 1 and 365")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Days must be between 1 and 365")
 		return
 	}
 
 	limit := h.getIntQueryParam(r, "limit", 50)
 	companies, err := h.companyService.GetCompaniesWithExpiringSubscription(ctx, days, limit)
 	if err != nil {
-		h.respondWithError(w, h.getStatusCode(err), err, "Failed to get companies with expiring subscriptions")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -2801,18 +2650,19 @@ func (h *AdminHandler) GetCompaniesWithExpiringSubscription(w http.ResponseWrite
 			"limit": limit,
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Companies with expiring subscriptions retrieved"))
-	h.logger.Debug("Companies with expiring subscriptions retrieved",
-		util.Int("days", days),
-		util.Int("count", len(companies)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// GetCompanyHierarchy retrieves the full employee hierarchy of a company.
+// @Summary Get company hierarchy
+// @Tags admin-companies
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Success 200 {object} map[string]interface{} "Hierarchy tree"
+// @Failure 400 {object} map[string]interface{} "Invalid company ID"
+// @Router /api/v1/admin/companies/{companyID}/hierarchy [get]
 func (h *AdminHandler) GetCompanyHierarchy(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -2823,7 +2673,8 @@ func (h *AdminHandler) GetCompanyHierarchy(w http.ResponseWriter, r *http.Reques
 
 	hierarchy, err := h.companyService.GetCompanyHierarchy(ctx, companyID)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get company hierarchy")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -2834,18 +2685,19 @@ func (h *AdminHandler) GetCompanyHierarchy(w http.ResponseWriter, r *http.Reques
 			"count":      len(hierarchy),
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Company hierarchy retrieved successfully"))
-	h.logger.Debug("Company hierarchy retrieved",
-		util.String("company_id", companyID.String()),
-		util.Int("employee_count", len(hierarchy)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// GetCompanyRBACStats returns RBAC statistics for a company.
+// @Summary Get company RBAC statistics
+// @Tags admin-companies
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Success 200 {object} map[string]interface{} "RBAC stats (department load, role distribution, etc.)"
+// @Failure 400 {object} map[string]interface{} "Invalid company ID"
+// @Router /api/v1/admin/companies/{companyID}/rbac-stats [get]
 func (h *AdminHandler) GetCompanyRBACStats(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -2856,17 +2708,16 @@ func (h *AdminHandler) GetCompanyRBACStats(w http.ResponseWriter, r *http.Reques
 
 	deptLoad, err := h.companyService.GetDepartmentLoad(ctx, companyID)
 	if err != nil {
-		h.logger.Warn("Failed to get department load", util.ErrorField(err))
+		// non-critical, continue
+		_ = err
 	}
-
 	roleDist, err := h.companyService.GetRoleDistribution(ctx, companyID)
 	if err != nil {
-		h.logger.Warn("Failed to get role distribution", util.ErrorField(err))
+		_ = err
 	}
-
 	stats, err := h.companyService.GetCompanyStats(ctx, companyID)
 	if err != nil {
-		h.logger.Warn("Failed to get company stats", util.ErrorField(err))
+		_ = err
 	}
 
 	response := map[string]interface{}{
@@ -2878,17 +2729,21 @@ func (h *AdminHandler) GetCompanyRBACStats(w http.ResponseWriter, r *http.Reques
 			"timestamp":  time.Now().UTC(),
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Company RBAC statistics retrieved successfully"))
-	h.logger.Debug("Company RBAC stats retrieved",
-		util.String("company_id", companyID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// GetCompanyRoles lists all roles within a company.
+// @Summary Get company roles
+// @Tags admin-companies
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "Roles with metadata"
+// @Failure 400 {object} map[string]interface{} "Invalid company ID"
+// @Router /api/v1/admin/companies/{companyID}/roles [get]
 func (h *AdminHandler) GetCompanyRoles(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -2902,7 +2757,8 @@ func (h *AdminHandler) GetCompanyRoles(w http.ResponseWriter, r *http.Request) {
 
 	roles, total, err := h.companyService.GetRolesByCompany(ctx, companyID, limit, offset)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get company roles")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -2916,22 +2772,34 @@ func (h *AdminHandler) GetCompanyRoles(w http.ResponseWriter, r *http.Request) {
 			"offset":     offset,
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Company roles retrieved successfully"))
-	h.logger.Debug("Company roles retrieved",
-		util.String("company_id", companyID.String()),
-		util.Int("count", len(roles)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// ==================== User Management Methods (Maintained from original) ====================
+// ============================
+// USER MANAGEMENT HANDLERS
+// ============================
 
+// SearchUsersAdvanced performs advanced user search with filters.
+// @Summary Advanced user search
+// @Tags admin-user-management
+// @Produce json
+// @Param username query string false "Filter by username"
+// @Param full_name query string false "Filter by full name"
+// @Param phone_hash query string false "Filter by phone hash"
+// @Param kyc_status query string false "Filter by KYC status"
+// @Param data_region query string false "Filter by data region"
+// @Param is_verified query bool false "Filter by verified status"
+// @Param is_active query bool false "Filter by active status"
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "Search results with metadata"
+// @Failure 400 {object} map[string]interface{} "Invalid parameters"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/user-management/search/advanced [get]
 func (h *AdminHandler) SearchUsersAdvanced(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
-	adminID, err := h.getRequesterAdminID(r)
+	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
 		return
@@ -2965,7 +2833,8 @@ func (h *AdminHandler) SearchUsersAdvanced(w http.ResponseWriter, r *http.Reques
 
 	users, total, err := h.userService.SearchUsersAdvanced(ctx, filters, limit, offset)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to search users with advanced filters")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -2984,20 +2853,23 @@ func (h *AdminHandler) SearchUsersAdvanced(w http.ResponseWriter, r *http.Reques
 			"has_more": offset+limit < total,
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Advanced user search completed"))
-	h.logger.Info("Advanced user search executed",
-		util.String("admin_id", adminID.String()),
-		util.Int("results", len(users)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// SearchUsersByUsername searches users by username (partial match).
+// @Summary Search users by username
+// @Tags admin-user-management
+// @Produce json
+// @Param username query string true "Username to search"
+// @Param limit query int false "Max results" default(20)
+// @Success 200 {object} map[string]interface{} "Matching users with metadata"
+// @Failure 400 {object} map[string]interface{} "Missing username"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/user-management/search/username [get]
 func (h *AdminHandler) SearchUsersByUsername(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
-	adminID, err := h.getRequesterAdminID(r)
+	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
 		return
@@ -3005,15 +2877,15 @@ func (h *AdminHandler) SearchUsersByUsername(w http.ResponseWriter, r *http.Requ
 
 	username := r.URL.Query().Get("username")
 	if username == "" {
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("USERNAME_REQUIRED"), "Username is required")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Username is required")
 		return
 	}
 
 	limit := h.getIntQueryParam(r, "limit", 20)
 	users, err := h.userService.SearchUsersByUsername(ctx, username, limit)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to search users by username")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -3030,21 +2902,23 @@ func (h *AdminHandler) SearchUsersByUsername(w http.ResponseWriter, r *http.Requ
 			"search_type": "partial_match",
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Username search completed"))
-	h.logger.Info("Username search executed",
-		util.String("admin_id", adminID.String()),
-		util.String("username", username),
-		util.Int("results", len(users)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// SearchUsersByFullName searches users by full name (partial match).
+// @Summary Search users by full name
+// @Tags admin-user-management
+// @Produce json
+// @Param full_name query string true "Full name to search"
+// @Param limit query int false "Max results" default(20)
+// @Success 200 {object} map[string]interface{} "Matching users with metadata"
+// @Failure 400 {object} map[string]interface{} "Missing full name"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/user-management/search/full-name [get]
 func (h *AdminHandler) SearchUsersByFullName(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
-	adminID, err := h.getRequesterAdminID(r)
+	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
 		return
@@ -3052,15 +2926,15 @@ func (h *AdminHandler) SearchUsersByFullName(w http.ResponseWriter, r *http.Requ
 
 	fullName := r.URL.Query().Get("full_name")
 	if fullName == "" {
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("FULL_NAME_REQUIRED"), "Full name is required")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Full name is required")
 		return
 	}
 
 	limit := h.getIntQueryParam(r, "limit", 20)
 	users, err := h.userService.SearchUsersByFullName(ctx, fullName, limit)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to search users by full name")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -3077,21 +2951,23 @@ func (h *AdminHandler) SearchUsersByFullName(w http.ResponseWriter, r *http.Requ
 			"search_type": "partial_match",
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Full name search completed"))
-	h.logger.Info("Full name search executed",
-		util.String("admin_id", adminID.String()),
-		util.String("full_name", fullName),
-		util.Int("results", len(users)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// GetUserSuggestions returns user suggestions based on a prefix.
+// @Summary Get user suggestions
+// @Tags admin-user-management
+// @Produce json
+// @Param prefix query string true "Prefix for suggestion"
+// @Param limit query int false "Max results" default(10)
+// @Success 200 {object} map[string]interface{} "List of suggestions"
+// @Failure 400 {object} map[string]interface{} "Missing prefix"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/user-management/suggestions [get]
 func (h *AdminHandler) GetUserSuggestions(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
-	adminID, err := h.getRequesterAdminID(r)
+	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
 		return
@@ -3099,31 +2975,36 @@ func (h *AdminHandler) GetUserSuggestions(w http.ResponseWriter, r *http.Request
 
 	prefix := r.URL.Query().Get("prefix")
 	if prefix == "" {
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("PREFIX_REQUIRED"), "Prefix is required for suggestions")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Prefix is required for suggestions")
 		return
 	}
 
 	limit := h.getIntQueryParam(r, "limit", 10)
 	suggestions, err := h.userService.GetUserSuggestions(ctx, prefix, limit)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get user suggestions")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(suggestions, "User suggestions retrieved"))
-	h.logger.Debug("User suggestions retrieved",
-		util.String("admin_id", adminID.String()),
-		util.Int("suggestions", len(suggestions)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// UpdateUser updates a user's details (admin only).
+// @Summary Update user
+// @Tags admin-user-management
+// @Accept json
+// @Produce json
+// @Param userID path string true "User UUID"
+// @Param body body object true "Update fields" example({"username":"newuser","full_name":"New Name","is_active":true})
+// @Success 200 {object} map[string]interface{} "Updated user"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/user-management/{userID} [put]
 func (h *AdminHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
-	adminID, err := h.getRequesterAdminID(r)
+	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
 		return
@@ -3147,7 +3028,6 @@ func (h *AdminHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 		KYCStatus         *string `json:"kyc_status,omitempty"`
 		KYCLevel          *string `json:"kyc_level,omitempty"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
@@ -3167,23 +3047,28 @@ func (h *AdminHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 
 	user, err := h.userService.UpdateUser(ctx, userID, updateReq)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to update user")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.sanitizeUserForAdmin(user)
 	h.respondWithJSON(w, http.StatusOK, successResponse(user, "User updated successfully"))
-	h.logger.Info("User updated",
-		util.String("admin_id", adminID.String()),
-		util.String("user_id", userID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// UpdateUserKYC updates a user's KYC status.
+// @Summary Update user KYC
+// @Tags admin-user-management
+// @Accept json
+// @Produce json
+// @Param userID path string true "User UUID"
+// @Param body body object true "KYC update" example({"status":"verified","level":"full","reason":"Document verified"})
+// @Success 200 {object} map[string]interface{} "KYC updated"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/user-management/{userID}/kyc [patch]
 func (h *AdminHandler) UpdateUserKYC(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	adminID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -3203,7 +3088,6 @@ func (h *AdminHandler) UpdateUserKYC(w http.ResponseWriter, r *http.Request) {
 		Level  string `json:"level" validate:"required,oneof=basic advanced full"`
 		Reason string `json:"reason,omitempty"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
@@ -3218,22 +3102,27 @@ func (h *AdminHandler) UpdateUserKYC(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.userService.UpdateKYCStatus(ctx, &kycReq); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to update user KYC")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "User KYC status updated successfully"))
-	h.logger.Info("User KYC status updated",
-		util.String("user_id", userID.String()),
-		util.String("updated_by", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// BanUser bans a user with a reason.
+// @Summary Ban user
+// @Tags admin-user-management
+// @Accept json
+// @Produce json
+// @Param userID path string true "User UUID"
+// @Param body body object true "Ban reason" example({"reason":"Violation of terms"})
+// @Success 200 {object} map[string]interface{} "User banned"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/user-management/{userID}/ban [post]
 func (h *AdminHandler) BanUser(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -3251,7 +3140,6 @@ func (h *AdminHandler) BanUser(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Reason string `json:"reason" validate:"required"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
@@ -3264,22 +3152,27 @@ func (h *AdminHandler) BanUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.userService.BanUser(ctx, &banReq); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to ban user")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "User banned successfully"))
-	h.logger.Info("User banned",
-		util.String("user_id", userID.String()),
-		util.String("banned_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// UnbanUser unbans a previously banned user.
+// @Summary Unban user
+// @Tags admin-user-management
+// @Accept json
+// @Produce json
+// @Param userID path string true "User UUID"
+// @Param body body object true "Unban reason" example({"reason":"Appeal accepted"})
+// @Success 200 {object} map[string]interface{} "User unbanned"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/user-management/{userID}/unban [post]
 func (h *AdminHandler) UnbanUser(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -3297,31 +3190,33 @@ func (h *AdminHandler) UnbanUser(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Reason string `json:"reason" validate:"required"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
 
 	if err := h.userService.UnbanUser(ctx, userID, requesterID, req.Reason); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to unban user")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "User unbanned successfully"))
-	h.logger.Info("User unbanned",
-		util.String("user_id", userID.String()),
-		util.String("unbanned_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// GetBannedUsers lists all banned users.
+// @Summary Get banned users
+// @Tags admin-user-management
+// @Produce json
+// @Param limit query int false "Page size" default(100)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "List of banned users with metadata"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/user-management/banned [get]
 func (h *AdminHandler) GetBannedUsers(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
-	adminID, err := h.getRequesterAdminID(r)
+	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
 		return
@@ -3332,7 +3227,8 @@ func (h *AdminHandler) GetBannedUsers(w http.ResponseWriter, r *http.Request) {
 
 	users, total, err := h.userService.GetBannedUsers(ctx, limit, offset)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get banned users")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -3366,17 +3262,26 @@ func (h *AdminHandler) GetBannedUsers(w http.ResponseWriter, r *http.Request) {
 			"has_more": offset+limit < total,
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Banned users retrieved successfully"))
-	h.logger.Info("Banned users retrieved",
-		util.String("admin_id", adminID.String()),
-		util.Int("count", len(users)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// ============================
+// TOKEN & SESSION HANDLERS
+// ============================
+
+// RefreshAdminTokens refreshes the access token using a refresh token.
+// @Summary Refresh admin tokens
+// @Tags admin-auth
+// @Accept json
+// @Produce json
+// @Param body body object true "Refresh token" example({"refresh_token":"..."})
+// @Success 200 {object} map[string]interface{} "New token pair"
+// @Failure 400 {object} map[string]interface{} "Invalid request"
+// @Failure 401 {object} map[string]interface{} "Invalid refresh token"
+// @Router /api/v1/admin-auth/refresh [post]
 func (h *AdminHandler) RefreshAdminTokens(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.injectClientIP(r.Context(), r)
+
 	var req struct {
 		RefreshToken string `json:"refresh_token" validate:"required"`
 	}
@@ -3388,15 +3293,27 @@ func (h *AdminHandler) RefreshAdminTokens(w http.ResponseWriter, r *http.Request
 	ipAddress := h.getClientIP(r)
 	tokenPair, err := h.sessionService.RefreshTokenPair(ctx, req.RefreshToken, ipAddress)
 	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Failed to refresh tokens")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(tokenPair, "Admin tokens refreshed successfully"))
 }
 
+// LogoutAdmin invalidates the refresh token.
+// @Summary Logout admin
+// @Tags admin-auth
+// @Accept json
+// @Produce json
+// @Param body body object true "Refresh token" example({"refresh_token":"..."})
+// @Success 200 {object} map[string]interface{} "Logged out"
+// @Failure 400 {object} map[string]interface{} "Invalid request"
+// @Failure 500 {object} map[string]interface{} "Internal error"
+// @Router /api/v1/admin-auth/logout [post]
 func (h *AdminHandler) LogoutAdmin(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.injectClientIP(r.Context(), r)
+
 	var req struct {
 		RefreshToken string `json:"refresh_token" validate:"required"`
 	}
@@ -3406,17 +3323,31 @@ func (h *AdminHandler) LogoutAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.sessionService.RevokeRefreshToken(ctx, req.RefreshToken); err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to logout")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Admin logged out successfully"))
 }
 
+// ============================
+// HEALTH & STATS
+// ============================
+
+// HealthCheck returns the health status of the admin service.
+// @Summary Admin health check
+// @Tags admin-health
+// @Produce json
+// @Success 200 {object} map[string]interface{} "Service healthy"
+// @Failure 503 {object} map[string]interface{} "Service unhealthy"
+// @Router /api/v1/admin-auth/health [get]
 func (h *AdminHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.injectClientIP(r.Context(), r)
+
 	if err := h.adminService.HealthCheck(ctx); err != nil {
-		h.respondWithError(w, http.StatusServiceUnavailable, err, "Admin service unhealthy")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -3426,32 +3357,48 @@ func (h *AdminHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	}, "Admin service is healthy"))
 }
 
+// GetStats returns system statistics for admins.
+// @Summary Get admin stats
+// @Tags admin-stats
+// @Produce json
+// @Success 200 {object} map[string]interface{} "Statistics"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/stats [get]
 func (h *AdminHandler) GetStats(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	stats, err := h.adminService.GetStats(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get stats")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(stats, "Admin statistics retrieved successfully"))
-	h.logger.Debug("Admin stats retrieved via HTTP",
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// ============================
+// ADMIN MPIN ADMINISTRATION
+// ============================
+
+// ChangeAdminMPINByAdmin allows one admin to change another's MPIN (super-admin/manager only).
+// @Summary Change admin MPIN by admin
+// @Tags admin-auth
+// @Accept json
+// @Produce json
+// @Param body body object true "Change request" example({"admin_id":"...","new_mpin":"123456","reason":"Reset due to security"})
+// @Success 200 {object} map[string]interface{} "MPIN changed"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/mpin/change-by-admin [post]
 func (h *AdminHandler) ChangeAdminMPINByAdmin(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	var req struct {
 		AdminID string `json:"admin_id" validate:"required"`
 		NewMPIN string `json:"new_mpin" validate:"required,min=6,max=8"`
 		Reason  string `json:"reason,omitempty"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
@@ -3482,126 +3429,31 @@ func (h *AdminHandler) ChangeAdminMPINByAdmin(w http.ResponseWriter, r *http.Req
 	}
 
 	if err := h.mpinService.ChangeAdminMPINByAdmin(ctx, changeReq); err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to change admin MPIN")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
 		"message": "Admin MPIN changed successfully by administrator",
 	}, "Admin MPIN change by admin successful"))
-
-	h.logger.Warn("Admin MPIN changed by another admin",
-		util.String("admin_id", adminID.String()),
-		util.String("changed_by", requesterID.String()),
-		util.String("reason", req.Reason),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// func (h *AdminHandler) ChangeOwnPhone(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
-// 	startTime := time.Now()
+// ============================
+// ADMIN WITH PERMISSIONS
+// ============================
 
-// 	requesterID, err := h.getRequesterAdminID(r)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-// 		return
-// 	}
-
-// 	requesterRoleMask, err := h.getRequesterAdminRoleMask(r)
-// 	if err != nil {
-// 		h.logger.Warn("Failed to get admin role mask from token",
-// 			util.String("admin_id", requesterID.String()),
-// 			util.ErrorField(err))
-// 		h.respondWithError(w, http.StatusUnauthorized, err, "Unable to verify admin role")
-// 		return
-// 	}
-
-// 	if requesterRoleMask != models.RoleMaskOwner {
-// 		h.logger.Warn("Non-owner attempting to change own phone via admin endpoint",
-// 			util.String("admin_id", requesterID.String()),
-// 			util.Uint64("role_mask", requesterRoleMask))
-// 		h.respondWithError(w, http.StatusForbidden,
-// 			fmt.Errorf("PERMISSION_DENIED"),
-// 			"Only system owner can change phone numbers")
-// 		return
-// 	}
-
-// 	var req struct {
-// 		NewPhone string `json:"new_phone" validate:"required,phone"`
-// 	}
-
-// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-// 		return
-// 	}
-
-// 	sessionType, _ := ctx.Value("session_type").(string)
-// 	if sessionType != "admin" {
-// 		h.respondWithError(w, http.StatusForbidden,
-// 			fmt.Errorf("INVALID_SESSION_TYPE"),
-// 			"Admin session required")
-// 		return
-// 	}
-
-// 	// Call service method (will be added to service)
-// 	if err := h.adminService.UpdateAdminPhone(ctx, requesterID, req.NewPhone, requesterID); err != nil {
-// 		statusCode := h.getStatusCode(err)
-// 		h.respondWithError(w, statusCode, err, "Failed to change phone")
-// 		return
-// 	}
-
-// 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Phone updated successfully"))
-// 	h.logger.Info("Owner changed own phone via HTTP",
-// 		util.String("admin_id", requesterID.String()),
-// 		util.Uint64("requester_role_mask", requesterRoleMask),
-// 		util.Duration("duration", time.Since(startTime)),
-// 	)
-// }
-
-// func (h *AdminHandler) CheckAdminDepartmentAccess(w http.ResponseWriter, r *http.Request) {
-//     ctx := r.Context()
-//     startTime := time.Now()
-
-//     adminIDStr := chi.URLParam(r, "adminID")
-//     adminID, err := uuid.Parse(adminIDStr)
-//     if err != nil {
-//         h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
-//         return
-//     }
-
-//     departmentName := r.URL.Query().Get("department")
-//     if departmentName == "" {
-//         h.respondWithError(w, http.StatusBadRequest,
-//             fmt.Errorf("department parameter required"),
-//             "Department name is required")
-//         return
-//     }
-
-//     hasAccess, err := h.adminService.CheckAdminDepartmentAccess(ctx, adminID, departmentName)
-//     if err != nil {
-//         statusCode := h.getStatusCode(err)
-//         h.respondWithError(w, statusCode, err, "Failed to check department access")
-//         return
-//     }
-
-//     h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
-//         "has_access": hasAccess,
-//         "department": departmentName,
-//         "admin_id": adminID.String(),
-//     }, "Department access check completed"))
-
-//     h.logger.Debug("Admin department access checked",
-//         util.String("admin_id", adminID.String()),
-//         util.String("department", departmentName),
-//         util.Bool("has_access", hasAccess),
-//         util.Duration("duration", time.Since(startTime)),
-//     )
-// }
-
+// GetAdminWithPermissions returns an admin with their permissions.
+// @Summary Get admin with permissions
+// @Tags admin-users
+// @Produce json
+// @Param adminID path string true "Admin UUID"
+// @Success 200 {object} map[string]interface{} "Admin with permissions"
+// @Failure 400 {object} map[string]interface{} "Invalid admin ID"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID}/with-permissions [get]
 func (h *AdminHandler) GetAdminWithPermissions(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -3618,21 +3470,29 @@ func (h *AdminHandler) GetAdminWithPermissions(w http.ResponseWriter, r *http.Re
 
 	adminWithPerms, err := h.adminService.GetAdminWithPermissions(ctx, adminID, requesterID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get admin with permissions")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(adminWithPerms, "Admin with permissions retrieved successfully"))
-	h.logger.Debug("Admin with permissions retrieved",
-		util.String("admin_id", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// ============================
+// ADMIN ROLE DEPARTMENT MANAGEMENT
+// ============================
+
+// GetAdminRoleDepartments retrieves departments associated with an admin role.
+// @Summary Get admin role departments
+// @Tags admin-roles
+// @Produce json
+// @Param roleID path string true "Role UUID"
+// @Success 200 {object} map[string]interface{} "List of departments"
+// @Failure 400 {object} map[string]interface{} "Invalid role ID"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/roles/{roleID}/departments [get]
 func (h *AdminHandler) GetAdminRoleDepartments(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -3647,24 +3507,29 @@ func (h *AdminHandler) GetAdminRoleDepartments(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Pass the requesterID to the service method
 	departments, err := h.adminService.GetAdminRoleDepartments(ctx, roleID, requesterID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get admin role departments")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(departments, "Admin role departments retrieved successfully"))
-	h.logger.Debug("Admin role departments retrieved",
-		util.String("role_id", roleID.String()),
-		util.Int("department_count", len(departments)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
+
+// AssignDepartmentToAdminRole assigns a department to an admin role.
+// @Summary Assign department to admin role
+// @Tags admin-roles
+// @Accept json
+// @Produce json
+// @Param roleID path string true "Role UUID"
+// @Param body body object true "Department ID" example({"department_id":"..."})
+// @Success 200 {object} map[string]interface{} "Department assigned"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/roles/{roleID}/departments/{departmentID} [post]
 func (h *AdminHandler) AssignDepartmentToAdminRole(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -3682,7 +3547,6 @@ func (h *AdminHandler) AssignDepartmentToAdminRole(w http.ResponseWriter, r *htt
 	var req struct {
 		DepartmentID string `json:"department_id" validate:"required,uuid"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
@@ -3694,25 +3558,26 @@ func (h *AdminHandler) AssignDepartmentToAdminRole(w http.ResponseWriter, r *htt
 		return
 	}
 
-	// Pass the requesterID to the service method
 	if err := h.adminService.AssignDepartmentToAdminRole(ctx, roleID, departmentID, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to assign department to admin role")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Department assigned to admin role successfully"))
-	h.logger.Info("Department assigned to admin role",
-		util.String("role_id", roleID.String()),
-		util.String("department_id", departmentID.String()),
-		util.String("assigned_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// RemoveDepartmentFromAdminRole removes a department from an admin role.
+// @Summary Remove department from admin role
+// @Tags admin-roles
+// @Param roleID path string true "Role UUID"
+// @Param departmentID path string true "Department UUID"
+// @Success 200 {object} map[string]interface{} "Department removed"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/roles/{roleID}/departments/{departmentID} [delete]
 func (h *AdminHandler) RemoveDepartmentFromAdminRole(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -3735,23 +3600,30 @@ func (h *AdminHandler) RemoveDepartmentFromAdminRole(w http.ResponseWriter, r *h
 	}
 
 	if err := h.adminService.RemoveDepartmentFromAdminRole(ctx, roleID, departmentID, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to remove department from admin role")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Department removed from admin role successfully"))
-	h.logger.Info("Department removed from admin role",
-		util.String("role_id", roleID.String()),
-		util.String("department_id", departmentID.String()),
-		util.String("removed_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// ============================
+// BULK & LIST OPERATIONS
+// ============================
+
+// BulkUpdateReportsTo updates the reports-to manager for multiple admins.
+// @Summary Bulk update reports_to
+// @Tags admin-hierarchy
+// @Accept json
+// @Produce json
+// @Param body body object true "Bulk update" example({"admin_ids":["id1","id2"],"reports_to":"manager-id"})
+// @Success 200 {object} map[string]interface{} "Update successful"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/bulk-update-reports-to [post]
 func (h *AdminHandler) BulkUpdateReportsTo(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -3763,7 +3635,6 @@ func (h *AdminHandler) BulkUpdateReportsTo(w http.ResponseWriter, r *http.Reques
 		AdminIDs  []string `json:"admin_ids" validate:"required,min=1"`
 		ReportsTo *string  `json:"reports_to,omitempty"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
@@ -3790,157 +3661,27 @@ func (h *AdminHandler) BulkUpdateReportsTo(w http.ResponseWriter, r *http.Reques
 	}
 
 	if err := h.adminService.BulkUpdateReportsTo(ctx, adminIDs, reportsToUUID, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to bulk update reports_to")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Bulk reports_to update successful"))
-	h.logger.Info("Bulk reports_to update",
-		util.Int("admin_count", len(adminIDs)),
-		util.String("updated_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// func (h *AdminHandler) GetAllAdmins(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
-// 	startTime := time.Now()
-
-// 	requesterID, err := h.getRequesterAdminID(r)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-// 		return
-// 	}
-
-// 	limit := h.getIntQueryParam(r, "limit", 50)
-// 	offset := h.getIntQueryParam(r, "offset", 0)
-
-// 	// Use AdminUserSearchRequest with no filters to get all admins
-// 	req := &models.AdminUserSearchRequest{
-// 		Query:           "",
-// 		SearchType:      "all",
-// 		IncludeInactive: true, // Include both active and inactive
-// 		Limit:           limit,
-// 		Offset:          offset,
-// 	}
-
-// 	admins, total, err := h.adminService.SearchAdminUsers(ctx, req, requesterID)
-// 	if err != nil {
-// 		statusCode := h.getStatusCode(err)
-// 		h.respondWithError(w, statusCode, err, "Failed to get all admins")
-// 		return
-// 	}
-
-// 	response := map[string]interface{}{
-// 		"admins": admins,
-// 		"meta": map[string]interface{}{
-// 			"total":  total,
-// 			"limit":  limit,
-// 			"offset": offset,
-// 			"count":  len(admins),
-// 		},
-// 	}
-
-// 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "All admins retrieved successfully"))
-// 	h.logger.Debug("All admins retrieved",
-// 		util.Int("count", len(admins)),
-// 		util.Duration("duration", time.Since(startTime)),
-// 	)
-// }
-// func (h *AdminHandler) GetActiveAdmins(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
-// 	startTime := time.Now()
-
-// 	requesterID, err := h.getRequesterAdminID(r)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-// 		return
-// 	}
-
-// 	limit := h.getIntQueryParam(r, "limit", 50)
-// 	offset := h.getIntQueryParam(r, "offset", 0)
-
-// 	// Use AdminUserSearchRequest
-// 	req := &models.AdminUserSearchRequest{
-// 		Query:           "",
-// 		SearchType:      "all",
-// 		IncludeInactive: false, // Set to false for active admins
-// 		Limit:           limit,
-// 		Offset:          offset,
-// 	}
-
-// 	admins, total, err := h.adminService.SearchAdminUsers(ctx, req, requesterID)
-// 	if err != nil {
-// 		statusCode := h.getStatusCode(err)
-// 		h.respondWithError(w, statusCode, err, "Failed to get active admins")
-// 		return
-// 	}
-
-// 	response := map[string]interface{}{
-// 		"admins": admins,
-// 		"meta": map[string]interface{}{
-// 			"total":  total,
-// 			"limit":  limit,
-// 			"offset": offset,
-// 			"count":  len(admins),
-// 		},
-// 	}
-
-// 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Active admins retrieved successfully"))
-// 	h.logger.Debug("Active admins retrieved",
-// 		util.Int("count", len(admins)),
-// 		util.Duration("duration", time.Since(startTime)),
-// 	)
-// }
-// func (h *AdminHandler) GetInactiveAdmins(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
-// 	startTime := time.Now()
-
-// 	requesterID, err := h.getRequesterAdminID(r)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-// 		return
-// 	}
-
-// 	limit := h.getIntQueryParam(r, "limit", 50)
-// 	offset := h.getIntQueryParam(r, "offset", 0)
-
-// 	// Use AdminUserSearchRequest instead of AdminSearchRequest
-// 	req := &models.AdminUserSearchRequest{
-// 		Query:           "",
-// 		SearchType:      "all",
-// 		IncludeInactive: true,
-// 		Limit:           limit,
-// 		Offset:          offset,
-// 	}
-
-// 	admins, total, err := h.adminService.SearchAdminUsers(ctx, req, requesterID)
-// 	if err != nil {
-// 		statusCode := h.getStatusCode(err)
-// 		h.respondWithError(w, statusCode, err, "Failed to get inactive admins")
-// 		return
-// 	}
-
-// 	response := map[string]interface{}{
-// 		"admins": admins,
-// 		"meta": map[string]interface{}{
-// 			"total":  total,
-// 			"limit":  limit,
-// 			"offset": offset,
-// 			"count":  len(admins),
-// 		},
-// 	}
-
-//		h.respondWithJSON(w, http.StatusOK, successResponse(response, "Inactive admins retrieved successfully"))
-//		h.logger.Debug("Inactive admins retrieved",
-//			util.Int("count", len(admins)),
-//			util.Duration("duration", time.Since(startTime)),
-//		)
-//	}
+// GetAdminsByRole retrieves admins assigned to a specific role.
+// @Summary Get admins by role
+// @Tags admin-users
+// @Produce json
+// @Param roleID path string true "Role UUID"
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "Admins with metadata"
+// @Failure 400 {object} map[string]interface{} "Invalid role ID"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/role/{roleID} [get]
 func (h *AdminHandler) GetAdminsByRole(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -3960,8 +3701,8 @@ func (h *AdminHandler) GetAdminsByRole(w http.ResponseWriter, r *http.Request) {
 
 	admins, err := h.adminService.GetAdminsByRole(ctx, roleID, limit, offset, requesterID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get admins by role")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -3974,17 +3715,23 @@ func (h *AdminHandler) GetAdminsByRole(w http.ResponseWriter, r *http.Request) {
 			"count":   len(admins),
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admins by role retrieved successfully"))
-	h.logger.Debug("Admins by role retrieved",
-		util.String("role_id", roleID.String()),
-		util.Int("count", len(admins)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
+
+// GetAdminsByRoleType retrieves admins by role type (employee/manager).
+// @Summary Get admins by role type
+// @Tags admin-users
+// @Produce json
+// @Param roleType path int true "Role type (1=employee, 2=manager, 3=super admin)"
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Param include_inactive query bool false "Include inactive admins"
+// @Success 200 {object} map[string]interface{} "Admins with metadata"
+// @Failure 400 {object} map[string]interface{} "Invalid role type"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/role-type/{roleType} [get]
 func (h *AdminHandler) GetAdminsByRoleType(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -4003,11 +3750,10 @@ func (h *AdminHandler) GetAdminsByRoleType(w http.ResponseWriter, r *http.Reques
 	offset := h.getIntQueryParam(r, "offset", 0)
 	includeInactive := h.getBoolQueryParam(r, "include_inactive", false)
 
-	// Call the correct service method
 	admins, err := h.adminService.GetAdminsByRoleType(ctx, roleType, requesterID, includeInactive, limit, offset)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get admins by role type")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -4021,17 +3767,20 @@ func (h *AdminHandler) GetAdminsByRoleType(w http.ResponseWriter, r *http.Reques
 			"count":            len(admins),
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admins by role type retrieved successfully"))
-	h.logger.Debug("Admins by role type retrieved",
-		util.Int("role_type", roleType),
-		util.Int("count", len(admins)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
+
+// GetAvailableManagers returns managers available to be assigned as reports_to.
+// @Summary Get available managers
+// @Tags admin-hierarchy
+// @Produce json
+// @Param exclude_id query string false "Admin ID to exclude"
+// @Success 200 {object} map[string]interface{} "List of managers"
+// @Failure 400 {object} map[string]interface{} "Invalid exclude_id"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/available-managers [get]
 func (h *AdminHandler) GetAvailableManagers(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -4051,21 +3800,25 @@ func (h *AdminHandler) GetAvailableManagers(w http.ResponseWriter, r *http.Reque
 
 	managers, err := h.adminService.GetAvailableManagers(ctx, excludeID, requesterID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get available managers")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(managers, "Available managers retrieved successfully"))
-	h.logger.Debug("Available managers retrieved",
-		util.Int("count", len(managers)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// GetAdminWithReportsToName returns an admin with the reports-to name included.
+// @Summary Get admin with reports_to name
+// @Tags admin-users
+// @Produce json
+// @Param adminID path string true "Admin UUID"
+// @Success 200 {object} map[string]interface{} "Admin with reports_to name"
+// @Failure 400 {object} map[string]interface{} "Invalid admin ID"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID}/with-reports-to-name [get]
 func (h *AdminHandler) GetAdminWithReportsToName(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -4082,22 +3835,26 @@ func (h *AdminHandler) GetAdminWithReportsToName(w http.ResponseWriter, r *http.
 
 	admin, err := h.adminService.GetAdminWithReportsToName(ctx, adminID, requesterID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get admin with reports_to name")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(admin, "Admin with reports_to name retrieved successfully"))
-	h.logger.Debug("Admin with reports_to name retrieved",
-		util.String("admin_id", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
-func (h *AdminHandler) GetAdminWithDetails(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
 
-	// Declare err variable
+// GetAdminWithDetails returns admin with permissions and department names.
+// @Summary Get admin with details
+// @Tags admin-users
+// @Produce json
+// @Param adminID path string true "Admin UUID"
+// @Success 200 {object} map[string]interface{} "Admin with permission and department names"
+// @Failure 400 {object} map[string]interface{} "Invalid admin ID"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID}/details [get]
+func (h *AdminHandler) GetAdminWithDetails(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
+
 	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
@@ -4113,8 +3870,8 @@ func (h *AdminHandler) GetAdminWithDetails(w http.ResponseWriter, r *http.Reques
 
 	admin, permissionNames, departmentNames, err := h.adminService.GetAdminWithDetails(ctx, adminID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get admin with details")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -4123,52 +3880,24 @@ func (h *AdminHandler) GetAdminWithDetails(w http.ResponseWriter, r *http.Reques
 		"permission_names": permissionNames,
 		"department_names": departmentNames,
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admin with details retrieved successfully"))
-	h.logger.Debug("Admin with details retrieved",
-		util.String("admin_id", adminID.String()),
-		util.Int("permission_count", len(permissionNames)),
-		util.Int("department_count", len(departmentNames)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// func (h *AdminHandler) GetAdminOwner(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
-// 	startTime := time.Now()
+// ============================
+// AVATAR INFO HANDLERS
+// ============================
 
-// 	// Declare err variable
-// 	_, err := h.getRequesterAdminID(r)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-// 		return
-// 	}
-
-// 	// Check if requester is owner
-// 	requesterRoleMask, err := h.getRequesterAdminRoleMask(r)
-// 	if err != nil || requesterRoleMask != models.RoleMaskOwner {
-// 		h.respondWithError(w, http.StatusForbidden,
-// 			errors.New("PERMISSION_DENIED"),
-// 			"Only system owner can access this endpoint")
-// 		return
-// 	}
-
-// 	admin, err := h.adminService.GetAdminOwner(ctx)
-// 	if err != nil {
-// 		statusCode := h.getStatusCode(err)
-// 		h.respondWithError(w, statusCode, err, "Failed to get admin owner")
-// 		return
-// 	}
-
-// 	h.respondWithJSON(w, http.StatusOK, successResponse(admin, "Admin owner retrieved successfully"))
-// 	h.logger.Debug("Admin owner retrieved",
-// 		util.Duration("duration", time.Since(startTime)),
-// 	)
-// }
-
+// GetAvatarInfo retrieves avatar metadata for an admin.
+// @Summary Get avatar info
+// @Tags admin-avatar
+// @Produce json
+// @Param adminID path string true "Admin UUID"
+// @Success 200 {object} map[string]interface{} "Avatar metadata"
+// @Failure 400 {object} map[string]interface{} "Invalid admin ID"
+// @Failure 404 {object} map[string]interface{} "Avatar not found"
+// @Router /api/v1/admin/admins/{adminID}/avatar/info [get]
 func (h *AdminHandler) GetAvatarInfo(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	adminIDStr := chi.URLParam(r, "adminID")
 	adminID, err := uuid.Parse(adminIDStr)
@@ -4179,26 +3908,30 @@ func (h *AdminHandler) GetAvatarInfo(w http.ResponseWriter, r *http.Request) {
 
 	avatarInfo, err := h.adminService.GetAvatarInfo(ctx, adminID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get avatar info")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(avatarInfo, "Avatar info retrieved successfully"))
-	h.logger.Debug("Avatar info retrieved",
-		util.String("admin_id", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// BulkGetAvatarInfo retrieves avatar info for multiple admins.
+// @Summary Bulk get avatar info
+// @Tags admin-avatar
+// @Accept json
+// @Produce json
+// @Param body body object true "Admin IDs" example({"admin_ids":["id1","id2"]})
+// @Success 200 {object} map[string]interface{} "Avatar info list"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/bulk-avatar-info [post]
 func (h *AdminHandler) BulkGetAvatarInfo(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	var req struct {
 		AdminIDs []string `json:"admin_ids" validate:"required,min=1,max=100"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
@@ -4216,8 +3949,8 @@ func (h *AdminHandler) BulkGetAvatarInfo(w http.ResponseWriter, r *http.Request)
 
 	avatarInfos, err := h.adminService.BulkGetAvatarInfo(ctx, adminIDs)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to bulk get avatar info")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -4228,19 +3961,25 @@ func (h *AdminHandler) BulkGetAvatarInfo(w http.ResponseWriter, r *http.Request)
 			"retrieved_count": len(avatarInfos),
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Bulk avatar info retrieved successfully"))
-	h.logger.Debug("Bulk avatar info retrieved",
-		util.Int("requested_count", len(adminIDs)),
-		util.Int("retrieved_count", len(avatarInfos)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// ==================== Missing Permission Methods ====================
+// ============================
+// PERMISSION CHECK HANDLERS
+// ============================
+
+// CheckAdminPermission checks if an admin has a specific permission.
+// @Summary Check admin permission
+// @Tags admin-permissions
+// @Produce json
+// @Param adminID path string true "Admin UUID"
+// @Param permission query string true "Permission name"
+// @Success 200 {object} map[string]interface{} "Permission check result"
+// @Failure 400 {object} map[string]interface{} "Missing permission parameter"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID}/permissions/check [get]
 func (h *AdminHandler) CheckAdminPermission(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -4257,34 +3996,27 @@ func (h *AdminHandler) CheckAdminPermission(w http.ResponseWriter, r *http.Reque
 
 	permissionName := r.URL.Query().Get("permission")
 	if permissionName == "" {
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("permission parameter required"),
-			"Permission name is required")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Permission name is required")
 		return
 	}
 
-	// Check if requester can view target admin's permissions
 	if requesterID != adminID {
-		// Get requester to check permissions
 		requesterAdmin, err := h.adminService.GetAdminUser(ctx, requesterID, requesterID)
 		if err != nil {
-			h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get requester admin")
+			status, msg := h.mapServiceError(err)
+			h.respondWithError(w, status, err, msg)
 			return
 		}
-
-		// Only owner or super employee can check other admins' permissions
 		if !requesterAdmin.IsOwner() && !requesterAdmin.IsSuperEmployee() {
-			h.respondWithError(w, http.StatusForbidden,
-				errors.New("PERMISSION_DENIED"),
-				"Cannot check permissions for other admins")
+			h.respondWithError(w, http.StatusForbidden, customErrors.ErrPermissionDenied, "Cannot check permissions for other admins")
 			return
 		}
 	}
 
 	hasPermission, err := h.adminService.CheckAdminPermission(ctx, adminID, permissionName)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to check permission")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -4293,18 +4025,23 @@ func (h *AdminHandler) CheckAdminPermission(w http.ResponseWriter, r *http.Reque
 		"permission":     permissionName,
 		"admin_id":       adminID.String(),
 	}, "Permission check completed"))
-
-	h.logger.Debug("Admin permission check",
-		util.String("requester_id", requesterID.String()),
-		util.String("admin_id", adminID.String()),
-		util.String("permission", permissionName),
-		util.Bool("has_permission", hasPermission),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
+
+// ============================
+// PERMISSION MASK & REPORTS
+// ============================
+
+// GetAdminPermissionMask retrieves the permission bitmask for an admin.
+// @Summary Get admin permission mask
+// @Tags admin-permissions
+// @Produce json
+// @Param adminID path string true "Admin UUID"
+// @Success 200 {object} map[string]interface{} "Permission mask with metadata"
+// @Failure 400 {object} map[string]interface{} "Invalid admin ID"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID}/permissions/mask [get]
 func (h *AdminHandler) GetAdminPermissionMask(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -4319,26 +4056,22 @@ func (h *AdminHandler) GetAdminPermissionMask(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Check if requester can view target admin's permission mask
 	if requesterID != adminID {
-		requester, err := h.adminService.GetAdminUser(ctx, requesterID, requesterID) // Get requester admin
+		requester, err := h.adminService.GetAdminUser(ctx, requesterID, requesterID)
 		if err != nil {
-			h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get requester admin")
+			status, msg := h.mapServiceError(err)
+			h.respondWithError(w, status, err, msg)
 			return
 		}
-
 		targetAdmin, err := h.adminService.GetAdminUser(ctx, adminID, requesterID)
 		if err != nil {
-			h.respondWithError(w, http.StatusNotFound, err, "Target admin not found")
+			status, msg := h.mapServiceError(err)
+			h.respondWithError(w, status, err, msg)
 			return
 		}
-
-		// Check if requester can manage target admin
 		if !requester.IsOwner() && !requester.IsSuperEmployee() {
 			if !h.canManageAdmin(requester, targetAdmin) {
-				h.respondWithError(w, http.StatusForbidden,
-					errors.New("PERMISSION_DENIED"),
-					"Cannot view permission mask for this admin")
+				h.respondWithError(w, http.StatusForbidden, customErrors.ErrPermissionDenied, "Cannot view permission mask for this admin")
 				return
 			}
 		}
@@ -4346,8 +4079,8 @@ func (h *AdminHandler) GetAdminPermissionMask(w http.ResponseWriter, r *http.Req
 
 	permissionMask, err := h.adminService.GetAdminPermissionMask(ctx, adminID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get permission mask")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -4357,20 +4090,20 @@ func (h *AdminHandler) GetAdminPermissionMask(w http.ResponseWriter, r *http.Req
 		"total_bits":      len(permissionMask) * 64,
 		"admin_id":        adminID.String(),
 	}, "Permission mask retrieved successfully"))
-
-	h.logger.Debug("Admin permission mask retrieved",
-		util.String("requester_id", requesterID.String()),
-		util.String("admin_id", adminID.String()),
-		util.Int("segments", len(permissionMask)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// ==================== Missing Reports To Methods ====================
-
+// CanAssignReportsTo checks if an admin can assign reports to a target admin.
+// @Summary Check if assigner can assign reports to target
+// @Tags admin-hierarchy
+// @Produce json
+// @Param assignerID path string true "Assigner admin UUID"
+// @Param targetID path string true "Target admin UUID"
+// @Success 200 {object} map[string]interface{} "Result with reason"
+// @Failure 400 {object} map[string]interface{} "Invalid IDs"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{assignerID}/can-assign/{targetID} [get]
 func (h *AdminHandler) CanAssignReportsTo(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -4392,27 +4125,23 @@ func (h *AdminHandler) CanAssignReportsTo(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Check if requester is authorized
 	if requesterID != assignerID {
 		requester, err := h.adminService.GetAdminUser(ctx, requesterID, requesterID)
 		if err != nil {
-			h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get requester admin")
+			status, msg := h.mapServiceError(err)
+			h.respondWithError(w, status, err, msg)
 			return
 		}
-
-		// Only owner or super employee can check other admins' permissions
 		if !requester.IsOwner() && !requester.IsSuperEmployee() {
-			h.respondWithError(w, http.StatusForbidden,
-				errors.New("PERMISSION_DENIED"),
-				"Cannot check assign permissions for other admins")
+			h.respondWithError(w, http.StatusForbidden, customErrors.ErrPermissionDenied, "Cannot check assign permissions for other admins")
 			return
 		}
 	}
 
 	canAssign, err := h.adminService.CanAssignReportsTo(ctx, assignerID, targetID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to check assign permissions")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -4422,21 +4151,18 @@ func (h *AdminHandler) CanAssignReportsTo(w http.ResponseWriter, r *http.Request
 		"target_id":   targetID.String(),
 		"reason":      getCanAssignReason(canAssign),
 	}, "Assign permissions check completed"))
-
-	h.logger.Debug("Can assign reports to check",
-		util.String("requester_id", requesterID.String()),
-		util.String("assigner_id", assignerID.String()),
-		util.String("target_id", targetID.String()),
-		util.Bool("can_assign", canAssign),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// ==================== Missing Failed Login Management ====================
-
+// ResetAdminFailedLoginAttempts resets failed login attempts for an admin.
+// @Summary Reset admin failed login attempts
+// @Tags admin-auth
+// @Param adminID path string true "Admin UUID"
+// @Success 200 {object} map[string]interface{} "Reset confirmation"
+// @Failure 400 {object} map[string]interface{} "Invalid admin ID"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID}/reset-failed-login [post]
 func (h *AdminHandler) ResetAdminFailedLoginAttempts(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -4451,34 +4177,30 @@ func (h *AdminHandler) ResetAdminFailedLoginAttempts(w http.ResponseWriter, r *h
 		return
 	}
 
-	// Check if requester can reset failed attempts
 	if requesterID != adminID {
 		requester, err := h.adminService.GetAdminUser(ctx, requesterID, requesterID)
 		if err != nil {
-			h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get requester admin")
+			status, msg := h.mapServiceError(err)
+			h.respondWithError(w, status, err, msg)
 			return
 		}
-
 		targetAdmin, err := h.adminService.GetAdminUser(ctx, adminID, requesterID)
 		if err != nil {
-			h.respondWithError(w, http.StatusNotFound, err, "Target admin not found")
+			status, msg := h.mapServiceError(err)
+			h.respondWithError(w, status, err, msg)
 			return
 		}
-
-		// Only owner or super employee can reset other admins' failed attempts
 		if !requester.IsOwner() && !requester.IsSuperEmployee() {
 			if !h.canManageAdmin(requester, targetAdmin) {
-				h.respondWithError(w, http.StatusForbidden,
-					errors.New("PERMISSION_DENIED"),
-					"Cannot reset failed login attempts for this admin")
+				h.respondWithError(w, http.StatusForbidden, customErrors.ErrPermissionDenied, "Cannot reset failed login attempts for this admin")
 				return
 			}
 		}
 	}
 
 	if err := h.adminService.ResetAdminFailedLoginAttempts(ctx, adminID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to reset failed login attempts")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -4486,19 +4208,20 @@ func (h *AdminHandler) ResetAdminFailedLoginAttempts(w http.ResponseWriter, r *h
 		"message":  "Failed login attempts reset successfully",
 		"admin_id": adminID.String(),
 	}, "Failed login attempts reset"))
-
-	h.logger.Info("Admin failed login attempts reset",
-		util.String("requester_id", requesterID.String()),
-		util.String("admin_id", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// ==================== Missing Department Access Methods ====================
-
+// CheckAdminDepartmentAccess checks if an admin has access to a specific department.
+// @Summary Check admin department access
+// @Tags admin-permissions
+// @Produce json
+// @Param adminID path string true "Admin UUID"
+// @Param department path string true "Department name"
+// @Success 200 {object} map[string]interface{} "Access result"
+// @Failure 400 {object} map[string]interface{} "Invalid parameters"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID}/department-access/{department} [get]
 func (h *AdminHandler) CheckAdminDepartmentAccess(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -4515,32 +4238,26 @@ func (h *AdminHandler) CheckAdminDepartmentAccess(w http.ResponseWriter, r *http
 
 	departmentName := chi.URLParam(r, "department")
 	if departmentName == "" {
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("department parameter required"),
-			"Department name is required")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Department name is required")
 		return
 	}
 
-	// Check if requester can view target admin's department access
 	if requesterID != adminID {
 		requester, err := h.adminService.GetAdminUser(ctx, requesterID, requesterID)
 		if err != nil {
-			h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get requester admin")
+			status, msg := h.mapServiceError(err)
+			h.respondWithError(w, status, err, msg)
 			return
 		}
-
 		targetAdmin, err := h.adminService.GetAdminUser(ctx, adminID, requesterID)
 		if err != nil {
-			h.respondWithError(w, http.StatusNotFound, err, "Target admin not found")
+			status, msg := h.mapServiceError(err)
+			h.respondWithError(w, status, err, msg)
 			return
 		}
-
-		// Check if requester can manage target admin
 		if !requester.IsOwner() && !requester.IsSuperEmployee() {
 			if !h.canManageAdmin(requester, targetAdmin) {
-				h.respondWithError(w, http.StatusForbidden,
-					errors.New("PERMISSION_DENIED"),
-					"Cannot check department access for this admin")
+				h.respondWithError(w, http.StatusForbidden, customErrors.ErrPermissionDenied, "Cannot check department access for this admin")
 				return
 			}
 		}
@@ -4548,8 +4265,8 @@ func (h *AdminHandler) CheckAdminDepartmentAccess(w http.ResponseWriter, r *http
 
 	hasAccess, err := h.adminService.CheckAdminDepartmentAccess(ctx, adminID, departmentName)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to check department access")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -4558,44 +4275,27 @@ func (h *AdminHandler) CheckAdminDepartmentAccess(w http.ResponseWriter, r *http
 		"department": departmentName,
 		"admin_id":   adminID.String(),
 	}, "Department access check completed"))
-
-	h.logger.Debug("Admin department access check",
-		util.String("requester_id", requesterID.String()),
-		util.String("admin_id", adminID.String()),
-		util.String("department", departmentName),
-		util.Bool("has_access", hasAccess),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// ==================== Missing Promotion Methods ====================
+// ============================
+// HELPER FUNCTIONS (internal)
+// ============================
 
-// ==================== Missing Owner Management ====================
-
-// ==================== Missing Department Bitmask Methods ====================
-
-// ==================== Helper Functions ====================
-
+// canManageAdmin determines if a manager can manage a target admin.
 func (h *AdminHandler) canManageAdmin(manager, target *models.AdminUser) bool {
-	// Owner can manage everyone
 	if manager.IsOwner() {
 		return true
 	}
-
-	// Super employee can manage employees
 	if manager.IsSuperEmployee() && target.IsEmployee() {
 		return true
 	}
-
-	// Managers can only manage employees in their departments
 	if manager.IsManager() && target.IsEmployee() {
-		// This is a simplified check - you'll need to implement actual department access check
 		return true
 	}
-
 	return false
 }
 
+// getCanAssignReason returns a human-readable reason for the assign permission result.
 func getCanAssignReason(canAssign bool) string {
 	if canAssign {
 		return "Assigner has sufficient permissions and hierarchy allows"
@@ -4603,22 +4303,26 @@ func getCanAssignReason(canAssign bool) string {
 	return "Assigner lacks permissions or hierarchy violation"
 }
 
-func getRoleStringFromMask(roleMask uint64) string {
-	switch roleMask {
-	case 1:
-		return "Employee"
-	case 2:
-		return "Manager"
-	case 4:
-		return "Super Admin"
-	default:
-		return "Unknown"
-	}
-}
+// ============================
+// ADMIN SEARCH HANDLERS
+// ============================
 
+// SearchAdminsWithFilters performs an admin search with filters.
+// @Summary Search admins with filters
+// @Tags admin-search
+// @Produce json
+// @Param q query string false "Search query"
+// @Param search_type query string false "Search type (all/partial/fulltext)" default(all)
+// @Param role_type query int false "Filter by role type"
+// @Param include_inactive query bool false "Include inactive admins"
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "Search results with metadata"
+// @Failure 400 {object} map[string]interface{} "Invalid parameters"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/search [get]
 func (h *AdminHandler) SearchAdminsWithFilters(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -4626,17 +4330,15 @@ func (h *AdminHandler) SearchAdminsWithFilters(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Parse query parameters
 	query := r.URL.Query().Get("q")
 	searchType := r.URL.Query().Get("search_type")
 	if searchType == "" {
 		searchType = "all"
 	}
-
 	limit := h.getIntQueryParam(r, "limit", 50)
 	offset := h.getIntQueryParam(r, "offset", 0)
 
-	var includeInactive bool
+	includeInactive := false
 	if inactiveParam := r.URL.Query().Get("include_inactive"); inactiveParam != "" {
 		includeInactive = inactiveParam == "true"
 	}
@@ -4660,8 +4362,8 @@ func (h *AdminHandler) SearchAdminsWithFilters(w http.ResponseWriter, r *http.Re
 
 	results, total, err := h.adminService.SearchAdminsWithFilters(ctx, requesterID, req)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to search admins with filters")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -4674,19 +4376,23 @@ func (h *AdminHandler) SearchAdminsWithFilters(w http.ResponseWriter, r *http.Re
 			"count":  len(results),
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admin search completed successfully"))
-	h.logger.Info("Admin search with filters executed",
-		util.String("requester_id", requesterID.String()),
-		util.String("query", query),
-		util.Int("results", len(results)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// GetAdminsByDepartment retrieves admins belonging to a department.
+// @Summary Get admins by department
+// @Tags admin-users
+// @Produce json
+// @Param departmentID path string true "Department UUID"
+// @Param include_inactive query bool false "Include inactive admins"
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "Admins with metadata"
+// @Failure 400 {object} map[string]interface{} "Invalid department ID"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/departments/{departmentID}/admins [get]
 func (h *AdminHandler) GetAdminsByDepartment(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -4707,8 +4413,8 @@ func (h *AdminHandler) GetAdminsByDepartment(w http.ResponseWriter, r *http.Requ
 
 	admins, total, err := h.adminService.GetAdminsByDepartment(ctx, departmentID, requesterID, includeInactive, limit, offset)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get admins by department")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -4722,17 +4428,25 @@ func (h *AdminHandler) GetAdminsByDepartment(w http.ResponseWriter, r *http.Requ
 			"count":         len(admins),
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admins by department retrieved successfully"))
-	h.logger.Debug("Admins by department retrieved",
-		util.String("department_id", departmentID.String()),
-		util.Int("count", len(admins)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
+
+// SearchAdmins performs a simple admin search (alias for SearchAdminsWithFilters with default parameters).
+// @Summary Search admins (basic)
+// @Tags admin-search
+// @Produce json
+// @Param q query string true "Search query"
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Param search_type query string false "Search type (partial/fulltext)" default(partial)
+// @Param include_inactive query bool false "Include inactive admins"
+// @Param role_type query int false "Filter by role type"
+// @Success 200 {object} map[string]interface{} "Search results"
+// @Failure 400 {object} map[string]interface{} "Missing query"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/search [get]
 func (h *AdminHandler) SearchAdmins(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -4742,9 +4456,7 @@ func (h *AdminHandler) SearchAdmins(w http.ResponseWriter, r *http.Request) {
 
 	query := r.URL.Query().Get("q")
 	if query == "" {
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("QUERY_REQUIRED"),
-			"Search query is required")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Search query is required")
 		return
 	}
 
@@ -4762,7 +4474,6 @@ func (h *AdminHandler) SearchAdmins(w http.ResponseWriter, r *http.Request) {
 		Offset:          offset,
 		IncludeInactive: h.getBoolQueryParam(r, "include_inactive", false),
 	}
-
 	if roleTypeStr := r.URL.Query().Get("role_type"); roleTypeStr != "" {
 		roleType, err := strconv.Atoi(roleTypeStr)
 		if err == nil {
@@ -4772,8 +4483,8 @@ func (h *AdminHandler) SearchAdmins(w http.ResponseWriter, r *http.Request) {
 
 	results, total, err := h.adminService.SearchAdminsWithFilters(ctx, requesterID, req)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to search admins")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -4786,19 +4497,29 @@ func (h *AdminHandler) SearchAdmins(w http.ResponseWriter, r *http.Request) {
 			"count":  len(results),
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admin search completed successfully"))
-	h.logger.Info("Admin search executed",
-		util.String("requester_id", requesterID.String()),
-		util.String("query", query),
-		util.Int("results", len(results)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// SearchAdminsAdvanced performs an advanced search with multiple filters.
+// @Summary Advanced admin search
+// @Tags admin-search
+// @Produce json
+// @Param q query string false "Search query"
+// @Param role_id query string false "Filter by role ID"
+// @Param department_id query string false "Filter by department ID"
+// @Param reports_to query string false "Filter by reports-to admin ID"
+// @Param created_after query string false "Filter by creation date (RFC3339)"
+// @Param created_before query string false "Filter by creation date (RFC3339)"
+// @Param sort_by query string false "Sort field" default(relevance)
+// @Param sort_order query string false "Sort order (asc/desc)" default(desc)
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "Search results with metadata"
+// @Failure 400 {object} map[string]interface{} "Invalid parameters"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/search/advanced [get]
 func (h *AdminHandler) SearchAdminsAdvanced(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -4806,38 +4527,31 @@ func (h *AdminHandler) SearchAdminsAdvanced(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Parse query parameters into AdminAdvancedSearchRequest
 	var filters models.AdminSearchFilter
-
-	// Parse various filter parameters
 	if roleIDStr := r.URL.Query().Get("role_id"); roleIDStr != "" {
 		roleID, err := uuid.Parse(roleIDStr)
 		if err == nil {
 			filters.RoleID = &roleID
 		}
 	}
-
 	if deptIDStr := r.URL.Query().Get("department_id"); deptIDStr != "" {
 		deptID, err := uuid.Parse(deptIDStr)
 		if err == nil {
 			filters.DepartmentID = &deptID
 		}
 	}
-
 	if reportsToStr := r.URL.Query().Get("reports_to"); reportsToStr != "" {
 		reportsTo, err := uuid.Parse(reportsToStr)
 		if err == nil {
 			filters.ReportsTo = &reportsTo
 		}
 	}
-
 	if createdAfterStr := r.URL.Query().Get("created_after"); createdAfterStr != "" {
 		createdAfter, err := time.Parse(time.RFC3339, createdAfterStr)
 		if err == nil {
 			filters.CreatedAfter = &createdAfter
 		}
 	}
-
 	if createdBeforeStr := r.URL.Query().Get("created_before"); createdBeforeStr != "" {
 		createdBefore, err := time.Parse(time.RFC3339, createdBeforeStr)
 		if err == nil {
@@ -4853,7 +4567,6 @@ func (h *AdminHandler) SearchAdminsAdvanced(w http.ResponseWriter, r *http.Reque
 		SortBy:    r.URL.Query().Get("sort_by"),
 		SortOrder: r.URL.Query().Get("sort_order"),
 	}
-
 	if req.SortBy == "" {
 		req.SortBy = "relevance"
 	}
@@ -4863,8 +4576,8 @@ func (h *AdminHandler) SearchAdminsAdvanced(w http.ResponseWriter, r *http.Reque
 
 	results, total, err := h.adminService.SearchAdminsAdvanced(ctx, requesterID, req)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to search admins")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -4879,20 +4592,23 @@ func (h *AdminHandler) SearchAdminsAdvanced(w http.ResponseWriter, r *http.Reque
 			"sort_order": req.SortOrder,
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Advanced admin search completed"))
-	h.logger.Info("Advanced admin search executed",
-		util.String("requester_id", requesterID.String()),
-		util.String("query", req.Query),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-func (h *AdminHandler) GetSystemDepartments(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+// ============================
+// SYSTEM & PERMISSION HANDLERS
+// ============================
 
-	// Simply check if user is authenticated, don't need the ID
+// GetSystemDepartments retrieves system-level departments.
+// @Summary Get system departments
+// @Tags admin-system
+// @Produce json
+// @Success 200 {object} map[string]interface{} "List of system departments"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/system/departments [get]
+func (h *AdminHandler) GetSystemDepartments(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
+
 	if _, err := h.getRequesterAdminID(r); err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
 		return
@@ -4900,22 +4616,26 @@ func (h *AdminHandler) GetSystemDepartments(w http.ResponseWriter, r *http.Reque
 
 	systemDepts, err := h.companyService.GetSystemDepartments(ctx)
 	if err != nil {
-
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get system departments")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(systemDepts, "System departments retrieved successfully"))
-	h.logger.Debug("System departments retrieved",
-		util.Int("count", len(systemDepts)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
-func (h *AdminHandler) GetPermissionsByModule(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
 
-	// Simply check if user is authenticated, don't need the ID
+// GetPermissionsByModule retrieves permissions for a specific module.
+// @Summary Get permissions by module
+// @Tags admin-system
+// @Produce json
+// @Param module path string true "Module name"
+// @Success 200 {object} map[string]interface{} "Permissions with metadata"
+// @Failure 400 {object} map[string]interface{} "Missing module"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/system/permissions/module/{module} [get]
+func (h *AdminHandler) GetPermissionsByModule(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
+
 	if _, err := h.getRequesterAdminID(r); err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
 		return
@@ -4923,13 +4643,14 @@ func (h *AdminHandler) GetPermissionsByModule(w http.ResponseWriter, r *http.Req
 
 	module := chi.URLParam(r, "module")
 	if module == "" {
-		h.respondWithError(w, http.StatusBadRequest, fmt.Errorf("module required"), "Module is required")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Module is required")
 		return
 	}
 
 	permissions, err := h.companyService.GetPermissionsByModule(ctx, module)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get permissions by module")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -4940,19 +4661,21 @@ func (h *AdminHandler) GetPermissionsByModule(w http.ResponseWriter, r *http.Req
 			"count":  len(permissions),
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Permissions retrieved by module"))
-	h.logger.Debug("Permissions retrieved by module",
-		util.String("module", module),
-		util.Int("count", len(permissions)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// GetAllPermissions retrieves all permissions with optional filtering
+// GetAllPermissions retrieves all available permissions with optional filters.
+// @Summary Get all permissions
+// @Tags admin-system
+// @Produce json
+// @Param module query string false "Filter by module"
+// @Param category query string false "Filter by category"
+// @Param tier query string false "Filter by tier"
+// @Success 200 {object} map[string]interface{} "Permissions with metadata"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/system/permissions [get]
 func (h *AdminHandler) GetAllPermissions(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	module := r.URL.Query().Get("module")
 	category := r.URL.Query().Get("category")
@@ -4960,7 +4683,8 @@ func (h *AdminHandler) GetAllPermissions(w http.ResponseWriter, r *http.Request)
 
 	permissions, err := h.companyService.GetAllPermissions(ctx, module, category, tier)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get permissions")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -4973,20 +4697,26 @@ func (h *AdminHandler) GetAllPermissions(w http.ResponseWriter, r *http.Request)
 			"tier":     tier,
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "All permissions retrieved successfully"))
-
-	h.logger.Debug("All permissions retrieved",
-		util.Int("count", len(permissions)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// ==================== Admin Search Methods (Add these) ====================
+// ============================
+// ADDITIONAL SEARCH HANDLERS
+// ============================
 
+// SearchAdminsByName searches admins by name.
+// @Summary Search admins by name
+// @Tags admin-search
+// @Produce json
+// @Param name query string true "Name to search"
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "Admins with metadata"
+// @Failure 400 {object} map[string]interface{} "Missing name"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/search/name [get]
 func (h *AdminHandler) SearchAdminsByName(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -4996,9 +4726,7 @@ func (h *AdminHandler) SearchAdminsByName(w http.ResponseWriter, r *http.Request
 
 	name := r.URL.Query().Get("name")
 	if name == "" {
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("NAME_REQUIRED"),
-			"Name is required")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Name is required")
 		return
 	}
 
@@ -5007,8 +4735,8 @@ func (h *AdminHandler) SearchAdminsByName(w http.ResponseWriter, r *http.Request
 
 	results, total, err := h.adminService.SearchAdminsByName(ctx, name, requesterID, limit, offset)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to search admins by name")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -5021,19 +4749,21 @@ func (h *AdminHandler) SearchAdminsByName(w http.ResponseWriter, r *http.Request
 			"count":  len(results),
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admins found by name"))
-	h.logger.Info("Admin search by name executed",
-		util.String("requester_id", requesterID.String()),
-		util.String("name", name),
-		util.Int("results", len(results)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// SearchAdminEmployees searches employee-type admins.
+// @Summary Search admin employees
+// @Tags admin-search
+// @Produce json
+// @Param q query string false "Search query"
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "Admins with metadata"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/search/employees [get]
 func (h *AdminHandler) SearchAdminEmployees(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -5047,8 +4777,8 @@ func (h *AdminHandler) SearchAdminEmployees(w http.ResponseWriter, r *http.Reque
 
 	results, total, err := h.adminService.SearchAdminEmployees(ctx, query, requesterID, limit, offset)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to search admin employees")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -5061,19 +4791,21 @@ func (h *AdminHandler) SearchAdminEmployees(w http.ResponseWriter, r *http.Reque
 			"count":  len(results),
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admin employees found"))
-	h.logger.Info("Admin employees search executed",
-		util.String("requester_id", requesterID.String()),
-		util.String("query", query),
-		util.Int("results", len(results)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// SearchAdminManagers searches manager-type admins.
+// @Summary Search admin managers
+// @Tags admin-search
+// @Produce json
+// @Param q query string false "Search query"
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "Admins with metadata"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/search/managers [get]
 func (h *AdminHandler) SearchAdminManagers(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -5087,8 +4819,8 @@ func (h *AdminHandler) SearchAdminManagers(w http.ResponseWriter, r *http.Reques
 
 	results, total, err := h.adminService.SearchAdminManagers(ctx, query, requesterID, limit, offset)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to search admin managers")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -5101,109 +4833,24 @@ func (h *AdminHandler) SearchAdminManagers(w http.ResponseWriter, r *http.Reques
 			"count":  len(results),
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admin managers found"))
-	h.logger.Info("Admin managers search executed",
-		util.String("requester_id", requesterID.String()),
-		util.String("query", query),
-		util.Int("results", len(results)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// ============================
+// UTILITY HELPERS (internal)
+// ============================
+
+// sanitizeUserForAdmin removes sensitive fields from a user object.
 func (h *AdminHandler) sanitizeUserForAdmin(u *models.User) {
 	if u == nil {
 		return
 	}
-	// Remove or zero sensitive fields
 	u.PhoneEncrypted = nil
 	u.PhoneKeyID = uuid.Nil
 	u.PhoneEncryptedDEK = ""
-	// Keep phone_hash and other non-sensitive fields for admin listing
 }
 
-// // GetAdminPhoneNumber retrieves and decrypts an admin's phone number (super admin only)
-// func (h *AdminHandler) GetAdminPhoneNumber(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
-// 	startTime := time.Now()
-
-// 	// Get requester ID
-// 	requesterID, err := h.getRequesterAdminID(r)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-// 		return
-// 	}
-
-// 	// Get target admin ID from URL
-// 	adminIDStr := chi.URLParam(r, "adminID")
-// 	adminID, err := uuid.Parse(adminIDStr)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
-// 		return
-// 	}
-
-// 	// Check if requester is owner by verifying their role mask
-// 	requesterRoleMask, err := h.getRequesterAdminRoleMask(r)
-// 	if err != nil {
-// 		h.logger.Warn("Failed to get admin role mask from token",
-// 			util.String("admin_id", requesterID.String()),
-// 			util.ErrorField(err))
-// 		h.respondWithError(w, http.StatusUnauthorized, err, "Unable to verify admin role")
-// 		return
-// 	}
-
-// 	// Only owner (super admin) can access decrypted phone numbers
-// 	if requesterRoleMask != models.RoleMaskOwner {
-// 		h.logger.Warn("Non-owner attempting to access admin phone number",
-// 			util.String("requester_id", requesterID.String()),
-// 			util.String("target_admin_id", adminID.String()),
-// 			util.Uint64("requester_role_mask", requesterRoleMask))
-
-// 		h.respondWithError(w, http.StatusForbidden,
-// 			fmt.Errorf("PERMISSION_DENIED"),
-// 			"Only system owner can access decrypted phone numbers")
-// 		return
-// 	}
-
-// 	// Check if session type is admin
-// 	sessionType, ok := ctx.Value("session_type").(string)
-// 	if !ok || sessionType != "admin" {
-// 		h.respondWithError(w, http.StatusForbidden,
-// 			fmt.Errorf("INVALID_SESSION_TYPE"),
-// 			"Admin session required")
-// 		return
-// 	}
-
-// 	// Call service method
-// 	phoneNumber, err := h.adminService.GetAdminPhoneNumber(ctx, adminID, requesterID)
-// 	if err != nil {
-// 		statusCode := h.getStatusCode(err)
-// 		h.respondWithError(w, statusCode, err, "Failed to get admin phone number")
-// 		return
-// 	}
-
-// 	// Create response (mask part of the phone number for security)
-// 	maskedPhone := maskPhoneNumber(phoneNumber)
-
-// 	response := map[string]interface{}{
-// 		"phone_number":     phoneNumber,
-// 		"masked_phone":     maskedPhone,
-// 		"admin_id":         adminID.String(),
-// 		"accessed_by":      requesterID.String(),
-// 		"access_timestamp": time.Now().UTC(),
-// 	}
-
-// 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admin phone number retrieved successfully"))
-
-// 	h.logger.Info("Admin phone number accessed",
-// 		util.String("requester_id", requesterID.String()),
-// 		util.String("target_admin_id", adminID.String()),
-// 		util.Bool("is_owner", true),
-// 		util.Duration("duration", time.Since(startTime)),
-// 	)
-// }
-
-// Helper function to mask phone number for logging/response
+// maskPhoneNumber masks a phone number for display.
 func maskPhoneNumber(phone string) string {
 	if len(phone) <= 4 {
 		return "****"
@@ -5211,20 +4858,20 @@ func maskPhoneNumber(phone string) string {
 	return "****" + phone[len(phone)-4:]
 }
 
-// ==================== Super Admin Initialization ====================
-// ==================== Super Admin Initialization ====================
+// ============================
+// SUPER ADMIN HANDLERS
+// ============================
 
-// InitDefaultSuperAdminHandler initializes the default super admin (Sarvesh Chhabra)
-// This is a public endpoint for initial system setup
+// InitSuperAdminHandler initializes the default super admin if none exists.
+// @Summary Initialize super admin
+// @Tags admin-setup
+// @Produce json
+// @Success 200 {object} map[string]interface{} "Super admin status"
+// @Failure 500 {object} map[string]interface{} "Initialization failed"
+// @Router /api/v1/setup/super-admin [post]
 func (h *AdminHandler) InitSuperAdminHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
-	h.logger.Info("Default super admin initialization request received",
-		util.String("source_ip", h.getClientIP(r)),
-		util.String("user_agent", r.UserAgent()))
-
-	// Check if super admin already exists first
 	existingAdmin, err := h.adminService.GetSuperAdmin(ctx)
 	if err == nil && existingAdmin != nil {
 		h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
@@ -5238,21 +4885,13 @@ func (h *AdminHandler) InitSuperAdminHandler(w http.ResponseWriter, r *http.Requ
 			"created_at":         existingAdmin.AdminCreatedAt,
 			"message":            "Super admin already exists",
 		}, "Super admin already initialized"))
-
-		h.logger.Info("Super admin already exists - returning existing admin",
-			util.String("admin_id", existingAdmin.AdminID.String()),
-			util.String("username", existingAdmin.Username))
 		return
 	}
 
-	// Initialize default super admin (Sarvesh Chhabra)
 	admin, err := h.adminService.InitDefaultSuperAdmin(ctx)
 	if err != nil {
-		h.logger.Error("Failed to initialize default super admin",
-			util.ErrorField(err),
-			util.String("source_ip", h.getClientIP(r)))
-
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to initialize super admin")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -5263,26 +4902,27 @@ func (h *AdminHandler) InitSuperAdminHandler(w http.ResponseWriter, r *http.Requ
 		"full_name":          admin.FullName,
 		"role_type":          admin.RoleType,
 		"role_string":        admin.GetRoleString(),
-		"phone_number":       "+917206583437", // Returning for reference
+		"phone_number":       "+917206583437",
 		"is_active":          admin.IsActive,
 		"created_at":         admin.AdminCreatedAt,
 		"message":            "Default super admin (Sarvesh Chhabra) initialized successfully",
 	}, "Super admin initialization complete"))
-
-	h.logger.Info("Default super admin initialized successfully",
-		util.String("admin_id", admin.AdminID.String()),
-		util.String("username", admin.Username),
-		util.Duration("duration", time.Since(startTime)))
 }
 
-// CheckSuperAdminStatusHandler checks if super admin exists (public endpoint)
+// CheckSuperAdminStatusHandler checks if a super admin exists.
+// @Summary Check super admin status
+// @Tags admin-setup
+// @Produce json
+// @Success 200 {object} map[string]interface{} "Status with admin info if exists"
+// @Failure 500 {object} map[string]interface{} "Internal error"
+// @Router /api/v1/setup/super-admin/status [get]
 func (h *AdminHandler) CheckSuperAdminStatusHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	initialized, admin, err := h.adminService.CheckAndInitSuperAdmin(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to check super admin status")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -5305,16 +4945,10 @@ func (h *AdminHandler) CheckSuperAdminStatusHandler(w http.ResponseWriter, r *ht
 		"admin":              adminInfo,
 		"message":            getSuperAdminStatusMessage(initialized, admin),
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Super admin status retrieved"))
-
-	h.logger.Debug("Super admin status checked",
-		util.Bool("exists", admin != nil),
-		util.Bool("initialized", initialized),
-		util.Duration("duration", time.Since(startTime)))
 }
 
-// Helper function for status messages
+// getSuperAdminStatusMessage returns a status message based on super admin existence.
 func getSuperAdminStatusMessage(initialized bool, admin *models.AdminUser) string {
 	if admin == nil {
 		return "Super admin does not exist"
@@ -5325,19 +4959,23 @@ func getSuperAdminStatusMessage(initialized bool, admin *models.AdminUser) strin
 	return "Super admin already exists"
 }
 
-// HealthCheckHandler is a public health check endpoint
+// HealthCheckHandler performs a health check on the service.
+// @Summary Service health check
+// @Tags admin-health
+// @Produce json
+// @Success 200 {object} map[string]interface{} "Service healthy"
+// @Failure 503 {object} map[string]interface{} "Service unhealthy"
+// @Router /api/v1/health [get]
 func (h *AdminHandler) HealthCheckHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.injectClientIP(r.Context(), r)
 
-	// Check database connectivity
 	if err := h.adminService.HealthCheck(ctx); err != nil {
-		h.respondWithError(w, http.StatusServiceUnavailable, err, "Service unhealthy")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
-	// Check super admin status
 	exists, _, _ := h.adminService.CheckAndInitSuperAdmin(ctx)
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
 		"status":            "healthy",
 		"service":           "auth-service",
@@ -5346,382 +4984,21 @@ func (h *AdminHandler) HealthCheckHandler(w http.ResponseWriter, r *http.Request
 	}, "Service is healthy"))
 }
 
-// Helper function for phone maski
+// ============================
+// ADMIN ROLE DETAILS HANDLERS
+// ============================
 
-// handler/admin_handler.go - Add these new handler methods
-
-// func (h *AdminHandler) CreateEmployeeRole(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
-// 	startTime := time.Now()
-
-// 	requesterID, err := h.getRequesterAdminID(r)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-// 		return
-// 	}
-
-// 	var req models.EmployeeRoleCreateRequest
-// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-// 		return
-// 	}
-
-// 	// Convert to the internal request format
-// 	internalReq := models.AdminRoleCreateRequest{
-// 		RoleName:    req.RoleName,
-// 		RoleType:    models.RoleTypeEmployee, // Employee role
-// 		Description: req.Description,
-// 	}
-
-// 	// Get department IDs and validate permissions
-// 	systemDepartments, err := h.companyService.GetSystemDepartments(ctx)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get system departments")
-// 		return
-// 	}
-
-// 	deptIDMap := make(map[string]uuid.UUID)
-// 	for _, dept := range systemDepartments {
-// 		deptIDMap[dept.Name] = dept.SystemDepartmentID
-// 	}
-
-// 	// Validate department permissions
-// 	for _, deptPerm := range req.DepartmentPermissions {
-// 		deptID, exists := deptIDMap[deptPerm.DepartmentName]
-// 		if !exists {
-// 			h.respondWithError(w, http.StatusBadRequest,
-// 				fmt.Errorf("department not found: %s", deptPerm.DepartmentName),
-// 				fmt.Sprintf("Department %s does not exist", deptPerm.DepartmentName))
-// 			return
-// 		}
-
-// 		// Get permissions for this department
-// 		permissions, err := h.companyService.GetPermissionsByModule(ctx, deptPerm.DepartmentName)
-// 		if err != nil {
-// 			h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get department permissions")
-// 			return
-// 		}
-
-// 		// Create a set of valid permissions for this department
-// 		validPerms := make(map[string]bool)
-// 		for _, perm := range permissions {
-// 			validPerms[perm.PermissionName] = true
-// 		}
-
-// 		// Validate each permission
-// 		for _, permName := range deptPerm.Permissions {
-// 			if !validPerms[permName] {
-// 				h.respondWithError(w, http.StatusBadRequest,
-// 					fmt.Errorf("permission not found in department"),
-// 					fmt.Sprintf("Permission %s does not exist in department %s", permName, deptPerm.DepartmentName))
-// 				return
-// 			}
-// 		}
-
-// 		// Store department ID
-// 		internalReq.DepartmentIDs = append(internalReq.DepartmentIDs, deptID)
-// 	}
-
-// 	role, err := h.adminService.CreateAdminRole(ctx, &internalReq, requesterID)
-// 	if err != nil {
-// 		statusCode := h.getStatusCode(err)
-// 		h.respondWithError(w, statusCode, err, "Failed to create employee role")
-// 		return
-// 	}
-
-// 	h.respondWithJSON(w, http.StatusCreated, successResponse(role, "Employee role created successfully"))
-// 	h.logger.Info("Employee role created",
-// 		util.String("role_id", role.AdminRoleID.String()),
-// 		util.String("created_by", requesterID.String()),
-// 		util.Duration("duration", time.Since(startTime)),
-// 	)
-// }
-
-// func (h *AdminHandler) CreateManagerRole(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
-// 	startTime := time.Now()
-
-// 	requesterID, err := h.getRequesterAdminID(r)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-// 		return
-// 	}
-
-// 	var req models.ManagerRoleCreateRequest
-// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-// 		return
-// 	}
-
-// 	// Convert to the internal request format
-// 	internalReq := models.AdminRoleCreateRequest{
-// 		RoleName:    req.RoleName,
-// 		RoleType:    models.RoleTypeManager, // Manager role
-// 		Description: req.Description,
-// 	}
-
-// 	// Get department IDs
-// 	systemDepartments, err := h.companyService.GetSystemDepartments(ctx)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get system departments")
-// 		return
-// 	}
-
-// 	deptIDMap := make(map[string]uuid.UUID)
-// 	for _, dept := range systemDepartments {
-// 		deptIDMap[dept.Name] = dept.SystemDepartmentID
-// 	}
-
-// 	// Validate department names and get IDs
-// 	for _, deptName := range req.DepartmentNames {
-// 		deptID, exists := deptIDMap[deptName]
-// 		if !exists {
-// 			h.respondWithError(w, http.StatusBadRequest,
-// 				fmt.Errorf("department not found: %s", deptName),
-// 				fmt.Sprintf("Department %s does not exist", deptName))
-// 			return
-// 		}
-// 		internalReq.DepartmentIDs = append(internalReq.DepartmentIDs, deptID)
-// 	}
-
-// 	role, err := h.adminService.CreateAdminRole(ctx, &internalReq, requesterID)
-// 	if err != nil {
-// 		statusCode := h.getStatusCode(err)
-// 		h.respondWithError(w, statusCode, err, "Failed to create manager role")
-// 		return
-// 	}
-
-// 	h.respondWithJSON(w, http.StatusCreated, successResponse(role, "Manager role created successfully"))
-// 	h.logger.Info("Manager role created",
-// 		util.String("role_id", role.AdminRoleID.String()),
-// 		util.String("created_by", requesterID.String()),
-// 		util.Duration("duration", time.Since(startTime)),
-// 	)
-// }
-
-// func (h *AdminHandler) CreateEmployeeRole(w http.ResponseWriter, r *http.Request) {
-//     ctx := r.Context()
-//     startTime := time.Now()
-//     requesterID, err := h.getRequesterAdminID(r)
-//     if err != nil {
-//         h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-//         return
-//     }
-
-//     var req models.EmployeeRoleCreateRequest
-//     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-//         h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-//         return
-//     }
-
-//     internalReq := models.AdminRoleCreateRequest{
-//         RoleName:    req.RoleName,
-//         RoleType:    models.RoleTypeEmployee,
-//         Description: req.Description,
-//     }
-
-//     systemDepartments, err := h.companyService.GetSystemDepartments(ctx)
-//     if err != nil {
-//         h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get system departments")
-//         return
-//     }
-
-//     // Create map from department name to department object
-//     deptMap := make(map[string]*models.SystemDepartment)
-//     for _, dept := range systemDepartments {
-//         deptMap[dept.Name] = dept
-//     }
-
-//     for _, deptPerm := range req.DepartmentPermissions {
-//         dept, exists := deptMap[deptPerm.DepartmentName]
-//         if !exists {
-//             h.respondWithError(w, http.StatusBadRequest,
-//                 fmt.Errorf("department not found: %s", deptPerm.DepartmentName),
-//                 fmt.Sprintf("Department %s does not exist", deptPerm.DepartmentName))
-//             return
-//         }
-
-//         // Get module code from department and use it to fetch permissions
-//         moduleCode := dept.ModuleCode // This should be 'sales' for department 'Sales'
-//         permissions, err := h.companyService.GetPermissionsByModule(ctx, moduleCode)
-//         if err != nil {
-//             h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get department permissions")
-//             return
-//         }
-
-//         validPerms := make(map[string]bool)
-//         for _, perm := range permissions {
-//             validPerms[perm.PermissionName] = true
-//         }
-
-//         for _, permName := range deptPerm.Permissions {
-//             if !validPerms[permName] {
-//                 h.respondWithError(w, http.StatusBadRequest,
-//                     fmt.Errorf("permission not found in department"),
-//                     fmt.Sprintf("Permission %s does not exist in department %s (module: %s)",
-//                         permName, deptPerm.DepartmentName, moduleCode))
-//                 return
-//             }
-//         }
-
-//         internalReq.DepartmentIDs = append(internalReq.DepartmentIDs, dept.SystemDepartmentID)
-//     }
-
-//     role, err := h.adminService.CreateAdminRole(ctx, &internalReq, requesterID)
-//     if err != nil {
-//         statusCode := h.getStatusCode(err)
-//         h.respondWithError(w, statusCode, err, "Failed to create employee role")
-//         return
-//     }
-
-//     h.respondWithJSON(w, http.StatusCreated, successResponse(role, "Employee role created successfully"))
-//     h.logger.Info("Employee role created",
-//         util.String("role_id", role.AdminRoleID.String()),
-//         util.String("created_by", requesterID.String()),
-//         util.Duration("duration", time.Since(startTime)),
-//     )
-// }
-
-// func (h *AdminHandler) CreateEmployeeRole(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
-// 	startTime := time.Now()
-// 	requesterID, err := h.getRequesterAdminID(r)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-// 		return
-// 	}
-
-// 	var req models.EmployeeRoleCreateRequest
-// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-// 		return
-// 	}
-
-// 	// Create the base role
-// 	internalReq := models.AdminRoleCreateRequest{
-// 		RoleName:    req.RoleName,
-// 		RoleType:    models.RoleTypeEmployee,
-// 		Description: req.Description,
-// 	}
-
-// 	// Get system departments
-// 	systemDepartments, err := h.companyService.GetSystemDepartments(ctx)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get system departments")
-// 		return
-// 	}
-
-// 	// Map department names to IDs and collect department IDs
-// 	deptMap := make(map[string]*models.SystemDepartment)
-// 	departmentIDs := make([]uuid.UUID, 0, len(req.DepartmentPermissions))
-
-// 	for _, deptPerm := range req.DepartmentPermissions {
-// 		dept, exists := deptMap[deptPerm.DepartmentName]
-// 		if !exists {
-// 			// Find the department in system departments
-// 			for _, sysDept := range systemDepartments {
-// 				if sysDept.Name == deptPerm.DepartmentName {
-// 					dept = sysDept
-// 					deptMap[deptPerm.DepartmentName] = sysDept
-// 					break
-// 				}
-// 			}
-// 			if dept == nil {
-// 				h.respondWithError(w, http.StatusBadRequest,
-// 					fmt.Errorf("department not found: %s", deptPerm.DepartmentName),
-// 					fmt.Sprintf("Department %s does not exist", deptPerm.DepartmentName))
-// 				return
-// 			}
-// 		}
-
-// 		// Validate permissions exist for this department/module
-// 		permissions, err := h.companyService.GetPermissionsByModule(ctx, dept.ModuleCode)
-// 		if err != nil {
-// 			h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get department permissions")
-// 			return
-// 		}
-
-// 		// Build a map of valid permission names for this module
-// 		validPerms := make(map[string]bool)
-// 		for _, perm := range permissions {
-// 			validPerms[perm.PermissionName] = true
-// 		}
-
-// 		// Validate each requested permission
-// 		for _, permName := range deptPerm.Permissions {
-// 			if !validPerms[permName] {
-// 				h.respondWithError(w, http.StatusBadRequest,
-// 					fmt.Errorf("permission not found in department"),
-// 					fmt.Sprintf("Permission %s does not exist in department %s (module: %s)",
-// 						permName, deptPerm.DepartmentName, dept.ModuleCode))
-// 				return
-// 			}
-// 		}
-
-// 		departmentIDs = append(departmentIDs, dept.SystemDepartmentID)
-// 	}
-
-// 	internalReq.DepartmentIDs = departmentIDs
-
-// 	// Create the role first
-// 	role, err := h.adminService.CreateAdminRole(ctx, &internalReq, requesterID)
-// 	if err != nil {
-// 		statusCode := h.getStatusCode(err)
-// 		h.respondWithError(w, statusCode, err, "Failed to create employee role")
-// 		return
-// 	}
-
-// 	// Now grant the specific permissions for each department
-// 	for _, deptPerm := range req.DepartmentPermissions {
-// 		dept := deptMap[deptPerm.DepartmentName]
-
-// 		// Get all permissions for this module to find their IDs
-// 		permissions, err := h.companyService.GetPermissionsByModule(ctx, dept.ModuleCode)
-// 		if err != nil {
-// 			h.logger.Warn("Failed to get permissions for granting",
-// 				zap.String("role_id", role.AdminRoleID.String()),
-// 				zap.String("department", dept.Name),
-// 				zap.Error(err))
-// 			continue
-// 		}
-
-// 		// Create a map of permission name to ID
-// 		permMap := make(map[string]uuid.UUID)
-// 		for _, perm := range permissions {
-// 			permMap[perm.PermissionName] = perm.PermissionID
-// 		}
-
-// 		// Grant each specified permission
-// 		for _, permName := range deptPerm.Permissions {
-// 			permID, exists := permMap[permName]
-// 			if !exists {
-// 				h.logger.Warn("Permission not found for granting",
-// 					zap.String("role_id", role.AdminRoleID.String()),
-// 					zap.String("permission", permName))
-// 				continue
-// 			}
-
-// 			// Grant this specific permission to the role
-// 			if err := h.adminService.GrantPermissionToAdminRole(ctx, role.AdminRoleID, permID, requesterID); err != nil {
-// 				h.logger.Warn("Failed to grant permission to role",
-// 					zap.String("role_id", role.AdminRoleID.String()),
-// 					zap.String("permission_id", permID.String()),
-// 					zap.Error(err))
-// 			}
-// 		}
-// 	}
-
-// 	h.respondWithJSON(w, http.StatusCreated, successResponse(role, "Employee role created successfully"))
-// 	h.logger.Info("Employee role created",
-// 		zap.String("role_id", role.AdminRoleID.String()),
-// 		zap.String("created_by", requesterID.String()),
-// 		zap.Duration("duration", time.Since(startTime)),
-// 	)
-// }
-
+// GetAdminRoleWithDetails retrieves a role with its departments and permissions.
+// @Summary Get admin role with details
+// @Tags admin-roles
+// @Produce json
+// @Param roleID path string true "Role UUID"
+// @Success 200 {object} map[string]interface{} "Role with departments and permissions"
+// @Failure 400 {object} map[string]interface{} "Invalid role ID"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/roles/{roleID}/details [get]
 func (h *AdminHandler) GetAdminRoleWithDetails(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -5738,8 +5015,8 @@ func (h *AdminHandler) GetAdminRoleWithDetails(w http.ResponseWriter, r *http.Re
 
 	role, departments, permissions, err := h.adminService.GetAdminRoleWithDetails(ctx, roleID, requesterID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get admin role details")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -5748,20 +5025,18 @@ func (h *AdminHandler) GetAdminRoleWithDetails(w http.ResponseWriter, r *http.Re
 		"departments": departments,
 		"permissions": permissions,
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admin role details retrieved successfully"))
-
-	h.logger.Info("Admin role details retrieved",
-		util.String("role_id", roleID.String()),
-		util.String("requester_id", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// GetEmployeeAdminRoles handles GET /admin/employee-roles
+// GetEmployeeAdminRoles retrieves all employee-type admin roles.
+// @Summary Get employee admin roles
+// @Tags admin-roles
+// @Produce json
+// @Success 200 {object} map[string]interface{} "List of employee roles"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/roles/employee [get]
 func (h *AdminHandler) GetEmployeeAdminRoles(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -5771,8 +5046,8 @@ func (h *AdminHandler) GetEmployeeAdminRoles(w http.ResponseWriter, r *http.Requ
 
 	roles, err := h.adminService.GetEmployeeAdminRoles(ctx, requesterID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get employee admin roles")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -5783,19 +5058,18 @@ func (h *AdminHandler) GetEmployeeAdminRoles(w http.ResponseWriter, r *http.Requ
 			"role_type": "employee",
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Employee admin roles retrieved successfully"))
-	h.logger.Info("Employee admin roles retrieved",
-		util.String("requester_id", requesterID.String()),
-		util.Int("count", len(roles)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// GetManagerAdminRoles handles GET /admin/manager-roles
+// GetManagerAdminRoles retrieves all manager-type admin roles.
+// @Summary Get manager admin roles
+// @Tags admin-roles
+// @Produce json
+// @Success 200 {object} map[string]interface{} "List of manager roles"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/roles/manager [get]
 func (h *AdminHandler) GetManagerAdminRoles(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -5805,8 +5079,8 @@ func (h *AdminHandler) GetManagerAdminRoles(w http.ResponseWriter, r *http.Reque
 
 	roles, err := h.adminService.GetManagerAdminRoles(ctx, requesterID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get manager admin roles")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -5817,19 +5091,20 @@ func (h *AdminHandler) GetManagerAdminRoles(w http.ResponseWriter, r *http.Reque
 			"role_type": "manager",
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Manager admin roles retrieved successfully"))
-	h.logger.Info("Manager admin roles retrieved",
-		util.String("requester_id", requesterID.String()),
-		util.Int("count", len(roles)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// GetAdminRolesByType handles GET /admin/roles/type/{roleType}
+// GetAdminRolesByType retrieves admin roles by role type.
+// @Summary Get admin roles by type
+// @Tags admin-roles
+// @Produce json
+// @Param roleType path int true "Role type (1=employee, 2=manager, 3=super admin)"
+// @Success 200 {object} map[string]interface{} "Roles with metadata"
+// @Failure 400 {object} map[string]interface{} "Invalid role type"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/roles/type/{roleType} [get]
 func (h *AdminHandler) GetAdminRolesByType(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -5844,7 +5119,6 @@ func (h *AdminHandler) GetAdminRolesByType(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Validate role type
 	validRoleTypes := []int{models.RoleTypeEmployee, models.RoleTypeManager, models.RoleTypeSuperAdmin}
 	isValid := false
 	for _, validType := range validRoleTypes {
@@ -5853,22 +5127,18 @@ func (h *AdminHandler) GetAdminRolesByType(w http.ResponseWriter, r *http.Reques
 			break
 		}
 	}
-
 	if !isValid {
-		h.respondWithError(w, http.StatusBadRequest,
-			fmt.Errorf("invalid role type: %d", roleType),
-			"Role type must be 1 (employee), 2 (manager), or 3 (super admin)")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Role type must be 1 (employee), 2 (manager), or 3 (super admin)")
 		return
 	}
 
 	roles, err := h.adminService.GetAdminRolesByType(ctx, roleType, requesterID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get admin roles by type")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
-	// Get role type string for response
 	roleTypeString := ""
 	switch roleType {
 	case models.RoleTypeEmployee:
@@ -5889,164 +5159,28 @@ func (h *AdminHandler) GetAdminRolesByType(w http.ResponseWriter, r *http.Reques
 			"role_type_string": roleTypeString,
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admin roles by type retrieved successfully"))
-	h.logger.Info("Admin roles by type retrieved",
-		util.String("requester_id", requesterID.String()),
-		util.Int("role_type", roleType),
-		util.Int("count", len(roles)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// func (h *AdminHandler) CreateEmployeeRole(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
-// 	startTime := time.Now()
+// ============================
+// ADMIN LISTING HANDLERS
+// ============================
 
-// 	requesterID, err := h.getRequesterAdminID(r)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-// 		return
-// 	}
-
-// 	var req models.EmployeeRoleCreateRequest
-// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-// 		return
-// 	}
-
-// 	// Check if role with the same name already exists BEFORE trying to create
-// 	existingRole, err := h.adminService.GetAdminRoleByName(ctx, req.RoleName)
-// 	if err != nil && !strings.Contains(err.Error(), "admin role not found") {
-// 		// If error is not "not found", log but continue (not critical)
-// 		h.logger.Warn("Failed to check existing role",
-// 			zap.String("role_name", req.RoleName),
-// 			zap.Error(err))
-// 	}
-
-// 	if existingRole != nil {
-// 		h.respondWithError(w, http.StatusConflict,
-// 			fmt.Errorf("role with name '%s' already exists", req.RoleName),
-// 			"Role name already exists")
-// 		return
-// 	}
-
-// 	internalReq := models.AdminRoleCreateRequest{
-// 		RoleName:    req.RoleName,
-// 		RoleType:    models.RoleTypeEmployee,
-// 		Description: req.Description,
-// 	}
-
-// 	systemDepartments, err := h.companyService.GetSystemDepartments(ctx)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get system departments")
-// 		return
-// 	}
-
-// 	deptMap := make(map[string]*models.SystemDepartment)
-// 	departmentIDs := make([]uuid.UUID, 0, len(req.DepartmentPermissions))
-
-// 	for _, deptPerm := range req.DepartmentPermissions {
-// 		dept, exists := deptMap[deptPerm.DepartmentName]
-// 		if !exists {
-// 			for _, sysDept := range systemDepartments {
-// 				if sysDept.Name == deptPerm.DepartmentName {
-// 					dept = sysDept
-// 					deptMap[deptPerm.DepartmentName] = sysDept
-// 					break
-// 				}
-// 			}
-// 			if dept == nil {
-// 				h.respondWithError(w, http.StatusBadRequest,
-// 					fmt.Errorf("department not found: %s", deptPerm.DepartmentName),
-// 					fmt.Sprintf("Department %s does not exist", deptPerm.DepartmentName))
-// 				return
-// 			}
-// 		}
-
-// 		permissions, err := h.companyService.GetPermissionsByModule(ctx, dept.ModuleCode)
-// 		if err != nil {
-// 			h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get department permissions")
-// 			return
-// 		}
-
-// 		validPerms := make(map[string]bool)
-// 		for _, perm := range permissions {
-// 			validPerms[perm.PermissionName] = true
-// 		}
-
-// 		for _, permName := range deptPerm.Permissions {
-// 			if !validPerms[permName] {
-// 				h.respondWithError(w, http.StatusBadRequest,
-// 					fmt.Errorf("permission not found in department"),
-// 					fmt.Sprintf("Permission %s does not exist in department %s (module: %s)",
-// 						permName, deptPerm.DepartmentName, dept.ModuleCode))
-// 				return
-// 			}
-// 		}
-
-// 		departmentIDs = append(departmentIDs, dept.SystemDepartmentID)
-// 	}
-
-// 	internalReq.DepartmentIDs = departmentIDs
-
-// 	role, err := h.adminService.CreateAdminRole(ctx, &internalReq, requesterID)
-// 	if err != nil {
-// 		statusCode := h.getStatusCode(err)
-// 		// Check for duplicate key error from database
-// 		if strings.Contains(err.Error(), "duplicate key value violates unique constraint") {
-// 			statusCode = http.StatusConflict
-// 			err = fmt.Errorf("role with name '%s' already exists", req.RoleName)
-// 		}
-// 		h.respondWithError(w, statusCode, err, "Failed to create employee role")
-// 		return
-// 	}
-
-// 	// Grant permissions to the role
-// 	for _, deptPerm := range req.DepartmentPermissions {
-// 		dept := deptMap[deptPerm.DepartmentName]
-// 		permissions, err := h.companyService.GetPermissionsByModule(ctx, dept.ModuleCode)
-// 		if err != nil {
-// 			h.logger.Warn("Failed to get permissions for granting",
-// 				zap.String("role_id", role.AdminRoleID.String()),
-// 				zap.String("department", dept.Name),
-// 				zap.Error(err))
-// 			continue
-// 		}
-
-// 		permMap := make(map[string]uuid.UUID)
-// 		for _, perm := range permissions {
-// 			permMap[perm.PermissionName] = perm.PermissionID
-// 		}
-
-// 		for _, permName := range deptPerm.Permissions {
-// 			permID, exists := permMap[permName]
-// 			if !exists {
-// 				h.logger.Warn("Permission not found for granting",
-// 					zap.String("role_id", role.AdminRoleID.String()),
-// 					zap.String("permission", permName))
-// 				continue
-// 			}
-
-// 			if err := h.adminService.GrantPermissionToAdminRole(ctx, role.AdminRoleID, permID, requesterID); err != nil {
-// 				h.logger.Warn("Failed to grant permission to role",
-// 					zap.String("role_id", role.AdminRoleID.String()),
-// 					zap.String("permission_id", permID.String()),
-// 					zap.Error(err))
-// 			}
-// 		}
-// 	}
-
-//		h.respondWithJSON(w, http.StatusCreated, successResponse(role, "Employee role created successfully"))
-//		h.logger.Info("Employee role created",
-//			zap.String("role_id", role.AdminRoleID.String()),
-//			zap.String("created_by", requesterID.String()),
-//			zap.Duration("duration", time.Since(startTime)),
-//		)
-//	}
+// ListAdmins lists admins with optional filters (alias for SearchAdminsWithFilters).
+// @Summary List admins
+// @Tags admin-users
+// @Produce json
+// @Param query query string false "Search query"
+// @Param role_type query int false "Filter by role type"
+// @Param include_inactive query bool false "Include inactive admins"
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "Admins with metadata"
+// @Failure 400 {object} map[string]interface{} "Invalid parameters"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins [get]
 func (h *AdminHandler) ListAdmins(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -6064,7 +5198,6 @@ func (h *AdminHandler) ListAdmins(w http.ResponseWriter, r *http.Request) {
 		Offset:          offset,
 		IncludeInactive: h.getBoolQueryParam(r, "include_inactive", false),
 	}
-
 	if roleTypeStr := r.URL.Query().Get("role_type"); roleTypeStr != "" {
 		roleType, err := strconv.Atoi(roleTypeStr)
 		if err == nil {
@@ -6074,8 +5207,8 @@ func (h *AdminHandler) ListAdmins(w http.ResponseWriter, r *http.Request) {
 
 	results, total, err := h.adminService.SearchAdminsWithFilters(ctx, requesterID, req)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to list admins")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -6088,17 +5221,20 @@ func (h *AdminHandler) ListAdmins(w http.ResponseWriter, r *http.Request) {
 			"count":  len(results),
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admins listed successfully"))
-	h.logger.Debug("Admins listed",
-		util.Int("count", len(results)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// GetAllAdmins retrieves all admins (including inactive).
+// @Summary Get all admins
+// @Tags admin-users
+// @Produce json
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "All admins with metadata"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/all [get]
 func (h *AdminHandler) GetAllAdmins(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -6109,18 +5245,16 @@ func (h *AdminHandler) GetAllAdmins(w http.ResponseWriter, r *http.Request) {
 	limit := h.getIntQueryParam(r, "limit", 50)
 	offset := h.getIntQueryParam(r, "offset", 0)
 
-	// Get ALL admins including inactive
 	results, total, err := h.adminService.SearchAdminsWithFilters(ctx, requesterID, &models.AdminSearchRequest{
 		Query:           "",
 		SearchType:      "all",
 		Limit:           limit,
 		Offset:          offset,
-		IncludeInactive: true, // Include inactive users
+		IncludeInactive: true,
 	})
-
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get all admins")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -6133,17 +5267,20 @@ func (h *AdminHandler) GetAllAdmins(w http.ResponseWriter, r *http.Request) {
 			"count":  len(results),
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "All admins retrieved successfully"))
-	h.logger.Debug("All admins retrieved",
-		util.Int("count", len(results)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// GetActiveAdmins retrieves only active admins.
+// @Summary Get active admins
+// @Tags admin-users
+// @Produce json
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "Active admins with metadata"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/active [get]
 func (h *AdminHandler) GetActiveAdmins(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -6154,18 +5291,16 @@ func (h *AdminHandler) GetActiveAdmins(w http.ResponseWriter, r *http.Request) {
 	limit := h.getIntQueryParam(r, "limit", 50)
 	offset := h.getIntQueryParam(r, "offset", 0)
 
-	// Get only ACTIVE admins
 	results, total, err := h.adminService.SearchAdminsWithFilters(ctx, requesterID, &models.AdminSearchRequest{
 		Query:           "",
 		SearchType:      "all",
 		Limit:           limit,
 		Offset:          offset,
-		IncludeInactive: false, // Only active users
+		IncludeInactive: false,
 	})
-
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get active admins")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -6178,17 +5313,24 @@ func (h *AdminHandler) GetActiveAdmins(w http.ResponseWriter, r *http.Request) {
 			"count":  len(results),
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Active admins retrieved successfully"))
-	h.logger.Debug("Active admins retrieved",
-		util.Int("count", len(results)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// ============================
+// INACTIVE ADMINS
+// ============================
+
+// GetInactiveAdmins retrieves all inactive admins.
+// @Summary Get inactive admins
+// @Tags admin-users
+// @Produce json
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "Inactive admins with metadata"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/inactive [get]
 func (h *AdminHandler) GetInactiveAdmins(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -6199,23 +5341,19 @@ func (h *AdminHandler) GetInactiveAdmins(w http.ResponseWriter, r *http.Request)
 	limit := h.getIntQueryParam(r, "limit", 50)
 	offset := h.getIntQueryParam(r, "offset", 0)
 
-	// We need to filter inactive admins differently since the service method doesn't have an "inactive only" flag
-	// Let's get all admins and filter them, or create a new service method
 	results, total, err := h.adminService.SearchAdminsWithFilters(ctx, requesterID, &models.AdminSearchRequest{
 		Query:           "",
 		SearchType:      "all",
 		Limit:           limit,
 		Offset:          offset,
-		IncludeInactive: true, // Include both active and inactive
+		IncludeInactive: true,
 	})
-
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get inactive admins")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
-	// Filter for inactive admins only
 	var inactiveAdmins []*models.AdminUserSearchResult
 	for _, admin := range results {
 		if !admin.IsActive {
@@ -6223,20 +5361,15 @@ func (h *AdminHandler) GetInactiveAdmins(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	// Calculate total inactive count (for pagination)
-	// This is a simplified approach - in production you'd want a separate DB query
 	totalInactive := 0
 	if total > 0 {
-		// For simplicity, estimate based on current page ratio
-		// Better to create a separate repository method
 		allResults, _, err := h.adminService.SearchAdminsWithFilters(ctx, requesterID, &models.AdminSearchRequest{
 			Query:           "",
 			SearchType:      "all",
-			Limit:           1000, // Large limit to get all
+			Limit:           1000,
 			Offset:          0,
 			IncludeInactive: true,
 		})
-
 		if err == nil {
 			for _, admin := range allResults {
 				if !admin.IsActive {
@@ -6244,7 +5377,6 @@ func (h *AdminHandler) GetInactiveAdmins(w http.ResponseWriter, r *http.Request)
 				}
 			}
 		} else {
-			// Fallback: use current page ratio
 			totalInactive = int(float64(len(inactiveAdmins)) / float64(len(results)) * float64(total))
 		}
 	}
@@ -6258,108 +5390,27 @@ func (h *AdminHandler) GetInactiveAdmins(w http.ResponseWriter, r *http.Request)
 			"count":  len(inactiveAdmins),
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Inactive admins retrieved successfully"))
-	h.logger.Debug("Inactive admins retrieved",
-		util.Int("count", len(inactiveAdmins)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// func (h *AdminHandler) CreateManagerRole(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
-// 	startTime := time.Now()
+// ============================
+// EMPLOYEE & MANAGER ROLE CREATION
+// ============================
 
-// 	requesterID, err := h.getRequesterAdminID(r)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-// 		return
-// 	}
-
-// 	var req models.ManagerRoleCreateRequest
-// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-// 		return
-// 	}
-
-// 	// Validate request
-// 	if req.RoleName == "" {
-// 		h.respondWithError(w, http.StatusBadRequest,
-// 			fmt.Errorf("role name cannot be empty"),
-// 			"Role name is required")
-// 		return
-// 	}
-
-// 	if len(req.DepartmentNames) == 0 {
-// 		h.respondWithError(w, http.StatusBadRequest,
-// 			fmt.Errorf("at least one department must be specified"),
-// 			"At least one department is required")
-// 		return
-// 	}
-
-// 	// Check if role with same name already exists
-// 	existingRole, err := h.adminService.GetAdminRoleByName(ctx, req.RoleName)
-// 	if err != nil && !strings.Contains(err.Error(), "admin role not found") {
-// 		h.respondWithError(w, http.StatusInternalServerError, err,
-// 			"Failed to check existing roles")
-// 		return
-// 	}
-
-// 	if existingRole != nil {
-// 		h.respondWithError(w, http.StatusConflict,
-// 			fmt.Errorf("role with name '%s' already exists", req.RoleName),
-// 			fmt.Sprintf("Role '%s' already exists", req.RoleName))
-// 		return
-// 	}
-
-// 	internalReq := models.AdminRoleCreateRequest{
-// 		RoleName:    req.RoleName,
-// 		RoleType:    models.RoleTypeManager,
-// 		Description: req.Description,
-// 	}
-
-// 	systemDepartments, err := h.companyService.GetSystemDepartments(ctx)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusInternalServerError, err,
-// 			"Failed to get system departments")
-// 		return
-// 	}
-
-// 	deptIDMap := make(map[string]uuid.UUID)
-// 	for _, dept := range systemDepartments {
-// 		deptIDMap[dept.Name] = dept.SystemDepartmentID
-// 	}
-
-// 	for _, deptName := range req.DepartmentNames {
-// 		deptID, exists := deptIDMap[deptName]
-// 		if !exists {
-// 			h.respondWithError(w, http.StatusBadRequest,
-// 				fmt.Errorf("department not found: %s", deptName),
-// 				fmt.Sprintf("Department '%s' does not exist", deptName))
-// 			return
-// 		}
-// 		internalReq.DepartmentIDs = append(internalReq.DepartmentIDs, deptID)
-// 	}
-
-// 	role, err := h.adminService.CreateAdminRole(ctx, &internalReq, requesterID)
-// 	if err != nil {
-// 		statusCode := h.getStatusCode(err)
-// 		h.respondWithError(w, statusCode, err, "Failed to create manager role")
-// 		return
-// 	}
-
-// 	h.respondWithJSON(w, http.StatusCreated, successResponse(role, "Manager role created successfully"))
-
-// 	h.logger.Info("Manager role created",
-// 		util.String("role_id", role.AdminRoleID.String()),
-// 		util.String("created_by", requesterID.String()),
-// 		util.Duration("duration", time.Since(startTime)),
-// 	)
-// }
-
+// CreateEmployeeRole creates a new employee-type admin role.
+// @Summary Create employee role
+// @Tags admin-roles
+// @Accept json
+// @Produce json
+// @Param body body models.EmployeeRoleCreateRequest true "Employee role details"
+// @Success 201 {object} map[string]interface{} "Role created"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Failure 409 {object} map[string]interface{} "Role name already exists"
+// @Router /api/v1/admin/roles/employee [post]
 func (h *AdminHandler) CreateEmployeeRole(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
+
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
@@ -6372,44 +5423,38 @@ func (h *AdminHandler) CreateEmployeeRole(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Check if role name already exists
 	existingRole, err := h.adminService.GetAdminRoleByName(ctx, req.RoleName)
 	if err != nil {
-		// Only log if it's not a "not found" error
+		// Ignore "not found" errors, treat others as internal
 		if !strings.Contains(err.Error(), "admin role not found") && !strings.Contains(err.Error(), "admin role is nil") {
-			h.logger.Warn("Failed to check existing role",
-				zap.String("role_name", req.RoleName),
-				zap.Error(err))
+			status, msg := h.mapServiceError(err)
+			h.respondWithError(w, status, err, msg)
+			return
 		}
 	} else if existingRole != nil {
-		h.respondWithError(w, http.StatusConflict,
-			fmt.Errorf("role with name '%s' already exists", req.RoleName),
-			"Role name already exists")
+		h.respondWithError(w, http.StatusConflict, customErrors.ErrDuplicate, "Role name already exists")
 		return
 	}
 
-	// Create internal request
 	internalReq := models.AdminRoleCreateRequest{
 		RoleName:    req.RoleName,
 		RoleType:    models.RoleTypeEmployee,
 		Description: req.Description,
 	}
 
-	// Get system departments
 	systemDepartments, err := h.companyService.GetSystemDepartments(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get system departments")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	deptMap := make(map[string]*models.SystemDepartment)
 	departmentIDs := make([]uuid.UUID, 0, len(req.DepartmentPermissions))
 
-	// Validate departments and permissions
 	for _, deptPerm := range req.DepartmentPermissions {
 		dept, exists := deptMap[deptPerm.DepartmentName]
 		if !exists {
-			// Find the department in system departments
 			found := false
 			for _, sysDept := range systemDepartments {
 				if sysDept.Name == deptPerm.DepartmentName {
@@ -6420,101 +5465,81 @@ func (h *AdminHandler) CreateEmployeeRole(w http.ResponseWriter, r *http.Request
 				}
 			}
 			if !found {
-				h.respondWithError(w, http.StatusBadRequest,
-					fmt.Errorf("department not found: %s", deptPerm.DepartmentName),
-					fmt.Sprintf("Department %s does not exist", deptPerm.DepartmentName))
+				h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, fmt.Sprintf("Department %s does not exist", deptPerm.DepartmentName))
 				return
 			}
 		}
 
-		// Get permissions for this department/module
 		permissions, err := h.companyService.GetPermissionsByModule(ctx, dept.ModuleCode)
 		if err != nil {
-			h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get department permissions")
+			status, msg := h.mapServiceError(err)
+			h.respondWithError(w, status, err, msg)
 			return
 		}
-
-		// Validate permissions exist in department
 		validPerms := make(map[string]bool)
 		for _, perm := range permissions {
 			validPerms[perm.PermissionName] = true
 		}
-
 		for _, permName := range deptPerm.Permissions {
 			if !validPerms[permName] {
-				h.respondWithError(w, http.StatusBadRequest,
-					fmt.Errorf("permission not found in department"),
-					fmt.Sprintf("Permission %s does not exist in department %s (module: %s)",
-						permName, deptPerm.DepartmentName, dept.ModuleCode))
+				h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, fmt.Sprintf("Permission %s does not exist in department %s (module: %s)", permName, deptPerm.DepartmentName, dept.ModuleCode))
 				return
 			}
 		}
-
 		departmentIDs = append(departmentIDs, dept.SystemDepartmentID)
 	}
-
 	internalReq.DepartmentIDs = departmentIDs
 
-	// Create the role
 	role, err := h.adminService.CreateAdminRole(ctx, &internalReq, requesterID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		if strings.Contains(err.Error(), "duplicate key value violates unique constraint") {
-			statusCode = http.StatusConflict
-			err = fmt.Errorf("role with name '%s' already exists", req.RoleName)
+		status, msg := h.mapServiceError(err)
+		// Override if duplicate role name
+		if strings.Contains(err.Error(), "duplicate key") || strings.Contains(err.Error(), "already exists") {
+			status = http.StatusConflict
+			msg = "Role name already exists"
 		}
-		h.respondWithError(w, statusCode, err, "Failed to create employee role")
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
-	// Grant permissions to the role
+	// Grant permissions per department
 	for _, deptPerm := range req.DepartmentPermissions {
 		dept := deptMap[deptPerm.DepartmentName]
 		permissions, err := h.companyService.GetPermissionsByModule(ctx, dept.ModuleCode)
 		if err != nil {
-			h.logger.Warn("Failed to get permissions for granting",
-				zap.String("role_id", role.AdminRoleID.String()),
-				zap.String("department", dept.Name),
-				zap.Error(err))
+			// non-critical, continue
 			continue
 		}
-
-		// Map permission names to IDs
 		permMap := make(map[string]uuid.UUID)
 		for _, perm := range permissions {
 			permMap[perm.PermissionName] = perm.PermissionID
 		}
-
-		// Grant each permission
 		for _, permName := range deptPerm.Permissions {
 			permID, exists := permMap[permName]
 			if !exists {
-				h.logger.Warn("Permission not found for granting",
-					zap.String("role_id", role.AdminRoleID.String()),
-					zap.String("permission", permName))
 				continue
 			}
-
-			if err := h.adminService.GrantPermissionToAdminRole(ctx, role.AdminRoleID, permID, requesterID); err != nil {
-				h.logger.Warn("Failed to grant permission to role",
-					zap.String("role_id", role.AdminRoleID.String()),
-					zap.String("permission_id", permID.String()),
-					zap.Error(err))
-			}
+			_ = h.adminService.GrantPermissionToAdminRole(ctx, role.AdminRoleID, permID, requesterID)
 		}
 	}
 
 	h.respondWithJSON(w, http.StatusCreated, successResponse(role, "Employee role created successfully"))
-	h.logger.Info("Employee role created",
-		zap.String("role_id", role.AdminRoleID.String()),
-		zap.String("created_by", requesterID.String()),
-		zap.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// CreateManagerRole creates a new manager-type admin role.
+// @Summary Create manager role
+// @Tags admin-roles
+// @Accept json
+// @Produce json
+// @Param body body models.ManagerRoleCreateRequest true "Manager role details"
+// @Success 201 {object} map[string]interface{} "Role created"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Failure 409 {object} map[string]interface{} "Role name already exists"
+// @Router /api/v1/admin/roles/manager [post]
 func (h *AdminHandler) CreateManagerRole(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
+
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
@@ -6528,97 +5553,84 @@ func (h *AdminHandler) CreateManagerRole(w http.ResponseWriter, r *http.Request)
 	}
 
 	if req.RoleName == "" {
-		h.respondWithError(w, http.StatusBadRequest,
-			fmt.Errorf("role name cannot be empty"),
-			"Role name is required")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Role name is required")
 		return
 	}
-
 	if len(req.DepartmentNames) == 0 {
-		h.respondWithError(w, http.StatusBadRequest,
-			fmt.Errorf("at least one department must be specified"),
-			"At least one department is required")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "At least one department is required")
 		return
 	}
 
-	// Check if role already exists
 	existingRole, err := h.adminService.GetAdminRoleByName(ctx, req.RoleName)
 	if err != nil {
-		// Only return error if it's not a "not found" error
 		if !strings.Contains(err.Error(), "admin role not found") && !strings.Contains(err.Error(), "admin role is nil") {
-			h.respondWithError(w, http.StatusInternalServerError, err,
-				"Failed to check existing roles")
+			status, msg := h.mapServiceError(err)
+			h.respondWithError(w, status, err, msg)
 			return
 		}
 	} else if existingRole != nil {
-		h.respondWithError(w, http.StatusConflict,
-			fmt.Errorf("role with name '%s' already exists", req.RoleName),
-			fmt.Sprintf("Role '%s' already exists", req.RoleName))
+		h.respondWithError(w, http.StatusConflict, customErrors.ErrDuplicate, fmt.Sprintf("Role '%s' already exists", req.RoleName))
 		return
 	}
 
-	// Create internal request
 	internalReq := models.AdminRoleCreateRequest{
 		RoleName:    req.RoleName,
 		RoleType:    models.RoleTypeManager,
 		Description: req.Description,
 	}
 
-	// Get system departments
 	systemDepartments, err := h.companyService.GetSystemDepartments(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err,
-			"Failed to get system departments")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
-	// Map department names to IDs
 	deptIDMap := make(map[string]uuid.UUID)
 	for _, dept := range systemDepartments {
 		deptIDMap[dept.Name] = dept.SystemDepartmentID
 	}
-
-	// Validate and collect department IDs
 	for _, deptName := range req.DepartmentNames {
 		deptID, exists := deptIDMap[deptName]
 		if !exists {
-			h.respondWithError(w, http.StatusBadRequest,
-				fmt.Errorf("department not found: %s", deptName),
-				fmt.Sprintf("Department '%s' does not exist", deptName))
+			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, fmt.Sprintf("Department '%s' does not exist", deptName))
 			return
 		}
 		internalReq.DepartmentIDs = append(internalReq.DepartmentIDs, deptID)
 	}
 
-	// Create the role
 	role, err := h.adminService.CreateAdminRole(ctx, &internalReq, requesterID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to create manager role")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusCreated, successResponse(role, "Manager role created successfully"))
-	h.logger.Info("Manager role created",
-		util.String("role_id", role.AdminRoleID.String()),
-		util.String("created_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// GetAdminPhoneNumber retrieves and decrypts an admin's phone number (super admin only)
-func (h *AdminHandler) GetAdminPhoneNumber(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+// ============================
+// ADMIN PHONE NUMBER
+// ============================
 
-	// Get requester ID
+// GetAdminPhoneNumber retrieves the phone number of an admin (with masking).
+// @Summary Get admin phone number
+// @Tags admin-users
+// @Produce json
+// @Param adminID path string true "Admin UUID"
+// @Success 200 {object} map[string]interface{} "Phone number (masked and raw)"
+// @Failure 400 {object} map[string]interface{} "Invalid admin ID"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID}/phone [get]
+func (h *AdminHandler) GetAdminPhoneNumber(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
+
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
 		return
 	}
 
-	// Get target admin ID from URL
 	adminIDStr := chi.URLParam(r, "adminID")
 	adminID, err := uuid.Parse(adminIDStr)
 	if err != nil {
@@ -6626,17 +5638,14 @@ func (h *AdminHandler) GetAdminPhoneNumber(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Call service method
 	phoneNumber, err := h.adminService.GetAdminPhoneNumber(ctx, adminID, requesterID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get admin phone number")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
-	// Create response (mask part of the phone number for security)
 	maskedPhone := maskPhoneNumber(phoneNumber)
-
 	response := map[string]interface{}{
 		"phone_number":     phoneNumber,
 		"masked_phone":     maskedPhone,
@@ -6644,73 +5653,67 @@ func (h *AdminHandler) GetAdminPhoneNumber(w http.ResponseWriter, r *http.Reques
 		"accessed_by":      requesterID.String(),
 		"access_timestamp": time.Now().UTC(),
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admin phone number retrieved successfully"))
-
-	h.logger.Info("Admin phone number accessed",
-		util.String("requester_id", requesterID.String()),
-		util.String("target_admin_id", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-func (h *AdminHandler) ListUsersByKYCStatus(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+// ============================
+// USER KYC & RECENT ACTIVITY
+// ============================
 
-	// Get requester admin ID for authorization
-	adminID, err := h.getRequesterAdminID(r)
+// ListUsersByKYCStatus lists users by KYC status.
+// @Summary List users by KYC status
+// @Tags admin-user-management
+// @Produce json
+// @Param status path string true "KYC status (pending, verified, rejected, under_review, expired)"
+// @Param limit query int false "Page size" default(100)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "Users with metadata"
+// @Failure 400 {object} map[string]interface{} "Invalid status or limit"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/user-management/kyc/{status} [get]
+func (h *AdminHandler) ListUsersByKYCStatus(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
+
+	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
 		return
 	}
 
-	// Get KYC status from URL parameter
 	status := chi.URLParam(r, "status")
 	if status == "" {
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("STATUS_REQUIRED"), "KYC status is required")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "KYC status is required")
 		return
 	}
 
-	// Validate KYC status
 	validStatuses := map[string]bool{
 		"pending": true, "verified": true, "rejected": true,
 		"under_review": true, "expired": true,
 	}
 	if !validStatuses[status] {
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("INVALID_KYC_STATUS"),
-			"Invalid KYC status. Must be: pending, verified, rejected, under_review, or expired")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Invalid KYC status. Must be: pending, verified, rejected, under_review, or expired")
 		return
 	}
 
-	// Get pagination parameters
 	limit := h.getIntQueryParam(r, "limit", 100)
 	offset := h.getIntQueryParam(r, "offset", 0)
-
-	// Validate limit
 	if limit <= 0 || limit > 1000 {
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("INVALID_LIMIT"),
-			"Limit must be between 1 and 1000")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Limit must be between 1 and 1000")
 		return
 	}
 
-	// Call service method
 	users, total, err := h.userService.GetUsersByKYCStatus(ctx, status, limit, offset)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get users by KYC status")
+		statusCode, msg := h.mapServiceError(err)
+		h.respondWithError(w, statusCode, err, msg)
 		return
 	}
 
-	// Sanitize user data for admin response
 	sanitizedUsers := make([]map[string]interface{}, len(users))
 	for i, user := range users {
 		sanitizedUsers[i] = h.sanitizeUserForAdminResponse(user)
 	}
 
-	// Prepare response
 	response := map[string]interface{}{
 		"users": sanitizedUsers,
 		"meta": map[string]interface{}{
@@ -6722,64 +5725,52 @@ func (h *AdminHandler) ListUsersByKYCStatus(w http.ResponseWriter, r *http.Reque
 			"has_more":   offset+limit < total,
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Users retrieved by KYC status"))
-
-	h.logger.Info("Users retrieved by KYC status",
-		util.String("admin_id", adminID.String()),
-		util.String("kyc_status", status),
-		util.Int("count", len(users)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// GetRecentlyActiveUsers retrieves users active within the last N days.
+// @Summary Get recently active users
+// @Tags admin-user-management
+// @Produce json
+// @Param days query int false "Days threshold" default(7)
+// @Param limit query int false "Page size" default(100)
+// @Success 200 {object} map[string]interface{} "Users with metadata"
+// @Failure 400 {object} map[string]interface{} "Invalid days or limit"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/user-management/recently-active [get]
 func (h *AdminHandler) GetRecentlyActiveUsers(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
-	// Get requester admin ID for authorization
-	adminID, err := h.getRequesterAdminID(r)
+	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
 		return
 	}
 
-	// Get query parameters
 	days := h.getIntQueryParam(r, "days", 7)
 	limit := h.getIntQueryParam(r, "limit", 100)
-
-	// Validate parameters
 	if days <= 0 || days > 365 {
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("INVALID_DAYS_RANGE"),
-			"Days must be between 1 and 365")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Days must be between 1 and 365")
 		return
 	}
-
 	if limit <= 0 || limit > 1000 {
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("INVALID_LIMIT"),
-			"Limit must be between 1 and 1000")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Limit must be between 1 and 1000")
 		return
 	}
 
-	// Calculate since time
 	since := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
-
-	// Call service method
 	users, err := h.userService.GetRecentlyActiveUsers(ctx, since, limit)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get recently active users")
+		statusCode, msg := h.mapServiceError(err)
+		h.respondWithError(w, statusCode, err, msg)
 		return
 	}
 
-	// Sanitize user data for admin response
 	sanitizedUsers := make([]map[string]interface{}, len(users))
 	for i, user := range users {
 		sanitizedUsers[i] = h.sanitizeUserForAdminResponse(user)
 	}
 
-	// Prepare response
 	response := map[string]interface{}{
 		"users": sanitizedUsers,
 		"meta": map[string]interface{}{
@@ -6790,42 +5781,24 @@ func (h *AdminHandler) GetRecentlyActiveUsers(w http.ResponseWriter, r *http.Req
 			"retrieved_at": time.Now().UTC().Format(time.RFC3339),
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Recently active users retrieved"))
-
-	h.logger.Info("Recently active users retrieved",
-		util.String("admin_id", adminID.String()),
-		util.Int("days", days),
-		util.Int("count", len(users)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// Helper method to sanitize user data for admin response
-func (h *AdminHandler) sanitizeUserForAdminResponse(user *models.User) map[string]interface{} {
-	return map[string]interface{}{
-		"user_id":            user.UserID,
-		"username":           user.Username,
-		"full_name":          user.FullName,
-		"phone_hash":         user.PhoneHash,
-		"kyc_status":         user.KYCStatus,
-		"kyc_level":          user.KYCLevel,
-		"kyc_verified_at":    user.KYCVerifiedAt,
-		"is_verified":        user.IsVerified,
-		"is_active":          user.IsActive,
-		"data_region":        user.DataRegion,
-		"created_at":         user.CreatedAt,
-		"updated_at":         user.UpdatedAt,
-		"last_login":         user.LastLogin,
-		"device_id":          user.DeviceID,
-		"device_fingerprint": user.DeviceFingerprint,
-	}
-}
+// ============================
+// ADMIN DEPARTMENTS
+// ============================
 
-// GetAdminDepartments gets all departments assigned to an admin user
+// GetAdminDepartments retrieves departments accessible to an admin.
+// @Summary Get admin departments
+// @Tags admin-users
+// @Produce json
+// @Param adminID path string true "Admin UUID"
+// @Success 200 {object} map[string]interface{} "List of departments"
+// @Failure 400 {object} map[string]interface{} "Invalid admin ID"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID}/departments [get]
 func (h *AdminHandler) GetAdminDepartments(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -6842,8 +5815,8 @@ func (h *AdminHandler) GetAdminDepartments(w http.ResponseWriter, r *http.Reques
 
 	departments, err := h.adminService.GetAdminDepartments(ctx, adminID, requesterID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get admin departments")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -6854,30 +5827,29 @@ func (h *AdminHandler) GetAdminDepartments(w http.ResponseWriter, r *http.Reques
 			"count":    len(departments),
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admin departments retrieved successfully"))
-
-	h.logger.Debug("Admin departments retrieved",
-		util.String("requester_id", requesterID.String()),
-		util.String("admin_id", adminID.String()),
-		util.Int("department_count", len(departments)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// UpdateAdminUserRole updates an admin user's role
+// UpdateAdminUserRole updates the role of an admin user.
+// @Summary Update admin user role
+// @Tags admin-users
+// @Accept json
+// @Produce json
+// @Param adminID path string true "Admin UUID"
+// @Param body body object true "New role ID" example({"new_role_id":"..."})
+// @Success 200 {object} map[string]interface{} "Role updated"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/admins/{adminID}/role [put]
 func (h *AdminHandler) UpdateAdminUserRole(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
-	// Get requester admin ID (who is making the change)
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
 		return
 	}
 
-	// Get admin ID from URL parameter
 	adminIDStr := chi.URLParam(r, "adminID")
 	adminID, err := uuid.Parse(adminIDStr)
 	if err != nil {
@@ -6885,50 +5857,47 @@ func (h *AdminHandler) UpdateAdminUserRole(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Parse request body
 	var req struct {
 		NewRoleID string `json:"new_role_id" validate:"required,uuid"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
 
-	// Validate new role ID
 	newRoleID, err := uuid.Parse(req.NewRoleID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid role ID")
 		return
 	}
 
-	// Call the service method
 	if err := h.adminService.UpdateAdminUserRole(ctx, adminID, newRoleID, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to update admin user role")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Admin user role updated successfully"))
-
-	h.logger.Info("Admin user role updated",
-		util.String("admin_id", adminID.String()),
-		util.String("new_role_id", newRoleID.String()),
-		util.String("updated_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// ==================== Position Management Handlers ====================
+// ============================
+// POSITION HANDLERS
+// ============================
 
-// CreatePosition creates a new position in a company
-
-// GetPosition retrieves a position by ID
+// GetPosition retrieves a position by ID.
+// @Summary Get position
+// @Tags admin-positions
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param positionID path string true "Position UUID"
+// @Success 200 {object} map[string]interface{} "Position details"
+// @Failure 400 {object} map[string]interface{} "Invalid IDs"
+// @Failure 403 {object} map[string]interface{} "Forbidden"
+// @Router /api/v1/companies/{companyID}/positions/{positionID} [get]
 func (h *AdminHandler) GetPosition(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
-	requesterID, err := h.getRequesterAdminID(r)
+	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
 		return
@@ -6947,61 +5916,33 @@ func (h *AdminHandler) GetPosition(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid position ID")
 		return
 	}
-
-	h.logger.Debug(
-		"GetPosition request received",
-		util.String("requested_by", requesterID.String()),
-		util.String("company_id", companyID.String()),
-		util.String("position_id", positionID.String()),
-	)
 
 	position, err := h.companyService.GetPosition(ctx, positionID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get position")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
-	// Verify position belongs to the company
 	if position.CompanyID != companyID {
-		h.logger.Warn(
-			"Position access denied: company mismatch",
-			util.String("requested_by", requesterID.String()),
-			util.String("position_company_id", position.CompanyID.String()),
-			util.String("request_company_id", companyID.String()),
-			util.String("position_id", positionID.String()),
-		)
-
-		h.respondWithError(
-			w,
-			http.StatusForbidden,
-			errors.New("position does not belong to company"),
-			"Position not found in this company",
-		)
+		h.respondWithError(w, http.StatusForbidden, customErrors.ErrPermissionDenied, "Position not found in this company")
 		return
 	}
 
-	h.respondWithJSON(
-		w,
-		http.StatusOK,
-		successResponse(position, "Position retrieved successfully"),
-	)
-
-	h.logger.Info(
-		"Position retrieved successfully",
-		util.String("requested_by", requesterID.String()),
-		util.String("company_id", companyID.String()),
-		util.String("position_id", positionID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
+	h.respondWithJSON(w, http.StatusOK, successResponse(position, "Position retrieved successfully"))
 }
 
-// ListPositions lists positions with filtering
-
-// DeletePosition deletes a position
+// DeletePosition deletes a position.
+// @Summary Delete position
+// @Tags admin-positions
+// @Param companyID path string true "Company UUID"
+// @Param positionID path string true "Position UUID"
+// @Success 200 {object} map[string]interface{} "Position deleted"
+// @Failure 400 {object} map[string]interface{} "Invalid IDs"
+// @Failure 403 {object} map[string]interface{} "Forbidden"
+// @Router /api/v1/companies/{companyID}/positions/{positionID} [delete]
 func (h *AdminHandler) DeletePosition(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -7023,44 +5964,44 @@ func (h *AdminHandler) DeletePosition(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get existing position to verify company
 	existingPosition, err := h.companyService.GetPosition(ctx, positionID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Position not found")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
-
 	if existingPosition.CompanyID != companyID {
-		h.respondWithError(w, http.StatusForbidden,
-			errors.New("position does not belong to company"),
-			"Cannot delete position in another company")
+		h.respondWithError(w, http.StatusForbidden, customErrors.ErrPermissionDenied, "Cannot delete position in another company")
 		return
 	}
 
 	if err := h.companyService.DeletePosition(ctx, positionID, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to delete position")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Position deleted successfully"))
-	h.logger.Info("Position deleted",
-		util.String("company_id", companyID.String()),
-		util.String("position_id", positionID.String()),
-		util.String("deleted_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// UpdatePositionStatus updates the open/closed status of a position
+// ============================
+// DEPARTMENT HIERARCHY HANDLERS
+// ============================
 
-// ==================== Department Hierarchy Handlers ====================
-
-// UpdateDepartmentParent updates a department's parent department
+// UpdateDepartmentParent updates the parent of a department.
+// @Summary Update department parent
+// @Tags admin-departments
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param departmentID path string true "Department UUID"
+// @Param body body service.UpdateDepartmentParentRequest true "New parent ID"
+// @Success 200 {object} map[string]interface{} "Parent updated"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Forbidden"
+// @Router /api/v1/companies/{companyID}/departments/{departmentID}/parent [put]
 func (h *AdminHandler) UpdateDepartmentParent(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -7087,47 +6028,42 @@ func (h *AdminHandler) UpdateDepartmentParent(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
-
-	// Set department ID from URL path
 	req.DepartmentID = departmentID
 
-	// Verify department belongs to company
 	department, err := h.companyService.GetDepartment(ctx, departmentID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Department not found")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
-
 	if department.CompanyID != companyID {
-		h.respondWithError(w, http.StatusForbidden,
-			errors.New("department does not belong to company"),
-			"Cannot update department in another company")
+		h.respondWithError(w, http.StatusForbidden, customErrors.ErrPermissionDenied, "Cannot update department in another company")
 		return
 	}
 
 	if err := h.companyService.UpdateDepartmentParent(ctx, &req, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to update department parent")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Department parent updated successfully"))
-	h.logger.Info("Department parent updated",
-		util.String("company_id", companyID.String()),
-		util.String("department_id", departmentID.String()),
-		util.String("updated_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// GetDepartmentChildren retrieves immediate children of a department
-// GetDepartmentChildren retrieves immediate children of a department
+// GetDepartmentChildren retrieves child departments.
+// @Summary Get department children
+// @Tags admin-departments
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param departmentID path string true "Department UUID"
+// @Success 200 {object} map[string]interface{} "List of child departments"
+// @Failure 400 {object} map[string]interface{} "Invalid IDs"
+// @Failure 403 {object} map[string]interface{} "Forbidden"
+// @Router /api/v1/companies/{companyID}/departments/{departmentID}/children [get]
 func (h *AdminHandler) GetDepartmentChildren(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
-	requesterID, err := h.getRequesterAdminID(r)
+	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
 		return
@@ -7147,69 +6083,41 @@ func (h *AdminHandler) GetDepartmentChildren(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	h.logger.Debug(
-		"GetDepartmentChildren request received",
-		util.String("requested_by", requesterID.String()),
-		util.String("company_id", companyID.String()),
-		util.String("department_id", departmentID.String()),
-	)
-
-	// Verify department belongs to company
 	department, err := h.companyService.GetDepartment(ctx, departmentID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Department not found")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
-
 	if department.CompanyID != companyID {
-		h.logger.Warn(
-			"Department access denied: company mismatch",
-			util.String("requested_by", requesterID.String()),
-			util.String("department_id", departmentID.String()),
-			util.String("department_company_id", department.CompanyID.String()),
-			util.String("request_company_id", companyID.String()),
-		)
-
-		h.respondWithError(
-			w,
-			http.StatusForbidden,
-			errors.New("department does not belong to company"),
-			"Cannot access department in another company",
-		)
+		h.respondWithError(w, http.StatusForbidden, customErrors.ErrPermissionDenied, "Cannot access department in another company")
 		return
 	}
 
 	children, err := h.companyService.GetDepartmentChildren(ctx, departmentID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get department children")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
-	h.respondWithJSON(
-		w,
-		http.StatusOK,
-		successResponse(children, "Department children retrieved successfully"),
-	)
-
-	h.logger.Info(
-		"Department children retrieved successfully",
-		util.String("requested_by", requesterID.String()),
-		util.String("company_id", companyID.String()),
-		util.String("department_id", departmentID.String()),
-		util.Int("children_count", len(children)),
-		util.Duration("duration", time.Since(startTime)),
-	)
+	h.respondWithJSON(w, http.StatusOK, successResponse(children, "Department children retrieved successfully"))
 }
 
-// GetDepartmentTree retrieves entire subtree of a department
-// GetDepartmentTree retrieves entire subtree of a department
+// GetDepartmentTree retrieves the full department tree.
+// @Summary Get department tree
+// @Tags admin-departments
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param departmentID path string true "Department UUID"
+// @Success 200 {object} map[string]interface{} "Department tree"
+// @Failure 400 {object} map[string]interface{} "Invalid IDs"
+// @Failure 403 {object} map[string]interface{} "Forbidden"
+// @Router /api/v1/companies/{companyID}/departments/{departmentID}/tree [get]
 func (h *AdminHandler) GetDepartmentTree(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
-	requesterID, err := h.getRequesterAdminID(r)
+	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
 		return
@@ -7229,69 +6137,41 @@ func (h *AdminHandler) GetDepartmentTree(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	h.logger.Debug(
-		"GetDepartmentTree request received",
-		util.String("requested_by", requesterID.String()),
-		util.String("company_id", companyID.String()),
-		util.String("department_id", departmentID.String()),
-	)
-
-	// Verify department belongs to company
 	department, err := h.companyService.GetDepartment(ctx, departmentID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Department not found")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
-
 	if department.CompanyID != companyID {
-		h.logger.Warn(
-			"Department tree access denied: company mismatch",
-			util.String("requested_by", requesterID.String()),
-			util.String("department_id", departmentID.String()),
-			util.String("department_company_id", department.CompanyID.String()),
-			util.String("request_company_id", companyID.String()),
-		)
-
-		h.respondWithError(
-			w,
-			http.StatusForbidden,
-			errors.New("department does not belong to company"),
-			"Cannot access department in another company",
-		)
+		h.respondWithError(w, http.StatusForbidden, customErrors.ErrPermissionDenied, "Cannot access department in another company")
 		return
 	}
 
 	tree, err := h.companyService.GetDepartmentTree(ctx, departmentID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get department tree")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
-	h.respondWithJSON(
-		w,
-		http.StatusOK,
-		successResponse(tree, "Department tree retrieved successfully"),
-	)
-
-	h.logger.Info(
-		"Department tree retrieved successfully",
-		util.String("requested_by", requesterID.String()),
-		util.String("company_id", companyID.String()),
-		util.String("department_id", departmentID.String()),
-		util.Int("tree_size", len(tree)),
-		util.Duration("duration", time.Since(startTime)),
-	)
+	h.respondWithJSON(w, http.StatusOK, successResponse(tree, "Department tree retrieved successfully"))
 }
 
-// GetDepartmentParents gets all parent departments up to root
-// GetDepartmentParents gets all parent departments up to root
+// GetDepartmentParents retrieves the parent chain of a department.
+// @Summary Get department parents
+// @Tags admin-departments
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param departmentID path string true "Department UUID"
+// @Success 200 {object} map[string]interface{} "List of parent departments"
+// @Failure 400 {object} map[string]interface{} "Invalid IDs"
+// @Failure 403 {object} map[string]interface{} "Forbidden"
+// @Router /api/v1/companies/{companyID}/departments/{departmentID}/parents [get]
 func (h *AdminHandler) GetDepartmentParents(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
-	requesterID, err := h.getRequesterAdminID(r)
+	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
 		return
@@ -7311,66 +6191,41 @@ func (h *AdminHandler) GetDepartmentParents(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	h.logger.Debug(
-		"GetDepartmentParents request received",
-		util.String("requested_by", requesterID.String()),
-		util.String("company_id", companyID.String()),
-		util.String("department_id", departmentID.String()),
-	)
-
-	// Verify department belongs to company
 	department, err := h.companyService.GetDepartment(ctx, departmentID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Department not found")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
-
 	if department.CompanyID != companyID {
-		h.logger.Warn(
-			"Department parents access denied: company mismatch",
-			util.String("requested_by", requesterID.String()),
-			util.String("department_id", departmentID.String()),
-			util.String("department_company_id", department.CompanyID.String()),
-			util.String("request_company_id", companyID.String()),
-		)
-
-		h.respondWithError(
-			w,
-			http.StatusForbidden,
-			errors.New("department does not belong to company"),
-			"Cannot access department in another company",
-		)
+		h.respondWithError(w, http.StatusForbidden, customErrors.ErrPermissionDenied, "Cannot access department in another company")
 		return
 	}
 
 	parents, err := h.companyService.GetDepartmentParents(ctx, departmentID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get department parents")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
-	h.respondWithJSON(
-		w,
-		http.StatusOK,
-		successResponse(parents, "Department parents retrieved successfully"),
-	)
-
-	h.logger.Info(
-		"Department parents retrieved successfully",
-		util.String("requested_by", requesterID.String()),
-		util.String("company_id", companyID.String()),
-		util.String("department_id", departmentID.String()),
-		util.Int("parents_count", len(parents)),
-		util.Duration("duration", time.Since(startTime)),
-	)
+	h.respondWithJSON(w, http.StatusOK, successResponse(parents, "Department parents retrieved successfully"))
 }
 
-// MoveDepartmentWithEmployees moves a department and its employees to a new parent
+// MoveDepartmentWithEmployees moves a department along with its employees.
+// @Summary Move department with employees
+// @Tags admin-departments
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param departmentID path string true "Department UUID"
+// @Param body body object true "New parent ID" example({"new_parent_department_id":"..."})
+// @Success 200 {object} map[string]interface{} "Department moved"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Forbidden"
+// @Router /api/v1/companies/{companyID}/departments/{departmentID}/move [post]
 func (h *AdminHandler) MoveDepartmentWithEmployees(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -7395,48 +6250,44 @@ func (h *AdminHandler) MoveDepartmentWithEmployees(w http.ResponseWriter, r *htt
 	var req struct {
 		NewParentDepartmentID *uuid.UUID `json:"new_parent_department_id"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
 
-	// Verify department belongs to company
 	department, err := h.companyService.GetDepartment(ctx, departmentID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Department not found")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
-
 	if department.CompanyID != companyID {
-		h.respondWithError(w, http.StatusForbidden,
-			errors.New("department does not belong to company"),
-			"Cannot move department in another company")
+		h.respondWithError(w, http.StatusForbidden, customErrors.ErrPermissionDenied, "Cannot move department in another company")
 		return
 	}
 
 	if err := h.companyService.MoveDepartmentWithEmployees(ctx, departmentID, req.NewParentDepartmentID, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to move department")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Department moved successfully"))
-	h.logger.Info("Department moved with employees",
-		util.String("company_id", companyID.String()),
-		util.String("department_id", departmentID.String()),
-		util.String("moved_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// GetRootDepartments gets all root departments (no parent) for a company
+// GetRootDepartments retrieves root departments of a company.
+// @Summary Get root departments
+// @Tags admin-departments
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Success 200 {object} map[string]interface{} "List of root departments"
+// @Failure 400 {object} map[string]interface{} "Invalid company ID"
+// @Failure 403 {object} map[string]interface{} "Forbidden"
+// @Router /api/v1/companies/{companyID}/departments/root [get]
 func (h *AdminHandler) GetRootDepartments(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
-	requesterID, err := h.getRequesterAdminID(r)
+	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
 		return
@@ -7449,40 +6300,32 @@ func (h *AdminHandler) GetRootDepartments(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	h.logger.Debug(
-		"GetRootDepartments request received",
-		util.String("requested_by", requesterID.String()),
-		util.String("company_id", companyID.String()),
-	)
-
 	departments, err := h.companyService.GetRootDepartments(ctx, companyID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get root departments")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
-	h.respondWithJSON(
-		w,
-		http.StatusOK,
-		successResponse(departments, "Root departments retrieved successfully"),
-	)
-
-	h.logger.Info(
-		"Root departments retrieved successfully",
-		util.String("requested_by", requesterID.String()),
-		util.String("company_id", companyID.String()),
-		util.Int("count", len(departments)),
-		util.Duration("duration", time.Since(startTime)),
-	)
+	h.respondWithJSON(w, http.StatusOK, successResponse(departments, "Root departments retrieved successfully"))
 }
 
-// ValidateDepartmentHierarchy validates if a department move is valid
+// ValidateDepartmentHierarchy validates if a department move would create a valid hierarchy.
+// @Summary Validate department hierarchy
+// @Tags admin-departments
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param departmentID path string true "Department UUID"
+// @Param body body object true "New parent ID" example({"new_parent_department_id":"..."})
+// @Success 200 {object} map[string]interface{} "Validation result"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Forbidden"
+// @Router /api/v1/companies/{companyID}/departments/{departmentID}/validate-hierarchy [post]
 func (h *AdminHandler) ValidateDepartmentHierarchy(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
-	requesterID, err := h.getRequesterAdminID(r)
+	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
 		return
@@ -7505,59 +6348,26 @@ func (h *AdminHandler) ValidateDepartmentHierarchy(w http.ResponseWriter, r *htt
 	var req struct {
 		NewParentDepartmentID *uuid.UUID `json:"new_parent_department_id"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
 
-	h.logger.Debug(
-		"ValidateDepartmentHierarchy request received",
-		util.String("requested_by", requesterID.String()),
-		util.String("company_id", companyID.String()),
-		util.String("department_id", departmentID.String()),
-		func() zap.Field {
-			if req.NewParentDepartmentID != nil {
-				return util.String("new_parent_department_id", req.NewParentDepartmentID.String())
-			}
-			return util.String("new_parent_department_id", "root")
-		}(),
-	)
-
-	// Verify department belongs to company
 	department, err := h.companyService.GetDepartment(ctx, departmentID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Department not found")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
-
 	if department.CompanyID != companyID {
-		h.logger.Warn(
-			"Department hierarchy validation denied: company mismatch",
-			util.String("requested_by", requesterID.String()),
-			util.String("department_id", departmentID.String()),
-			util.String("department_company_id", department.CompanyID.String()),
-			util.String("request_company_id", companyID.String()),
-		)
-
-		h.respondWithError(
-			w,
-			http.StatusForbidden,
-			errors.New("department does not belong to company"),
-			"Cannot validate department in another company",
-		)
+		h.respondWithError(w, http.StatusForbidden, customErrors.ErrPermissionDenied, "Cannot validate department in another company")
 		return
 	}
 
-	valid, err := h.companyService.ValidateDepartmentHierarchy(
-		ctx,
-		departmentID,
-		req.NewParentDepartmentID,
-	)
+	valid, err := h.companyService.ValidateDepartmentHierarchy(ctx, departmentID, req.NewParentDepartmentID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to validate department hierarchy")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -7568,24 +6378,24 @@ func (h *AdminHandler) ValidateDepartmentHierarchy(w http.ResponseWriter, r *htt
 	if !valid {
 		response["message"] = "Department move would create invalid hierarchy"
 	}
-
-	h.respondWithJSON(
-		w,
-		http.StatusOK,
-		successResponse(response, "Hierarchy validation completed"),
-	)
-
-	h.logger.Info(
-		"Department hierarchy validated",
-		util.String("requested_by", requesterID.String()),
-		util.String("company_id", companyID.String()),
-		util.String("department_id", departmentID.String()),
-		util.Bool("is_valid", valid),
-		util.Duration("duration", time.Since(startTime)),
-	)
+	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Hierarchy validation completed"))
 }
+
+// ============================
+// COMPANY INFO & DEPARTMENT QUOTA
+// ============================
+
+// GetCompanyByID retrieves a company by ID (alias for admin use).
+// @Summary Get company by ID
+// @Tags admin-companies
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Success 200 {object} map[string]interface{} "Company details"
+// @Failure 400 {object} map[string]interface{} "Invalid company ID"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Router /api/v1/admin/companies/{companyID}/info [get]
 func (h *AdminHandler) GetCompanyByID(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	_, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -7602,7 +6412,8 @@ func (h *AdminHandler) GetCompanyByID(w http.ResponseWriter, r *http.Request) {
 
 	company, err := h.companyService.GetCompanyByID(ctx, companyID)
 	if err != nil {
-		h.respondWithError(w, h.getStatusCode(err), err, "Failed to fetch company")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -7611,8 +6422,18 @@ func (h *AdminHandler) GetCompanyByID(w http.ResponseWriter, r *http.Request) {
 		"data":    company,
 	})
 }
+
+// GetActiveDepartmentCount returns the count of active departments in a company.
+// @Summary Get active department count
+// @Tags admin-companies
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Success 200 {object} map[string]interface{} "Active departments count"
+// @Failure 400 {object} map[string]interface{} "Invalid company ID"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Router /api/v1/admin/companies/{companyID}/active-departments-count [get]
 func (h *AdminHandler) GetActiveDepartmentCount(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	_, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -7628,7 +6449,8 @@ func (h *AdminHandler) GetActiveDepartmentCount(w http.ResponseWriter, r *http.R
 
 	count, err := h.companyService.GetActiveDepartmentCount(ctx, companyID)
 	if err != nil {
-		h.respondWithError(w, h.getStatusCode(err), err, "Failed to get department count")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -7639,8 +6461,18 @@ func (h *AdminHandler) GetActiveDepartmentCount(w http.ResponseWriter, r *http.R
 		},
 	})
 }
+
+// GetCompanyDepartmentInfo retrieves department quota and usage info for a company.
+// @Summary Get company department info
+// @Tags admin-companies
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Success 200 {object} map[string]interface{} "Department quota and usage"
+// @Failure 400 {object} map[string]interface{} "Invalid company ID"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Router /api/v1/admin/companies/{companyID}/department-info [get]
 func (h *AdminHandler) GetCompanyDepartmentInfo(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	_, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -7656,7 +6488,8 @@ func (h *AdminHandler) GetCompanyDepartmentInfo(w http.ResponseWriter, r *http.R
 
 	info, err := h.companyService.GetCompanyDepartmentInfo(ctx, companyID)
 	if err != nil {
-		h.respondWithError(w, h.getStatusCode(err), err, "Failed to fetch department quota")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -7665,8 +6498,19 @@ func (h *AdminHandler) GetCompanyDepartmentInfo(w http.ResponseWriter, r *http.R
 		"data":    info,
 	})
 }
+
+// CheckDepartmentLimit checks if a company can create more departments.
+// @Summary Check department limit
+// @Tags admin-companies
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Success 200 {object} map[string]interface{} "Creation allowed"
+// @Failure 400 {object} map[string]interface{} "Invalid company ID"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Failure 409 {object} map[string]interface{} "Limit reached"
+// @Router /api/v1/admin/companies/{companyID}/check-department-limit [get]
 func (h *AdminHandler) CheckDepartmentLimit(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	_, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -7681,7 +6525,8 @@ func (h *AdminHandler) CheckDepartmentLimit(w http.ResponseWriter, r *http.Reque
 	}
 
 	if err := h.companyService.CheckDepartmentLimit(ctx, companyID); err != nil {
-		h.respondWithError(w, http.StatusConflict, err, err.Error())
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -7691,15 +6536,31 @@ func (h *AdminHandler) CheckDepartmentLimit(w http.ResponseWriter, r *http.Reque
 	})
 }
 
+// ============================
+// UPDATE MAX DEPARTMENTS
+// ============================
+
+// UpdateMaxDepartmentsRequest represents the request to update max departments.
 type UpdateMaxDepartmentsRequest struct {
 	MaxDepartments int `json:"max_departments"`
 }
 
+// UpdateMaxDepartments updates the maximum number of departments allowed for a company.
+// @Summary Update max departments
+// @Tags admin-companies
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param body body UpdateMaxDepartmentsRequest true "New max departments"
+// @Success 200 {object} map[string]interface{} "Updated successfully"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/companies/{companyID}/max-departments [put]
 func (h *AdminHandler) UpdateMaxDepartments(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	start := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
-	adminID, err := h.getRequesterAdminID(r)
+	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
 		return
@@ -7718,12 +6579,13 @@ func (h *AdminHandler) UpdateMaxDepartments(w http.ResponseWriter, r *http.Reque
 	}
 
 	if req.MaxDepartments < 1 || req.MaxDepartments > 100 {
-		h.respondWithError(w, http.StatusBadRequest, nil, "max_departments must be between 1 and 100")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "max_departments must be between 1 and 100")
 		return
 	}
 
 	if err := h.companyService.UpdateMaxDepartments(ctx, companyID, req.MaxDepartments); err != nil {
-		h.respondWithError(w, h.getStatusCode(err), err, "Failed to update max_departments")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -7731,16 +6593,24 @@ func (h *AdminHandler) UpdateMaxDepartments(w http.ResponseWriter, r *http.Reque
 		"success": true,
 		"message": "Max departments updated successfully",
 	})
-
-	h.logger.Info("Company max_departments updated by admin",
-		util.String("company_id", companyID.String()),
-		util.Int("new_max_departments", req.MaxDepartments),
-		util.String("updated_by", adminID.String()),
-		util.Duration("duration", time.Since(start)),
-	)
 }
+
+// ============================
+// DEPARTMENT SOFT DELETE & ACTIVATE
+// ============================
+
+// SoftDeleteDepartment soft-deletes a department.
+// @Summary Soft delete department
+// @Tags admin-departments
+// @Param companyID path string true "Company UUID"
+// @Param departmentID path string true "Department UUID"
+// @Success 200 {object} map[string]interface{} "Deleted successfully"
+// @Failure 400 {object} map[string]interface{} "Invalid IDs"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/companies/{companyID}/departments/{departmentID}/soft [delete]
 func (h *AdminHandler) SoftDeleteDepartment(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -7755,7 +6625,8 @@ func (h *AdminHandler) SoftDeleteDepartment(w http.ResponseWriter, r *http.Reque
 	}
 
 	if err := h.companyService.SoftDeleteDepartment(ctx, companyID, departmentID); err != nil {
-		h.respondWithError(w, h.getStatusCode(err), err, "Failed to delete department")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -7765,57 +6636,18 @@ func (h *AdminHandler) SoftDeleteDepartment(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-func (h *AdminHandler) CreateSubDepartment(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid companyID")
-		return
-	}
-
-	// IMPORTANT: only ONE param name is correct
-	parentDeptIDStr := chi.URLParam(r, "parentDepartmentID")
-	if parentDeptIDStr == "" {
-		parentDeptIDStr = chi.URLParam(r, "departmentID")
-	}
-
-	parentDeptID, err := uuid.Parse(parentDeptIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid parentDepartmentID")
-		return
-	}
-
-	var req CreateSubDepartmentRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
-
-	if strings.TrimSpace(req.DepartmentName) == "" {
-		h.respondWithError(w, http.StatusBadRequest, nil, "department_name is required")
-		return
-	}
-
-	dept, err := h.companyService.CreateSubDepartment(
-		ctx,
-		companyID,
-		parentDeptID,
-		req.DepartmentName,
-	)
-	if err != nil {
-		h.respondWithError(w, h.getStatusCode(err), err, "Failed to create sub-department")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
-		"success": true,
-		"data":    dept,
-	})
-}
-
+// ActivateDepartment activates a department.
+// @Summary Activate department
+// @Tags admin-departments
+// @Param companyID path string true "Company UUID"
+// @Param departmentID path string true "Department UUID"
+// @Success 200 {object} map[string]interface{} "Activated successfully"
+// @Failure 400 {object} map[string]interface{} "Invalid IDs"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/companies/{companyID}/departments/{departmentID}/activate [patch]
 func (h *AdminHandler) ActivateDepartment(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -7830,7 +6662,8 @@ func (h *AdminHandler) ActivateDepartment(w http.ResponseWriter, r *http.Request
 	}
 
 	if err := h.companyService.ActivateDepartment(ctx, companyID, departmentID); err != nil {
-		h.respondWithError(w, h.getStatusCode(err), err, "Failed to activate department")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -7840,15 +6673,96 @@ func (h *AdminHandler) ActivateDepartment(w http.ResponseWriter, r *http.Request
 	})
 }
 
+// ============================
+// CREATE SUB-DEPARTMENT
+// ============================
+
+// CreateSubDepartmentRequest represents the request to create a sub-department.
 type CreateSubDepartmentRequest struct {
 	DepartmentName string `json:"department_name" validate:"required"`
 }
 
-func (h *AdminHandler) AdminAddDepartment(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	start := time.Now()
+// CreateSubDepartment creates a sub-department under a parent department.
+// @Summary Create sub-department
+// @Tags admin-departments
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param parentDepartmentID path string true "Parent Department UUID"
+// @Param body body CreateSubDepartmentRequest true "Department name"
+// @Success 201 {object} map[string]interface{} "Sub-department created"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/companies/{companyID}/departments/{parentDepartmentID}/sub-departments [post]
+func (h *AdminHandler) CreateSubDepartment(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
-	adminID, err := h.getRequesterAdminID(r)
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid companyID")
+		return
+	}
+
+	parentDeptIDStr := chi.URLParam(r, "parentDepartmentID")
+	if parentDeptIDStr == "" {
+		parentDeptIDStr = chi.URLParam(r, "departmentID")
+	}
+	parentDeptID, err := uuid.Parse(parentDeptIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid parentDepartmentID")
+		return
+	}
+
+	var req CreateSubDepartmentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+	if strings.TrimSpace(req.DepartmentName) == "" {
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "department_name is required")
+		return
+	}
+
+	dept, err := h.companyService.CreateSubDepartment(ctx, companyID, parentDeptID, req.DepartmentName)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"data":    dept,
+	})
+}
+
+// ============================
+// ADMIN ADD DEPARTMENT
+// ============================
+
+// AdminAddDepartmentRequest represents the request to add a department.
+type AdminAddDepartmentRequest struct {
+	DepartmentName     string    `json:"department_name"`
+	SystemDepartmentID uuid.UUID `json:"system_department_id"`
+}
+
+// AdminAddDepartment adds a new department to a company (admin only).
+// @Summary Add department (admin)
+// @Tags admin-departments
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param body body AdminAddDepartmentRequest true "Department details"
+// @Success 201 {object} map[string]interface{} "Department created"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/admin/companies/{companyID}/departments [post]
+func (h *AdminHandler) AdminAddDepartment(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
+
+	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
 		return
@@ -7865,20 +6779,15 @@ func (h *AdminHandler) AdminAddDepartment(w http.ResponseWriter, r *http.Request
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
-
 	if strings.TrimSpace(req.DepartmentName) == "" {
-		h.respondWithError(w, http.StatusBadRequest, nil, "department_name is required")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "department_name is required")
 		return
 	}
 
-	department, err := h.companyService.AdminAddDepartment(
-		ctx,
-		companyID,
-		req.DepartmentName,
-		req.SystemDepartmentID,
-	)
+	department, err := h.companyService.AdminAddDepartment(ctx, companyID, req.DepartmentName, req.SystemDepartmentID)
 	if err != nil {
-		h.respondWithError(w, h.getStatusCode(err), err, "Failed to add department")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -7893,26 +6802,28 @@ func (h *AdminHandler) AdminAddDepartment(w http.ResponseWriter, r *http.Request
 			"created_at":      department.CreatedAt,
 		},
 	})
-
-	h.logger.Info("Department added by admin",
-		util.String("company_id", companyID.String()),
-		util.String("department_id", department.DepartmentID.String()),
-		util.String("created_by", adminID.String()),
-		util.Duration("duration", time.Since(start)),
-	)
 }
 
-type AdminAddDepartmentRequest struct {
-	DepartmentName     string    `json:"department_name"`
-	SystemDepartmentID uuid.UUID `json:"system_department_id"`
-}
+// ============================
+// DEPARTMENT SEARCH & SUGGESTIONS
+// ============================
 
-// Add to handler/admin_handler.go
+// SearchDepartments searches departments within a company.
+// @Summary Search departments
+// @Tags admin-departments
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param q query string false "Search query"
+// @Param limit query int false "Page size" default(20)
+// @Param offset query int false "Offset" default(0)
+// @Param include_inactive query bool false "Include inactive departments"
+// @Success 200 {object} map[string]interface{} "Search results with metadata"
+// @Failure 400 {object} map[string]interface{} "Invalid company ID"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Router /api/v1/companies/{companyID}/departments/search [get]
 func (h *AdminHandler) SearchDepartments(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
-	// Get company ID from URL
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -7920,7 +6831,6 @@ func (h *AdminHandler) SearchDepartments(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Parse query parameters
 	query := r.URL.Query().Get("q")
 	limitStr := r.URL.Query().Get("limit")
 	offsetStr := r.URL.Query().Get("offset")
@@ -7932,20 +6842,17 @@ func (h *AdminHandler) SearchDepartments(w http.ResponseWriter, r *http.Request)
 			limit = l
 		}
 	}
-
 	offset := 0
 	if offsetStr != "" {
 		if o, err := strconv.Atoi(offsetStr); err == nil && o >= 0 {
 			offset = o
 		}
 	}
-
 	includeInactive := false
 	if includeInactiveStr == "true" {
 		includeInactive = true
 	}
 
-	// Create search request
 	searchReq := &service.SearchDepartmentsRequest{
 		Query:           query,
 		Limit:           limit,
@@ -7953,29 +6860,30 @@ func (h *AdminHandler) SearchDepartments(w http.ResponseWriter, r *http.Request)
 		IncludeInactive: includeInactive,
 	}
 
-	// Call service
 	response, err := h.companyService.SearchDepartments(ctx, companyID, searchReq)
 	if err != nil {
-		h.respondWithError(w, h.getStatusCode(err), err, "Failed to search departments")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Departments search completed successfully"))
-
-	h.logger.Info("Department search executed",
-		util.String("company_id", companyID.String()),
-		util.String("query", query),
-		util.Int("limit", limit),
-		util.Int("offset", offset),
-		util.Int("results", len(response.Departments)),
-		util.Duration("duration", time.Since(startTime)))
 }
 
+// GetDepartmentSuggestions returns department name suggestions based on a prefix.
+// @Summary Get department suggestions
+// @Tags admin-departments
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param prefix query string true "Prefix"
+// @Param limit query int false "Max results" default(10)
+// @Success 200 {object} map[string]interface{} "Suggestions"
+// @Failure 400 {object} map[string]interface{} "Invalid parameters"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Router /api/v1/companies/{companyID}/departments/suggestions [get]
 func (h *AdminHandler) GetDepartmentSuggestions(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
-	// Get company ID from URL
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -7983,12 +6891,9 @@ func (h *AdminHandler) GetDepartmentSuggestions(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Parse query parameters
 	prefix := r.URL.Query().Get("prefix")
 	if prefix == "" {
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("prefix is required"),
-			"Prefix parameter is required")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Prefix parameter is required")
 		return
 	}
 
@@ -8000,24 +6905,21 @@ func (h *AdminHandler) GetDepartmentSuggestions(w http.ResponseWriter, r *http.R
 		}
 	}
 
-	// Call service
 	suggestions, err := h.companyService.GetDepartmentSuggestions(ctx, companyID, prefix, limit)
 	if err != nil {
-		h.respondWithError(w, h.getStatusCode(err), err, "Failed to get department suggestions")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(suggestions, "Department suggestions retrieved"))
-
-	h.logger.Debug("Department suggestions retrieved",
-		util.String("company_id", companyID.String()),
-		util.String("prefix", prefix),
-		util.Int("suggestions", len(suggestions)),
-		util.Duration("duration", time.Since(startTime)))
 }
 
-// handler/admin_handler.go
-// Add these methods to the AdminHandler struct
+// ============================
+// POSITION CRUD
+// ============================
+
+// CreatePositionRequest is the request payload for creating a position.
 type CreatePositionRequest struct {
 	CompanyID          uuid.UUID `json:"company_id"`
 	DepartmentID       uuid.UUID `json:"department_id"`
@@ -8029,10 +6931,20 @@ type CreatePositionRequest struct {
 	WorkCenterCode     string    `json:"work_center_code"`
 }
 
-// Updated CreatePosition handler
+// CreatePosition creates a new position.
+// @Summary Create position
+// @Tags admin-positions
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param body body service.CreatePositionRequest true "Position details"
+// @Success 201 {object} map[string]interface{} "Position created"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/companies/{companyID}/positions [post]
 func (h *AdminHandler) CreatePosition(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -8052,30 +6964,20 @@ func (h *AdminHandler) CreatePosition(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
-
 	req.CompanyID = companyID
 
-	// ===== DEFAULT VALUES (Pointer-safe) =====
-
-	// Default IsOpen = true
 	if req.IsOpen == nil {
 		defaultVal := true
 		req.IsOpen = &defaultVal
 	}
-
-	// Default IsSchedulable = true
 	if req.IsSchedulable == nil {
 		defaultVal := true
 		req.IsSchedulable = &defaultVal
 	}
-
-	// Default AttendanceRequired = true
 	if req.AttendanceRequired == nil {
 		defaultVal := true
 		req.AttendanceRequired = &defaultVal
 	}
-
-	// Default OvertimeAllowed = false
 	if req.OvertimeAllowed == nil {
 		defaultVal := false
 		req.OvertimeAllowed = &defaultVal
@@ -8083,8 +6985,8 @@ func (h *AdminHandler) CreatePosition(w http.ResponseWriter, r *http.Request) {
 
 	position, err := h.companyService.CreatePosition(ctx, &req, requesterID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to create position")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -8101,25 +7003,26 @@ func (h *AdminHandler) CreatePosition(w http.ResponseWriter, r *http.Request) {
 		"created_at":          position.CreatedAt,
 		"updated_at":          position.UpdatedAt,
 	}
-
 	h.respondWithJSON(w, http.StatusCreated, successResponse(response, "Position created successfully"))
-
-	h.logger.Info("Position created",
-		util.String("company_id", companyID.String()),
-		util.String("position_id", position.PositionID.String()),
-		util.String("created_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// Updated GetPosition handler remains the same (just returns additional fields)
-
-// Updated ListPositions handler response
+// ListPositions lists positions for a company with filters.
+// @Summary List positions
+// @Tags admin-positions
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param department_id query string false "Filter by department ID"
+// @Param only_open query bool false "Only open positions"
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "Positions with metadata"
+// @Failure 400 {object} map[string]interface{} "Invalid parameters"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Router /api/v1/companies/{companyID}/positions [get]
 func (h *AdminHandler) ListPositions(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
-	requesterID, err := h.getRequesterAdminID(r)
+	_, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
 		return
@@ -8146,27 +7049,10 @@ func (h *AdminHandler) ListPositions(w http.ResponseWriter, r *http.Request) {
 		departmentID = &deptID
 	}
 
-	h.logger.Debug(
-		"ListPositions request received",
-		util.String("requested_by", requesterID.String()),
-		util.String("company_id", companyID.String()),
-		util.Bool("only_open", onlyOpen),
-		util.Int("limit", limit),
-		util.Int("offset", offset),
-		func() zap.Field {
-			if departmentID != nil {
-				return util.String("department_id", departmentID.String())
-			}
-			return util.String("department_id", "all")
-		}(),
-	)
-
-	positions, total, err := h.companyService.ListPositions(
-		ctx, companyID, departmentID, onlyOpen, limit, offset,
-	)
+	positions, total, err := h.companyService.ListPositions(ctx, companyID, departmentID, onlyOpen, limit, offset)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to list positions")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -8198,27 +7084,24 @@ func (h *AdminHandler) ListPositions(w http.ResponseWriter, r *http.Request) {
 			"count":  len(positions),
 		},
 	}
-
-	h.respondWithJSON(
-		w,
-		http.StatusOK,
-		successResponse(response, "Positions listed successfully"),
-	)
-
-	h.logger.Info(
-		"Positions listed successfully",
-		util.String("requested_by", requesterID.String()),
-		util.String("company_id", companyID.String()),
-		util.Int("total", total),
-		util.Int("returned_count", len(positions)),
-		util.Duration("duration", time.Since(startTime)),
-	)
+	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Positions listed successfully"))
 }
 
-// New UpdatePosition handler (for full updates)
+// UpdatePosition updates a position.
+// @Summary Update position
+// @Tags admin-positions
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param positionID path string true "Position UUID"
+// @Param body body service.UpdatePositionRequest true "Update fields"
+// @Success 200 {object} map[string]interface{} "Position updated"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Failure 403 {object} map[string]interface{} "Forbidden"
+// @Router /api/v1/companies/{companyID}/positions/{positionID} [put]
 func (h *AdminHandler) UpdatePosition(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -8245,44 +7128,43 @@ func (h *AdminHandler) UpdatePosition(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
-
 	req.PositionID = positionID
 
-	// Validate position belongs to company
 	existingPosition, err := h.companyService.GetPosition(ctx, positionID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Position not found")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
-
 	if existingPosition.CompanyID != companyID {
-		h.respondWithError(w, http.StatusForbidden,
-			errors.New("position does not belong to company"),
-			"Cannot update position in another company")
+		h.respondWithError(w, http.StatusForbidden, customErrors.ErrPermissionDenied, "Cannot update position in another company")
 		return
 	}
 
 	if err := h.companyService.UpdatePosition(ctx, &req, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to update position")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Position updated successfully"))
-
-	h.logger.Info("Position updated",
-		util.String("company_id", companyID.String()),
-		util.String("position_id", positionID.String()),
-		util.String("updated_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// Updated UpdatePositionStatus handler (now handles partial updates)
+// UpdatePositionStatus updates the status flags of a position.
+// @Summary Update position status
+// @Tags admin-positions
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param positionID path string true "Position UUID"
+// @Param body body object true "Status flags" example({"is_open":false,"is_schedulable":true})
+// @Success 200 {object} map[string]interface{} "Status updated"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Failure 403 {object} map[string]interface{} "Forbidden"
+// @Router /api/v1/companies/{companyID}/positions/{positionID}/status [patch]
 func (h *AdminHandler) UpdatePositionStatus(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	requesterID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -8311,28 +7193,22 @@ func (h *AdminHandler) UpdatePositionStatus(w http.ResponseWriter, r *http.Reque
 		OvertimeAllowed    *bool   `json:"overtime_allowed,omitempty"`
 		WorkCenterCode     *string `json:"work_center_code,omitempty"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
 
-	// Validate position belongs to company
 	existingPosition, err := h.companyService.GetPosition(ctx, positionID)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Position not found")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
-
 	if existingPosition.CompanyID != companyID {
-		h.respondWithError(w, http.StatusForbidden,
-			errors.New("position does not belong to company"),
-			"Cannot update position in another company")
+		h.respondWithError(w, http.StatusForbidden, customErrors.ErrPermissionDenied, "Cannot update position in another company")
 		return
 	}
 
-	// Create update request
 	updateReq := &service.UpdatePositionRequest{
 		PositionID:         positionID,
 		Title:              existingPosition.Title,
@@ -8343,8 +7219,6 @@ func (h *AdminHandler) UpdatePositionStatus(w http.ResponseWriter, r *http.Reque
 		OvertimeAllowed:    &existingPosition.OvertimeAllowed,
 		WorkCenterCode:     existingPosition.WorkCenterCode,
 	}
-
-	// Update only provided fields
 	if req.IsOpen != nil {
 		updateReq.IsOpen = *req.IsOpen
 	}
@@ -8362,34 +7236,34 @@ func (h *AdminHandler) UpdatePositionStatus(w http.ResponseWriter, r *http.Reque
 	}
 
 	if err := h.companyService.UpdatePosition(ctx, updateReq, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to update position status")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Position status updated successfully"))
-
-	h.logger.Info("Position status updated",
-		util.String("company_id", companyID.String()),
-		util.String("position_id", positionID.String()),
-		util.String("updated_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
-// Updated GetOpenPositions handler
+// GetOpenPositions retrieves open positions for a company.
+// @Summary Get open positions
+// @Tags admin-positions
+// @Produce json
+// @Param company_id query string true "Company UUID"
+// @Param is_open query bool false "Filter by open status"
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "Open positions with metadata"
+// @Failure 400 {object} map[string]interface{} "Missing company_id"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Router /api/v1/companies/{companyID}/positions/open [get]
 func (h *AdminHandler) GetOpenPositions(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectClientIP(r.Context(), r)
 
 	companyIDStr := r.URL.Query().Get("company_id")
 	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest,
-			errors.New("COMPANY_ID_REQUIRED"),
-			"company_id is required")
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "company_id is required")
 		return
 	}
-
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
@@ -8409,8 +7283,8 @@ func (h *AdminHandler) GetOpenPositions(w http.ResponseWriter, r *http.Request) 
 
 	positions, total, err := h.companyService.GetOpenPositions(ctx, companyID, isOpen, limit, offset)
 	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get open positions")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -8441,48 +7315,50 @@ func (h *AdminHandler) GetOpenPositions(w http.ResponseWriter, r *http.Request) 
 			"count":  len(positions),
 		},
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Open positions retrieved successfully"))
-
-	h.logger.Info("Open positions retrieved",
-		util.String("company_id", companyID.String()),
-		util.Int("count", len(positions)),
-		util.Duration("duration", time.Since(startTime)),
-	)
 }
 
+// ============================
+// CREATE COMPANY
+// ============================
+
+// CreateCompanyRequest is the request payload for creating a company.
 type CreateCompanyRequest struct {
-	CompanyName        string `json:"company_name" validate:"required,max=255"`
-	OwnerPhone         string `json:"owner_phone" validate:"required"`
-	OwnerUsername      string `json:"owner_username" validate:"required,min=3,max=100,alphanum"`
-	OwnerFullName      string `json:"owner_full_name" validate:"required,max=255"`
-	OwnerPositionTitle string `json:"owner_position_title" validate:"required,max=255"`
-
-	SubscriptionTier string `json:"subscription_tier" validate:"required,oneof=basic premium enterprise"`
-	MaxEmployees     int    `json:"max_employees" validate:"required,min=1,max=2000"`
-	MaxDepartments   int    `json:"max_departments" validate:"required,min=1,max=100"`
-
-	DataRegion         string   `json:"data_region" validate:"required"`
-	SubscriptionMonths int      `json:"subscription_months" validate:"required,min=1,max=36"`
-	SubscriptionDays   int      `json:"subscription_days" validate:"min=0,max=30"`
-	Departments        []string `json:"departments"`
-
-	// ✅ NEW FIELD
-	FinancialYearStartMonth int `json:"financial_year_start_month" validate:"required,min=1,max=12"`
-
-	// Work Center
-	WorkCenterCode   string  `json:"work_center_code" validate:"required,max=100"`
-	WorkCenterName   string  `json:"work_center_name" validate:"required,max=255"`
-	WorkCenterDesc   *string `json:"work_center_description,omitempty"`
-	WorkCenterTZ     string  `json:"work_center_timezone" validate:"required"`
-	WorkCenterActive bool    `json:"work_center_is_active"`
-
-	PositionWorkCenterCode *string `json:"position_work_center_code,omitempty"`
+	CompanyName             string   `json:"company_name" validate:"required,max=255"`
+	OwnerPhone              string   `json:"owner_phone" validate:"required"`
+	OwnerUsername           string   `json:"owner_username" validate:"required,min=3,max=100,alphanum"`
+	OwnerFullName           string   `json:"owner_full_name" validate:"required,max=255"`
+	OwnerPositionTitle      string   `json:"owner_position_title" validate:"required,max=255"`
+	SubscriptionTier        string   `json:"subscription_tier" validate:"required,oneof=basic premium enterprise"`
+	MaxEmployees            int      `json:"max_employees" validate:"required,min=1,max=2000"`
+	MaxDepartments          int      `json:"max_departments" validate:"required,min=1,max=100"`
+	DataRegion              string   `json:"data_region" validate:"required"`
+	SubscriptionMonths      int      `json:"subscription_months" validate:"required,min=1,max=36"`
+	SubscriptionDays        int      `json:"subscription_days" validate:"min=0,max=30"`
+	Departments             []string `json:"departments"`
+	FinancialYearStartMonth int      `json:"financial_year_start_month" validate:"required,min=1,max=12"`
+	WorkCenterCode          string   `json:"work_center_code" validate:"required,max=100"`
+	WorkCenterName          string   `json:"work_center_name" validate:"required,max=255"`
+	WorkCenterDesc          *string  `json:"work_center_description,omitempty"`
+	WorkCenterTZ            string   `json:"work_center_timezone" validate:"required"`
+	WorkCenterActive        bool     `json:"work_center_is_active"`
+	PositionWorkCenterCode  *string  `json:"position_work_center_code,omitempty"`
 }
 
+// CreateCompany creates a new company (admin only).
+// @Summary Create company
+// @Tags admin-companies
+// @Accept json
+// @Produce json
+// @Param body body CreateCompanyRequest true "Company creation details"
+// @Success 201 {object} map[string]interface{} "Company created"
+// @Failure 400 {object} map[string]interface{} "Validation failed"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Failure 409 {object} map[string]interface{} "Company already exists"
+// @Router /api/v1/admin/companies [post]
 func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
 
 	adminID, err := h.getRequesterAdminID(r)
 	if err != nil {
@@ -8496,45 +7372,41 @@ func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validation
 	if err := validateCreateCompanyRequest(req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Validation failed")
 		return
 	}
 
 	companyReq := service.CreateCompanyRequest{
-		CompanyName:        req.CompanyName,
-		OwnerPhone:         req.OwnerPhone,
-		OwnerUsername:      req.OwnerUsername,
-		OwnerFullName:      req.OwnerFullName,
-		OwnerPositionTitle: req.OwnerPositionTitle,
-		SubscriptionTier:   req.SubscriptionTier,
-		MaxEmployees:       req.MaxEmployees,
-		MaxDepartments:     req.MaxDepartments,
-		DataRegion:         req.DataRegion,
-		SubscriptionMonths: req.SubscriptionMonths,
-		SubscriptionDays:   req.SubscriptionDays,
-		Departments:        req.Departments,
-
-		// ✅ NEW
+		CompanyName:             req.CompanyName,
+		OwnerPhone:              req.OwnerPhone,
+		OwnerUsername:           req.OwnerUsername,
+		OwnerFullName:           req.OwnerFullName,
+		OwnerPositionTitle:      req.OwnerPositionTitle,
+		SubscriptionTier:        req.SubscriptionTier,
+		MaxEmployees:            req.MaxEmployees,
+		MaxDepartments:          req.MaxDepartments,
+		DataRegion:              req.DataRegion,
+		SubscriptionMonths:      req.SubscriptionMonths,
+		SubscriptionDays:        req.SubscriptionDays,
+		Departments:             req.Departments,
 		FinancialYearStartMonth: req.FinancialYearStartMonth,
-
-		WorkCenterCode:   req.WorkCenterCode,
-		WorkCenterName:   req.WorkCenterName,
-		WorkCenterDesc:   req.WorkCenterDesc,
-		WorkCenterTZ:     req.WorkCenterTZ,
-		WorkCenterActive: req.WorkCenterActive,
-
-		PositionWorkCenterCode: req.PositionWorkCenterCode,
+		WorkCenterCode:          req.WorkCenterCode,
+		WorkCenterName:          req.WorkCenterName,
+		WorkCenterDesc:          req.WorkCenterDesc,
+		WorkCenterTZ:            req.WorkCenterTZ,
+		WorkCenterActive:        req.WorkCenterActive,
+		PositionWorkCenterCode:  req.PositionWorkCenterCode,
 	}
 
 	company, err := h.companyService.CreateCompany(ctx, &companyReq, adminID)
 	if err != nil {
+		status, msg := h.mapServiceError(err)
 		if strings.Contains(err.Error(), "already exists") {
-			h.respondWithError(w, http.StatusConflict, err, "Company already exists for this owner")
-			return
+			status = http.StatusConflict
+			msg = "Company already exists for this owner"
 		}
-		h.respondWithError(w, h.getStatusCode(err), err, "Failed to create company")
+		h.respondWithError(w, status, err, msg)
 		return
 	}
 
@@ -8547,15 +7419,77 @@ func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
 			"owner_user_id":     company.OwnerUserID.String(),
 			"subscription_tier": company.SubscriptionTier,
 			"max_departments":   company.MaxDepartments,
-			"departments":       len(req.Departments) + 1, // incl Administration
+			"departments":       len(req.Departments) + 1,
 			"created_at":        company.CreatedAt,
 		},
 	})
+}
 
-	h.logger.Info("Company created by admin",
-		util.String("company_id", company.CompanyID.String()),
-		util.String("company_name", company.CompanyName),
-		util.String("created_by", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
+// sanitizeUserForAdminResponse returns a sanitized map for admin responses.
+func (h *AdminHandler) sanitizeUserForAdminResponse(user *models.User) map[string]interface{} {
+	if user == nil {
+		return nil
+	}
+	return map[string]interface{}{
+		"user_id":            user.UserID,
+		"username":           user.Username,
+		"full_name":          user.FullName,
+		"phone_hash":         user.PhoneHash,
+		"kyc_status":         user.KYCStatus,
+		"kyc_level":          user.KYCLevel,
+		"kyc_verified_at":    user.KYCVerifiedAt,
+		"is_verified":        user.IsVerified,
+		"is_active":          user.IsActive,
+		"data_region":        user.DataRegion,
+		"created_at":         user.CreatedAt,
+		"updated_at":         user.UpdatedAt,
+		"last_login":         user.LastLogin,
+		"device_id":          user.DeviceID,
+		"device_fingerprint": user.DeviceFingerprint,
+	}
+}
+
+// GetDeactivatedDepartments godoc
+// @Summary Get deactivated departments
+// @Description Retrieves a list of all departments that are inactive (is_active = false) for a given company.
+// @Tags admin-companies
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Success 200 {object} map[string]interface{} "List of deactivated departments"
+// @Failure 400 {object} map[string]interface{} "Invalid company ID"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Router /api/v1/admin/companies/{companyID}/deactivated-departments [get]
+func (h *AdminHandler) GetDeactivatedDepartments(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
+
+	// Authenticate admin
+	_, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	// Parse company ID from URL parameter (e.g., /companies/{companyID}/deactivated-departments)
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company_id")
+		return
+	}
+
+	departments, err := h.companyService.GetDeactivatedDepartments(ctx, companyID)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	// Ensure the response is always an array (not null)
+	if departments == nil {
+		departments = []*models.Department{}
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    departments,
+	})
 }

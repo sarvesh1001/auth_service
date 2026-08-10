@@ -214,7 +214,7 @@
         created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
-quantity
+
     CREATE TABLE subscription.addons (
         addon_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id          UUID NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
@@ -905,7 +905,7 @@ quantity
 
 
 
-    ALTER TABLE subscription.billing_frequency ADD COLUMN created_at TIMESTAMPTZ DEFAULT NOW();
+ALTER TABLE subscription.billing_frequency ADD COLUMN created_at TIMESTAMPTZ DEFAULT NOW();
 ALTER TABLE subscription.pricing_model       ADD COLUMN created_at TIMESTAMPTZ DEFAULT NOW();
 ALTER TABLE subscription.plan_type           ADD COLUMN created_at TIMESTAMPTZ DEFAULT NOW();
 ALTER TABLE subscription.statuses            ADD COLUMN created_at TIMESTAMPTZ DEFAULT NOW();
@@ -918,21 +918,18 @@ CREATE UNIQUE INDEX idx_unique_company_plan_name
 ON subscription.plans (company_id, name) 
 WHERE deleted_at IS NULL;
 
- ALTER TABLE subscription.benefits
- ADD CONSTRAINT benefits_plan_item_type_value_unique
-UNIQUE (plan_item_id, benefit_type, value);
- an index to speed up the duplicate check
-CREATE INDEX idx_benefits_plan_item_type_value
-ON subscription.benefits (plan_item_id, benefit_type, value);
-ALTER TABLE
+-- Add a unique constraint to prevent duplicate benefit entries
+ALTER TABLE subscription.benefits
+    ADD CONSTRAINT benefits_plan_item_type_value_unique
+    UNIQUE (plan_item_id, benefit_type, value);
 
 -- Optional: create an index to speed up the duplicate check
 CREATE INDEX idx_benefits_plan_item_type_value
-auth_service-# ON subscription.benefits (plan_item_id, benefit_type, value);
-CREATE INDEX
-ALTER TABLE subscription.plan_items ADD COLUMN company_id UUID;
-ALTER TABLE subscription.plan_items ADD COLUMN tax_rate NUMERIC(10,2);
-ALTER TABLE subscription.plan_items ADD COLUMN product_id UUID;
-ALTER TABLE subscription.plan_items ADD COLUMN metadata JSONB;
+    ON subscription.benefits (plan_item_id, benefit_type, value);
 
-
+-- Add missing columns to plan_items
+ALTER TABLE subscription.plan_items
+    ADD COLUMN company_id UUID,
+    ADD COLUMN tax_rate NUMERIC(10,2),
+    ADD COLUMN product_id UUID,
+    ADD COLUMN metadata JSONB;

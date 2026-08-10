@@ -1092,7 +1092,6 @@ func (af *AcademicsInfraFactory) RegisterRoutes(r chi.Router, jwtService *mainse
 		af.TimetableHandler(),
 		af.TransportHandler(),
 		sessGenHandler,
-		logger,
 	)
 	af.log.Info("✅ Academic routes registered")
 }

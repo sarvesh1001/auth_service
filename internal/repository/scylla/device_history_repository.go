@@ -5,58 +5,51 @@ import (
 	"fmt"
 	"time"
 
+	apperrors "auth-service/internal/errors"
 	"auth-service/internal/models"
-	"auth-service/internal/util"
 
 	"github.com/gocql/gocql"
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 )
 
-// DeviceHistoryRepositoryImpl tracks device binding history
 type DeviceHistoryRepositoryImpl struct {
 	client  *ScyllaClient
-	logger  *zap.Logger
 	metrics *RepositoryMetrics
 }
 
-// NewDeviceHistoryRepository creates a new device history repository
-func NewDeviceHistoryRepository(client *ScyllaClient, logger *zap.Logger) *DeviceHistoryRepositoryImpl {
+func NewDeviceHistoryRepository(client *ScyllaClient) *DeviceHistoryRepositoryImpl {
 	return &DeviceHistoryRepositoryImpl{
 		client:  client,
-		logger:  logger,
 		metrics: &RepositoryMetrics{},
 	}
 }
 
-// RecordBinding records a device binding event (bind or unbind)
 func (r *DeviceHistoryRepositoryImpl) RecordBinding(
 	ctx context.Context,
 	userID uuid.UUID,
 	deviceID string,
 	sessionID *uuid.UUID,
 	bindToken string,
-	action string, // "bind" or "unbind"
+	action string,
 ) error {
 	startTime := time.Now()
 	defer func() {
 		r.metrics.RecordQuery(time.Since(startTime), true)
 	}()
 
-	// Validate inputs
 	if userID == uuid.Nil {
-		return fmt.Errorf("invalid user ID")
+		return apperrors.ErrInvalidInput
 	}
 	if deviceID == "" {
-		return fmt.Errorf("device ID cannot be empty")
+		return apperrors.ErrInvalidInput
 	}
 	if action != "bind" && action != "unbind" {
-		return fmt.Errorf("invalid action: %s", action)
+		return apperrors.ErrInvalidInput
 	}
 
 	now := time.Now().UTC()
 	query := r.client.Session.Query(`
-        INSERT INTO user_device_binding_history 
+        INSERT INTO user_device_binding_history
         (user_id, bound_at, device_id, session_id, bind_token, action, action_timestamp)
         VALUES (?, ?, ?, ?, ?, ?, ?)
     `,
@@ -70,35 +63,20 @@ func (r *DeviceHistoryRepositoryImpl) RecordBinding(
 	)
 
 	if err := r.client.ExecuteWithRetry(query.WithContext(ctx), 3); err != nil {
-		r.logger.Error("Failed to record device binding",
-			util.ErrorField(err),
-			util.String("user_id", userID.String()),
-			util.String("device_id", deviceID),
-			util.String("action", action))
 		return fmt.Errorf("failed to record device binding: %w", err)
 	}
-
-	r.logger.Info("Device binding recorded",
-		util.String("user_id", userID.String()),
-		util.String("device_id", deviceID),
-		util.String("action", action),
-		util.Duration("duration", time.Since(startTime)))
-
 	return nil
 }
 
-// GetBindingHistory retrieves complete binding history for a user
 func (r *DeviceHistoryRepositoryImpl) GetBindingHistory(
 	ctx context.Context,
 	userID uuid.UUID,
 	limit int,
 ) ([]*models.UserActiveDevice, error) {
 	startTime := time.Now()
-
 	if userID == uuid.Nil {
-		return nil, fmt.Errorf("invalid user ID")
+		return nil, apperrors.ErrInvalidInput
 	}
-
 	if limit <= 0 || limit > 100 {
 		limit = 100
 	}
@@ -119,21 +97,18 @@ func (r *DeviceHistoryRepositoryImpl) GetBindingHistory(
 	var scannedSessionID *gocql.UUID
 	var device models.UserActiveDevice
 
-	// ✅ FIX: Scan in same order as SELECT statement
 	for iter.Scan(
-		&scannedUserID,      // user_id
-		&device.DeviceID,    // device_id
-		&scannedSessionID,   // session_id
-		&device.BoundAt,     // bound_at
-		&device.BindToken,   // bind_token
+		&scannedUserID,
+		&device.DeviceID,
+		&scannedSessionID,
+		&device.BoundAt,
+		&device.BindToken,
 	) {
 		device.UserID = uuid.UUID(scannedUserID).String()
 		if scannedSessionID != nil {
 			sessionID := uuid.UUID(*scannedSessionID)
 			device.SessionID = sessionID.String()
 		}
-		
-		// Make a copy to append
 		devCopy := device
 		devices = append(devices, &devCopy)
 		device = models.UserActiveDevice{}
@@ -141,31 +116,19 @@ func (r *DeviceHistoryRepositoryImpl) GetBindingHistory(
 
 	if err := iter.Close(); err != nil {
 		r.metrics.RecordQuery(time.Since(startTime), false)
-		r.logger.Error("Failed to get binding history",
-			util.ErrorField(err),
-			util.String("user_id", userID.String()))
 		return nil, fmt.Errorf("failed to get binding history: %w", err)
 	}
-
 	r.metrics.RecordQuery(time.Since(startTime), true)
-	r.logger.Info("Retrieved binding history",
-		util.String("user_id", userID.String()),
-		util.Int("count", len(devices)),
-		util.Duration("duration", time.Since(startTime)))
-
 	return devices, nil
 }
 
-// GetUsersByDeviceFromHistory finds users by device ID from history
-// Uses materialized view for efficient lookup
 func (r *DeviceHistoryRepositoryImpl) GetUsersByDeviceFromHistory(
 	ctx context.Context,
 	deviceID string,
 ) ([]*models.UserActiveDevice, error) {
 	startTime := time.Now()
-
 	if deviceID == "" {
-		return nil, fmt.Errorf("device ID cannot be empty")
+		return nil, apperrors.ErrInvalidInput
 	}
 
 	query := r.client.Session.Query(`
@@ -181,16 +144,13 @@ func (r *DeviceHistoryRepositoryImpl) GetUsersByDeviceFromHistory(
 	var scannedUserID gocql.UUID
 	var device models.UserActiveDevice
 
-	// ✅ FIX: Scan in same order as SELECT statement
 	for iter.Scan(
-		&scannedUserID,      // user_id
-		&device.DeviceID,    // device_id
-		&device.BoundAt,     // bound_at
-		&device.BindToken,   // bind_token
+		&scannedUserID,
+		&device.DeviceID,
+		&device.BoundAt,
+		&device.BindToken,
 	) {
 		device.UserID = uuid.UUID(scannedUserID).String()
-		
-		// Make a copy to append
 		devCopy := device
 		devices = append(devices, &devCopy)
 		device = models.UserActiveDevice{}
@@ -198,22 +158,12 @@ func (r *DeviceHistoryRepositoryImpl) GetUsersByDeviceFromHistory(
 
 	if err := iter.Close(); err != nil {
 		r.metrics.RecordQuery(time.Since(startTime), false)
-		r.logger.Error("Failed to get users by device from history",
-			util.ErrorField(err),
-			util.String("device_id", deviceID))
 		return nil, fmt.Errorf("failed to get users by device from history: %w", err)
 	}
-
 	r.metrics.RecordQuery(time.Since(startTime), true)
-	r.logger.Info("Retrieved users by device from history",
-		util.String("device_id", deviceID),
-		util.Int("user_count", len(devices)),
-		util.Duration("duration", time.Since(startTime)))
-
 	return devices, nil
 }
 
-// HealthCheck verifies history repository connectivity
 func (r *DeviceHistoryRepositoryImpl) HealthCheck(ctx context.Context) error {
 	var count int
 	if err := r.client.Session.Query("SELECT COUNT(*) FROM system.local").

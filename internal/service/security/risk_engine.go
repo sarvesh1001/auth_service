@@ -1,7 +1,6 @@
 package security
 
 import (
-	"auth-service/internal/util"
 	"time"
 )
 
@@ -40,29 +39,13 @@ func NewRiskEngine(botDetector *BotDetector, ipReputation *IPReputation) *RiskEn
 }
 
 func (e *RiskEngine) AssessRisk(req RiskAssessmentRequest) RiskAssessment {
-
-	// 🔥 BASIC LOGGING
-	util.Info("AssessRisk called",
-		util.String("purpose", req.Purpose),
-		util.String("ip", req.IPAddress),
-		util.String("user_agent", req.UserAgent),
-		util.String("device_id", req.DeviceID),
-	)
-
 	assessment := RiskAssessment{
 		RiskScore: 0,
 		Reasons:   []string{},
 	}
 
-	// ===============================================================
-	// SECURITY BYPASS FOR LOGIN & ADMIN_LOGIN
-	// ===============================================================
+	// ----- Login / Admin Login -----
 	if req.Purpose == "login" || req.Purpose == "admin_login" {
-
-		util.Info("Login/Admin Login Risk Check Started",
-			util.String("purpose", req.Purpose),
-		)
-
 		botReq := BotDetectionRequest{
 			UserAgent:      req.UserAgent,
 			IPAddress:      req.IPAddress,
@@ -70,23 +53,15 @@ func (e *RiskEngine) AssessRisk(req RiskAssessmentRequest) RiskAssessment {
 			DeviceID:       req.DeviceID,
 			PhoneNumber:    req.PhoneNumber,
 		}
-
 		botResult := e.botDetector.Detect(botReq)
-
 		if botResult.IsBot {
-			util.Warn("Bot detected", util.Strings("reasons", botResult.DetectionReasons))
 			assessment.RiskScore += botResult.RiskScore
 			assessment.Reasons = append(assessment.Reasons, botResult.DetectionReasons...)
 		}
 
 		ipInfo := e.ipReputation.CheckIP(req.IPAddress)
 		if ipInfo != nil {
-			util.Info("IP Reputation Triggered",
-				util.Int("ip_score", ipInfo.RiskScore),
-			)
-
 			assessment.RiskScore += ipInfo.RiskScore
-
 			if ipInfo.IsTOR {
 				assessment.Reasons = append(assessment.Reasons, "tor_network")
 			}
@@ -99,19 +74,14 @@ func (e *RiskEngine) AssessRisk(req RiskAssessmentRequest) RiskAssessment {
 		}
 
 		if req.FailedAttempts > 5 {
-			util.Warn("High failed attempts", util.Int("failed_attempts", req.FailedAttempts))
 			assessment.RiskScore += 15
 			assessment.Reasons = append(assessment.Reasons, "high_failed_attempts")
 		}
-
 		if req.DailyOTPCount > 10 {
-			util.Warn("High daily OTP usage", util.Int("otp_count", req.DailyOTPCount))
 			assessment.RiskScore += 10
 			assessment.Reasons = append(assessment.Reasons, "high_daily_otp_volume")
 		}
-
 		if req.RequestLatency < 50*time.Millisecond {
-			util.Warn("Request too fast", util.Duration("latency", req.RequestLatency))
 			assessment.RiskScore += 20
 			assessment.Reasons = append(assessment.Reasons, "too_fast_request")
 		}
@@ -119,22 +89,11 @@ func (e *RiskEngine) AssessRisk(req RiskAssessmentRequest) RiskAssessment {
 		assessment.RiskLevel = e.calculateRiskLevel(assessment.RiskScore)
 		assessment.BlockAction = assessment.RiskScore >= 150
 		assessment.Confidence = e.calculateConfidence(assessment.RiskScore)
-
-		util.Info("Login Risk Assessment Complete",
-			util.Int("risk_score", assessment.RiskScore),
-			util.String("risk_level", assessment.RiskLevel),
-		)
-
 		return assessment
 	}
 
-	// ===============================================================
-	// STRICT RISK ASSESSMENT FOR FORGOT_MPIN
-	// ===============================================================
+	// ----- Forgot MPIN -----
 	if req.Purpose == "forgot_mpin" {
-
-		util.Info("Forgot MPIN Risk Check Started")
-
 		botReq := BotDetectionRequest{
 			UserAgent:      req.UserAgent,
 			IPAddress:      req.IPAddress,
@@ -142,49 +101,36 @@ func (e *RiskEngine) AssessRisk(req RiskAssessmentRequest) RiskAssessment {
 			DeviceID:       req.DeviceID,
 			PhoneNumber:    req.PhoneNumber,
 		}
-
 		botResult := e.botDetector.Detect(botReq)
 		if botResult.IsBot {
-			util.Warn("Bot detected in forgot_mpin", util.Strings("reasons", botResult.DetectionReasons))
 			assessment.RiskScore += botResult.RiskScore
 			assessment.Reasons = append(assessment.Reasons, botResult.DetectionReasons...)
 		}
 
 		ipInfo := e.ipReputation.CheckIP(req.IPAddress)
 		if ipInfo != nil {
-			util.Info("IP check triggered", util.Int("ip_score", ipInfo.RiskScore))
 			assessment.RiskScore += ipInfo.RiskScore
 		}
 
 		if req.FailedAttempts > 3 {
-			util.Warn("Failed attempts high", util.Int("failed_attempts", req.FailedAttempts))
 			assessment.RiskScore += 25
 			assessment.Reasons = append(assessment.Reasons, "high_failed_attempts")
 		}
-
 		if req.DailyOTPCount > 5 {
-			util.Warn("High OTP usage", util.Int("otp_count", req.DailyOTPCount))
 			assessment.RiskScore += 20
 			assessment.Reasons = append(assessment.Reasons, "high_daily_otp_volume")
 		}
-
 		if req.IsNewDevice {
-			util.Warn("New Device Detected")
 			assessment.Reasons = append(assessment.Reasons, "new_device")
 			assessment.RiskScore += 20
 		}
-
 		if req.IsNewIP {
-			util.Warn("New IP Detected")
 			assessment.Reasons = append(assessment.Reasons, "new_ip")
 			assessment.RiskScore += 15
 		}
-
 		if req.RequestLatency < 100*time.Millisecond {
-			util.Warn("Fast request", util.Duration("latency", req.RequestLatency))
 			assessment.RiskScore += 20
 		}
-
 		if assessment.RiskScore > 0 {
 			assessment.RiskScore += 25
 			assessment.Reasons = append(assessment.Reasons, "forgot_mpin_sensitive")
@@ -193,21 +139,10 @@ func (e *RiskEngine) AssessRisk(req RiskAssessmentRequest) RiskAssessment {
 		assessment.RiskLevel = e.calculateRiskLevel(assessment.RiskScore)
 		assessment.BlockAction = assessment.RiskScore >= 150
 		assessment.Confidence = e.calculateConfidence(assessment.RiskScore)
-
-		util.Info("Forgot MPIN Risk Complete",
-			util.Int("risk_score", assessment.RiskScore),
-			util.String("risk_level", assessment.RiskLevel),
-		)
-
 		return assessment
 	}
 
-	// ===============================================================
-	// DEFAULT RISK ASSESSMENT (UNCHANGED LOGIC)
-	// ===============================================================
-
-	util.Info("Default Risk Assessment Started")
-
+	// ----- Default -----
 	botReq := BotDetectionRequest{
 		UserAgent:      req.UserAgent,
 		IPAddress:      req.IPAddress,
@@ -215,53 +150,35 @@ func (e *RiskEngine) AssessRisk(req RiskAssessmentRequest) RiskAssessment {
 		DeviceID:       req.DeviceID,
 		PhoneNumber:    req.PhoneNumber,
 	}
-
 	botResult := e.botDetector.Detect(botReq)
 	if botResult.IsBot {
-		util.Warn("Bot detected", util.Strings("reasons", botResult.DetectionReasons))
 		assessment.RiskScore += botResult.RiskScore
 	}
 
 	ipInfo := e.ipReputation.CheckIP(req.IPAddress)
 	if ipInfo != nil {
-		util.Info("IP Reputation Triggered", util.Int("ip_score", ipInfo.RiskScore))
 		assessment.RiskScore += ipInfo.RiskScore
 	}
 
 	if req.FailedAttempts > 3 {
-		util.Warn("Failed attempts high", util.Int("failed_attempts", req.FailedAttempts))
 		assessment.RiskScore += 20
 	}
-
 	if req.DailyOTPCount > 5 {
-		util.Warn("High OTP count!", util.Int("otp_count", req.DailyOTPCount))
 		assessment.RiskScore += 15
 	}
-
 	if req.IsNewDevice {
-		util.Warn("New device detected")
 		assessment.RiskScore += 10
 	}
-
 	if req.IsNewIP {
-		util.Warn("New IP detected")
 		assessment.RiskScore += 5
 	}
-
 	if req.RequestLatency < 100*time.Millisecond {
-		util.Warn("Fast request detected", util.Duration("latency", req.RequestLatency))
 		assessment.RiskScore += 15
 	}
 
 	assessment.RiskLevel = e.calculateRiskLevel(assessment.RiskScore)
 	assessment.BlockAction = assessment.RiskScore >= 70
 	assessment.Confidence = e.calculateConfidence(assessment.RiskScore)
-
-	util.Info("Default Risk Complete",
-		util.Int("risk_score", assessment.RiskScore),
-		util.String("risk_level", assessment.RiskLevel),
-	)
-
 	return assessment
 }
 
@@ -293,33 +210,20 @@ func (e *RiskEngine) calculateConfidence(score int) string {
 
 // Quick risk check
 func (e *RiskEngine) QuickRiskCheck(ip, userAgent string, latency time.Duration, purpose string) (int, bool) {
-
-	util.Info("QuickRiskCheck",
-		util.String("ip", ip),
-		util.String("ua", userAgent),
-		util.Duration("latency", latency),
-		util.String("purpose", purpose),
-	)
-
 	// DO NOT BLOCK for: login, admin_login, forgot_mpin
-	// Let full risk engine handle those
 	allowPurpose := purpose == "login" || purpose == "admin_login" || purpose == "forgot_mpin"
 
 	// 1. Quick bot detection
 	if e.botDetector.QuickDetect(userAgent, latency) {
-		util.Warn("Quick bot detection triggered")
-
 		if allowPurpose {
-			return 80, false // allow, no block
+			return 80, false // allow
 		}
-		return 80, true // block for other purposes (if added later)
+		return 80, true // block for other purposes
 	}
 
 	// 2. IP reputation
 	isRiskyIP, ipScore := e.ipReputation.QuickCheck(ip)
 	if isRiskyIP {
-		util.Warn("Risky IP detected", util.Int("ip_score", ipScore))
-
 		if allowPurpose {
 			return ipScore + 20, false // allow
 		}
@@ -328,8 +232,6 @@ func (e *RiskEngine) QuickRiskCheck(ip, userAgent string, latency time.Duration,
 
 	// 3. Too fast (<50ms)
 	if latency < 50*time.Millisecond {
-		util.Warn("Request too fast in quick check")
-
 		if allowPurpose {
 			return 60, false // allow
 		}

@@ -1,27 +1,26 @@
-// internal/service/rbac_init_service.go
 package service
 
 import (
-	"auth-service/internal/rbac"
-	"auth-service/internal/repository/postgres"
 	"context"
 	"fmt"
 
-	"go.uber.org/zap"
+	"auth-service/internal/rbac"
+	"auth-service/internal/repository/postgres"
 )
 
+// RBACInitService initializes the permission registry from the database.
 type RBACInitService struct {
 	companyRepo postgres.CompanyRepository
-	logger      *zap.Logger
 }
 
-func NewRBACInitService(companyRepo postgres.CompanyRepository, logger *zap.Logger) *RBACInitService {
+// NewRBACInitService creates a new RBACInitService.
+func NewRBACInitService(companyRepo postgres.CompanyRepository) *RBACInitService {
 	return &RBACInitService{
 		companyRepo: companyRepo,
-		logger:      logger,
 	}
 }
 
+// InitializePermissionRegistry loads permissions from DB and sets up the global registry.
 func (s *RBACInitService) InitializePermissionRegistry(ctx context.Context) error {
 	permissions, err := s.companyRepo.GetPermissionsWithBitIndex(ctx)
 	if err != nil {
@@ -36,10 +35,7 @@ func (s *RBACInitService) InitializePermissionRegistry(ctx context.Context) erro
 	registry := rbac.GetPermissionRegistry()
 	registry.Initialize(permissionMap)
 
-	s.logger.Info("Permission registry initialized",
-		zap.Int("permission_count", len(permissionMap)),
-		zap.Any("permission_map", permissionMap),
-	)
-
+	// No logger – this is a system init, we assume success.
+	// Optionally, you could add an audit log here if auditService is injected.
 	return nil
 }

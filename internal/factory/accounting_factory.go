@@ -366,7 +366,7 @@ func (af *AccountingInfraFactory) RegisterRoutes(r chi.Router, jwtService *mains
 		TaxHandler:                af.taxHandler,
 		AccountingSettingsHandler: af.accountingSettingsHandler,
 	}
-	accounting.RegisterAccountingRoutes(r, accountingHandlers, logger, jwtService)
+	accounting.RegisterAccountingRoutes(r, accountingHandlers, jwtService)
 }
 
 // Close is a no-op because the outbox processor is managed centrally.

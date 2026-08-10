@@ -21,26 +21,26 @@ type WebSocketMessage struct {
 	Payload interface{} `json:"payload"`
 }
 type PairingSession struct {
-    SessionID   string    `json:"session_id"`
-    UserID      string    `json:"user_id,omitempty"`
-    PhoneNumber string    `json:"phone_number,omitempty"`
-    DeviceID    string    `json:"device_id,omitempty"`
-    Status      string    `json:"status"` // pending, scanned, confirmed, expired
-    Nonce       string    `json:"nonce"`
-    QRPayload   string    `json:"qr_payload"`
-    CreatedAt   time.Time `json:"created_at"`
-    ExpiresAt   time.Time `json:"expires_at"`
-    ScannedAt   time.Time `json:"scanned_at,omitempty"`
-    ConfirmedAt time.Time `json:"confirmed_at,omitempty"`
-    IPAddress   string    `json:"ip_address,omitempty"`
-    UserAgent   string    `json:"user_agent,omitempty"`
-    WebDeviceID string    `json:"web_device_id"`
-
-    // Session type and role information
-    SessionType string   `json:"session_type,omitempty"` // "user" or "admin"
-    Role        string   `json:"role,omitempty"`         // user role or admin role string
-    Permissions []string `json:"permissions,omitempty"`  // admin permissions
+	SessionID   string    `json:"session_id"`
+	UserID      string    `json:"user_id,omitempty"`
+	PhoneNumber string    `json:"phone_number,omitempty"`
+	DeviceID    string    `json:"device_id,omitempty"`
+	CompanyID   string    `json:"company_id,omitempty"` // 👈 NEW
+	Status      string    `json:"status"`               // pending, scanned, confirmed, expired
+	Nonce       string    `json:"nonce"`
+	QRPayload   string    `json:"qr_payload"`
+	CreatedAt   time.Time `json:"created_at"`
+	ExpiresAt   time.Time `json:"expires_at"`
+	ScannedAt   time.Time `json:"scanned_at,omitempty"`
+	ConfirmedAt time.Time `json:"confirmed_at,omitempty"`
+	IPAddress   string    `json:"ip_address,omitempty"`
+	UserAgent   string    `json:"user_agent,omitempty"`
+	WebDeviceID string    `json:"web_device_id"`
+	SessionType string    `json:"session_type,omitempty"`
+	Role        string    `json:"role,omitempty"`
+	Permissions []string  `json:"permissions,omitempty"`
 }
+
 // // GetRoleMask converts role string to role mask
 // func (p *PairingSession) GetRoleMask() uint64 {
 // 	switch p.Role {
@@ -77,34 +77,33 @@ type PairingStatusResponse struct {
 	ExpiresAt   time.Time `json:"expires_at"`
 }
 
-
 // GetRoleString converts role type int to role string
 func GetRoleString(roleType int, sessionType string) string {
-    if sessionType == "admin" {
-        switch roleType {
-        case RoleTypeSuperAdmin:
-            return RoleAdminSuperAdmin
-        case RoleTypeManager:
-            return RoleAdminManager
-        case RoleTypeEmployee:
-            return RoleAdminEmployee
-        default:
-            return ""
-        }
-    }
-    return ""
+	if sessionType == "admin" {
+		switch roleType {
+		case RoleTypeSuperAdmin:
+			return RoleAdminSuperAdmin
+		case RoleTypeManager:
+			return RoleAdminManager
+		case RoleTypeEmployee:
+			return RoleAdminEmployee
+		default:
+			return ""
+		}
+	}
+	return ""
 }
 
 // GetRoleTypeFromString converts role string to role type int
 func GetRoleTypeFromString(role string) int {
-    switch role {
-    case RoleAdminSuperAdmin:
-        return RoleTypeSuperAdmin
-    case RoleAdminManager:
-        return RoleTypeManager
-    case RoleAdminEmployee:
-        return RoleTypeEmployee
-    default:
-        return 0
-    }
+	switch role {
+	case RoleAdminSuperAdmin:
+		return RoleTypeSuperAdmin
+	case RoleAdminManager:
+		return RoleTypeManager
+	case RoleAdminEmployee:
+		return RoleTypeEmployee
+	default:
+		return 0
+	}
 }

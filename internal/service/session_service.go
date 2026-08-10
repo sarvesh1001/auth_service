@@ -1,1275 +1,1193 @@
 package service
 
 import (
-    "auth-service/internal/config"
-    "auth-service/internal/models"
-    "auth-service/internal/repository/postgres"
-    "auth-service/internal/repository/redis"
-    "auth-service/internal/util"
-    "context"
-    "crypto/rand"
-    "encoding/base64"
-    "fmt"
-    "net"
-    "time"
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"net"
+	"time"
 
-    "github.com/google/uuid"
-    "go.uber.org/zap"
+	"github.com/google/uuid"
+
+	"auth-service/internal/config"
+	appErrors "auth-service/internal/errors"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/models"
+	"auth-service/internal/repository/postgres"
+	"auth-service/internal/repository/redis"
 )
 
+// SessionService handles session management, JWT issuance, and token lifecycle.
 type SessionService struct {
-    sessionRepo redis.SessionRepository
-    config      *config.Config
-    jwtService  *JWTService
-    logger      *zap.Logger
-    logProducer *LogProducerService
-    companyRepo postgres.CompanyRepository
+	sessionRepo  redis.SessionRepository
+	config       *config.Config
+	jwtService   *JWTService
+	logProducer  *LogProducerService
+	companyRepo  postgres.CompanyRepository
+	auditService *audit.AuditService
+	// idempotencyStore removed – no longer used
 }
-// NewSessionService creates a new session service
+
+// NewSessionService creates a new session service.
 func NewSessionService(
-    sessionRepo redis.SessionRepository,
-    config *config.Config,
-    jwtService *JWTService,
-    logger *zap.Logger,
-    logProducer *LogProducerService,
-    companyRepo postgres.CompanyRepository,
+	sessionRepo redis.SessionRepository,
+	config *config.Config,
+	jwtService *JWTService,
+	logProducer *LogProducerService,
+	companyRepo postgres.CompanyRepository,
+	auditService *audit.AuditService,
 ) *SessionService {
-    return &SessionService{
-        sessionRepo: sessionRepo,
-        config:      config,
-        jwtService:  jwtService,
-        logger:      logger,
-        logProducer: logProducer,
-        companyRepo: companyRepo,
-    }
+	return &SessionService{
+		sessionRepo:  sessionRepo,
+		config:       config,
+		jwtService:   jwtService,
+		logProducer:  logProducer,
+		companyRepo:  companyRepo,
+		auditService: auditService,
+	}
 }
 
-// CreateSessionRequest represents session creation request
+// --------------------------------------------------------------------
+// REQUEST / RESPONSE TYPES
+// --------------------------------------------------------------------
+
 type CreateSessionRequest struct {
-    UserID            uuid.UUID `json:"user_id" validate:"required"`
-    DeviceID          string    `json:"device_id" validate:"required"`
-    DeviceFingerprint string    `json:"device_fingerprint"`
-    KYCVerified       bool      `json:"kyc_verified"`
-    IPAddress         string    `json:"ip_address"`
-    SessionType       string    `json:"session_type" validate:"oneof=user admin"`
+	UserID            uuid.UUID `json:"user_id" validate:"required"`
+	DeviceID          string    `json:"device_id" validate:"required"`
+	DeviceFingerprint string    `json:"device_fingerprint"`
+	KYCVerified       bool      `json:"kyc_verified"`
+	IPAddress         string    `json:"ip_address"`
+	SessionType       string    `json:"session_type" validate:"oneof=user admin"`
 }
 
-// CreateAdminSessionRequest simplified
 type CreateAdminSessionRequest struct {
-    AdminID           uuid.UUID `json:"admin_id" validate:"required"`
-    Role              string    `json:"role" validate:"required,oneof=super_admin admin_manager admin_employee"`
-    DeviceID          string    `json:"device_id" validate:"required"`
-    DeviceFingerprint string    `json:"device_fingerprint"`
-    IPAddress         string    `json:"ip_address"`
-    PermissionMask    []uint64  `json:"permission_mask"`
+	AdminID           uuid.UUID `json:"admin_id" validate:"required"`
+	Role              string    `json:"role" validate:"required,oneof=super_admin admin_manager admin_employee"`
+	DeviceID          string    `json:"device_id" validate:"required"`
+	DeviceFingerprint string    `json:"device_fingerprint"`
+	IPAddress         string    `json:"ip_address"`
+	PermissionMask    []uint64  `json:"permission_mask"`
 }
 
-// IssueTokenPairRequest simplified
 type IssueTokenPairRequest struct {
-    UserID         string
-    Role           string    // Role string (e.g., "super_admin", "admin_manager", "owner", "employee")
-    DeviceID       string
-    SessionType    string
-    IPAddress      string
-    CompanyID      string
-    PermissionMask []uint64
+	UserID         string
+	Role           string
+	DeviceID       string
+	SessionType    string
+	IPAddress      string
+	CompanyID      string
+	PermissionMask []uint64
 }
-// logSessionEvent helper method
+
+// --------------------------------------------------------------------
+// INTERNAL LOG HELPER (Kafka Session Events)
+// --------------------------------------------------------------------
+
 func (s *SessionService) logSessionEvent(ctx context.Context, event *models.SessionLogEvent) {
-    if s.logProducer != nil {
-        _ = s.logProducer.ProduceSessionEvent(ctx, event)
-    }
+	if s.logProducer != nil {
+		_ = s.logProducer.ProduceSessionEvent(ctx, event)
+	}
 }
-// IssueTokenPair issues JWT access + opaque refresh tokens with CompanyID
+
+// --------------------------------------------------------------------
+// TOKEN ISSUANCE (NO IDEMPOTENCY)
+// --------------------------------------------------------------------
+
 func (s *SessionService) IssueTokenPair(ctx context.Context, req *IssueTokenPairRequest) (*models.TokenPairResponse, error) {
-    // Validate required fields
-    if req.UserID == "" {
-        return nil, fmt.Errorf("user ID is required")
-    }
-    
-    if req.DeviceID == "" {
-        return nil, fmt.Errorf("device ID is required")
-    }
+	ip, _ := ctx.Value("ip_address").(string)
+	if ip == "" {
+		ip = req.IPAddress
+	}
 
-    if req.Role == "" {
-        return nil, fmt.Errorf("role is required")
-    }
+	if req.UserID == "" || req.DeviceID == "" || req.Role == "" {
+		return nil, appErrors.ErrInvalidInput
+	}
 
-    // Generate JWT Access Token with CompanyID
-    accessToken, jti, err := s.jwtService.CreateAccessToken(ctx, &CreateAccessTokenRequest{
-        UserID:         req.UserID,
-        Role:           req.Role,
-        DeviceID:       req.DeviceID,
-        SessionType:    req.SessionType,
-        CompanyID:      req.CompanyID,
-        PermissionMask: req.PermissionMask,
-    })
-    if err != nil {
-        s.logger.Error("Failed to create access token",
-            util.ErrorField(err),
-            util.String("user_id", req.UserID),
-            util.String("company_id", req.CompanyID))
-        return nil, fmt.Errorf("failed to create access token: %w", err)
-    }
+	// Generate JWT Access Token
+	accessToken, jti, err := s.jwtService.CreateAccessToken(ctx, &CreateAccessTokenRequest{
+		UserID:         req.UserID,
+		Role:           req.Role,
+		DeviceID:       req.DeviceID,
+		SessionType:    req.SessionType,
+		CompanyID:      req.CompanyID,
+		PermissionMask: req.PermissionMask,
+	})
+	if err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to create access token",
+			},
+			UserID:    req.UserID,
+			Status:    "failed",
+			ErrorCode: "ACCESS_TOKEN_FAILED",
+		})
+		return nil, fmt.Errorf("%w: failed to create access token", appErrors.ErrInternal)
+	}
 
-    // Store Access Token in Redis
-    now := time.Now().UTC()
-    
-    accessTokenData := &models.AccessTokenData{
-        JTI:         jti,
-        UserID:      req.UserID,
-        DeviceID:    req.DeviceID,
-        CompanyID:   req.CompanyID,
-        SessionType: req.SessionType,
-        Active:      true,
-        ExpiresAt:   now.Add(s.config.JWT.AccessTTL),
-        IPAddress:   req.IPAddress,
-    }
+	// Store Access Token in Redis
+	now := time.Now().UTC()
+	accessData := &models.AccessTokenData{
+		JTI:         jti,
+		UserID:      req.UserID,
+		DeviceID:    req.DeviceID,
+		CompanyID:   req.CompanyID,
+		SessionType: req.SessionType,
+		Active:      true,
+		ExpiresAt:   now.Add(s.config.JWT.AccessTTL),
+		IPAddress:   ip,
+	}
+	if err := s.sessionRepo.StoreAccessToken(ctx, accessData); err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to store access token",
+			},
+			UserID:    req.UserID,
+			Status:    "failed",
+			ErrorCode: "STORE_ACCESS_FAILED",
+		})
+		return nil, fmt.Errorf("%w: failed to store access token", appErrors.ErrInternal)
+	}
 
-    if err := s.sessionRepo.StoreAccessToken(ctx, accessTokenData); err != nil {
-        s.logger.Error("Failed to store access token in Redis",
-            util.ErrorField(err),
-            util.String("jti", jti),
-            util.String("user_id", req.UserID))
-        return nil, fmt.Errorf("failed to store access token: %w", err)
-    }
+	// Generate Refresh Token
+	refreshToken, err := s.jwtService.GenerateRefreshToken()
+	if err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to generate refresh token",
+			},
+			UserID:    req.UserID,
+			Status:    "failed",
+			ErrorCode: "REFRESH_TOKEN_GEN_FAILED",
+		})
+		_ = s.sessionRepo.DeleteAccessToken(ctx, jti) // cleanup
+		return nil, fmt.Errorf("%w: failed to generate refresh token", appErrors.ErrInternal)
+	}
 
-    // Generate Opaque Refresh Token
-    refreshToken, err := s.jwtService.GenerateRefreshToken()
-    if err != nil {
-        s.logger.Error("Failed to generate refresh token",
-            util.ErrorField(err),
-            util.String("user_id", req.UserID))
-        // Clean up access token if refresh token generation fails
-        s.sessionRepo.DeleteAccessToken(ctx, jti)
-        return nil, fmt.Errorf("failed to generate refresh token: %w", err)
-    }
+	// Store Refresh Token
+	refreshData := &models.RefreshTokenData{
+		RefreshID:   refreshToken,
+		UserID:      req.UserID,
+		DeviceID:    req.DeviceID,
+		SessionType: req.SessionType,
+		CompanyID:   req.CompanyID,
+		IssuedAt:    now,
+		ExpiresAt:   now.Add(s.config.JWT.RefreshTTL),
+		LastUsed:    now,
+		Revoked:     false,
+		IPAddress:   ip,
+		JTI:         jti,
+	}
+	if err := s.sessionRepo.StoreRefreshToken(ctx, refreshData); err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to store refresh token",
+			},
+			UserID:    req.UserID,
+			Status:    "failed",
+			ErrorCode: "STORE_REFRESH_FAILED",
+		})
+		_ = s.sessionRepo.DeleteAccessToken(ctx, jti)
+		return nil, fmt.Errorf("%w: failed to store refresh token", appErrors.ErrInternal)
+	}
 
-    // Store refresh token in Redis WITH JTI reference
-    refreshData := &models.RefreshTokenData{
-        RefreshID:   refreshToken,
-        UserID:      req.UserID,
-        DeviceID:    req.DeviceID,
-        SessionType: req.SessionType,
-        CompanyID:   req.CompanyID,
-        IssuedAt:    now,
-        ExpiresAt:   now.Add(s.config.JWT.RefreshTTL),
-        LastUsed:    now,
-        Revoked:     false,
-        IPAddress:   req.IPAddress,
-        JTI:         jti, // Store reference to access token
-    }
+	// Log success (Kafka)
+	s.logSessionEvent(ctx, &models.SessionLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   string(models.LogEventTypeSession),
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: s.config.Environment,
+			Version:     ServiceVersion,
+			Level:       string(models.LogLevelInfo),
+			Message:     "Token pair issued successfully",
+		},
+		UserID:      req.UserID,
+		Status:      "issued",
+		SessionType: req.SessionType,
+		IPAddress:   ip,
+	})
 
-    if err := s.sessionRepo.StoreRefreshToken(ctx, refreshData); err != nil {
-        s.logger.Error("Failed to store refresh token",
-            util.ErrorField(err),
-            util.String("user_id", req.UserID),
-            util.String("company_id", req.CompanyID))
-        // Clean up access token if refresh token storage fails
-        s.sessionRepo.DeleteAccessToken(ctx, jti)
-        return nil, fmt.Errorf("failed to store refresh token: %w", err)
-    }
+	// Audit: token issuance
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "session", "issue_token_pair", "user",
+			nil, "system", nil, nil, nil, map[string]interface{}{
+				"user_id":      req.UserID,
+				"session_type": req.SessionType,
+				"role":         req.Role,
+				"device_id":    req.DeviceID,
+				"company_id":   req.CompanyID,
+				"ip":           ip,
+			})
+	}
 
-    // Log token issuance with CompanyID
-    s.logger.Info("Token pair issued",
-        util.String("user_id", req.UserID),
-        util.String("session_type", req.SessionType),
-        util.String("company_id", req.CompanyID),
-        util.String("role", req.Role),
-        util.String("jti", jti),
-        util.String("device_id", req.DeviceID),
-        util.Int64("refresh_ttl_seconds", int64(s.config.JWT.RefreshTTL.Seconds())),
-    )
-
-    // Final response
-    return &models.TokenPairResponse{
-        AccessToken:  accessToken,
-        RefreshToken: refreshToken,
-        ExpiresIn:    int(s.config.JWT.AccessTTL.Seconds()),
-        TokenType:    "Bearer",
-        CompanyID:    req.CompanyID,
-    }, nil
+	// No idempotency cache – return fresh tokens
+	return &models.TokenPairResponse{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		ExpiresIn:    int(s.config.JWT.AccessTTL.Seconds()),
+		TokenType:    "Bearer",
+		CompanyID:    req.CompanyID,
+	}, nil
 }
+
+// --------------------------------------------------------------------
+// REFRESH TOKEN (NO IDEMPOTENCY)
+// --------------------------------------------------------------------
+
 func (s *SessionService) RefreshTokenPair(ctx context.Context, refreshToken string, ipAddress string) (*models.TokenPairResponse, error) {
-    refreshData, err := s.sessionRepo.GetRefreshToken(ctx, refreshToken)
-    if err != nil {
-        s.logger.Warn("Invalid refresh token provided",
-            util.ErrorField(err),
-            util.String("refresh_token", util.MaskString(refreshToken, 8)))
-        return nil, fmt.Errorf("invalid refresh token: %w", err)
-    }
+	ip, _ := ctx.Value("ip_address").(string)
+	if ip == "" {
+		ip = ipAddress
+	}
 
-    if refreshData.Revoked {
-        s.logger.Warn("Refresh token revoked",
-            util.String("user_id", refreshData.UserID),
-            util.String("refresh_id", refreshData.RefreshID))
-        return nil, fmt.Errorf("refresh token revoked")
-    }
+	refreshData, err := s.sessionRepo.GetRefreshToken(ctx, refreshToken)
+	if err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "Invalid refresh token",
+			},
+			Status:    "failed",
+			ErrorCode: "INVALID_REFRESH",
+		})
+		return nil, fmt.Errorf("%w: invalid refresh token", appErrors.ErrUnauthorized)
+	}
+	if refreshData.Revoked {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "Refresh token revoked",
+			},
+			UserID:    refreshData.UserID,
+			Status:    "failed",
+			ErrorCode: "REFRESH_REVOKED",
+		})
+		return nil, appErrors.ErrUnauthorized
+	}
+	if time.Now().After(refreshData.ExpiresAt) {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "Refresh token expired",
+			},
+			UserID:    refreshData.UserID,
+			Status:    "failed",
+			ErrorCode: "REFRESH_EXPIRED",
+		})
+		return nil, appErrors.ErrUnauthorized
+	}
 
-    if time.Now().After(refreshData.ExpiresAt) {
-        s.logger.Warn("Refresh token expired",
-            util.String("user_id", refreshData.UserID),
-            util.Time("expires_at", refreshData.ExpiresAt))
-        return nil, fmt.Errorf("refresh token expired")
-    }
+	// Update last used
+	refreshData.LastUsed = time.Now().UTC()
+	_ = s.sessionRepo.StoreRefreshToken(ctx, refreshData) // ignore errors
 
-    refreshData.LastUsed = time.Now().UTC()
-    if err := s.sessionRepo.StoreRefreshToken(ctx, refreshData); err != nil {
-        s.logger.Warn("Failed to update refresh token last used", util.ErrorField(err))
-    }
+	// Delete old access token
+	if refreshData.JTI != "" {
+		_ = s.sessionRepo.DeleteAccessToken(ctx, refreshData.JTI)
+	}
 
-    if refreshData.JTI != "" {
-        if err := s.sessionRepo.DeleteAccessToken(ctx, refreshData.JTI); err != nil {
-            s.logger.Warn("Failed to delete old access token during refresh",
-                util.ErrorField(err),
-                util.String("jti", refreshData.JTI))
-        }
-    }
+	// Optionally rotate refresh token
+	if s.config.JWT.RotateRefreshTokens {
+		_ = s.sessionRepo.DeleteRefreshToken(ctx, refreshToken)
+	}
 
-    if s.config.JWT.RotateRefreshTokens {
-        if err := s.sessionRepo.DeleteRefreshToken(ctx, refreshToken); err != nil {
-            s.logger.Warn("Failed to delete old refresh token", util.ErrorField(err))
-        }
-    }
+	// Get permission mask if admin
+	var permMask []uint64
+	if refreshData.SessionType == "admin" {
+		// In production, fetch from DB or session store. For now, empty.
+		permMask = []uint64{}
+	}
 
-    // Get permission mask if it's an admin session
-    var permissionMask []uint64
-    if refreshData.SessionType == "admin" {
-        // For admin sessions, we need to get the permission mask
-        // This could be stored in the refresh token or fetched from the database
-        // For now, we'll use an empty mask
-        permissionMask = []uint64{}
-    }
+	// Issue new pair (fresh tokens)
+	newReq := &IssueTokenPairRequest{
+		UserID:         refreshData.UserID,
+		Role:           refreshData.SessionType, // Note: might need actual role
+		DeviceID:       refreshData.DeviceID,
+		SessionType:    refreshData.SessionType,
+		IPAddress:      ip,
+		CompanyID:      refreshData.CompanyID,
+		PermissionMask: permMask,
+	}
+	resp, err := s.IssueTokenPair(ctx, newReq)
+	if err != nil {
+		return nil, err
+	}
 
-    return s.IssueTokenPair(ctx, &IssueTokenPairRequest{
-        UserID:         refreshData.UserID,
-        Role:           refreshData.SessionType, // Note: This might need to be the actual role, not session type
-        DeviceID:       refreshData.DeviceID,
-        SessionType:    refreshData.SessionType,
-        IPAddress:      ipAddress,
-        CompanyID:      refreshData.CompanyID,
-        PermissionMask: permissionMask, // Use the permission mask
-    })
+	// Audit refresh
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "session", "refresh_token", "user",
+			nil, "system", nil, nil, nil, map[string]interface{}{
+				"user_id": refreshData.UserID,
+				"ip":      ip,
+			})
+	}
+
+	return resp, nil
 }
-// ValidateAccessToken validates JWT and checks Redis for active status
+
+// --------------------------------------------------------------------
+// TOKEN VALIDATION
+// --------------------------------------------------------------------
+
 func (s *SessionService) ValidateAccessToken(ctx context.Context, tokenStr string) (*models.JWTClaims, error) {
-    // Validate JWT signature and parse claims
-    claims, err := s.jwtService.ValidateAccessToken(ctx, tokenStr)
-    if err != nil {
-        return nil, fmt.Errorf("invalid JWT: %w", err)
-    }
+	claims, err := s.jwtService.ValidateAccessToken(ctx, tokenStr)
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid JWT", appErrors.ErrUnauthorized)
+	}
 
-    // Check Redis for active access token
-    accessData, err := s.sessionRepo.GetAccessToken(ctx, claims.JTI)
-    if err != nil {
-        return nil, fmt.Errorf("access token not found or revoked: %w", err)
-    }
+	accessData, err := s.sessionRepo.GetAccessToken(ctx, claims.JTI)
+	if err != nil {
+		return nil, fmt.Errorf("%w: access token not found", appErrors.ErrUnauthorized)
+	}
+	if !accessData.Active {
+		return nil, fmt.Errorf("%w: access token revoked", appErrors.ErrUnauthorized)
+	}
+	if accessData.DeviceID != claims.DeviceID {
+		return nil, fmt.Errorf("%w: device mismatch", appErrors.ErrUnauthorized)
+	}
 
-    // Check if token is active
-    if !accessData.Active {
-        return nil, fmt.Errorf("access token revoked")
-    }
+	// For user sessions, validate company ID
+	if claims.SessionType == "user" {
+		if accessData.CompanyID != claims.CompanyID || accessData.CompanyID == "" {
+			return nil, fmt.Errorf("%w: company mismatch", appErrors.ErrUnauthorized)
+		}
+	}
 
-    // Validate device match
-    if accessData.DeviceID != claims.DeviceID {
-        s.logger.Warn("Device ID mismatch",
-            util.String("jti", claims.JTI),
-            util.String("redis_device", accessData.DeviceID),
-            util.String("token_device", claims.DeviceID))
-        return nil, fmt.Errorf("device mismatch")
-    }
-
-    // For user sessions, validate company ID
-    if claims.SessionType == "user" {
-        if accessData.CompanyID != claims.CompanyID {
-            s.logger.Warn("Company ID mismatch for user session",
-                util.String("jti", claims.JTI),
-                util.String("redis_company", accessData.CompanyID),
-                util.String("token_company", claims.CompanyID))
-            return nil, fmt.Errorf("company mismatch")
-        }
-        
-        // Additional check: company ID should not be empty for user sessions
-        if accessData.CompanyID == "" || claims.CompanyID == "" {
-            return nil, fmt.Errorf("company ID required for user sessions")
-        }
-    }
-    // For admin sessions, skip company ID validation (admins have access to all companies)
-
-    return claims, nil
+	return claims, nil
 }
 
-// RevokeAccessToken revokes an access token by JTI
+// --------------------------------------------------------------------
+// REVOCATION (idempotent by nature – no caching needed)
+// --------------------------------------------------------------------
+
 func (s *SessionService) RevokeAccessToken(ctx context.Context, jti string) error {
-    s.logger.Info("Revoking access token",
-        util.String("jti", jti))
-    
-    if err := s.sessionRepo.DeleteAccessToken(ctx, jti); err != nil {
-        s.logger.Error("Failed to revoke access token", 
-            util.ErrorField(err),
-            util.String("jti", jti))
-        return fmt.Errorf("failed to revoke access token: %w", err)
-    }
-    
-    s.logger.Info("Access token revoked successfully",
-        util.String("jti", jti))
-    return nil
+	ip, _ := ctx.Value("ip_address").(string)
+
+	if err := s.sessionRepo.DeleteAccessToken(ctx, jti); err != nil {
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "session", "revoke_access_token", "access_token",
+			nil, "system", nil, nil, nil, map[string]interface{}{
+				"jti": jti,
+				"ip":  ip,
+			})
+	}
+	return nil
 }
 
-// RevokeRefreshToken revokes both refresh token and associated access token
 func (s *SessionService) RevokeRefreshToken(ctx context.Context, refreshToken string) error {
-    s.logger.Info("Revoking refresh token",
-        util.String("refresh_token", util.MaskString(refreshToken, 8)))
-    
-    // Get refresh token data to get the JTI
-    refreshData, err := s.sessionRepo.GetRefreshToken(ctx, refreshToken)
-    if err != nil {
-        s.logger.Warn("Refresh token not found, might already be revoked",
-            util.String("refresh_token", util.MaskString(refreshToken, 8)))
-        // Still try to delete it
-    } else {
-        // Delete associated access token if JTI exists
-        if refreshData.JTI != "" {
-            if err := s.sessionRepo.DeleteAccessToken(ctx, refreshData.JTI); err != nil {
-                s.logger.Warn("Failed to delete associated access token",
-                    util.ErrorField(err),
-                    util.String("jti", refreshData.JTI))
-            }
-        }
-    }
-    
-    // Delete refresh token
-    if err := s.sessionRepo.DeleteRefreshToken(ctx, refreshToken); err != nil {
-        s.logger.Error("Failed to revoke refresh token", util.ErrorField(err))
-        return fmt.Errorf("failed to revoke refresh token: %w", err)
-    }
-    
-    s.logger.Info("Refresh token and associated access token revoked successfully")
-    return nil
+	ip, _ := ctx.Value("ip_address").(string)
+
+	refreshData, err := s.sessionRepo.GetRefreshToken(ctx, refreshToken)
+	if err == nil && refreshData.JTI != "" {
+		_ = s.sessionRepo.DeleteAccessToken(ctx, refreshData.JTI)
+	}
+	if err := s.sessionRepo.DeleteRefreshToken(ctx, refreshToken); err != nil {
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "session", "revoke_refresh_token", "refresh_token",
+			nil, "system", nil, nil, nil, map[string]interface{}{
+				"ip": ip,
+			})
+	}
+	return nil
 }
 
-// RevokeAllUserRefreshTokens revokes all tokens for a user
 func (s *SessionService) RevokeAllUserRefreshTokens(ctx context.Context, userID string) error {
-    s.logger.Info("Revoking all refresh tokens for user",
-        util.String("user_id", userID))
-    
-    // Get all refresh tokens for user
-    refreshTokens, err := s.sessionRepo.GetUserRefreshTokens(ctx, userID)
-    if err != nil {
-        return fmt.Errorf("failed to get user refresh tokens: %w", err)
-    }
-    
-    // Revoke each refresh token (which will also delete associated access tokens)
-    for _, refreshToken := range refreshTokens {
-        s.RevokeRefreshToken(ctx, refreshToken)
-    }
-    
-    s.logger.Info("All refresh tokens revoked for user",
-        util.String("user_id", userID),
-        util.Int("count", len(refreshTokens)))
-    return nil
+	ip, _ := ctx.Value("ip_address").(string)
+
+	tokens, err := s.sessionRepo.GetUserRefreshTokens(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	for _, rt := range tokens {
+		_ = s.RevokeRefreshToken(ctx, rt) // ignore errors per token
+	}
+
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "session", "revoke_all_user_tokens", "user",
+			nil, "system", nil, nil, nil, map[string]interface{}{
+				"user_id": userID,
+				"count":   len(tokens),
+				"ip":      ip,
+			})
+	}
+	return nil
 }
 
-// CreateSession creates a new session (legacy - now returns JWT tokens)
+// --------------------------------------------------------------------
+// LEGACY SESSION METHODS (backwards compatibility)
+// --------------------------------------------------------------------
+
 func (s *SessionService) CreateSession(ctx context.Context, req *CreateSessionRequest) (*models.ActiveSession, error) {
-    startTime := time.Now()
+	token, err := s.generateSessionToken()
+	if err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to generate session token",
+			},
+			UserID:    req.UserID.String(),
+			Status:    "failed",
+			ErrorCode: "TOKEN_GENERATION_FAILED",
+		})
+		return nil, fmt.Errorf("%w: failed to generate token", appErrors.ErrInternal)
+	}
 
-    // Generate session token
-    token, err := s.generateSessionToken()
-    if err != nil {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "Failed to generate session token",
-            },
-            UserID:    req.UserID.String(),
-            SessionID: "",
-            Status:    "failed",
-            DeviceID:  req.DeviceID,
-            IPAddress: req.IPAddress,
-            ErrorCode: "TOKEN_GENERATION_FAILED",
-        })
-        return nil, fmt.Errorf("failed to generate session token: %w", err)
-    }
+	var ipAddr net.IP
+	if req.IPAddress != "" {
+		ipAddr = net.ParseIP(req.IPAddress)
+	}
+	encKey := make([]byte, 32)
+	if _, err := rand.Read(encKey); err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to generate encryption key",
+			},
+			UserID:    req.UserID.String(),
+			Status:    "failed",
+			ErrorCode: "ENCRYPTION_KEY_FAILED",
+		})
+		return nil, fmt.Errorf("%w: failed to generate encryption key", appErrors.ErrInternal)
+	}
 
-    // Parse IP address
-    var ipAddr net.IP
-    if req.IPAddress != "" {
-        ipAddr = net.ParseIP(req.IPAddress)
-    }
+	now := time.Now()
+	ttl := time.Duration(s.config.Auth.SessionTTL) * time.Second
+	if req.SessionType == "admin" {
+		ttl = 7 * 24 * time.Hour
+	}
+	expiresAt := now.Add(ttl)
+	sessionType := req.SessionType
+	if sessionType == "" {
+		sessionType = "user"
+	}
 
-    // Generate encryption key for session
-    encKey := make([]byte, 32)
-    if _, err := rand.Read(encKey); err != nil {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "Failed to generate encryption key",
-            },
-            UserID:    req.UserID.String(),
-            SessionID: token,
-            Status:    "failed",
-            DeviceID:  req.DeviceID,
-            IPAddress: req.IPAddress,
-            ErrorCode: "ENCRYPTION_KEY_FAILED",
-        })
-        return nil, fmt.Errorf("failed to generate encryption key: %w", err)
-    }
+	session := &models.ActiveSession{
+		UserID:            req.UserID.String(),
+		SessionToken:      token,
+		DeviceID:          req.DeviceID,
+		DeviceFingerprint: req.DeviceFingerprint,
+		KYCVerified:       req.KYCVerified,
+		CreatedAt:         now,
+		LastActivity:      now,
+		ExpiresAt:         expiresAt,
+		IPAddress:         ipAddr,
+		EncryptionKey:     encKey,
+		SessionType:       sessionType,
+	}
 
-    now := time.Now()
+	if err := s.sessionRepo.CreateSession(ctx, session); err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to create session in repository",
+			},
+			UserID:    req.UserID.String(),
+			SessionID: token,
+			Status:    "failed",
+			ErrorCode: "REPOSITORY_CREATE_FAILED",
+		})
+		return nil, fmt.Errorf("%w: failed to create session", appErrors.ErrInternal)
+	}
 
-    // Get TTL based on session type
-    ttl := time.Duration(s.config.Auth.SessionTTL) * time.Second
-    if req.SessionType == "admin" {
-        ttl = 7 * 24 * time.Hour
-    }
+	s.logSessionEvent(ctx, &models.SessionLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   string(models.LogEventTypeSession),
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: s.config.Environment,
+			Version:     ServiceVersion,
+			Level:       string(models.LogLevelInfo),
+			Message:     "Session created successfully",
+		},
+		UserID:      req.UserID.String(),
+		SessionID:   token,
+		Status:      "created",
+		SessionType: sessionType,
+		TTL:         int64(ttl.Seconds()),
+	})
 
-    expiresAt := now.Add(ttl)
-
-    // Set default session type to "user"
-    sessionType := req.SessionType
-    if sessionType == "" {
-        sessionType = "user"
-    }
-
-    session := &models.ActiveSession{
-        UserID:            req.UserID.String(),
-        SessionToken:      token,
-        DeviceID:          req.DeviceID,
-        DeviceFingerprint: req.DeviceFingerprint,
-        KYCVerified:       req.KYCVerified,
-        CreatedAt:         now,
-        LastActivity:      now,
-        ExpiresAt:         expiresAt,
-        IPAddress:         ipAddr,
-        EncryptionKey:     encKey,
-        SessionType:       sessionType,
-    }
-
-    if err := s.sessionRepo.CreateSession(ctx, session); err != nil {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "Failed to create session in repository",
-            },
-            UserID:      req.UserID.String(),
-            SessionID:   token,
-            Status:      "failed",
-            DeviceID:    req.DeviceID,
-            IPAddress:   req.IPAddress,
-            SessionType: sessionType,
-            TTL:         int64(ttl.Seconds()),
-            ErrorCode:   "REPOSITORY_CREATE_FAILED",
-        })
-        return nil, fmt.Errorf("failed to create session: %w", err)
-    }
-
-    s.logSessionEvent(ctx, &models.SessionLogEvent{
-        LogEnvelope: models.LogEnvelope{
-            EventID:     uuid.New().String(),
-            EventType:   string(models.LogEventTypeSession),
-            ServiceName: "auth-service",
-            Timestamp:   time.Now(),
-            Environment: s.config.Environment,
-            Version:     ServiceVersion,
-            Level:       string(models.LogLevelInfo),
-            Message:     "Session created successfully",
-        },
-        UserID:      req.UserID.String(),
-        SessionID:   token,
-        Status:      "created",
-        DeviceID:    req.DeviceID,
-        IPAddress:   req.IPAddress,
-        SessionType: sessionType,
-        TTL:         int64(ttl.Seconds()),
-    })
-
-    s.logger.Info("Session created",
-        util.String("user_id", req.UserID.String()),
-        util.String("device_id", req.DeviceID),
-        util.String("session_type", sessionType),
-        util.Duration("duration", time.Since(startTime)),
-    )
-
-    return session, nil
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "session", "create_session", "user",
+			&req.UserID, "system", nil, nil, nil, map[string]interface{}{
+				"device_id":    req.DeviceID,
+				"session_type": sessionType,
+				"ip":           req.IPAddress,
+			})
+	}
+	return session, nil
 }
-// CreateAdminSession creates a new admin session - UPDATED for bitmask
+
 func (s *SessionService) CreateAdminSession(ctx context.Context, req *CreateAdminSessionRequest) (*models.ActiveSession, error) {
-    startTime := time.Now()
+	token, err := s.generateSessionToken()
+	if err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to generate admin session token",
+			},
+			UserID:    req.AdminID.String(),
+			Status:    "failed",
+			ErrorCode: "TOKEN_GENERATION_FAILED",
+		})
+		return nil, fmt.Errorf("%w: failed to generate token", appErrors.ErrInternal)
+	}
 
-    token, err := s.generateSessionToken()
-    if err != nil {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "Failed to generate admin session token",
-            },
-            UserID:    req.AdminID.String(),
-            SessionID: "",
-            Status:    "failed",
-            DeviceID:  req.DeviceID,
-            IPAddress: req.IPAddress,
-            ErrorCode: "TOKEN_GENERATION_FAILED",
-        })
-        return nil, fmt.Errorf("failed to generate session token: %w", err)
-    }
+	var ipAddr net.IP
+	if req.IPAddress != "" {
+		ipAddr = net.ParseIP(req.IPAddress)
+	}
+	encKey := make([]byte, 32)
+	if _, err := rand.Read(encKey); err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to generate admin encryption key",
+			},
+			UserID:    req.AdminID.String(),
+			Status:    "failed",
+			ErrorCode: "ENCRYPTION_KEY_FAILED",
+		})
+		return nil, fmt.Errorf("%w: failed to generate encryption key", appErrors.ErrInternal)
+	}
 
-    var ipAddr net.IP
-    if req.IPAddress != "" {
-        ipAddr = net.ParseIP(req.IPAddress)
-    }
+	now := time.Now()
+	adminTTL := 7 * 24 * time.Hour
+	expiresAt := now.Add(adminTTL)
 
-    encKey := make([]byte, 32)
-    if _, err := rand.Read(encKey); err != nil {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "Failed to generate admin encryption key",
-            },
-            UserID:    req.AdminID.String(),
-            SessionID: token,
-            Status:    "failed",
-            DeviceID:  req.DeviceID,
-            IPAddress: req.IPAddress,
-            ErrorCode: "ENCRYPTION_KEY_FAILED",
-        })
-        return nil, fmt.Errorf("failed to generate encryption key: %w", err)
-    }
+	session := &models.ActiveSession{
+		UserID:            req.AdminID.String(),
+		SessionToken:      token,
+		DeviceID:          req.DeviceID,
+		DeviceFingerprint: req.DeviceFingerprint,
+		CreatedAt:         now,
+		LastActivity:      now,
+		ExpiresAt:         expiresAt,
+		IPAddress:         ipAddr,
+		EncryptionKey:     encKey,
+		SessionType:       "admin",
+		Role:              req.Role,
+		PermissionMask:    req.PermissionMask,
+	}
 
-    now := time.Now()
-    adminTTL := 7 * 24 * time.Hour
-    expiresAt := now.Add(adminTTL)
+	if err := s.sessionRepo.CreateSession(ctx, session); err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to create admin session in repository",
+			},
+			UserID:    req.AdminID.String(),
+			SessionID: token,
+			Status:    "failed",
+			ErrorCode: "REPOSITORY_CREATE_FAILED",
+		})
+		return nil, fmt.Errorf("%w: failed to create admin session", appErrors.ErrInternal)
+	}
 
-    // SIMPLIFIED: Use role string instead of bitmask
-    session := &models.ActiveSession{
-        UserID:             req.AdminID.String(),
-        SessionToken:       token,
-        DeviceID:          req.DeviceID,
-        DeviceFingerprint: req.DeviceFingerprint,
-        CreatedAt:         now,
-        LastActivity:      now,
-        ExpiresAt:         expiresAt,
-        IPAddress:         ipAddr,
-        EncryptionKey:     encKey,
-        SessionType:       "admin",
-        Role:              req.Role,           // ✅ Use role string
-        PermissionMask:    req.PermissionMask, // ✅ Use permission mask only
-    }
+	s.logSessionEvent(ctx, &models.SessionLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   string(models.LogEventTypeSession),
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: s.config.Environment,
+			Version:     ServiceVersion,
+			Level:       string(models.LogLevelInfo),
+			Message:     "Admin session created successfully",
+		},
+		UserID:      req.AdminID.String(),
+		SessionID:   token,
+		Status:      "created",
+		SessionType: "admin",
+		TTL:         int64(adminTTL.Seconds()),
+	})
 
-    if err := s.sessionRepo.CreateSession(ctx, session); err != nil {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "Failed to create admin session in repository",
-            },
-            UserID:      req.AdminID.String(),
-            SessionID:   token,
-            Status:      "failed",
-            DeviceID:    req.DeviceID,
-            IPAddress:   req.IPAddress,
-            SessionType: "admin",
-            TTL:         int64(adminTTL.Seconds()),
-            ErrorCode:   "REPOSITORY_CREATE_FAILED",
-        })
-        return nil, fmt.Errorf("failed to create admin session: %w", err)
-    }
-
-    s.logSessionEvent(ctx, &models.SessionLogEvent{
-        LogEnvelope: models.LogEnvelope{
-            EventID:     uuid.New().String(),
-            EventType:   string(models.LogEventTypeSession),
-            ServiceName: "auth-service",
-            Timestamp:   time.Now(),
-            Environment: s.config.Environment,
-            Version:     ServiceVersion,
-            Level:       string(models.LogLevelInfo),
-            Message:     "Admin session created successfully",
-        },
-        UserID:      req.AdminID.String(),
-        SessionID:   token,
-        Status:      "created",
-        DeviceID:    req.DeviceID,
-        IPAddress:   req.IPAddress,
-        SessionType: "admin",
-        TTL:         int64(adminTTL.Seconds()),
-    })
-
-    s.logger.Info("Admin session created",
-        util.String("admin_id", req.AdminID.String()),
-        util.String("role", req.Role),
-        util.String("device_id", req.DeviceID),
-        util.Int("permission_mask_segments", len(req.PermissionMask)),
-        util.Duration("duration", time.Since(startTime)),
-    )
-
-    return session, nil
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "session", "create_admin_session", "admin_user",
+			&req.AdminID, "system", nil, nil, nil, map[string]interface{}{
+				"role":      req.Role,
+				"device_id": req.DeviceID,
+				"ip":        req.IPAddress,
+			})
+	}
+	return session, nil
 }
-// GetSessionByUserID retrieves session by user ID
+
+// --------------------------------------------------------------------
+// SESSION RETRIEVAL
+// --------------------------------------------------------------------
+
 func (s *SessionService) GetSessionByUserID(ctx context.Context, userID uuid.UUID) (*models.ActiveSession, error) {
-    session, err := s.sessionRepo.GetSessionByUserID(ctx, userID)
-    if err != nil {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelWarning),
-                Message:     "Session not found by user ID",
-            },
-            UserID:    userID.String(),
-            SessionID: "",
-            Status:    "not_found",
-            ErrorCode: "SESSION_NOT_FOUND",
-        })
-        return nil, fmt.Errorf("%w: %v", ErrSessionNotFound, err)
-    }
-
-    return session, nil
+	session, err := s.sessionRepo.GetSessionByUserID(ctx, userID)
+	if err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "Session not found by user ID",
+			},
+			UserID:    userID.String(),
+			Status:    "not_found",
+			ErrorCode: "SESSION_NOT_FOUND",
+		})
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrNotFound, err)
+	}
+	return session, nil
 }
 
-// GetSessionByToken retrieves session by token
 func (s *SessionService) GetSessionByToken(ctx context.Context, sessionToken string) (*models.ActiveSession, error) {
-    session, err := s.sessionRepo.GetSessionByToken(ctx, sessionToken)
-    if err != nil {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelWarning),
-                Message:     "Session not found by token",
-            },
-            UserID:    "",
-            SessionID: sessionToken,
-            Status:    "not_found",
-            ErrorCode: "SESSION_NOT_FOUND",
-        })
-        return nil, fmt.Errorf("%w: %v", ErrSessionNotFound, err)
-    }
-
-    return session, nil
+	session, err := s.sessionRepo.GetSessionByToken(ctx, sessionToken)
+	if err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "Session not found by token",
+			},
+			SessionID: sessionToken,
+			Status:    "not_found",
+			ErrorCode: "SESSION_NOT_FOUND",
+		})
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrNotFound, err)
+	}
+	return session, nil
 }
 
-// GetSessionType quickly retrieves session type
 func (s *SessionService) GetSessionType(ctx context.Context, sessionToken string) (string, error) {
-    sessionType, err := s.sessionRepo.GetSessionType(ctx, sessionToken)
-    if err != nil {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "Failed to get session type",
-            },
-            SessionID: sessionToken,
-            Status:    "failed",
-            ErrorCode: "GET_TYPE_FAILED",
-        })
-        return "", fmt.Errorf("failed to get session type: %w", err)
-    }
-    return sessionType, nil
+	sessionType, err := s.sessionRepo.GetSessionType(ctx, sessionToken)
+	if err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to get session type",
+			},
+			SessionID: sessionToken,
+			Status:    "failed",
+			ErrorCode: "GET_TYPE_FAILED",
+		})
+		return "", fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	return sessionType, nil
 }
 
-// IsAdminSession checks if a token is an admin session
 func (s *SessionService) IsAdminSession(ctx context.Context, sessionToken string) (bool, error) {
-    isAdmin, err := s.sessionRepo.IsAdminSession(ctx, sessionToken)
-    if err != nil {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "Failed to check admin session",
-            },
-            SessionID: sessionToken,
-            Status:    "failed",
-            ErrorCode: "CHECK_ADMIN_FAILED",
-        })
-        return false, fmt.Errorf("failed to check admin session: %w", err)
-    }
-    return isAdmin, nil
+	isAdmin, err := s.sessionRepo.IsAdminSession(ctx, sessionToken)
+	if err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to check admin session",
+			},
+			SessionID: sessionToken,
+			Status:    "failed",
+			ErrorCode: "CHECK_ADMIN_FAILED",
+		})
+		return false, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	return isAdmin, nil
 }
 
-// UpdateSessionActivity updates session activity
+// --------------------------------------------------------------------
+// SESSION INVALIDATION / ACTIVITY
+// --------------------------------------------------------------------
+
 func (s *SessionService) UpdateSessionActivity(ctx context.Context, userID uuid.UUID, ipAddress string) error {
-    startTime := time.Now()
-
-    var ipAddr net.IP
-    if ipAddress != "" {
-        ipAddr = net.ParseIP(ipAddress)
-    }
-
-    err := s.sessionRepo.UpdateSessionActivity(ctx, userID, time.Now(), ipAddr)
-    if err != nil {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "Failed to update session activity",
-            },
-            UserID:    userID.String(),
-            Status:    "failed",
-            IPAddress: ipAddress,
-            ErrorCode: "UPDATE_ACTIVITY_FAILED",
-        })
-        return err
-    }
-
-    s.logSessionEvent(ctx, &models.SessionLogEvent{
-        LogEnvelope: models.LogEnvelope{
-            EventID:     uuid.New().String(),
-            EventType:   string(models.LogEventTypeSession),
-            ServiceName: "auth-service",
-            Timestamp:   time.Now(),
-            Environment: s.config.Environment,
-            Version:     ServiceVersion,
-            Level:       string(models.LogLevelDebug),
-            Message:     "Session activity updated",
-        },
-        UserID:    userID.String(),
-        Status:    "activity_updated",
-        IPAddress: ipAddress,
-    })
-
-    s.logger.Debug("Session activity updated",
-        util.String("user_id", userID.String()),
-        util.Duration("duration", time.Since(startTime)),
-    )
-
-    return nil
+	var ipAddr net.IP
+	if ipAddress != "" {
+		ipAddr = net.ParseIP(ipAddress)
+	}
+	err := s.sessionRepo.UpdateSessionActivity(ctx, userID, time.Now(), ipAddr)
+	if err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to update session activity",
+			},
+			UserID:    userID.String(),
+			Status:    "failed",
+			ErrorCode: "UPDATE_ACTIVITY_FAILED",
+		})
+		return err
+	}
+	return nil
 }
 
-// InvalidateSession invalidates a session
 func (s *SessionService) InvalidateSession(ctx context.Context, userID uuid.UUID) error {
-    startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
 
-    err := s.sessionRepo.InvalidateSession(ctx, userID)
-    if err != nil {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "Failed to invalidate session by user ID",
-            },
-            UserID:    userID.String(),
-            Status:    "failed",
-            ErrorCode: "INVALIDATE_FAILED",
-        })
-        return err
-    }
+	if err := s.sessionRepo.InvalidateSession(ctx, userID); err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to invalidate session by user ID",
+			},
+			UserID:    userID.String(),
+			Status:    "failed",
+			ErrorCode: "INVALIDATE_FAILED",
+		})
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
 
-    s.logSessionEvent(ctx, &models.SessionLogEvent{
-        LogEnvelope: models.LogEnvelope{
-            EventID:     uuid.New().String(),
-            EventType:   string(models.LogEventTypeSession),
-            ServiceName: "auth-service",
-            Timestamp:   time.Now(),
-            Environment: s.config.Environment,
-            Version:     ServiceVersion,
-            Level:       string(models.LogLevelInfo),
-            Message:     "Session invalidated by user ID",
-        },
-        UserID: userID.String(),
-        Status: "invalidated",
-    })
-
-    s.logger.Info("Session invalidated",
-        util.String("user_id", userID.String()),
-        util.Duration("duration", time.Since(startTime)),
-    )
-
-    return nil
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "session", "invalidate_session", "user",
+			&userID, "system", nil, nil, nil, map[string]interface{}{
+				"ip": ip,
+			})
+	}
+	return nil
 }
 
-// InvalidateSessionByToken invalidates session by token
 func (s *SessionService) InvalidateSessionByToken(ctx context.Context, sessionToken string) error {
-    startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
 
-    err := s.sessionRepo.InvalidateSessionByToken(ctx, sessionToken)
-    if err != nil {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "Failed to invalidate session by token",
-            },
-            SessionID: sessionToken,
-            Status:    "failed",
-            ErrorCode: "INVALIDATE_BY_TOKEN_FAILED",
-        })
-        return err
-    }
+	if err := s.sessionRepo.InvalidateSessionByToken(ctx, sessionToken); err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to invalidate session by token",
+			},
+			SessionID: sessionToken,
+			Status:    "failed",
+			ErrorCode: "INVALIDATE_BY_TOKEN_FAILED",
+		})
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
 
-    s.logSessionEvent(ctx, &models.SessionLogEvent{
-        LogEnvelope: models.LogEnvelope{
-            EventID:     uuid.New().String(),
-            EventType:   string(models.LogEventTypeSession),
-            ServiceName: "auth-service",
-            Timestamp:   time.Now(),
-            Environment: s.config.Environment,
-            Version:     ServiceVersion,
-            Level:       string(models.LogLevelInfo),
-            Message:     "Session invalidated by token",
-        },
-        SessionID: sessionToken,
-        Status:    "invalidated",
-    })
-
-    s.logger.Info("Session invalidated by token",
-        util.Duration("duration", time.Since(startTime)),
-    )
-
-    return nil
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "session", "invalidate_session_by_token", "session",
+			nil, "system", nil, nil, nil, map[string]interface{}{
+				"session_token": sessionToken,
+				"ip":            ip,
+			})
+	}
+	return nil
 }
 
-// RefreshSession refreshes a session
 func (s *SessionService) RefreshSession(ctx context.Context, userID uuid.UUID) (string, error) {
-    startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
 
-    newToken, err := s.generateSessionToken()
-    if err != nil {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "Failed to generate new session token for refresh",
-            },
-            UserID:    userID.String(),
-            Status:    "failed",
-            ErrorCode: "TOKEN_GENERATION_FAILED",
-        })
-        return "", fmt.Errorf("failed to generate new token: %w", err)
-    }
+	newToken, err := s.generateSessionToken()
+	if err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to generate new session token for refresh",
+			},
+			UserID:    userID.String(),
+			Status:    "failed",
+			ErrorCode: "TOKEN_GENERATION_FAILED",
+		})
+		return "", fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	expiresAt := time.Now().Add(time.Duration(s.config.Auth.SessionTTL) * time.Second)
+	if err := s.sessionRepo.RefreshSession(ctx, userID, newToken, expiresAt); err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to refresh session in repository",
+			},
+			UserID:    userID.String(),
+			SessionID: newToken,
+			Status:    "failed",
+			ErrorCode: "REFRESH_FAILED",
+		})
+		return "", fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
 
-    expiresAt := time.Now().Add(time.Duration(s.config.Auth.SessionTTL) * time.Second)
-
-    if err := s.sessionRepo.RefreshSession(ctx, userID, newToken, expiresAt); err != nil {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "Failed to refresh session in repository",
-            },
-            UserID:    userID.String(),
-            SessionID: newToken,
-            Status:    "failed",
-            ErrorCode: "REFRESH_FAILED",
-        })
-        return "", err
-    }
-
-    s.logSessionEvent(ctx, &models.SessionLogEvent{
-        LogEnvelope: models.LogEnvelope{
-            EventID:     uuid.New().String(),
-            EventType:   string(models.LogEventTypeSession),
-            ServiceName: "auth-service",
-            Timestamp:   time.Now(),
-            Environment: s.config.Environment,
-            Version:     ServiceVersion,
-            Level:       string(models.LogLevelInfo),
-            Message:     "Session refreshed successfully",
-        },
-        UserID:    userID.String(),
-        SessionID: newToken,
-        Status:    "refreshed",
-    })
-
-    s.logger.Info("Session refreshed",
-        util.String("user_id", userID.String()),
-        util.Duration("duration", time.Since(startTime)),
-    )
-
-    return newToken, nil
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "session", "refresh_session", "user",
+			&userID, "system", nil, nil, nil, map[string]interface{}{
+				"new_token": newToken,
+				"ip":        ip,
+			})
+	}
+	return newToken, nil
 }
 
-// InvalidateSessionsBatch invalidates multiple sessions
 func (s *SessionService) InvalidateSessionsBatch(ctx context.Context, userIDs []uuid.UUID) error {
-    startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
 
-    err := s.sessionRepo.InvalidateSessionsBatch(ctx, userIDs)
-    if err != nil {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "Failed to invalidate sessions batch",
-            },
-            Status:    "failed",
-            ErrorCode: "BATCH_INVALIDATE_FAILED",
-        })
-        return err
-    }
-
-    s.logSessionEvent(ctx, &models.SessionLogEvent{
-        LogEnvelope: models.LogEnvelope{
-            EventID:     uuid.New().String(),
-            EventType:   string(models.LogEventTypeSession),
-            ServiceName: "auth-service",
-            Timestamp:   time.Now(),
-            Environment: s.config.Environment,
-            Version:     ServiceVersion,
-            Level:       string(models.LogLevelInfo),
-            Message:     "Batch sessions invalidated successfully",
-        },
-        Status: "batch_invalidated",
-    })
-
-    s.logger.Info("Batch sessions invalidated",
-        util.Int("user_count", len(userIDs)),
-        util.Duration("duration", time.Since(startTime)),
-    )
-
-    return nil
+	if err := s.sessionRepo.InvalidateSessionsBatch(ctx, userIDs); err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to invalidate sessions batch",
+			},
+			Status:    "failed",
+			ErrorCode: "BATCH_INVALIDATE_FAILED",
+		})
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "session", "invalidate_batch", "user",
+			nil, "system", nil, nil, nil, map[string]interface{}{
+				"count": len(userIDs),
+				"ip":    ip,
+			})
+	}
+	return nil
 }
 
-// GetSessionsBatch retrieves multiple sessions
+// --------------------------------------------------------------------
+// BULK / DEVICE OPERATIONS
+// --------------------------------------------------------------------
+
 func (s *SessionService) GetSessionsBatch(ctx context.Context, userIDs []uuid.UUID) ([]*models.ActiveSession, error) {
-    return s.sessionRepo.GetSessionsBatch(ctx, userIDs)
+	return s.sessionRepo.GetSessionsBatch(ctx, userIDs)
 }
 
-// CleanupExpiredSessions cleans up expired sessions
 func (s *SessionService) CleanupExpiredSessions(ctx context.Context, batchSize int) (int, error) {
-    startTime := time.Now()
-
-    if batchSize <= 0 {
-        batchSize = 1000
-    }
-
-    cleanedCount, err := s.sessionRepo.CleanupExpiredSessions(ctx, batchSize)
-    if err != nil {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "Failed to cleanup expired sessions",
-            },
-            Status:    "failed",
-            ErrorCode: "CLEANUP_FAILED",
-        })
-        return 0, err
-    }
-
-    if cleanedCount > 0 {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelInfo),
-                Message:     "Expired sessions cleaned up",
-            },
-            Status: "cleanup_completed",
-        })
-
-        s.logger.Info("Expired sessions cleaned up",
-            util.Int("cleaned_count", cleanedCount),
-            util.Duration("duration", time.Since(startTime)),
-        )
-    }
-
-    return cleanedCount, nil
+	if batchSize <= 0 {
+		batchSize = 1000
+	}
+	count, err := s.sessionRepo.CleanupExpiredSessions(ctx, batchSize)
+	if err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to cleanup expired sessions",
+			},
+			Status:    "failed",
+			ErrorCode: "CLEANUP_FAILED",
+		})
+		return 0, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	if count > 0 && s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "session", "cleanup_expired", "system",
+			nil, "system", nil, nil, nil, map[string]interface{}{
+				"deleted_count": count,
+			})
+	}
+	return count, nil
 }
 
-// GetSessionsByDevice retrieves sessions by device
 func (s *SessionService) GetSessionsByDevice(ctx context.Context, deviceID string, limit int) ([]*models.ActiveSession, error) {
-    return s.sessionRepo.GetSessionsByDevice(ctx, deviceID, limit)
+	return s.sessionRepo.GetSessionsByDevice(ctx, deviceID, limit)
 }
 
-// InvalidateDeviceSessions invalidates all sessions for a device
 func (s *SessionService) InvalidateDeviceSessions(ctx context.Context, deviceID string) error {
-    startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
 
-    err := s.sessionRepo.InvalidateDeviceSessions(ctx, deviceID)
-    if err != nil {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "Failed to invalidate device sessions",
-            },
-            DeviceID:  deviceID,
-            Status:    "failed",
-            ErrorCode: "DEVICE_INVALIDATE_FAILED",
-        })
-        return err
-    }
-
-    s.logSessionEvent(ctx, &models.SessionLogEvent{
-        LogEnvelope: models.LogEnvelope{
-            EventID:     uuid.New().String(),
-            EventType:   string(models.LogEventTypeSession),
-            ServiceName: "auth-service",
-            Timestamp:   time.Now(),
-            Environment: s.config.Environment,
-            Version:     ServiceVersion,
-            Level:       string(models.LogLevelInfo),
-            Message:     "Device sessions invalidated",
-        },
-        DeviceID: deviceID,
-        Status:   "device_invalidated",
-    })
-
-    s.logger.Info("Device sessions invalidated",
-        util.String("device_id", deviceID),
-        util.Duration("duration", time.Since(startTime)),
-    )
-
-    return nil
+	if err := s.sessionRepo.InvalidateDeviceSessions(ctx, deviceID); err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to invalidate device sessions",
+			},
+			DeviceID:  deviceID,
+			Status:    "failed",
+			ErrorCode: "DEVICE_INVALIDATE_FAILED",
+		})
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "session", "invalidate_device", "device",
+			nil, "system", nil, nil, nil, map[string]interface{}{
+				"device_id": deviceID,
+				"ip":        ip,
+			})
+	}
+	return nil
 }
 
-// GetActiveSessionsCount gets active session count
-func (s *SessionService) GetActiveSessionsCount(ctx context.Context, userID uuid.UUID) (int, error) {
-    return s.sessionRepo.GetActiveSessionsCount(ctx, userID)
-}
+// --------------------------------------------------------------------
+// ADMIN SESSION SPECIFIC METHODS
+// --------------------------------------------------------------------
 
-// GetAdminSessions retrieves all admin sessions for a user
 func (s *SessionService) GetAdminSessions(ctx context.Context, userID uuid.UUID) ([]*models.ActiveSession, error) {
-    sessions, err := s.sessionRepo.GetAdminSessions(ctx, userID)
-    if err != nil {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "Failed to get admin sessions",
-            },
-            UserID:    userID.String(),
-            Status:    "failed",
-            ErrorCode: "GET_ADMIN_SESSIONS_FAILED",
-        })
-        return nil, fmt.Errorf("failed to get admin sessions: %w", err)
-    }
-    return sessions, nil
+	sessions, err := s.sessionRepo.GetAdminSessions(ctx, userID)
+	if err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to get admin sessions",
+			},
+			UserID:    userID.String(),
+			Status:    "failed",
+			ErrorCode: "GET_ADMIN_SESSIONS_FAILED",
+		})
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	return sessions, nil
 }
 
-// InvalidateAdminSessions invalidates all admin sessions for a user
 func (s *SessionService) InvalidateAdminSessions(ctx context.Context, userID uuid.UUID) error {
-    startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
 
-    err := s.sessionRepo.InvalidateAdminSessions(ctx, userID)
-    if err != nil {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "Failed to invalidate admin sessions",
-            },
-            UserID:    userID.String(),
-            Status:    "failed",
-            ErrorCode: "INVALIDATE_ADMIN_SESSIONS_FAILED",
-        })
-        return fmt.Errorf("failed to invalidate admin sessions: %w", err)
-    }
-
-    s.logSessionEvent(ctx, &models.SessionLogEvent{
-        LogEnvelope: models.LogEnvelope{
-            EventID:     uuid.New().String(),
-            EventType:   string(models.LogEventTypeSession),
-            ServiceName: "auth-service",
-            Timestamp:   time.Now(),
-            Environment: s.config.Environment,
-            Version:     ServiceVersion,
-            Level:       string(models.LogLevelInfo),
-            Message:     "Admin sessions invalidated",
-        },
-        UserID: userID.String(),
-        Status: "admin_sessions_invalidated",
-    })
-
-    s.logger.Info("All admin sessions invalidated",
-        util.String("user_id", userID.String()),
-        util.Duration("duration", time.Since(startTime)),
-    )
-
-    return nil
+	if err := s.sessionRepo.InvalidateAdminSessions(ctx, userID); err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to invalidate admin sessions",
+			},
+			UserID:    userID.String(),
+			Status:    "failed",
+			ErrorCode: "INVALIDATE_ADMIN_SESSIONS_FAILED",
+		})
+		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "session", "invalidate_admin_sessions", "admin_user",
+			&userID, "system", nil, nil, nil, map[string]interface{}{
+				"ip": ip,
+			})
+	}
+	return nil
 }
 
-// GetActiveAdminSessionsCount gets count of active admin sessions
-func (s *SessionService) GetActiveAdminSessionsCount(ctx context.Context, userID uuid.UUID) (int, error) {
-    count, err := s.sessionRepo.GetActiveAdminSessionsCount(ctx, userID)
-    if err != nil {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "Failed to get admin session count",
-            },
-            UserID:    userID.String(),
-            Status:    "failed",
-            ErrorCode: "GET_ADMIN_COUNT_FAILED",
-        })
-        return 0, fmt.Errorf("failed to get admin session count: %w", err)
-    }
-    return count, nil
-}
-
-// LogoutAdminSessions is an alias for InvalidateAdminSessions
 func (s *SessionService) LogoutAdminSessions(ctx context.Context, userID uuid.UUID) error {
-    return s.InvalidateAdminSessions(ctx, userID)
+	return s.InvalidateAdminSessions(ctx, userID)
 }
 
-// HealthCheck performs health check
+func (s *SessionService) GetActiveAdminSessionsCount(ctx context.Context, userID uuid.UUID) (int, error) {
+	count, err := s.sessionRepo.GetActiveAdminSessionsCount(ctx, userID)
+	if err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to get admin session count",
+			},
+			UserID:    userID.String(),
+			Status:    "failed",
+			ErrorCode: "GET_ADMIN_COUNT_FAILED",
+		})
+		return 0, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	return count, nil
+}
+
+// --------------------------------------------------------------------
+// STATS & HEALTH
+// --------------------------------------------------------------------
+
 func (s *SessionService) HealthCheck(ctx context.Context) error {
-    return s.sessionRepo.HealthCheck(ctx)
+	return s.sessionRepo.HealthCheck(ctx)
 }
 
-// GetSessionStats gets session statistics
 func (s *SessionService) GetSessionStats(ctx context.Context) (map[string]interface{}, error) {
-    stats, err := s.sessionRepo.GetRepositoryStats(ctx)
-    if err != nil {
-        s.logSessionEvent(ctx, &models.SessionLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   string(models.LogEventTypeSession),
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: s.config.Environment,
-                Version:     ServiceVersion,
-                Level:       string(models.LogLevelError),
-                Message:     "Failed to get session stats",
-            },
-            Status:    "failed",
-            ErrorCode: "GET_STATS_FAILED",
-        })
-        return nil, fmt.Errorf("failed to get session stats: %w", err)
-    }
-
-    // Add session type breakdown to stats
-    stats["session_types"] = map[string]interface{}{
-        "user_sessions":  "tracked_separately",
-        "admin_sessions": "tracked_separately",
-        "admin_ttl_days": 7,
-        "user_ttl_days":  30,
-    }
-
-    return stats, nil
+	stats, err := s.sessionRepo.GetRepositoryStats(ctx)
+	if err != nil {
+		s.logSessionEvent(ctx, &models.SessionLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeSession),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to get session stats",
+			},
+			Status:    "failed",
+			ErrorCode: "GET_STATS_FAILED",
+		})
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	stats["session_types"] = map[string]interface{}{
+		"user_sessions":  "tracked_separately",
+		"admin_sessions": "tracked_separately",
+		"admin_ttl_days": 7,
+		"user_ttl_days":  30,
+	}
+	return stats, nil
 }
 
-// generateSessionToken generates a secure session token
+// --------------------------------------------------------------------
+// HELPERS
+// --------------------------------------------------------------------
+
 func (s *SessionService) generateSessionToken() (string, error) {
-    b := make([]byte, 32)
-    if _, err := rand.Read(b); err != nil {
-        return "", err
-    }
-    return base64.URLEncoding.EncodeToString(b), nil
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.URLEncoding.EncodeToString(b), nil
 }
 
-// SetLogProducerService sets Kafka log producer service
 func (s *SessionService) SetLogProducerService(logProducer *LogProducerService) {
-    s.logProducer = logProducer
+	s.logProducer = logProducer
 }
 
 func (s *SessionService) GetAccessTokenDataByJTI(ctx context.Context, jti string) (*models.AccessTokenData, error) {
-    data, err := s.sessionRepo.GetAccessToken(ctx, jti)
-    if err != nil {
-        return nil, err
-    }
-    return data, nil
+	return s.sessionRepo.GetAccessToken(ctx, jti)
 }
+
+// Note: ServiceVersion is expected to be defined elsewhere in the package.

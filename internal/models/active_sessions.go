@@ -4,7 +4,7 @@ import (
 	"net"
 	"time"
 
-	"auth-service/internal/rbac" // Import rbac package
+	"auth-service/internal/rbac"
 )
 
 // PermissionMaskSegments defines the number of uint64 segments needed for permission mask
@@ -24,10 +24,10 @@ type ActiveSession struct {
 	EncryptionKey     []byte    `db:"encryption_key" json:"encryption_key"`
 
 	// Session type
-	SessionType string `db:"session_type" json:"session_type"` // "user", "admin", "student", or "web"
+	SessionType string `db:"session_type" json:"session_type"`
 
 	// Role and permissions
-	Role           string   `db:"role" json:"role,omitempty"` // e.g., "super_admin", "admin_manager", "owner", "employee"
+	Role           string   `db:"role" json:"role,omitempty"`
 	PermissionMask []uint64 `db:"permission_mask" json:"permission_mask,omitempty"`
 }
 
@@ -73,27 +73,25 @@ func (s *ActiveSession) SetWebSession() {
 
 // HasPermission checks if session has a specific permission
 func (s *ActiveSession) HasPermission(permissionName string) bool {
-	if s.PermissionMask == nil || len(s.PermissionMask) == 0 {
+	if len(s.PermissionMask) == 0 {
 		return false
 	}
 
-	// Use rbac package for permission checking
 	return rbac.HasPermission(s.PermissionMask, permissionName)
 }
 
 // GetPermissions returns list of permission names from mask
 func (s *ActiveSession) GetPermissions() []string {
-	if s.PermissionMask == nil || len(s.PermissionMask) == 0 {
+	if len(s.PermissionMask) == 0 {
 		return []string{}
 	}
 
-	// Use rbac package to get permissions from mask
 	return rbac.GetPermissionsFromMask(s.PermissionMask)
 }
 
 // HasAnyPermission checks if session has any of the given permissions
 func (s *ActiveSession) HasAnyPermission(permissions ...string) bool {
-	if s.PermissionMask == nil || len(s.PermissionMask) == 0 {
+	if len(s.PermissionMask) == 0 {
 		return false
 	}
 
@@ -102,7 +100,7 @@ func (s *ActiveSession) HasAnyPermission(permissions ...string) bool {
 
 // HasAllPermissions checks if session has all of the given permissions
 func (s *ActiveSession) HasAllPermissions(permissions ...string) bool {
-	if s.PermissionMask == nil || len(s.PermissionMask) == 0 {
+	if len(s.PermissionMask) == 0 {
 		return false
 	}
 
@@ -166,7 +164,7 @@ func (s *ActiveSession) HasRoleAccess(requiredRole string) bool {
 	return sessionLevel >= requiredLevel
 }
 
-// Helper function to get role level from string
+// getRoleLevelFromString returns hierarchy level for a role
 func (s *ActiveSession) getRoleLevelFromString(role string) int {
 	switch role {
 	case RoleAdminSuperAdmin:
@@ -186,11 +184,11 @@ func (s *ActiveSession) getRoleLevelFromString(role string) int {
 	}
 }
 
-// CreateFullPermissionMask creates a mask with all bits set (using global segment count)
+// CreateFullPermissionMask creates a mask with all bits set
 func (s *ActiveSession) CreateFullPermissionMask() []uint64 {
 	mask := make([]uint64, PermissionMaskSegments)
 	for i := range mask {
-		mask[i] = ^uint64(0) // Set all bits to 1
+		mask[i] = ^uint64(0)
 	}
 	return mask
 }
@@ -206,10 +204,9 @@ func (s *ActiveSession) BuildPermissionMaskFromBitPositions(bitPositions []uint6
 }
 
 // ============================================================================
-// Constants
+// Session type constants
 // ============================================================================
 
-// Session type constants
 const (
 	SessionTypeUser    = "user"
 	SessionTypeAdmin   = "admin"
@@ -217,7 +214,7 @@ const (
 	SessionTypeWeb     = "web"
 )
 
-// Global helper function to create a full permission mask (using 13 segments)
+// CreateFullPermissionMask creates a full permission mask (all bits set)
 func CreateFullPermissionMask() []uint64 {
 	mask := make([]uint64, PermissionMaskSegments)
 	for i := range mask {
