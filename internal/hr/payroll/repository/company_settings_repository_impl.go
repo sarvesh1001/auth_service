@@ -1,30 +1,27 @@
 package repository
 
 import (
-	"auth-service/internal/client"
-	"auth-service/internal/hr/payroll/models"
-	"auth-service/internal/util"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
-	"go.uber.org/zap"
+
+	"auth-service/internal/client"
+	hrErrors "auth-service/internal/hr/errors"
+	"auth-service/internal/hr/payroll/models"
 )
 
 type companySettingsRepository struct {
 	client *client.PostgresClient
-	logger *zap.Logger
 }
 
 func NewCompanySettingsRepository(
 	postgresClient *client.PostgresClient,
-	logger *zap.Logger,
 ) CompanySettingsRepository {
 	return &companySettingsRepository{
 		client: postgresClient,
-		logger: logger.Named("company_settings_repo"),
 	}
 }
 
@@ -55,12 +52,9 @@ func (r *companySettingsRepository) GetPayrollSettings(ctx context.Context, comp
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			// Use sentinel error instead of nil,nil
+			return nil, hrErrors.ErrPayrollSettingsNotFound
 		}
-		r.logger.Error("failed to get payroll settings",
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get payroll settings: %w", err)
 	}
 	return &settings, nil
@@ -85,17 +79,12 @@ func (r *companySettingsRepository) UpsertPayrollSettings(ctx context.Context, s
 			updated_at = NOW()
 	`
 	_, err := r.client.Exec(ctx, query,
-		settings.CompanyID,
 		nullString(settings.DefaultFineComponent),
 		nullString(settings.DefaultArrearsComponent),
 		nullString(settings.DefaultLoanComponent),
 		nullString(settings.DefaultBasicComponent),
 	)
 	if err != nil {
-		r.logger.Error("failed to upsert payroll settings",
-			util.String("company_id", settings.CompanyID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to upsert payroll settings: %w", err)
 	}
 	return nil

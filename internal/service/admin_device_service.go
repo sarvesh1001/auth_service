@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"auth-service/internal/config"
+	"auth-service/internal/devicefp"
 	appErrors "auth-service/internal/errors"
 	"auth-service/internal/infrastructure/audit"
 	"auth-service/internal/infrastructure/idempotency"
@@ -31,10 +32,9 @@ type AdminDeviceService struct {
 	idempotencyStore idempotency.Store
 	auditService     *audit.AuditService
 	config           config.Config
-	// logger removed
 }
 
-// NewAdminDeviceService creates a new AdminDeviceService (without logger).
+// NewAdminDeviceService creates a new AdminDeviceService.
 func NewAdminDeviceService(
 	deviceRepo scylla.AdminDeviceRepository,
 	trustRepo scylla.AdminDeviceTrustRepository,
@@ -44,6 +44,15 @@ func NewAdminDeviceService(
 	auditService *audit.AuditService,
 	config config.Config,
 ) *AdminDeviceService {
+	if deviceRepo == nil {
+		panic("service.NewAdminDeviceService: deviceRepo is required")
+	}
+	if trustRepo == nil {
+		panic("service.NewAdminDeviceService: trustRepo is required")
+	}
+	if idempotencyStore == nil {
+		panic("service.NewAdminDeviceService: idempotencyStore is required")
+	}
 	return &AdminDeviceService{
 		deviceRepo:       deviceRepo,
 		trustRepo:        trustRepo,
@@ -93,94 +102,102 @@ type AdminValidateDeviceResponse struct {
 	Message string `json:"message,omitempty"`
 }
 
-// BindDevice binds a new device to an admin with idempotency and audit.
+// ---------- helper ----------
+
+// BindDevice binds a new device to an admin atomically:
+// both the active binding and the trust row are written in a single
+// Scylla logged batch. If either fails, neither is persisted.
 func (s *AdminDeviceService) BindDevice(
 	ctx context.Context,
 	req AdminBindDeviceRequest,
 ) (*AdminBindDeviceResponse, error) {
-	// Extract idempotency key and IP from context
-	idempKey, _ := ctx.Value("idempotency_key").(string)
-	if idempKey == "" {
-		idempKey = uuid.New().String()
-	}
+
+	// --- 1. Resolve IP (context wins, then request) ---
 	ip, _ := ctx.Value("ip_address").(string)
-	if ip == "" && req.IPAddress != "" {
+	if ip == "" {
 		ip = req.IPAddress
 	}
-
-	// Check idempotency
-	var cachedResponse AdminBindDeviceResponse
-	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cachedResponse); err == nil && cachedResponse.Success {
-		// No logging; just return cached result
-		return &cachedResponse, nil
+	if ip == "" {
+		return nil, fmt.Errorf("%w: ip address required to bind admin device", appErrors.ErrInvalidInput)
 	}
 
+	// --- 2. Canonical fingerprint hash (empty stays empty) ---
+	fpHash := devicefp.Hash(req.DeviceFingerprint)
+
+	// --- 3. Deterministic, namespaced idempotency key ---
+	// Namespaced so it cannot collide with the outer verify_otp: key.
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("admin_bind:v2:%s:%s:%s", req.AdminID, req.DeviceID, fpHash)
+	}
+
+	var cached AdminBindDeviceResponse
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached.Success {
+		return &cached, nil
+	}
+
+	// --- 4. Generate bind token ---
 	bindToken, err := s.generateBindToken()
 	if err != nil {
-		return nil, fmt.Errorf("%w: token generation failed", appErrors.ErrInternal)
+		return nil, fmt.Errorf("%w: bind token generation failed", appErrors.ErrInternal)
 	}
 
-	// Perform binding
-	if err := s.deviceRepo.BindAdminDevice(ctx, req.AdminID, req.DeviceID, bindToken); err != nil {
-		return nil, fmt.Errorf("%w: bind failed", appErrors.ErrInternal)
+	// --- 5. Atomic bind + trust ---
+	result, err := s.deviceRepo.BindAndTrust(ctx, scylla.BindAndTrustRequest{
+		AdminID:         req.AdminID,
+		DeviceID:        req.DeviceID,
+		BindToken:       bindToken,
+		IPAddress:       ip,
+		IPSubnet:        extractSubnet24(ip),
+		UserAgent:       req.UserAgent,
+		DeviceModel:     req.DeviceModel,
+		OSVersion:       req.OSVersion,
+		AppVersion:      req.AppVersion,
+		FingerprintHash: fpHash,
+		Now:             time.Now().UTC(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: bind_and_trust failed: %v", appErrors.ErrInternal, err)
+	}
+	if result == nil || !result.Trusted {
+		// Fail-closed: caller must not treat this as a successful login.
+		return nil, fmt.Errorf("%w: bind succeeded but trust not established", appErrors.ErrInternal)
 	}
 
-	// Record history if available
+	// --- 6. Best-effort side channels (do NOT gate on these) ---
 	if s.historyRepo != nil {
 		if err := s.historyRepo.RecordAdminBinding(ctx, req.AdminID, req.DeviceID, nil, bindToken, "bind"); err != nil {
-			// Non‑critical; we don't fail the operation
+			// Non-critical: binding + trust are already durable.
 		}
 	}
 
-	// Update trust level if available
-	if s.trustRepo != nil {
-		trustLevel := &models.DeviceTrustLevel{
-			UserID:            req.AdminID,
-			DeviceID:          req.DeviceID,
-			TrustStatus:       models.TrustStatusTrusted,
-			DeviceFingerprint: req.DeviceFingerprint,
-			OSVersion:         req.OSVersion,
-			AppVersion:        req.AppVersion,
-			LastIPAddress:     ip,
-			UserAgent:         req.UserAgent,
-			DeviceModel:       req.DeviceModel,
-			IsBlocked:         false,
-			RiskScore:         0,
-		}
-		if err := s.trustRepo.MarkAdminSuccessfulLogin(ctx, req.AdminID, req.DeviceID, trustLevel); err != nil {
-			// Non‑critical
-		}
-	}
-
-	// Invalidate cache
-	if s.distCache != nil {
-		cacheKey := fmt.Sprintf("admin_device:%s", req.AdminID.String())
-		s.distCache.DeleteKey(ctx, cacheKey)
-	}
-
-	response := &AdminBindDeviceResponse{
-		BindToken: bindToken,
-		BoundAt:   time.Now().UTC(),
-		Success:   true,
-	}
-
-	// Store idempotency result
-	if err := s.idempotencyStore.Store(ctx, nil, idempKey, response); err != nil {
-		// Non‑critical; log might be elsewhere
-	}
-
-	// Audit log
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "admin_device", "bind_device", "admin",
 			&req.AdminID, "admin", &req.AdminID, nil, nil, map[string]interface{}{
-				"device_id":          req.DeviceID,
-				"device_fingerprint": req.DeviceFingerprint,
-				"ip_address":         ip,
-				"bind_token":         bindToken,
+				"device_id":  req.DeviceID,
+				"fp_hash":    fpHash, // hashed only — never log raw fingerprint
+				"ip_address": ip,
+				"ip_subnet":  result.IPSubnet,
+				"bind_token": bindToken,
 			})
 	}
 
-	return response, nil
+	// --- 7. Invalidate caches after writes are durable ---
+	if s.distCache != nil {
+		_ = s.distCache.DeleteKey(ctx, fmt.Sprintf("admin_device:%s", req.AdminID.String()))
+	}
+
+	// --- 8. Cache idempotency response ---
+	resp := &AdminBindDeviceResponse{
+		BindToken: bindToken,
+		BoundAt:   result.UpdatedAt,
+		Success:   true,
+	}
+	if err := s.idempotencyStore.Store(ctx, nil, idempKey, resp); err != nil {
+		// Non-critical: next call will regenerate an equivalent token.
+	}
+
+	return resp, nil
 }
 
 // GetActiveDevice retrieves the active device for an admin (with cache).
@@ -244,7 +261,7 @@ func (s *AdminDeviceService) UnbindDevice(ctx context.Context, adminID uuid.UUID
 
 	if device != nil && s.historyRepo != nil {
 		if err := s.historyRepo.RecordAdminBinding(ctx, adminID, device.DeviceID, nil, device.BindToken, "unbind"); err != nil {
-			// Non‑critical
+			// Non-critical
 		}
 	}
 
@@ -256,7 +273,7 @@ func (s *AdminDeviceService) UnbindDevice(ctx context.Context, adminID uuid.UUID
 
 	// Store idempotency marker
 	if err := s.idempotencyStore.Store(ctx, nil, idempKey, true); err != nil {
-		// Non‑critical
+		// Non-critical
 	}
 
 	// Audit - prepare before state as JSON bytes
@@ -309,7 +326,7 @@ func (s *AdminDeviceService) UpdateDeviceSession(
 	}
 
 	if err := s.idempotencyStore.Store(ctx, nil, idempKey, true); err != nil {
-		// Non‑critical
+		// Non-critical
 	}
 
 	if s.auditService != nil {
@@ -356,7 +373,7 @@ func (s *AdminDeviceService) ValidateDevice(
 
 	// Store idempotency result
 	if err := s.idempotencyStore.Store(ctx, nil, idempKey, response); err != nil {
-		// Non‑critical
+		// Non-critical
 	}
 
 	if s.auditService != nil {

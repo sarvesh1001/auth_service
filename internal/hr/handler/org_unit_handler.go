@@ -41,7 +41,7 @@ func NewOrgUnitHandler(
 
 func (h *OrgUnitHandler) CreateOrgUnit(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -113,7 +113,7 @@ func (h *OrgUnitHandler) CreateOrgUnit(w http.ResponseWriter, r *http.Request) {
 
 func (h *OrgUnitHandler) GetOrgUnit(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -156,7 +156,7 @@ func (h *OrgUnitHandler) GetOrgUnit(w http.ResponseWriter, r *http.Request) {
 
 func (h *OrgUnitHandler) UpdateOrgUnit(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -233,7 +233,7 @@ func (h *OrgUnitHandler) UpdateOrgUnit(w http.ResponseWriter, r *http.Request) {
 
 func (h *OrgUnitHandler) DeleteOrgUnit(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -295,7 +295,7 @@ func (h *OrgUnitHandler) DeleteOrgUnit(w http.ResponseWriter, r *http.Request) {
 
 func (h *OrgUnitHandler) ListOrgUnits(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -357,7 +357,7 @@ func (h *OrgUnitHandler) ListOrgUnits(w http.ResponseWriter, r *http.Request) {
 
 func (h *OrgUnitHandler) SearchOrgUnits(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -425,7 +425,7 @@ func (h *OrgUnitHandler) SearchOrgUnits(w http.ResponseWriter, r *http.Request) 
 
 func (h *OrgUnitHandler) GetActiveOrgUnits(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -455,7 +455,7 @@ func (h *OrgUnitHandler) GetActiveOrgUnits(w http.ResponseWriter, r *http.Reques
 
 func (h *OrgUnitHandler) AddMember(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -524,7 +524,7 @@ func (h *OrgUnitHandler) AddMember(w http.ResponseWriter, r *http.Request) {
 
 func (h *OrgUnitHandler) RemoveMember(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -593,9 +593,76 @@ func (h *OrgUnitHandler) RemoveMember(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *OrgUnitHandler) UpdateMember(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	ctx := injectCommonContext(r.Context(), r)
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+
+	orgUnitID, err := uuid.Parse(chi.URLParam(r, "orgUnitID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid org unit ID")
+		return
+	}
+
+	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
+		return
+	}
+
+	var req orgunit.UpdateMemberRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	actorType, actorID, err := h.getActorInfo(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+
+	metadata := map[string]interface{}{
+		"ip_address": r.RemoteAddr,
+		"user_agent": r.UserAgent(),
+	}
+
+	err = h.orgUnitService.UpdateMember(
+		ctx,
+		companyID,
+		orgUnitID,
+		userID,
+		&req,
+		actorType,
+		actorID,
+		metadata,
+	)
+	if err != nil {
+		h.logger.Error("Failed to update membership",
+			util.String("org_unit_id", orgUnitID.String()),
+			util.String("user_id", userID.String()),
+			util.ErrorField(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Membership updated successfully",
+		"meta": map[string]interface{}{
+			"duration": time.Since(startTime).String(),
+		},
+	})
+}
+
 func (h *OrgUnitHandler) AssignRole(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -665,7 +732,7 @@ func (h *OrgUnitHandler) AssignRole(w http.ResponseWriter, r *http.Request) {
 
 func (h *OrgUnitHandler) RemoveRole(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -744,7 +811,7 @@ func (h *OrgUnitHandler) RemoveRole(w http.ResponseWriter, r *http.Request) {
 
 func (h *OrgUnitHandler) GetOrgUnitMembers(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -760,7 +827,6 @@ func (h *OrgUnitHandler) GetOrgUnitMembers(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Verify org unit exists and belongs to company
 	_, err = h.orgUnitQueryService.GetOrgUnit(ctx, companyID, orgUnitID, false)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
@@ -771,9 +837,7 @@ func (h *OrgUnitHandler) GetOrgUnitMembers(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// ✅ FIX: default = false (return ALL members)
 	onlyActive := false
-
 	if v := r.URL.Query().Get("active"); v != "" {
 		onlyActive = v == "true"
 	}
@@ -787,7 +851,6 @@ func (h *OrgUnitHandler) GetOrgUnitMembers(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// ✅ NEVER return null arrays
 	if members == nil {
 		members = []*orgunit.OrgUnitMember{}
 	}
@@ -804,7 +867,7 @@ func (h *OrgUnitHandler) GetOrgUnitMembers(w http.ResponseWriter, r *http.Reques
 
 func (h *OrgUnitHandler) GetOrgUnitRoles(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -820,7 +883,6 @@ func (h *OrgUnitHandler) GetOrgUnitRoles(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Verify org unit exists and belongs to company
 	_, err = h.orgUnitQueryService.GetOrgUnit(ctx, companyID, orgUnitID, false)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
@@ -854,7 +916,7 @@ func (h *OrgUnitHandler) GetOrgUnitRoles(w http.ResponseWriter, r *http.Request)
 
 func (h *OrgUnitHandler) GetUserMemberships(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	userIDStr := chi.URLParam(r, "userID")
 	userID, err := uuid.Parse(userIDStr)
@@ -885,7 +947,7 @@ func (h *OrgUnitHandler) GetUserMemberships(w http.ResponseWriter, r *http.Reque
 }
 
 func (h *OrgUnitHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	if err := h.orgUnitService.HealthCheck(ctx); err != nil {
 		h.respondWithError(w, http.StatusServiceUnavailable,
@@ -905,6 +967,10 @@ func (h *OrgUnitHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
 	})
 }
+
+// ============================================================================
+// HELPER METHODS
+// ============================================================================
 
 func (h *OrgUnitHandler) getActorInfo(ctx context.Context) (string, uuid.UUID, error) {
 	sessionType, ok := ctx.Value("session_type").(string)
@@ -943,71 +1009,5 @@ func (h *OrgUnitHandler) respondWithError(w http.ResponseWriter, statusCode int,
 		"success": false,
 		"error":   message,
 		"code":    statusCode,
-	})
-}
-func (h *OrgUnitHandler) UpdateMember(w http.ResponseWriter, r *http.Request) {
-	startTime := time.Now()
-	ctx := r.Context()
-
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
-		return
-	}
-
-	orgUnitID, err := uuid.Parse(chi.URLParam(r, "orgUnitID"))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid org unit ID")
-		return
-	}
-
-	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
-		return
-	}
-
-	var req orgunit.UpdateMemberRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
-		return
-	}
-
-	actorType, actorID, err := h.getActorInfo(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
-		return
-	}
-
-	metadata := map[string]interface{}{
-		"ip_address": r.RemoteAddr,
-		"user_agent": r.UserAgent(),
-	}
-
-	err = h.orgUnitService.UpdateMember(
-		ctx,
-		companyID,
-		orgUnitID,
-		userID,
-		&req,
-		actorType,
-		actorID,
-		metadata,
-	)
-	if err != nil {
-		h.logger.Error("Failed to update membership",
-			util.String("org_unit_id", orgUnitID.String()),
-			util.String("user_id", userID.String()),
-			util.ErrorField(err))
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "Membership updated successfully",
-		"meta": map[string]interface{}{
-			"duration": time.Since(startTime).String(),
-		},
 	})
 }

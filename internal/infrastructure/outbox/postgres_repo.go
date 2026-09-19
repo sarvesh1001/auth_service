@@ -48,6 +48,12 @@ func (r *PostgresRepository) Store(ctx context.Context, tx *sql.Tx, event *Event
 		}
 	}
 
+	// ✅ Convert empty AggregateID to NULL for UUID column
+	var aggregateID interface{} = event.AggregateID
+	if aggregateID == "" {
+		aggregateID = nil
+	}
+
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO outbox.events (
 			event_id,
@@ -65,7 +71,7 @@ func (r *PostgresRepository) Store(ctx context.Context, tx *sql.Tx, event *Event
 	`,
 		event.EventID,
 		event.AggregateType,
-		event.AggregateID,
+		aggregateID, // nil if empty
 		event.EventType,
 		event.Topic,
 		event.Payload,
@@ -79,8 +85,6 @@ func (r *PostgresRepository) Store(ctx context.Context, tx *sql.Tx, event *Event
 // Fetch pending events with row-level locking
 // ============================================================
 func (r *PostgresRepository) FetchPending(ctx context.Context, limit int) ([]*Event, error) {
-	// ✅ CRITICAL FIX: Use FOR UPDATE SKIP LOCKED to prevent multiple outbox
-	// processors from grabbing the same event concurrently.
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT 
 			event_id,
@@ -108,11 +112,12 @@ func (r *PostgresRepository) FetchPending(ctx context.Context, limit int) ([]*Ev
 	for rows.Next() {
 		var e Event
 		var headers []byte
+		var aggregateID sql.NullString // ✅ handle NULL
 
 		if err := rows.Scan(
 			&e.EventID,
 			&e.AggregateType,
-			&e.AggregateID,
+			&aggregateID, // scan into NullString
 			&e.EventType,
 			&e.Topic,
 			&e.Payload,
@@ -121,6 +126,13 @@ func (r *PostgresRepository) FetchPending(ctx context.Context, limit int) ([]*Ev
 			&e.CreatedAt,
 		); err != nil {
 			return nil, err
+		}
+
+		// Convert NullString to string (empty if NULL)
+		if aggregateID.Valid {
+			e.AggregateID = aggregateID.String
+		} else {
+			e.AggregateID = ""
 		}
 
 		// Unmarshal headers
@@ -165,8 +177,6 @@ func (r *PostgresRepository) MarkFailed(ctx context.Context, eventID string, ret
 	}
 
 	status := "pending"
-
-	// optional: move to failed after max retries
 	if retryCount >= 5 {
 		status = "failed"
 	}

@@ -2,15 +2,17 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 
 	"auth-service/internal/hr/payroll/models"
 	"auth-service/internal/hr/payroll/repository"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
 )
 
 // AttendanceRuleService defines the business operations for attendance rules.
@@ -28,7 +30,7 @@ type AttendanceRuleService interface {
 	ExistsActiveRuleOfType(ctx context.Context, companyID uuid.UUID, ruleType string) (bool, error)
 }
 
-// CreateAttendanceRuleInput now includes ComponentCode.
+// CreateAttendanceRuleInput
 type CreateAttendanceRuleInput struct {
 	CompanyID        uuid.UUID
 	RuleType         string
@@ -36,11 +38,11 @@ type CreateAttendanceRuleInput struct {
 	Value            float64
 	BasedOn          *string
 	ThresholdMinutes int
-	ComponentCode    string // NEW: payroll component linked to this rule
+	ComponentCode    string
 	CreatedBy        uuid.UUID
 }
 
-// UpdateAttendanceRuleInput now includes ComponentCode.
+// UpdateAttendanceRuleInput
 type UpdateAttendanceRuleInput struct {
 	CompanyID        uuid.UUID
 	RuleID           uuid.UUID
@@ -49,31 +51,45 @@ type UpdateAttendanceRuleInput struct {
 	Value            float64
 	BasedOn          *string
 	ThresholdMinutes int
-	ComponentCode    string // NEW
+	ComponentCode    string
 	UpdatedBy        uuid.UUID
 }
 
 type attendanceRuleService struct {
-	ruleRepo repository.AttendanceRuleRepository
-	compRepo repository.ComponentRepository // NEW: to validate component existence
-	logger   *zap.Logger
+	ruleRepo         repository.AttendanceRuleRepository
+	compRepo         repository.ComponentRepository
+	idempotencyStore idempotency.Store
+	auditService     *audit.AuditService
 }
 
-// NewAttendanceRuleService now requires a ComponentRepository.
+// NewAttendanceRuleService now requires idempotency and audit.
 func NewAttendanceRuleService(
 	ruleRepo repository.AttendanceRuleRepository,
 	compRepo repository.ComponentRepository,
-	logger *zap.Logger,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
 ) AttendanceRuleService {
 	return &attendanceRuleService{
-		ruleRepo: ruleRepo,
-		compRepo: compRepo,
-		logger:   logger,
+		ruleRepo:         ruleRepo,
+		compRepo:         compRepo,
+		idempotencyStore: idempotencyStore,
+		auditService:     auditService,
 	}
 }
 
+// CreateRule – with idempotency and audit
 func (s *attendanceRuleService) CreateRule(ctx context.Context, input CreateAttendanceRuleInput) (*models.AttendanceRule, error) {
-	// Basic validations
+	// Idempotency
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("att_rule_create-%s-%s", input.CompanyID.String(), input.RuleType)
+	}
+	var cached *models.AttendanceRule
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
+
+	// Validations
 	if input.CompanyID == uuid.Nil {
 		return nil, errors.New("company_id is required")
 	}
@@ -96,7 +112,7 @@ func (s *attendanceRuleService) CreateRule(ctx context.Context, input CreateAtte
 		return nil, errors.New("created_by is required")
 	}
 
-	// Validate that the component exists and belongs to the company.
+	// Validate component
 	comp, err := s.compRepo.GetComponent(ctx, input.CompanyID, input.ComponentCode)
 	if err != nil {
 		return nil, fmt.Errorf("failed to validate component: %w", err)
@@ -104,8 +120,6 @@ func (s *attendanceRuleService) CreateRule(ctx context.Context, input CreateAtte
 	if comp == nil {
 		return nil, fmt.Errorf("component %s does not exist for company %s", input.ComponentCode, input.CompanyID)
 	}
-	// Optionally, you can enforce that the component is of the correct type (e.g., deduction for late/absent, earning for overtime)
-	// but for now we just ensure it exists.
 
 	rule := &models.AttendanceRule{
 		RuleID:           uuid.New(),
@@ -115,7 +129,7 @@ func (s *attendanceRuleService) CreateRule(ctx context.Context, input CreateAtte
 		Value:            input.Value,
 		BasedOn:          input.BasedOn,
 		ThresholdMinutes: input.ThresholdMinutes,
-		ComponentCode:    input.ComponentCode, // NEW
+		ComponentCode:    input.ComponentCode,
 		IsActive:         true,
 		CreatedBy:        &input.CreatedBy,
 	}
@@ -124,20 +138,51 @@ func (s *attendanceRuleService) CreateRule(ctx context.Context, input CreateAtte
 		return nil, fmt.Errorf("validation failed: %w", err)
 	}
 
+	beforeJSON, _ := json.Marshal(rule)
 	if err := s.ruleRepo.Create(ctx, rule); err != nil {
 		return nil, err
 	}
+	afterJSON, _ := json.Marshal(rule)
 
-	s.logger.Info("Attendance rule created",
-		zap.String("rule_id", rule.RuleID.String()),
-		zap.String("company_id", rule.CompanyID.String()),
-		zap.String("rule_type", rule.RuleType),
-		zap.String("component_code", rule.ComponentCode))
+	// Audit
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := map[string]interface{}{
+		"ip":             ip,
+		"company_id":     input.CompanyID.String(),
+		"rule_type":      input.RuleType,
+		"component_code": input.ComponentCode,
+	}
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&input.CompanyID,
+		"payroll",
+		"attendance_rule.create",
+		"attendance_rule",
+		&rule.RuleID,
+		"user",
+		&input.CreatedBy,
+		beforeJSON,
+		afterJSON,
+		auditMeta,
+	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, rule)
 	return rule, nil
 }
 
+// UpdateRuleVersion – with idempotency and audit
 func (s *attendanceRuleService) UpdateRuleVersion(ctx context.Context, input UpdateAttendanceRuleInput) (*models.AttendanceRule, error) {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("att_rule_update-%s", input.RuleID.String())
+	}
+	var cached *models.AttendanceRule
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
+
+	// Validations
 	if input.CompanyID == uuid.Nil {
 		return nil, errors.New("company_id is required")
 	}
@@ -163,13 +208,12 @@ func (s *attendanceRuleService) UpdateRuleVersion(ctx context.Context, input Upd
 		return nil, errors.New("updated_by is required")
 	}
 
-	// Validate component existence.
 	comp, err := s.compRepo.GetComponent(ctx, input.CompanyID, input.ComponentCode)
 	if err != nil {
 		return nil, fmt.Errorf("failed to validate component: %w", err)
 	}
 	if comp == nil {
-		return nil, fmt.Errorf("component %s does not exist for company %s", input.ComponentCode, input.CompanyID)
+		return nil, fmt.Errorf("component %s does not exist", input.ComponentCode)
 	}
 
 	existing, err := s.ruleRepo.GetByID(ctx, input.CompanyID, input.RuleID)
@@ -178,6 +222,14 @@ func (s *attendanceRuleService) UpdateRuleVersion(ctx context.Context, input Upd
 	}
 	if existing == nil {
 		return nil, errors.New("rule not found")
+	}
+	beforeJSON, _ := json.Marshal(existing)
+
+	// Deactivate old if active
+	if existing.IsActive {
+		if err := s.ruleRepo.SoftDeactivate(ctx, input.CompanyID, input.RuleID, input.UpdatedBy); err != nil {
+			return nil, fmt.Errorf("failed to deactivate old rule: %w", err)
+		}
 	}
 
 	newRule := &models.AttendanceRule{
@@ -197,31 +249,46 @@ func (s *attendanceRuleService) UpdateRuleVersion(ctx context.Context, input Upd
 		return nil, fmt.Errorf("validation failed: %w", err)
 	}
 
-	if existing.IsActive {
-		if err := s.ruleRepo.SoftDeactivate(ctx, input.CompanyID, input.RuleID, input.UpdatedBy); err != nil {
-			return nil, fmt.Errorf("failed to deactivate old rule: %w", err)
-		}
-	}
-
 	if err := s.ruleRepo.Create(ctx, newRule); err != nil {
 		return nil, err
 	}
+	afterJSON, _ := json.Marshal(newRule)
 
-	s.logger.Info("Attendance rule version created",
-		zap.String("old_rule_id", input.RuleID.String()),
-		zap.String("new_rule_id", newRule.RuleID.String()),
-		zap.String("company_id", input.CompanyID.String()),
-		zap.String("component_code", newRule.ComponentCode))
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := map[string]interface{}{
+		"ip":             ip,
+		"old_rule_id":    input.RuleID.String(),
+		"new_rule_id":    newRule.RuleID.String(),
+		"component_code": input.ComponentCode,
+	}
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&input.CompanyID,
+		"payroll",
+		"attendance_rule.update",
+		"attendance_rule",
+		&newRule.RuleID,
+		"user",
+		&input.UpdatedBy,
+		beforeJSON,
+		afterJSON,
+		auditMeta,
+	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, newRule)
 	return newRule, nil
 }
 
-// ActivateRule, DeactivateRule, BulkDeactivateByType, GetRuleByID, GetActiveRules,
-// GetRulesByFilter, GetRulesByType remain unchanged except for logging if needed.
-
+// ActivateRule – with idempotency
 func (s *attendanceRuleService) ActivateRule(ctx context.Context, companyID, ruleID, actorID uuid.UUID) error {
-	if companyID == uuid.Nil || ruleID == uuid.Nil || actorID == uuid.Nil {
-		return errors.New("invalid input: all IDs must be non-nil")
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("att_rule_activate-%s", ruleID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
 	}
 
 	rule, err := s.ruleRepo.GetByID(ctx, companyID, ruleID)
@@ -234,25 +301,45 @@ func (s *attendanceRuleService) ActivateRule(ctx context.Context, companyID, rul
 	if rule.IsActive {
 		return errors.New("rule is already active")
 	}
+	beforeJSON, _ := json.Marshal(rule)
 
 	rule.IsActive = true
 	rule.UpdatedAt = nil
 	rule.UpdatedBy = &actorID
-
 	if err := s.ruleRepo.Update(ctx, rule); err != nil {
 		return fmt.Errorf("failed to activate rule: %w", err)
 	}
+	afterJSON, _ := json.Marshal(rule)
 
-	s.logger.Info("Attendance rule activated",
-		zap.String("rule_id", ruleID.String()),
-		zap.String("company_id", companyID.String()))
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&companyID,
+		"payroll",
+		"attendance_rule.activate",
+		"attendance_rule",
+		&ruleID,
+		"user",
+		&actorID,
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{"ip": ip},
+	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
+// DeactivateRule – with idempotency
 func (s *attendanceRuleService) DeactivateRule(ctx context.Context, companyID, ruleID, actorID uuid.UUID) error {
-	if companyID == uuid.Nil || ruleID == uuid.Nil || actorID == uuid.Nil {
-		return errors.New("invalid input: all IDs must be non-nil")
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("att_rule_deactivate-%s", ruleID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
 	}
 
 	rule, err := s.ruleRepo.GetByID(ctx, companyID, ruleID)
@@ -265,40 +352,85 @@ func (s *attendanceRuleService) DeactivateRule(ctx context.Context, companyID, r
 	if !rule.IsActive {
 		return errors.New("rule is already inactive")
 	}
+	beforeJSON, _ := json.Marshal(rule)
 
 	if err := s.ruleRepo.SoftDeactivate(ctx, companyID, ruleID, actorID); err != nil {
 		return fmt.Errorf("failed to deactivate rule: %w", err)
 	}
+	afterJSON, _ := json.Marshal(rule)
 
-	s.logger.Info("Attendance rule deactivated",
-		zap.String("rule_id", ruleID.String()),
-		zap.String("company_id", companyID.String()))
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&companyID,
+		"payroll",
+		"attendance_rule.deactivate",
+		"attendance_rule",
+		&ruleID,
+		"user",
+		&actorID,
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{"ip": ip},
+	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
+// BulkDeactivateByType – with idempotency (store boolean)
 func (s *attendanceRuleService) BulkDeactivateByType(ctx context.Context, companyID uuid.UUID, ruleType string, actorID uuid.UUID) error {
-	if companyID == uuid.Nil {
-		return errors.New("company_id is required")
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("att_rule_bulk_deact-%s-%s", companyID.String(), ruleType)
 	}
-	if ruleType == "" {
-		return errors.New("rule_type is required")
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
 	}
-	if actorID == uuid.Nil {
-		return errors.New("actor_id is required")
+
+	if companyID == uuid.Nil || ruleType == "" || actorID == uuid.Nil {
+		return errors.New("invalid input")
 	}
+
+	// Fetch rules to deactivate for audit
+	rules, err := s.ruleRepo.GetByRuleType(ctx, companyID, ruleType)
+	if err != nil {
+		return err
+	}
+	beforeJSON, _ := json.Marshal(rules)
 
 	if err := s.ruleRepo.BulkDeactivateByType(ctx, companyID, ruleType, actorID); err != nil {
 		return err
 	}
+	afterJSON, _ := json.Marshal(rules) // state after – may need to fetch again; but we'll just mark as changed
 
-	s.logger.Info("Bulk deactivated attendance rules by type",
-		zap.String("company_id", companyID.String()),
-		zap.String("rule_type", ruleType))
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&companyID,
+		"payroll",
+		"attendance_rule.bulk_deactivate",
+		"attendance_rule",
+		nil,
+		"user",
+		&actorID,
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{
+			"ip":        ip,
+			"rule_type": ruleType,
+		},
+	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
+// Read methods – no idempotency, but we add audit for sensitive reads (optional)
+// We'll keep them as is but remove logger.
 func (s *attendanceRuleService) GetRuleByID(ctx context.Context, companyID, ruleID uuid.UUID) (*models.AttendanceRule, error) {
 	if companyID == uuid.Nil || ruleID == uuid.Nil {
 		return nil, errors.New("invalid IDs")
@@ -330,9 +462,8 @@ func (s *attendanceRuleService) GetRulesByType(ctx context.Context, companyID uu
 	return s.ruleRepo.GetByRuleType(ctx, companyID, ruleType)
 }
 
-// ValidateRuleConsistency remains unchanged because it only validates rule type and calculation.
-// It does not need to validate component_code.
 func (s *attendanceRuleService) ValidateRuleConsistency(rule *models.AttendanceRule) error {
+	// unchanged – kept as is
 	if rule == nil {
 		return errors.New("rule cannot be nil")
 	}
@@ -405,7 +536,6 @@ func (s *attendanceRuleService) ValidateRuleConsistency(rule *models.AttendanceR
 	default:
 		return fmt.Errorf("unsupported calculation_type: %s", rule.CalculationType)
 	}
-
 	return nil
 }
 

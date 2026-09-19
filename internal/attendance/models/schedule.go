@@ -6,15 +6,24 @@ import (
 	"github.com/google/uuid"
 )
 
+// ScheduleTemplate defines a reusable shift pattern.
+//
+// LocationID is an optional scope. When NULL, the template is company-wide.
+// When set, the template is specific to a location — useful when different
+// sites run different shift times.
 type ScheduleTemplate struct {
-	ScheduleTemplateID uuid.UUID     `json:"schedule_template_id" db:"schedule_template_id"`
-	CompanyID          uuid.UUID     `json:"company_id" db:"company_id"`
-	CalendarID         uuid.UUID     `json:"calendar_id" db:"calendar_id"`
-	TemplateType       string        `json:"template_type" db:"template_type"`
-	Name               string        `json:"name" db:"name"`
-	Rules              TemplateRules `json:"rules" db:"rules"`
-	IsActive           bool          `json:"is_active" db:"is_active"`
-	CreatedAt          time.Time     `json:"created_at" db:"created_at"`
+	ScheduleTemplateID uuid.UUID `json:"schedule_template_id" db:"schedule_template_id"`
+	CompanyID          uuid.UUID `json:"company_id" db:"company_id"`
+	CalendarID         uuid.UUID `json:"calendar_id" db:"calendar_id"`
+
+	// Optional scope. nil = company-wide template.
+	LocationID *uuid.UUID `json:"location_id,omitempty" db:"location_id"`
+
+	TemplateType string        `json:"template_type" db:"template_type"`
+	Name         string        `json:"name" db:"name"`
+	Rules        TemplateRules `json:"rules" db:"rules"`
+	IsActive     bool          `json:"is_active" db:"is_active"`
+	CreatedAt    time.Time     `json:"created_at" db:"created_at"`
 }
 
 type TemplateRules struct {
@@ -30,10 +39,21 @@ type ClassPeriod struct {
 	End    string `json:"end"`
 }
 
+// ScheduleInstance represents one generated occurrence of a schedule for a
+// specific user on a specific date.
+//
+// LocationID is a snapshot at generation time, copied from the source
+// (template's LocationID, or the work center's LocationID, whichever is
+// set). It's frozen so that later schedule changes don't retroactively
+// change historical records.
 type ScheduleInstance struct {
-	ScheduleInstanceID uuid.UUID        `json:"schedule_instance_id" db:"schedule_instance_id"`
-	CompanyID          uuid.UUID        `json:"company_id" db:"company_id"`
-	UserID             uuid.UUID        `json:"user_id" db:"user_id"`
+	ScheduleInstanceID uuid.UUID `json:"schedule_instance_id" db:"schedule_instance_id"`
+	CompanyID          uuid.UUID `json:"company_id" db:"company_id"`
+	UserID             uuid.UUID `json:"user_id" db:"user_id"`
+
+	// Snapshot at generation time.
+	LocationID *uuid.UUID `json:"location_id,omitempty" db:"location_id"`
+
 	ScheduleDate       time.Time        `json:"schedule_date" db:"schedule_date"`
 	ScheduleTemplateID uuid.UUID        `json:"schedule_template_id" db:"schedule_template_id"`
 	ExpectedStart      *time.Time       `json:"expected_start" db:"expected_start"`

@@ -13,23 +13,19 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 )
 
 // SalaryStructureHandler handles HTTP requests for salary structure management.
 type SalaryStructureHandler struct {
 	structService service.SalaryStructureService
-	logger        *zap.Logger
 }
 
 // NewSalaryStructureHandler creates a new SalaryStructureHandler.
 func NewSalaryStructureHandler(
 	structService service.SalaryStructureService,
-	logger *zap.Logger,
 ) *SalaryStructureHandler {
 	return &SalaryStructureHandler{
 		structService: structService,
-		logger:        logger,
 	}
 }
 
@@ -85,12 +81,29 @@ type bulkAssignStructureRequest struct {
 }
 
 // ---------------------------------------------------------------------
+// Helper methods
+// ---------------------------------------------------------------------
+
+func (h *SalaryStructureHandler) getAdminActor(ctx context.Context) (uuid.UUID, error) {
+	userIDStr, ok := ctx.Value("user_id").(string)
+	if !ok || userIDStr == "" {
+		return uuid.Nil, errors.New("unauthenticated user")
+	}
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return uuid.Nil, errors.New("invalid user_id in context")
+	}
+	return userID, nil
+}
+
+// ---------------------------------------------------------------------
 // Structure CRUD
 // ---------------------------------------------------------------------
 
 // CreateStructure handles POST /companies/{companyID}/payroll/structures
 func (h *SalaryStructureHandler) CreateStructure(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
@@ -125,7 +138,6 @@ func (h *SalaryStructureHandler) CreateStructure(w http.ResponseWriter, r *http.
 
 	structure, err := h.structService.CreateStructure(ctx, input)
 	if err != nil {
-		h.logger.Error("failed to create salary structure", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -138,7 +150,8 @@ func (h *SalaryStructureHandler) CreateStructure(w http.ResponseWriter, r *http.
 
 // UpdateStructure handles PUT /companies/{companyID}/payroll/structures/{structureID}
 func (h *SalaryStructureHandler) UpdateStructure(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
@@ -179,7 +192,6 @@ func (h *SalaryStructureHandler) UpdateStructure(w http.ResponseWriter, r *http.
 
 	structure, err := h.structService.UpdateStructure(ctx, input)
 	if err != nil {
-		h.logger.Error("failed to update salary structure", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -192,7 +204,8 @@ func (h *SalaryStructureHandler) UpdateStructure(w http.ResponseWriter, r *http.
 
 // CloneStructure handles POST /companies/{companyID}/payroll/structures/{structureID}/clone
 func (h *SalaryStructureHandler) CloneStructure(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
@@ -223,7 +236,6 @@ func (h *SalaryStructureHandler) CloneStructure(w http.ResponseWriter, r *http.R
 
 	newStructure, err := h.structService.CloneStructure(ctx, companyID, structureID, req.EffectiveFrom, actorID)
 	if err != nil {
-		h.logger.Error("failed to clone salary structure", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -236,7 +248,8 @@ func (h *SalaryStructureHandler) CloneStructure(w http.ResponseWriter, r *http.R
 
 // PublishStructure handles POST /companies/{companyID}/payroll/structures/{structureID}/publish
 func (h *SalaryStructureHandler) PublishStructure(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
@@ -255,7 +268,6 @@ func (h *SalaryStructureHandler) PublishStructure(w http.ResponseWriter, r *http
 	}
 
 	if err := h.structService.PublishStructure(ctx, companyID, structureID, actorID); err != nil {
-		h.logger.Error("failed to publish salary structure", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -268,7 +280,8 @@ func (h *SalaryStructureHandler) PublishStructure(w http.ResponseWriter, r *http
 
 // DeactivateStructure handles POST /companies/{companyID}/payroll/structures/{structureID}/deactivate
 func (h *SalaryStructureHandler) DeactivateStructure(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
@@ -287,7 +300,6 @@ func (h *SalaryStructureHandler) DeactivateStructure(w http.ResponseWriter, r *h
 	}
 
 	if err := h.structService.DeactivateStructure(ctx, companyID, structureID, actorID); err != nil {
-		h.logger.Error("failed to deactivate salary structure", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -300,7 +312,8 @@ func (h *SalaryStructureHandler) DeactivateStructure(w http.ResponseWriter, r *h
 
 // ListStructures handles GET /companies/{companyID}/payroll/structures
 func (h *SalaryStructureHandler) ListStructures(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
@@ -316,7 +329,6 @@ func (h *SalaryStructureHandler) ListStructures(w http.ResponseWriter, r *http.R
 
 	structures, total, err := h.structService.ListStructures(ctx, filter)
 	if err != nil {
-		h.logger.Error("failed to list salary structures", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -332,7 +344,8 @@ func (h *SalaryStructureHandler) ListStructures(w http.ResponseWriter, r *http.R
 
 // GetStructure handles GET /companies/{companyID}/payroll/structures/{structureID}
 func (h *SalaryStructureHandler) GetStructure(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
@@ -346,7 +359,6 @@ func (h *SalaryStructureHandler) GetStructure(w http.ResponseWriter, r *http.Req
 
 	detail, err := h.structService.GetStructure(ctx, companyID, structureID)
 	if err != nil {
-		h.logger.Error("failed to get salary structure", zap.Error(err))
 		h.respondWithError(w, http.StatusNotFound, err.Error())
 		return
 	}
@@ -363,7 +375,8 @@ func (h *SalaryStructureHandler) GetStructure(w http.ResponseWriter, r *http.Req
 
 // AddComponent handles POST /companies/{companyID}/payroll/structures/{structureID}/components
 func (h *SalaryStructureHandler) AddComponent(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
@@ -405,7 +418,6 @@ func (h *SalaryStructureHandler) AddComponent(w http.ResponseWriter, r *http.Req
 	}
 
 	if err := h.structService.AddComponent(ctx, input, actorID); err != nil {
-		h.logger.Error("failed to add component to salary structure", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -418,7 +430,8 @@ func (h *SalaryStructureHandler) AddComponent(w http.ResponseWriter, r *http.Req
 
 // UpdateComponent handles PUT /companies/{companyID}/payroll/structures/{structureID}/components/{componentCode}
 func (h *SalaryStructureHandler) UpdateComponent(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
@@ -447,10 +460,8 @@ func (h *SalaryStructureHandler) UpdateComponent(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// Fetch components with company validation to get the mapping ID
 	components, err := h.structService.GetStructureComponents(ctx, companyID, structureID)
 	if err != nil {
-		h.logger.Error("failed to get structure components", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -474,7 +485,6 @@ func (h *SalaryStructureHandler) UpdateComponent(w http.ResponseWriter, r *http.
 	}
 
 	if err := h.structService.UpdateComponent(ctx, input, actorID); err != nil {
-		h.logger.Error("failed to update component", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -487,7 +497,8 @@ func (h *SalaryStructureHandler) UpdateComponent(w http.ResponseWriter, r *http.
 
 // RemoveComponent handles DELETE /companies/{companyID}/payroll/structures/{structureID}/components/{componentCode}
 func (h *SalaryStructureHandler) RemoveComponent(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
@@ -511,7 +522,6 @@ func (h *SalaryStructureHandler) RemoveComponent(w http.ResponseWriter, r *http.
 	}
 
 	if err := h.structService.RemoveComponent(ctx, companyID, structureID, componentCode, actorID); err != nil {
-		h.logger.Error("failed to remove component", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -524,7 +534,8 @@ func (h *SalaryStructureHandler) RemoveComponent(w http.ResponseWriter, r *http.
 
 // ReorderComponents handles POST /companies/{companyID}/payroll/structures/{structureID}/reorder
 func (h *SalaryStructureHandler) ReorderComponents(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
@@ -553,7 +564,6 @@ func (h *SalaryStructureHandler) ReorderComponents(w http.ResponseWriter, r *htt
 	}
 
 	if err := h.structService.ReorderComponents(ctx, companyID, structureID, req.ComponentCodes, actorID); err != nil {
-		h.logger.Error("failed to reorder components", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -570,7 +580,8 @@ func (h *SalaryStructureHandler) ReorderComponents(w http.ResponseWriter, r *htt
 
 // AssignToEmployee handles POST /companies/{companyID}/payroll/structures/assign
 func (h *SalaryStructureHandler) AssignToEmployee(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
@@ -589,19 +600,16 @@ func (h *SalaryStructureHandler) AssignToEmployee(w http.ResponseWriter, r *http
 		return
 	}
 
-	// Basic validation
 	if req.UserID == uuid.Nil || req.StructureID == uuid.Nil || req.MonthlyCTC <= 0 || req.EffectiveFrom.IsZero() {
 		h.respondWithError(w, http.StatusBadRequest, "user_id, structure_id, monthly_ctc, and effective_from are required")
 		return
 	}
 
-	// Validate and default pay_type
 	if req.PayType == "" {
 		req.PayType = models.PayTypeMonthly
 	}
 	switch req.PayType {
 	case models.PayTypeMonthly, models.PayTypeDailyWage, models.PayTypeHourly:
-		// valid
 	default:
 		h.respondWithError(w, http.StatusBadRequest, "invalid pay_type, must be monthly, daily_wage, or hourly")
 		return
@@ -618,7 +626,9 @@ func (h *SalaryStructureHandler) AssignToEmployee(w http.ResponseWriter, r *http
 	}
 
 	if err := h.structService.AssignToEmployee(ctx, input); err != nil {
-		h.logger.Error("failed to assign salary structure", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -631,7 +641,8 @@ func (h *SalaryStructureHandler) AssignToEmployee(w http.ResponseWriter, r *http
 
 // BulkAssignToEmployees handles POST /companies/{companyID}/payroll/structures/bulk-assign
 func (h *SalaryStructureHandler) BulkAssignToEmployees(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
@@ -655,13 +666,11 @@ func (h *SalaryStructureHandler) BulkAssignToEmployees(w http.ResponseWriter, r 
 		return
 	}
 
-	// Validate and default pay_type
 	if req.PayType == "" {
 		req.PayType = models.PayTypeMonthly
 	}
 	switch req.PayType {
 	case models.PayTypeMonthly, models.PayTypeDailyWage, models.PayTypeHourly:
-		// valid
 	default:
 		h.respondWithError(w, http.StatusBadRequest, "invalid pay_type, must be monthly, daily_wage, or hourly")
 		return
@@ -678,7 +687,9 @@ func (h *SalaryStructureHandler) BulkAssignToEmployees(w http.ResponseWriter, r 
 	}
 
 	if err := h.structService.BulkAssignToEmployees(ctx, input); err != nil {
-		h.logger.Error("failed to bulk assign salary structures", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -690,33 +701,15 @@ func (h *SalaryStructureHandler) BulkAssignToEmployees(w http.ResponseWriter, r 
 }
 
 // ---------------------------------------------------------------------
-// Helper methods
+// Response helpers
 // ---------------------------------------------------------------------
 
-// getAdminActor extracts the admin user ID from the context.
-// Assumes that authentication middleware has set "session_type" and "user_id".
-func (h *SalaryStructureHandler) getAdminActor(ctx context.Context) (uuid.UUID, error) {
-	userIDStr, ok := ctx.Value("user_id").(string)
-	if !ok || userIDStr == "" {
-		return uuid.Nil, errors.New("unauthenticated user")
-	}
-
-	userID, err := uuid.Parse(userIDStr)
-	if err != nil {
-		return uuid.Nil, errors.New("invalid user_id in context")
-	}
-
-	return userID, nil
-}
-
-// respondWithJSON writes a JSON response.
 func (h *SalaryStructureHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(data)
 }
 
-// respondWithError writes a JSON error response.
 func (h *SalaryStructureHandler) respondWithError(w http.ResponseWriter, status int, message string) {
 	h.respondWithJSON(w, status, map[string]interface{}{
 		"success": false,

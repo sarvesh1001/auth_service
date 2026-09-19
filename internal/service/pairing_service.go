@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
 	"auth-service/internal/config"
 	appErrors "auth-service/internal/errors"
@@ -26,6 +27,7 @@ type PairingService struct {
 	config           *config.Config
 	auditService     *audit.AuditService
 	idempotencyStore idempotency.Store
+	companyService   *CompanyService // Injected to fetch role/permissions from DB
 }
 
 // NewPairingService creates a new PairingService.
@@ -36,6 +38,7 @@ func NewPairingService(
 	config *config.Config,
 	auditService *audit.AuditService,
 	idempotencyStore idempotency.Store,
+	companyService *CompanyService,
 ) *PairingService {
 	return &PairingService{
 		pairingRepo:      pairingRepo,
@@ -44,6 +47,7 @@ func NewPairingService(
 		config:           config,
 		auditService:     auditService,
 		idempotencyStore: idempotencyStore,
+		companyService:   companyService,
 	}
 }
 
@@ -63,17 +67,16 @@ type GenerateQRResponse struct {
 	StatusURL string `json:"status_url"`
 }
 
-// PairRequest is used to pair a device (scanned from mobile).
 type PairRequest struct {
 	SessionID   string   `json:"session_id"`
 	QRData      string   `json:"qr_data"`
 	UserID      string   `json:"user_id"`
 	PhoneNumber string   `json:"phone_number"`
 	DeviceID    string   `json:"device_id"`
-	SessionType string   `json:"session_type"` // "user" or "admin"
-	Role        string   `json:"role"`         // role string (e.g., "super_admin", "owner", "employee")
-	Permissions []string `json:"permissions"`  // admin permissions (for admin sessions)
-	CompanyID   string   `json:"company_id"`   // 👈 NEW: company ID from authenticated user
+	SessionType string   `json:"session_type"`
+	Role        string   `json:"role"`
+	Permissions []string `json:"permissions"`
+	CompanyID   string   `json:"company_id"`
 }
 
 // --------------------------------------------------------------------
@@ -86,6 +89,7 @@ func (s *PairingService) GenerateQRCode(ctx context.Context, req *GenerateQRRequ
 
 	qrData, nonce, err := s.qrUtil.GenerateQRCode(sessionID)
 	if err != nil {
+		zap.L().Error("QR generation failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: QR generation failed", appErrors.ErrInternal)
 	}
 
@@ -102,10 +106,15 @@ func (s *PairingService) GenerateQRCode(ctx context.Context, req *GenerateQRRequ
 	}
 
 	if err := s.pairingRepo.CreatePairingSession(ctx, session); err != nil {
+		zap.L().Error("Failed to create pairing session", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 
-	// Audit: QR generated
+	zap.L().Info("QR generated",
+		zap.String("session_id", sessionID),
+		zap.String("web_device_id", webDeviceID),
+	)
+
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "pairing", "generate_qr", "pairing_session",
 			nil, "system", nil, nil, nil, map[string]interface{}{
@@ -125,27 +134,33 @@ func (s *PairingService) GenerateQRCode(ctx context.Context, req *GenerateQRRequ
 }
 
 // --------------------------------------------------------------------
-// PAIR DEVICE (mobile scans QR and sends user/admin data)
+// PAIR DEVICE (mobile scans QR)
 // --------------------------------------------------------------------
 
 func (s *PairingService) PairDevice(ctx context.Context, req *PairRequest) error {
-	// Validate QR code
+	logger := zap.L().With(
+		zap.String("session_id", req.SessionID),
+		zap.String("user_id", req.UserID),
+		zap.String("company_id", req.CompanyID),
+	)
+	logger.Info("PairDevice called")
+
 	qrPayload, err := s.qrUtil.ParseQRCode(req.QRData)
 	if err != nil {
+		logger.Error("Invalid QR data", zap.Error(err))
 		return fmt.Errorf("%w: invalid QR code", appErrors.ErrInvalidInput)
 	}
 	if qrPayload.SessionID != req.SessionID {
+		logger.Error("Session mismatch", zap.String("qr_session", qrPayload.SessionID))
 		return fmt.Errorf("%w: session mismatch", appErrors.ErrInvalidInput)
 	}
 
-	// Check session exists
 	_, err = s.pairingRepo.GetPairingSession(ctx, req.SessionID)
 	if err != nil {
+		logger.Error("Session not found", zap.Error(err))
 		return fmt.Errorf("%w: %v", appErrors.ErrNotFound, err)
 	}
 
-	// Store user/admin data in redis (marks session as "scanned")
-	// Pass companyID to repository
 	err = s.pairingRepo.ScanPairingSession(
 		ctx,
 		req.SessionID,
@@ -155,13 +170,15 @@ func (s *PairingService) PairDevice(ctx context.Context, req *PairRequest) error
 		req.SessionType,
 		req.Role,
 		req.Permissions,
-		req.CompanyID, // 👈 NEW
+		req.CompanyID,
 	)
 	if err != nil {
+		logger.Error("Failed to scan pairing session", zap.Error(err))
 		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 
-	// Audit: device paired
+	logger.Info("PairDevice succeeded, session marked as scanned")
+
 	if s.auditService != nil {
 		ip, _ := ctx.Value("ip_address").(string)
 		_ = s.auditService.LogAction(ctx, nil, nil, "pairing", "pair_device", "pairing_session",
@@ -181,7 +198,7 @@ func (s *PairingService) PairDevice(ctx context.Context, req *PairRequest) error
 }
 
 // --------------------------------------------------------------------
-// GET PAIRING STATUS (used by web polling)
+// GET PAIRING STATUS
 // --------------------------------------------------------------------
 
 func (s *PairingService) GetPairingStatus(ctx context.Context, sessionID string) (*models.PairingStatusResponse, error) {
@@ -201,90 +218,133 @@ func (s *PairingService) GetPairingStatus(ctx context.Context, sessionID string)
 }
 
 // --------------------------------------------------------------------
-// CONFIRM PAIRING (web confirms after scanning) – issues tokens
+// CONFIRM PAIRING – now identical to MPIN: let JWTService fetch permissions
 // --------------------------------------------------------------------
 
 func (s *PairingService) ConfirmPairing(ctx context.Context, sessionID string) (*models.TokenPairResponse, error) {
-	// Idempotency: prevent duplicate token issuance
+	logger := zap.L().With(zap.String("session_id", sessionID))
+	logger.Info("ConfirmPairing started")
+
+	// Idempotency
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
 		idempKey = fmt.Sprintf("confirm_pairing-%s", sessionID)
 	}
 	var cached *models.TokenPairResponse
 	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		logger.Info("Returning cached token pair")
 		return cached, nil
 	}
 	ip, _ := ctx.Value("ip_address").(string)
 
+	// Get session
 	session, err := s.pairingRepo.GetPairingSession(ctx, sessionID)
 	if err != nil {
+		logger.Error("Failed to get session", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", appErrors.ErrNotFound, err)
 	}
+	logger.Info("Session retrieved",
+		zap.String("status", session.Status),
+		zap.String("user_id", session.UserID),
+		zap.String("company_id", session.CompanyID),
+		zap.String("session_type", session.SessionType),
+	)
+
 	if session.Status != "scanned" {
+		logger.Warn("Session not scanned", zap.String("status", session.Status))
 		return nil, fmt.Errorf("%w: session not scanned", appErrors.ErrInvalidState)
 	}
 	if session.UserID == "" {
+		logger.Warn("Missing user_id")
 		return nil, fmt.Errorf("%w: missing user", appErrors.ErrInvalidState)
 	}
+	if session.CompanyID == "" {
+		logger.Warn("Missing company_id")
+		return nil, fmt.Errorf("%w: missing company", appErrors.ErrInvalidState)
+	}
 
-	// Mark as confirmed
+	// Parse UUIDs
+	userID, err := uuid.Parse(session.UserID)
+	if err != nil {
+		logger.Error("Invalid user_id UUID", zap.Error(err))
+		return nil, fmt.Errorf("%w: invalid user_id", appErrors.ErrInvalidInput)
+	}
+	companyID, err := uuid.Parse(session.CompanyID)
+	if err != nil {
+		logger.Error("Invalid company_id UUID", zap.Error(err))
+		return nil, fmt.Errorf("%w: invalid company_id", appErrors.ErrInvalidInput)
+	}
+	logger.Debug("Parsed UUIDs", zap.String("user_uuid", userID.String()), zap.String("company_uuid", companyID.String()))
+
+	// Fetch company context (only needed for role; permissions will be fetched by JWTService)
+	logger.Info("Calling GetCompanyContextForCompany for role")
+	companyCtx, err := s.companyService.GetCompanyContextForCompany(ctx, userID, companyID)
+	if err != nil {
+		logger.Error("GetCompanyContextForCompany failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: user not active in company", appErrors.ErrPermissionDenied)
+	}
+	logger.Info("Company context fetched",
+		zap.String("role", companyCtx.RoleName),
+		zap.Int("permission_count", len(companyCtx.Permissions)), // just for logging
+		zap.String("company_id", companyCtx.CompanyID),
+	)
+
+	// Mark session as confirmed
 	if err := s.pairingRepo.ConfirmPairingSession(ctx, sessionID); err != nil {
+		logger.Error("Failed to confirm session", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 
-	// Build permission mask (for admin sessions)
-	var permissionMask []uint64
-	if session.SessionType == "admin" && len(session.Permissions) > 0 {
-		permissionMask = s.buildPermissionMask(session.Permissions)
-	}
-	// Normalise to 13 blocks (800 permissions)
-	if len(permissionMask) < 13 {
-		fullMask := make([]uint64, 13)
-		copy(fullMask, permissionMask)
-		permissionMask = fullMask
-	}
-
-	// Issue token pair – now using the company ID stored in the session
-	tokenPair, err := s.sessionService.IssueTokenPair(ctx, &IssueTokenPairRequest{
+	// ────────────────────────────────────────────────────────────────
+	// 🔥 FIX: Pass nil PermissionMask – JWTService will fetch from DB
+	// This matches the MPIN behaviour exactly.
+	// ────────────────────────────────────────────────────────────────
+	tokenReq := &IssueTokenPairRequest{
 		UserID:         session.UserID,
-		Role:           session.Role,
+		Role:           companyCtx.RoleName,
 		DeviceID:       session.WebDeviceID,
 		SessionType:    session.SessionType,
 		IPAddress:      session.IPAddress,
-		CompanyID:      session.CompanyID, // 👈 use stored company ID
-		PermissionMask: permissionMask,
-	})
+		CompanyID:      session.CompanyID,
+		PermissionMask: nil, // 👈 Let JWTService fetch permissions from DB
+	}
+	logger.Info("Issuing token pair (mask will be fetched from DB by JWTService)",
+		zap.String("role", tokenReq.Role),
+	)
+
+	tokenPair, err := s.sessionService.IssueTokenPair(ctx, tokenReq)
 	if err != nil {
+		logger.Error("Token issuance failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: token issue failed", appErrors.ErrInternal)
 	}
 
-	// Audit: pairing confirmed
+	// Audit
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "pairing", "confirm_pairing", "pairing_session",
 			nil, "system", nil, nil, nil, map[string]interface{}{
 				"session_id":   sessionID,
 				"user_id":      session.UserID,
 				"session_type": session.SessionType,
-				"role":         session.Role,
+				"role":         companyCtx.RoleName,
 				"company_id":   session.CompanyID,
 				"ip":           ip,
 			})
 	}
 
-	// Store idempotency result
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, tokenPair)
 
-	// Delete pairing session after a delay (non‑critical, run in background)
+	// Cleanup after delay
 	go func() {
 		time.Sleep(30 * time.Second)
 		_ = s.pairingRepo.DeletePairingSession(context.Background(), sessionID)
 	}()
 
+	logger.Info("ConfirmPairing completed successfully")
 	return tokenPair, nil
 }
 
 // --------------------------------------------------------------------
-// CLEANUP EXPIRED SESSIONS
+// CLEANUP
 // --------------------------------------------------------------------
 
 func (s *PairingService) CleanupExpiredSessions(ctx context.Context) (int, error) {
@@ -310,24 +370,4 @@ func generateWebDeviceID(userAgent, ip string) string {
 	h.Write([]byte(userAgent + ":" + ip))
 	hash := hex.EncodeToString(h.Sum(nil))
 	return "web-" + hash[:16]
-}
-
-// buildPermissionMask converts permission strings to a bitmask.
-// 🚨 SECURITY: In production, do NOT trust client‑supplied permissions.
-// Instead, fetch actual permissions from the database based on role/user.
-func (s *PairingService) buildPermissionMask(permissions []string) []uint64 {
-	// 800 permissions → 13 uint64 blocks
-	mask := make([]uint64, 13)
-
-	// TODO: Replace with actual permission registry mapping.
-	// Example:
-	// for _, perm := range permissions {
-	//     bitIndex := permissionMap[perm]   // e.g., "USER_CREATE" → 42
-	//     block := bitIndex / 64
-	//     offset := bitIndex % 64
-	//     mask[block] |= 1 << offset
-	// }
-
-	// For now returns an empty mask (all permissions denied).
-	return mask
 }

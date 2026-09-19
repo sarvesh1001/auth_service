@@ -34,7 +34,7 @@ func (r *deviceRepository) GetDevice(ctx context.Context, companyID uuid.UUID, d
 		SELECT
 			device_id, company_id, source_type, device_code,
 			device_name, manufacturer, model,
-			work_center_code, location_id,
+			work_center_code, geofence_id,
 			ip_address, mac_address,
 			is_active, is_trusted,
 			last_seen_at, installed_at,
@@ -51,7 +51,7 @@ func (r *deviceRepository) GetActiveDevice(ctx context.Context, companyID uuid.U
 		SELECT
 			device_id, company_id, source_type, device_code,
 			device_name, manufacturer, model,
-			work_center_code, location_id,
+			work_center_code, geofence_id,
 			ip_address, mac_address,
 			is_active, is_trusted,
 			last_seen_at, installed_at,
@@ -68,7 +68,7 @@ func (r *deviceRepository) GetDeviceByCode(ctx context.Context, companyID uuid.U
 		SELECT
 			device_id, company_id, source_type, device_code,
 			device_name, manufacturer, model,
-			work_center_code, location_id,
+			work_center_code, geofence_id,
 			ip_address, mac_address,
 			is_active, is_trusted,
 			last_seen_at, installed_at,
@@ -85,7 +85,7 @@ func (r *deviceRepository) GetDevicesByCompany(ctx context.Context, companyID uu
 		SELECT
 			device_id, company_id, source_type, device_code,
 			device_name, manufacturer, model,
-			work_center_code, location_id,
+			work_center_code, geofence_id,
 			ip_address, mac_address,
 			is_active, is_trusted,
 			last_seen_at, installed_at,
@@ -112,7 +112,7 @@ func (r *deviceRepository) GetDevicesByWorkCenter(ctx context.Context, companyID
 		SELECT
 			device_id, company_id, source_type, device_code,
 			device_name, manufacturer, model,
-			work_center_code, location_id,
+			work_center_code, geofence_id,
 			ip_address, mac_address,
 			is_active, is_trusted,
 			last_seen_at, installed_at,
@@ -139,7 +139,7 @@ func (r *deviceRepository) GetDevicesBySourceType(ctx context.Context, companyID
 		SELECT
 			device_id, company_id, source_type, device_code,
 			device_name, manufacturer, model,
-			work_center_code, location_id,
+			work_center_code, geofence_id,
 			ip_address, mac_address,
 			is_active, is_trusted,
 			last_seen_at, installed_at,
@@ -174,7 +174,7 @@ func (r *deviceRepository) CreateDevice(ctx context.Context, device *models.Atte
 		INSERT INTO attendance.attendance_devices (
 			device_id, company_id, source_type, device_code,
 			device_name, manufacturer, model,
-			work_center_code, location_id,
+			work_center_code, geofence_id,
 			ip_address, mac_address,
 			is_active, is_trusted,
 			last_seen_at, installed_at,
@@ -190,7 +190,7 @@ func (r *deviceRepository) CreateDevice(ctx context.Context, device *models.Atte
 		device.Manufacturer,
 		device.Model,
 		device.WorkCenterCode,
-		device.LocationID,
+		device.GeofenceID,
 		device.IPAddress,
 		device.MacAddress,
 		device.IsActive,
@@ -218,7 +218,7 @@ func (r *deviceRepository) UpdateDevice(ctx context.Context, device *models.Atte
 			manufacturer = $4,
 			model = $5,
 			work_center_code = $6,
-			location_id = $7,
+			geofence_id = $7,
 			ip_address = $8,
 			mac_address = $9,
 			is_active = $10,
@@ -235,7 +235,7 @@ func (r *deviceRepository) UpdateDevice(ctx context.Context, device *models.Atte
 		device.Manufacturer,
 		device.Model,
 		device.WorkCenterCode,
-		device.LocationID,
+		device.GeofenceID,
 		device.IPAddress,
 		device.MacAddress,
 		device.IsActive,
@@ -469,7 +469,7 @@ func (r *deviceRepository) scanDevice(row *sql.Row) (*models.AttendanceDevice, e
 	var dev models.AttendanceDevice
 	var metadataJSON []byte
 	var deviceName, manufacturer, model, workCenterCode, ipAddress, macAddress sql.NullString
-	var locationID sql.NullString
+	var geofenceID sql.NullString
 	var lastSeenAt, installedAt sql.NullTime
 
 	err := row.Scan(
@@ -481,7 +481,7 @@ func (r *deviceRepository) scanDevice(row *sql.Row) (*models.AttendanceDevice, e
 		&manufacturer,
 		&model,
 		&workCenterCode,
-		&locationID,
+		&geofenceID,
 		&ipAddress,
 		&macAddress,
 		&dev.IsActive,
@@ -510,9 +510,9 @@ func (r *deviceRepository) scanDevice(row *sql.Row) (*models.AttendanceDevice, e
 	if workCenterCode.Valid {
 		dev.WorkCenterCode = &workCenterCode.String
 	}
-	if locationID.Valid && locationID.String != "" {
-		if id, err := uuid.Parse(locationID.String); err == nil {
-			dev.LocationID = &id
+	if geofenceID.Valid && geofenceID.String != "" {
+		if id, err := uuid.Parse(geofenceID.String); err == nil {
+			dev.GeofenceID = &id
 		}
 	}
 	if ipAddress.Valid {
@@ -541,7 +541,7 @@ func (r *deviceRepository) scanDevices(rows *sql.Rows) ([]*models.AttendanceDevi
 		var dev models.AttendanceDevice
 		var metadataJSON []byte
 		var deviceName, manufacturer, model, workCenterCode, ipAddress, macAddress sql.NullString
-		var locationID sql.NullString
+		var geofenceID sql.NullString
 		var lastSeenAt, installedAt sql.NullTime
 
 		err := rows.Scan(
@@ -553,7 +553,7 @@ func (r *deviceRepository) scanDevices(rows *sql.Rows) ([]*models.AttendanceDevi
 			&manufacturer,
 			&model,
 			&workCenterCode,
-			&locationID,
+			&geofenceID,
 			&ipAddress,
 			&macAddress,
 			&dev.IsActive,
@@ -566,7 +566,7 @@ func (r *deviceRepository) scanDevices(rows *sql.Rows) ([]*models.AttendanceDevi
 		if err != nil {
 			return nil, fmt.Errorf("scan device: %w", err)
 		}
-		// fill nullables as above...
+
 		if deviceName.Valid {
 			dev.DeviceName = &deviceName.String
 		}
@@ -579,9 +579,9 @@ func (r *deviceRepository) scanDevices(rows *sql.Rows) ([]*models.AttendanceDevi
 		if workCenterCode.Valid {
 			dev.WorkCenterCode = &workCenterCode.String
 		}
-		if locationID.Valid && locationID.String != "" {
-			if id, err := uuid.Parse(locationID.String); err == nil {
-				dev.LocationID = &id
+		if geofenceID.Valid && geofenceID.String != "" {
+			if id, err := uuid.Parse(geofenceID.String); err == nil {
+				dev.GeofenceID = &id
 			}
 		}
 		if ipAddress.Valid {
@@ -607,4 +607,35 @@ func (r *deviceRepository) scanDevices(rows *sql.Rows) ([]*models.AttendanceDevi
 		return nil, fmt.Errorf("rows iteration: %w", err)
 	}
 	return devices, nil
+}
+func (r *deviceRepository) GetDevicesByGeofence(
+	ctx context.Context,
+	companyID uuid.UUID,
+	geofenceID uuid.UUID,
+	activeOnly bool,
+) ([]*models.AttendanceDevice, error) {
+	query := `
+		SELECT
+			device_id, company_id, source_type, device_code,
+			device_name, manufacturer, model,
+			work_center_code, geofence_id,
+			ip_address, mac_address,
+			is_active, is_trusted,
+			last_seen_at, installed_at,
+			metadata, created_at
+		FROM attendance.attendance_devices
+		WHERE company_id = $1 AND geofence_id = $2
+	`
+	if activeOnly {
+		query += " AND is_active = true"
+	}
+	query += " ORDER BY device_name"
+
+	rows, err := r.client.Query(ctx, query, companyID, geofenceID)
+	if err != nil {
+		return nil, fmt.Errorf("query devices by geofence: %w", err)
+	}
+	defer rows.Close()
+
+	return r.scanDevices(rows)
 }

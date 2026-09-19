@@ -344,9 +344,8 @@ func LoadConfig() *Config {
 			Elasticsearch: ElasticsearchConfig{
 				URL:      getEnv("ELASTICSEARCH_URL", "http://elasticsearch:9200"),
 				Username: getEnv("ELASTICSEARCH_USERNAME", "elastic"),
-				Password: getSecureEnv("ELASTIC_PASSWORD", ""),
+				Password: getSecureEnv("ELASTICSEARCH_PASSWORD", ""), // ✅ fixed
 			},
-
 			Clickhouse: ClickhouseConfig{
 				URL:      getEnv("CLICKHOUSE_URL", "http://clickhouse:8123"),
 				Username: getEnv("CLICKHOUSE_USER", "default"),

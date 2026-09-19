@@ -29,24 +29,44 @@ func NewScheduleRepository(pg *client.PostgresClient, logger *zap.Logger) reposi
 	}
 }
 
+// ── Column lists ──
+
+const workCenterCols = `
+	work_center_code, company_id, location_id, name, description,
+	timezone, is_active, created_at, updated_at
+`
+
+const workCalendarCols = `
+	calendar_id, company_id, location_id, year, name, timezone,
+	working_days, holidays, is_active, created_at
+`
+
+const scheduleTemplateCols = `
+	schedule_template_id, company_id, calendar_id, location_id,
+	template_type, name, rules, is_active, created_at
+`
+
+const scheduleInstanceCols = `
+	schedule_instance_id, company_id, user_id, location_id,
+	schedule_date, schedule_template_id,
+	expected_start, expected_end, timezone, metadata, work_center_code,
+	generated_at, status, cancel_reason, cancelled_at
+`
+
 // ── Work Centers ──
 
 func (r *scheduleRepository) GetWorkCenter(ctx context.Context, companyID uuid.UUID, workCenterCode string) (*models.WorkCenter, error) {
-	query := `
-		SELECT work_center_code, company_id, name, description, timezone, is_active, created_at, updated_at
+	query := `SELECT ` + workCenterCols + `
 		FROM attendance.work_centers
-		WHERE company_id = $1 AND work_center_code = $2
-	`
+		WHERE company_id = $1 AND work_center_code = $2`
 	row := r.client.QueryRow(ctx, query, companyID, workCenterCode)
 	return r.scanWorkCenter(row)
 }
 
 func (r *scheduleRepository) GetWorkCentersByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.WorkCenter, error) {
-	query := `
-		SELECT work_center_code, company_id, name, description, timezone, is_active, created_at, updated_at
+	query := `SELECT ` + workCenterCols + `
 		FROM attendance.work_centers
-		WHERE company_id = $1
-	`
+		WHERE company_id = $1`
 	if activeOnly {
 		query += " AND is_active = true"
 	}
@@ -56,88 +76,79 @@ func (r *scheduleRepository) GetWorkCentersByCompany(ctx context.Context, compan
 		return nil, fmt.Errorf("query work centers: %w", err)
 	}
 	defer rows.Close()
-	var centers []*models.WorkCenter
-	for rows.Next() {
-		wc, err := r.scanWorkCenterFromRows(rows)
-		if err != nil {
-			return nil, err
-		}
-		centers = append(centers, wc)
-	}
-	return centers, nil
+	return r.scanWorkCenters(rows)
 }
 
 // ── Work Calendars ──
 
 func (r *scheduleRepository) GetWorkCalendar(ctx context.Context, companyID uuid.UUID, year int) (*models.WorkCalendar, error) {
-	query := `
-		SELECT calendar_id, company_id, year, name, timezone, working_days, holidays, is_active, created_at
+	query := `SELECT ` + workCalendarCols + `
 		FROM attendance.work_calendars
 		WHERE company_id = $1 AND year = $2
-	`
+		ORDER BY location_id NULLS LAST, created_at DESC
+		LIMIT 1`
 	row := r.client.QueryRow(ctx, query, companyID, year)
 	return r.scanWorkCalendar(row)
 }
 
-func (r *scheduleRepository) GetWorkCalendarsByCompany(ctx context.Context, companyID uuid.UUID) ([]*models.WorkCalendar, error) {
-	query := `
-		SELECT calendar_id, company_id, year, name, timezone, working_days, holidays, is_active, created_at
+// GetWorkCalendarsByCompany — locationID == nil means no filter.
+func (r *scheduleRepository) GetWorkCalendarsByCompany(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+) ([]*models.WorkCalendar, error) {
+	var locArg interface{}
+	if locationID != nil {
+		locArg = *locationID
+	}
+	query := `SELECT ` + workCalendarCols + `
 		FROM attendance.work_calendars
 		WHERE company_id = $1
-		ORDER BY year DESC
-	`
-	rows, err := r.client.Query(ctx, query, companyID)
+		  AND ($2::uuid IS NULL OR location_id = $2)
+		ORDER BY year DESC`
+	rows, err := r.client.Query(ctx, query, companyID, locArg)
 	if err != nil {
 		return nil, fmt.Errorf("query work calendars: %w", err)
 	}
 	defer rows.Close()
-	var calendars []*models.WorkCalendar
-	for rows.Next() {
-		cal, err := r.scanWorkCalendarFromRows(rows)
-		if err != nil {
-			return nil, err
-		}
-		calendars = append(calendars, cal)
-	}
-	return calendars, nil
+	return r.scanCalendars(rows)
 }
 
 // ── Schedule Templates ──
 
 func (r *scheduleRepository) GetScheduleTemplate(ctx context.Context, templateID uuid.UUID) (*models.ScheduleTemplate, error) {
-	query := `
-		SELECT schedule_template_id, company_id, calendar_id, template_type, name, rules, is_active, created_at
+	query := `SELECT ` + scheduleTemplateCols + `
 		FROM attendance.schedule_templates
-		WHERE schedule_template_id = $1
-	`
+		WHERE schedule_template_id = $1`
 	row := r.client.QueryRow(ctx, query, templateID)
 	return r.scanScheduleTemplate(row)
 }
 
-func (r *scheduleRepository) GetScheduleTemplatesByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.ScheduleTemplate, error) {
-	query := `
-		SELECT schedule_template_id, company_id, calendar_id, template_type, name, rules, is_active, created_at
+// GetScheduleTemplatesByCompany — locationID == nil means no filter.
+func (r *scheduleRepository) GetScheduleTemplatesByCompany(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+	activeOnly bool,
+) ([]*models.ScheduleTemplate, error) {
+	var locArg interface{}
+	if locationID != nil {
+		locArg = *locationID
+	}
+	query := `SELECT ` + scheduleTemplateCols + `
 		FROM attendance.schedule_templates
 		WHERE company_id = $1
-	`
+		  AND ($2::uuid IS NULL OR location_id = $2)`
 	if activeOnly {
 		query += " AND is_active = true"
 	}
 	query += " ORDER BY name"
-	rows, err := r.client.Query(ctx, query, companyID)
+	rows, err := r.client.Query(ctx, query, companyID, locArg)
 	if err != nil {
 		return nil, fmt.Errorf("query schedule templates: %w", err)
 	}
 	defer rows.Close()
-	var templates []*models.ScheduleTemplate
-	for rows.Next() {
-		tmpl, err := r.scanScheduleTemplateFromRows(rows)
-		if err != nil {
-			return nil, err
-		}
-		templates = append(templates, tmpl)
-	}
-	return templates, nil
+	return r.scanScheduleTemplates(rows)
 }
 
 // ── User Schedule Assignments ──
@@ -150,8 +161,7 @@ func (r *scheduleRepository) GetUserActiveScheduleAssignment(ctx context.Context
 		  AND effective_from <= $2
 		  AND (effective_to IS NULL OR effective_to >= $2)
 		ORDER BY effective_from DESC
-		LIMIT 1
-	`
+		LIMIT 1`
 	row := r.client.QueryRow(ctx, query, userID, at)
 	return r.scanUserScheduleAssignment(row)
 }
@@ -163,8 +173,7 @@ func (r *scheduleRepository) GetUserScheduleAssignments(ctx context.Context, use
 		WHERE user_id = $1
 		  AND effective_from <= $2
 		  AND (effective_to IS NULL OR effective_to >= $3)
-		ORDER BY effective_from DESC
-	`
+		ORDER BY effective_from DESC`
 	rows, err := r.client.Query(ctx, query, userID, to, from)
 	if err != nil {
 		return nil, fmt.Errorf("query user schedule assignments: %w", err)
@@ -184,42 +193,26 @@ func (r *scheduleRepository) GetUserScheduleAssignments(ctx context.Context, use
 // ── Schedule Instances ──
 
 func (r *scheduleRepository) GetScheduleInstance(ctx context.Context, instanceID uuid.UUID) (*models.ScheduleInstance, error) {
-	query := `
-		SELECT schedule_instance_id, company_id, user_id, schedule_date, schedule_template_id,
-		       expected_start, expected_end, timezone, metadata, work_center_code,
-		       generated_at, status, cancel_reason, cancelled_at
+	query := `SELECT ` + scheduleInstanceCols + `
 		FROM attendance.schedule_instances
-		WHERE schedule_instance_id = $1
-	`
+		WHERE schedule_instance_id = $1`
 	row := r.client.QueryRow(ctx, query, instanceID)
 	return r.scanScheduleInstance(row)
 }
 
 func (r *scheduleRepository) GetScheduleInstancesByUserDate(ctx context.Context, userID uuid.UUID, date time.Time) ([]*models.ScheduleInstance, error) {
-	query := `
-		SELECT schedule_instance_id, company_id, user_id, schedule_date, schedule_template_id,
-		       expected_start, expected_end, timezone, metadata, work_center_code,
-		       generated_at, status, cancel_reason, cancelled_at
+	query := `SELECT ` + scheduleInstanceCols + `
 		FROM attendance.schedule_instances
 		WHERE user_id = $1
 		  AND schedule_date = $2
 		  AND status = 'active'
-		ORDER BY expected_start
-	`
+		ORDER BY expected_start`
 	rows, err := r.client.Query(ctx, query, userID, date)
 	if err != nil {
 		return nil, fmt.Errorf("query schedule instances: %w", err)
 	}
 	defer rows.Close()
-	var instances []*models.ScheduleInstance
-	for rows.Next() {
-		inst, err := r.scanScheduleInstanceFromRows(rows)
-		if err != nil {
-			return nil, err
-		}
-		instances = append(instances, inst)
-	}
-	return instances, nil
+	return r.scanScheduleInstances(rows)
 }
 
 func (r *scheduleRepository) CreateScheduleInstance(ctx context.Context, tx *sql.Tx, instance *models.ScheduleInstance) error {
@@ -236,11 +229,11 @@ func (r *scheduleRepository) CreateScheduleInstance(ctx context.Context, tx *sql
 
 	query := `
 		INSERT INTO attendance.schedule_instances (
-			schedule_instance_id, company_id, user_id, schedule_date, schedule_template_id,
+			schedule_instance_id, company_id, user_id, location_id,
+			schedule_date, schedule_template_id,
 			expected_start, expected_end, timezone, metadata, work_center_code,
 			generated_at, status, cancel_reason, cancelled_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-	`
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`
 	exec := func(q string, args ...interface{}) (sql.Result, error) {
 		if tx != nil {
 			return tx.ExecContext(ctx, q, args...)
@@ -251,6 +244,7 @@ func (r *scheduleRepository) CreateScheduleInstance(ctx context.Context, tx *sql
 		instance.ScheduleInstanceID,
 		instance.CompanyID,
 		instance.UserID,
+		instance.LocationID,
 		instance.ScheduleDate,
 		instance.ScheduleTemplateID,
 		instance.ExpectedStart,
@@ -269,9 +263,9 @@ func (r *scheduleRepository) CreateScheduleInstance(ctx context.Context, tx *sql
 func (r *scheduleRepository) UpdateScheduleInstanceStatus(ctx context.Context, tx *sql.Tx, instanceID uuid.UUID, status string, cancelReason *string) error {
 	query := `
 		UPDATE attendance.schedule_instances
-		SET status = $1, cancel_reason = $2, cancelled_at = CASE WHEN $1 = 'cancelled' THEN NOW() ELSE NULL END
-		WHERE schedule_instance_id = $3
-	`
+		SET status = $1, cancel_reason = $2,
+		    cancelled_at = CASE WHEN $1 = 'cancelled' THEN NOW() ELSE NULL END
+		WHERE schedule_instance_id = $3`
 	exec := func(q string, args ...interface{}) (sql.Result, error) {
 		if tx != nil {
 			return tx.ExecContext(ctx, q, args...)
@@ -284,10 +278,10 @@ func (r *scheduleRepository) UpdateScheduleInstanceStatus(ctx context.Context, t
 
 // ── Work Center Shifts ──
 
-// GetWorkCenterShift – used in older code; now also date‑casted for safety.
 func (r *scheduleRepository) GetWorkCenterShift(ctx context.Context, companyID uuid.UUID, workCenterCode string, at time.Time) (*models.WorkCenterShift, error) {
 	query := `
-		SELECT mapping_id, company_id, work_center_code, shift_id, effective_from, effective_to, is_active, created_at, updated_at
+		SELECT mapping_id, company_id, work_center_code, shift_id,
+		       effective_from, effective_to, is_active, created_at, updated_at
 		FROM attendance.work_center_shifts
 		WHERE company_id = $1
 		  AND work_center_code = $2
@@ -295,8 +289,7 @@ func (r *scheduleRepository) GetWorkCenterShift(ctx context.Context, companyID u
 		  AND (effective_to IS NULL OR effective_to::date >= $3::date)
 		  AND is_active = true
 		ORDER BY effective_from DESC
-		LIMIT 1
-	`
+		LIMIT 1`
 	row := r.client.QueryRow(ctx, query, companyID, workCenterCode, at)
 	shift, err := r.scanWorkCenterShift(row)
 	if err != nil {
@@ -319,11 +312,11 @@ func (r *scheduleRepository) GetWorkCenterShift(ctx context.Context, companyID u
 
 func (r *scheduleRepository) GetWorkCenterShifts(ctx context.Context, companyID uuid.UUID, workCenterCode string) ([]*models.WorkCenterShift, error) {
 	query := `
-		SELECT mapping_id, company_id, work_center_code, shift_id, effective_from, effective_to, is_active, created_at, updated_at
+		SELECT mapping_id, company_id, work_center_code, shift_id,
+		       effective_from, effective_to, is_active, created_at, updated_at
 		FROM attendance.work_center_shifts
 		WHERE company_id = $1 AND work_center_code = $2
-		ORDER BY effective_from DESC
-	`
+		ORDER BY effective_from DESC`
 	rows, err := r.client.Query(ctx, query, companyID, workCenterCode)
 	if err != nil {
 		return nil, fmt.Errorf("query work center shifts: %w", err)
@@ -344,26 +337,26 @@ func (r *scheduleRepository) GetWorkCenterShifts(ctx context.Context, companyID 
 
 func (r *scheduleRepository) GetUserWorkCenterAssignment(ctx context.Context, userID uuid.UUID, at time.Time) (*models.UserWorkCenterAssignment, error) {
 	query := `
-		SELECT assignment_id, company_id, user_id, work_center_code, effective_from, effective_to, is_active, created_at, updated_at
+		SELECT assignment_id, company_id, user_id, work_center_code,
+		       effective_from, effective_to, is_active, created_at, updated_at
 		FROM attendance.user_work_center_assignments
 		WHERE user_id = $1
 		  AND effective_from <= $2
 		  AND (effective_to IS NULL OR effective_to >= $2)
 		  AND is_active = true
 		ORDER BY effective_from DESC
-		LIMIT 1
-	`
+		LIMIT 1`
 	row := r.client.QueryRow(ctx, query, userID, at)
 	return r.scanUserWorkCenterAssignment(row)
 }
 
 func (r *scheduleRepository) GetUserWorkCenterAssignments(ctx context.Context, userID uuid.UUID) ([]*models.UserWorkCenterAssignment, error) {
 	query := `
-		SELECT assignment_id, company_id, user_id, work_center_code, effective_from, effective_to, is_active, created_at, updated_at
+		SELECT assignment_id, company_id, user_id, work_center_code,
+		       effective_from, effective_to, is_active, created_at, updated_at
 		FROM attendance.user_work_center_assignments
 		WHERE user_id = $1
-		ORDER BY effective_from DESC
-	`
+		ORDER BY effective_from DESC`
 	rows, err := r.client.Query(ctx, query, userID)
 	if err != nil {
 		return nil, fmt.Errorf("query user work center assignments: %w", err)
@@ -384,14 +377,14 @@ func (r *scheduleRepository) GetUserWorkCenterAssignments(ctx context.Context, u
 
 func (r *scheduleRepository) GetUserOffEntitlement(ctx context.Context, userID uuid.UUID, at time.Time) (*models.UserOffEntitlement, error) {
 	query := `
-		SELECT entitlement_id, company_id, user_id, period_type, off_count, requires_approval, effective_from, effective_to, created_at
+		SELECT entitlement_id, company_id, user_id, period_type, off_count,
+		       requires_approval, effective_from, effective_to, created_at
 		FROM attendance.user_off_entitlements
 		WHERE user_id = $1
 		  AND effective_from <= $2
 		  AND (effective_to IS NULL OR effective_to >= $2)
 		ORDER BY effective_from DESC
-		LIMIT 1
-	`
+		LIMIT 1`
 	row := r.client.QueryRow(ctx, query, userID, at)
 	return r.scanUserOffEntitlement(row)
 }
@@ -400,11 +393,11 @@ func (r *scheduleRepository) GetUserOffEntitlement(ctx context.Context, userID u
 
 func (r *scheduleRepository) GetOffRequests(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time) ([]*models.OffRequest, error) {
 	rows, err := r.client.Query(ctx, `
-		SELECT off_request_id, company_id, user_id, request_dates, status, requested_by, approved_by, approved_at, created_at
+		SELECT off_request_id, company_id, user_id, request_dates, status,
+		       requested_by, approved_by, approved_at, created_at
 		FROM attendance.off_requests
 		WHERE user_id = $1
-		  AND status = 'approved'
-	`, userID)
+		  AND status = 'approved'`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("query off requests: %w", err)
 	}
@@ -444,14 +437,14 @@ func (r *scheduleRepository) GetOffRequests(ctx context.Context, userID uuid.UUI
 	return requests, nil
 }
 
-// ── Schedule Overrides ──
+// ── Schedule Overrides (legacy) ──
 
 func (r *scheduleRepository) GetScheduleOverride(ctx context.Context, userID uuid.UUID, date time.Time) (*models.ScheduleOverride, error) {
 	query := `
-		SELECT override_id, company_id, user_id, override_date, override_type, reason, created_by, created_at
+		SELECT override_id, company_id, user_id, override_date, override_type,
+		       reason, created_by, created_at
 		FROM attendance.schedule_overrides
-		WHERE user_id = $1 AND override_date = $2
-	`
+		WHERE user_id = $1 AND override_date = $2`
 	row := r.client.QueryRow(ctx, query, userID, date)
 	return r.scanScheduleOverride(row)
 }
@@ -459,8 +452,7 @@ func (r *scheduleRepository) GetScheduleOverride(ctx context.Context, userID uui
 // ── Health Check ──
 
 func (r *scheduleRepository) HealthCheck(ctx context.Context) error {
-	query := `SELECT 1 FROM attendance.work_centers LIMIT 1`
-	_, err := r.client.Exec(ctx, query)
+	_, err := r.client.Exec(ctx, `SELECT 1 FROM attendance.work_centers LIMIT 1`)
 	if err != nil {
 		return fmt.Errorf("schedule repository health check failed: %w", err)
 	}
@@ -471,10 +463,11 @@ func (r *scheduleRepository) HealthCheck(ctx context.Context) error {
 
 func (r *scheduleRepository) scanWorkCenter(row *sql.Row) (*models.WorkCenter, error) {
 	var wc models.WorkCenter
-	var desc sql.NullString
+	var desc, locationID sql.NullString
 	err := row.Scan(
 		&wc.WorkCenterCode,
 		&wc.CompanyID,
+		&locationID,
 		&wc.Name,
 		&desc,
 		&wc.Timezone,
@@ -491,38 +484,58 @@ func (r *scheduleRepository) scanWorkCenter(row *sql.Row) (*models.WorkCenter, e
 	if desc.Valid {
 		wc.Description = &desc.String
 	}
+	if locationID.Valid && locationID.String != "" {
+		if id, err := uuid.Parse(locationID.String); err == nil {
+			wc.LocationID = &id
+		}
+	}
 	return &wc, nil
 }
 
-func (r *scheduleRepository) scanWorkCenterFromRows(rows *sql.Rows) (*models.WorkCenter, error) {
-	var wc models.WorkCenter
-	var desc sql.NullString
-	err := rows.Scan(
-		&wc.WorkCenterCode,
-		&wc.CompanyID,
-		&wc.Name,
-		&desc,
-		&wc.Timezone,
-		&wc.IsActive,
-		&wc.CreatedAt,
-		&wc.UpdatedAt,
-	)
-	if err != nil {
-		return nil, err
+func (r *scheduleRepository) scanWorkCenters(rows *sql.Rows) ([]*models.WorkCenter, error) {
+	var wcs []*models.WorkCenter
+	for rows.Next() {
+		var wc models.WorkCenter
+		var desc, locationID sql.NullString
+		if err := rows.Scan(
+			&wc.WorkCenterCode,
+			&wc.CompanyID,
+			&locationID,
+			&wc.Name,
+			&desc,
+			&wc.Timezone,
+			&wc.IsActive,
+			&wc.CreatedAt,
+			&wc.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		if desc.Valid {
+			wc.Description = &desc.String
+		}
+		if locationID.Valid && locationID.String != "" {
+			if id, err := uuid.Parse(locationID.String); err == nil {
+				wc.LocationID = &id
+			}
+		}
+		wcs = append(wcs, &wc)
 	}
-	if desc.Valid {
-		wc.Description = &desc.String
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
 	}
-	return &wc, nil
+	return wcs, nil
 }
 
 func (r *scheduleRepository) scanWorkCalendar(row *sql.Row) (*models.WorkCalendar, error) {
 	var cal models.WorkCalendar
 	var holidaysJSON []byte
 	var workingDays []int
+	var locationID sql.NullString
+
 	err := row.Scan(
 		&cal.CalendarID,
 		&cal.CompanyID,
+		&locationID,
 		&cal.Year,
 		&cal.Name,
 		&cal.Timezone,
@@ -538,6 +551,11 @@ func (r *scheduleRepository) scanWorkCalendar(row *sql.Row) (*models.WorkCalenda
 		return nil, err
 	}
 	cal.WorkingDays = workingDays
+	if locationID.Valid && locationID.String != "" {
+		if id, err := uuid.Parse(locationID.String); err == nil {
+			cal.LocationID = &id
+		}
+	}
 	if len(holidaysJSON) > 0 {
 		if err := json.Unmarshal(holidaysJSON, &cal.Holidays); err != nil {
 			return nil, fmt.Errorf("unmarshal holidays: %w", err)
@@ -546,40 +564,57 @@ func (r *scheduleRepository) scanWorkCalendar(row *sql.Row) (*models.WorkCalenda
 	return &cal, nil
 }
 
-func (r *scheduleRepository) scanWorkCalendarFromRows(rows *sql.Rows) (*models.WorkCalendar, error) {
-	var cal models.WorkCalendar
-	var holidaysJSON []byte
-	var workingDays []int
-	err := rows.Scan(
-		&cal.CalendarID,
-		&cal.CompanyID,
-		&cal.Year,
-		&cal.Name,
-		&cal.Timezone,
-		pq.Array(&workingDays),
-		&holidaysJSON,
-		&cal.IsActive,
-		&cal.CreatedAt,
-	)
-	if err != nil {
-		return nil, err
-	}
-	cal.WorkingDays = workingDays
-	if len(holidaysJSON) > 0 {
-		if err := json.Unmarshal(holidaysJSON, &cal.Holidays); err != nil {
-			return nil, fmt.Errorf("unmarshal holidays: %w", err)
+func (r *scheduleRepository) scanCalendars(rows *sql.Rows) ([]*models.WorkCalendar, error) {
+	var cals []*models.WorkCalendar
+	for rows.Next() {
+		var cal models.WorkCalendar
+		var holidaysJSON []byte
+		var workingDays []int
+		var locationID sql.NullString
+
+		if err := rows.Scan(
+			&cal.CalendarID,
+			&cal.CompanyID,
+			&locationID,
+			&cal.Year,
+			&cal.Name,
+			&cal.Timezone,
+			pq.Array(&workingDays),
+			&holidaysJSON,
+			&cal.IsActive,
+			&cal.CreatedAt,
+		); err != nil {
+			return nil, err
 		}
+		cal.WorkingDays = workingDays
+		if locationID.Valid && locationID.String != "" {
+			if id, err := uuid.Parse(locationID.String); err == nil {
+				cal.LocationID = &id
+			}
+		}
+		if len(holidaysJSON) > 0 {
+			if err := json.Unmarshal(holidaysJSON, &cal.Holidays); err != nil {
+				return nil, fmt.Errorf("unmarshal holidays: %w", err)
+			}
+		}
+		cals = append(cals, &cal)
 	}
-	return &cal, nil
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
+	}
+	return cals, nil
 }
 
 func (r *scheduleRepository) scanScheduleTemplate(row *sql.Row) (*models.ScheduleTemplate, error) {
 	var tmpl models.ScheduleTemplate
 	var rulesJSON []byte
+	var locationID sql.NullString
+
 	err := row.Scan(
 		&tmpl.ScheduleTemplateID,
 		&tmpl.CompanyID,
 		&tmpl.CalendarID,
+		&locationID,
 		&tmpl.TemplateType,
 		&tmpl.Name,
 		&rulesJSON,
@@ -592,6 +627,11 @@ func (r *scheduleRepository) scanScheduleTemplate(row *sql.Row) (*models.Schedul
 		}
 		return nil, err
 	}
+	if locationID.Valid && locationID.String != "" {
+		if id, err := uuid.Parse(locationID.String); err == nil {
+			tmpl.LocationID = &id
+		}
+	}
 	if len(rulesJSON) > 0 {
 		if err := json.Unmarshal(rulesJSON, &tmpl.Rules); err != nil {
 			return nil, fmt.Errorf("unmarshal rules: %w", err)
@@ -600,28 +640,42 @@ func (r *scheduleRepository) scanScheduleTemplate(row *sql.Row) (*models.Schedul
 	return &tmpl, nil
 }
 
-func (r *scheduleRepository) scanScheduleTemplateFromRows(rows *sql.Rows) (*models.ScheduleTemplate, error) {
-	var tmpl models.ScheduleTemplate
-	var rulesJSON []byte
-	err := rows.Scan(
-		&tmpl.ScheduleTemplateID,
-		&tmpl.CompanyID,
-		&tmpl.CalendarID,
-		&tmpl.TemplateType,
-		&tmpl.Name,
-		&rulesJSON,
-		&tmpl.IsActive,
-		&tmpl.CreatedAt,
-	)
-	if err != nil {
-		return nil, err
-	}
-	if len(rulesJSON) > 0 {
-		if err := json.Unmarshal(rulesJSON, &tmpl.Rules); err != nil {
-			return nil, fmt.Errorf("unmarshal rules: %w", err)
+func (r *scheduleRepository) scanScheduleTemplates(rows *sql.Rows) ([]*models.ScheduleTemplate, error) {
+	var tmpls []*models.ScheduleTemplate
+	for rows.Next() {
+		var tmpl models.ScheduleTemplate
+		var rulesJSON []byte
+		var locationID sql.NullString
+
+		if err := rows.Scan(
+			&tmpl.ScheduleTemplateID,
+			&tmpl.CompanyID,
+			&tmpl.CalendarID,
+			&locationID,
+			&tmpl.TemplateType,
+			&tmpl.Name,
+			&rulesJSON,
+			&tmpl.IsActive,
+			&tmpl.CreatedAt,
+		); err != nil {
+			return nil, err
 		}
+		if locationID.Valid && locationID.String != "" {
+			if id, err := uuid.Parse(locationID.String); err == nil {
+				tmpl.LocationID = &id
+			}
+		}
+		if len(rulesJSON) > 0 {
+			if err := json.Unmarshal(rulesJSON, &tmpl.Rules); err != nil {
+				return nil, fmt.Errorf("unmarshal rules: %w", err)
+			}
+		}
+		tmpls = append(tmpls, &tmpl)
 	}
-	return &tmpl, nil
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
+	}
+	return tmpls, nil
 }
 
 func (r *scheduleRepository) scanUserScheduleAssignment(row *sql.Row) (*models.UserScheduleAssignment, error) {
@@ -679,13 +733,14 @@ func (r *scheduleRepository) scanScheduleInstance(row *sql.Row) (*models.Schedul
 	var inst models.ScheduleInstance
 	var metadataJSON []byte
 	var expectedStart, expectedEnd sql.NullTime
-	var workCenterCode sql.NullString
-	var cancelReason sql.NullString
+	var workCenterCode, cancelReason, locationID sql.NullString
 	var cancelledAt sql.NullTime
+
 	err := row.Scan(
 		&inst.ScheduleInstanceID,
 		&inst.CompanyID,
 		&inst.UserID,
+		&locationID,
 		&inst.ScheduleDate,
 		&inst.ScheduleTemplateID,
 		&expectedStart,
@@ -704,54 +759,59 @@ func (r *scheduleRepository) scanScheduleInstance(row *sql.Row) (*models.Schedul
 		}
 		return nil, err
 	}
-	if expectedStart.Valid {
-		inst.ExpectedStart = &expectedStart.Time
-	}
-	if expectedEnd.Valid {
-		inst.ExpectedEnd = &expectedEnd.Time
-	}
-	if workCenterCode.Valid {
-		inst.WorkCenterCode = &workCenterCode.String
-	}
-	if cancelReason.Valid {
-		inst.CancelReason = &cancelReason.String
-	}
-	if cancelledAt.Valid {
-		inst.CancelledAt = &cancelledAt.Time
-	}
-	if len(metadataJSON) > 0 {
-		if err := json.Unmarshal(metadataJSON, &inst.Metadata); err != nil {
-			return nil, fmt.Errorf("unmarshal metadata: %w", err)
-		}
-	}
+	r.assignScheduleInstanceNulls(&inst, locationID, expectedStart, expectedEnd, workCenterCode, cancelReason, cancelledAt, metadataJSON)
 	return &inst, nil
 }
 
-func (r *scheduleRepository) scanScheduleInstanceFromRows(rows *sql.Rows) (*models.ScheduleInstance, error) {
-	var inst models.ScheduleInstance
-	var metadataJSON []byte
-	var expectedStart, expectedEnd sql.NullTime
-	var workCenterCode sql.NullString
-	var cancelReason sql.NullString
-	var cancelledAt sql.NullTime
-	err := rows.Scan(
-		&inst.ScheduleInstanceID,
-		&inst.CompanyID,
-		&inst.UserID,
-		&inst.ScheduleDate,
-		&inst.ScheduleTemplateID,
-		&expectedStart,
-		&expectedEnd,
-		&inst.Timezone,
-		&metadataJSON,
-		&workCenterCode,
-		&inst.GeneratedAt,
-		&inst.Status,
-		&cancelReason,
-		&cancelledAt,
-	)
-	if err != nil {
-		return nil, err
+func (r *scheduleRepository) scanScheduleInstances(rows *sql.Rows) ([]*models.ScheduleInstance, error) {
+	var instances []*models.ScheduleInstance
+	for rows.Next() {
+		var inst models.ScheduleInstance
+		var metadataJSON []byte
+		var expectedStart, expectedEnd sql.NullTime
+		var workCenterCode, cancelReason, locationID sql.NullString
+		var cancelledAt sql.NullTime
+
+		if err := rows.Scan(
+			&inst.ScheduleInstanceID,
+			&inst.CompanyID,
+			&inst.UserID,
+			&locationID,
+			&inst.ScheduleDate,
+			&inst.ScheduleTemplateID,
+			&expectedStart,
+			&expectedEnd,
+			&inst.Timezone,
+			&metadataJSON,
+			&workCenterCode,
+			&inst.GeneratedAt,
+			&inst.Status,
+			&cancelReason,
+			&cancelledAt,
+		); err != nil {
+			return nil, err
+		}
+		r.assignScheduleInstanceNulls(&inst, locationID, expectedStart, expectedEnd, workCenterCode, cancelReason, cancelledAt, metadataJSON)
+		instances = append(instances, &inst)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
+	}
+	return instances, nil
+}
+
+func (r *scheduleRepository) assignScheduleInstanceNulls(
+	inst *models.ScheduleInstance,
+	locationID sql.NullString,
+	expectedStart, expectedEnd sql.NullTime,
+	workCenterCode, cancelReason sql.NullString,
+	cancelledAt sql.NullTime,
+	metadataJSON []byte,
+) {
+	if locationID.Valid && locationID.String != "" {
+		if id, err := uuid.Parse(locationID.String); err == nil {
+			inst.LocationID = &id
+		}
 	}
 	if expectedStart.Valid {
 		inst.ExpectedStart = &expectedStart.Time
@@ -769,11 +829,8 @@ func (r *scheduleRepository) scanScheduleInstanceFromRows(rows *sql.Rows) (*mode
 		inst.CancelledAt = &cancelledAt.Time
 	}
 	if len(metadataJSON) > 0 {
-		if err := json.Unmarshal(metadataJSON, &inst.Metadata); err != nil {
-			return nil, fmt.Errorf("unmarshal metadata: %w", err)
-		}
+		_ = json.Unmarshal(metadataJSON, &inst.Metadata)
 	}
-	return &inst, nil
 }
 
 func (r *scheduleRepository) scanWorkCenterShift(row *sql.Row) (*models.WorkCenterShift, error) {
@@ -930,10 +987,8 @@ func (r *scheduleRepository) scanScheduleOverride(row *sql.Row) (*models.Schedul
 }
 
 // ============================================================
-// NEW METHODS (to be added to scheduleRepository)
+// WORK CALENDARS — CRUD (extended)
 // ============================================================
-
-// ── Work Calendars CRUD ──
 
 func (r *scheduleRepository) CreateWorkCalendar(ctx context.Context, calendar *models.WorkCalendar) error {
 	if calendar.CalendarID == uuid.Nil {
@@ -945,12 +1000,13 @@ func (r *scheduleRepository) CreateWorkCalendar(ctx context.Context, calendar *m
 	holidaysJSON, _ := json.Marshal(calendar.Holidays)
 	query := `
 		INSERT INTO attendance.work_calendars (
-			calendar_id, company_id, year, name, timezone, working_days, holidays, is_active, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-	`
+			calendar_id, company_id, location_id, year, name, timezone,
+			working_days, holidays, is_active, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
 	_, err := r.client.Exec(ctx, query,
 		calendar.CalendarID,
 		calendar.CompanyID,
+		calendar.LocationID,
 		calendar.Year,
 		calendar.Name,
 		calendar.Timezone,
@@ -963,11 +1019,9 @@ func (r *scheduleRepository) CreateWorkCalendar(ctx context.Context, calendar *m
 }
 
 func (r *scheduleRepository) GetWorkCalendarByID(ctx context.Context, calendarID uuid.UUID) (*models.WorkCalendar, error) {
-	query := `
-		SELECT calendar_id, company_id, year, name, timezone, working_days, holidays, is_active, created_at
+	query := `SELECT ` + workCalendarCols + `
 		FROM attendance.work_calendars
-		WHERE calendar_id = $1
-	`
+		WHERE calendar_id = $1`
 	row := r.client.QueryRow(ctx, query, calendarID)
 	return r.scanWorkCalendar(row)
 }
@@ -976,10 +1030,11 @@ func (r *scheduleRepository) UpdateWorkCalendar(ctx context.Context, calendar *m
 	holidaysJSON, _ := json.Marshal(calendar.Holidays)
 	query := `
 		UPDATE attendance.work_calendars
-		SET name = $1, timezone = $2, working_days = $3, holidays = $4, is_active = $5
-		WHERE calendar_id = $6
-	`
+		SET location_id = $1, name = $2, timezone = $3,
+		    working_days = $4, holidays = $5, is_active = $6
+		WHERE calendar_id = $7`
 	_, err := r.client.Exec(ctx, query,
+		calendar.LocationID,
 		calendar.Name,
 		calendar.Timezone,
 		pq.Array(calendar.WorkingDays),
@@ -991,12 +1046,14 @@ func (r *scheduleRepository) UpdateWorkCalendar(ctx context.Context, calendar *m
 }
 
 func (r *scheduleRepository) DeleteWorkCalendar(ctx context.Context, calendarID uuid.UUID) error {
-	query := `DELETE FROM attendance.work_calendars WHERE calendar_id = $1`
-	_, err := r.client.Exec(ctx, query, calendarID)
+	_, err := r.client.Exec(ctx,
+		`DELETE FROM attendance.work_calendars WHERE calendar_id = $1`, calendarID)
 	return err
 }
 
-// ── Schedule Templates CRUD ──
+// ============================================================
+// SCHEDULE TEMPLATES — CRUD (extended)
+// ============================================================
 
 func (r *scheduleRepository) CreateScheduleTemplate(ctx context.Context, template *models.ScheduleTemplate) error {
 	if template.ScheduleTemplateID == uuid.Nil {
@@ -1008,13 +1065,14 @@ func (r *scheduleRepository) CreateScheduleTemplate(ctx context.Context, templat
 	rulesJSON, _ := json.Marshal(template.Rules)
 	query := `
 		INSERT INTO attendance.schedule_templates (
-			schedule_template_id, company_id, calendar_id, template_type, name, rules, is_active, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-	`
+			schedule_template_id, company_id, calendar_id, location_id,
+			template_type, name, rules, is_active, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
 	_, err := r.client.Exec(ctx, query,
 		template.ScheduleTemplateID,
 		template.CompanyID,
 		template.CalendarID,
+		template.LocationID,
 		template.TemplateType,
 		template.Name,
 		rulesJSON,
@@ -1025,36 +1083,27 @@ func (r *scheduleRepository) CreateScheduleTemplate(ctx context.Context, templat
 }
 
 func (r *scheduleRepository) GetScheduleTemplatesByCalendar(ctx context.Context, calendarID uuid.UUID) ([]*models.ScheduleTemplate, error) {
-	query := `
-		SELECT schedule_template_id, company_id, calendar_id, template_type, name, rules, is_active, created_at
+	query := `SELECT ` + scheduleTemplateCols + `
 		FROM attendance.schedule_templates
 		WHERE calendar_id = $1
-		ORDER BY name
-	`
+		ORDER BY name`
 	rows, err := r.client.Query(ctx, query, calendarID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var templates []*models.ScheduleTemplate
-	for rows.Next() {
-		tmpl, err := r.scanScheduleTemplateFromRows(rows)
-		if err != nil {
-			return nil, err
-		}
-		templates = append(templates, tmpl)
-	}
-	return templates, nil
+	return r.scanScheduleTemplates(rows)
 }
 
 func (r *scheduleRepository) UpdateScheduleTemplate(ctx context.Context, template *models.ScheduleTemplate) error {
 	rulesJSON, _ := json.Marshal(template.Rules)
 	query := `
 		UPDATE attendance.schedule_templates
-		SET name = $1, calendar_id = $2, template_type = $3, rules = $4, is_active = $5
-		WHERE schedule_template_id = $6
-	`
+		SET location_id = $1, name = $2, calendar_id = $3,
+		    template_type = $4, rules = $5, is_active = $6
+		WHERE schedule_template_id = $7`
 	_, err := r.client.Exec(ctx, query,
+		template.LocationID,
 		template.Name,
 		template.CalendarID,
 		template.TemplateType,
@@ -1066,122 +1115,90 @@ func (r *scheduleRepository) UpdateScheduleTemplate(ctx context.Context, templat
 }
 
 func (r *scheduleRepository) DeleteScheduleTemplate(ctx context.Context, templateID uuid.UUID) error {
-	query := `DELETE FROM attendance.schedule_templates WHERE schedule_template_id = $1`
-	_, err := r.client.Exec(ctx, query, templateID)
+	_, err := r.client.Exec(ctx,
+		`DELETE FROM attendance.schedule_templates WHERE schedule_template_id = $1`, templateID)
 	return err
 }
 
-// ── Schedule Instances extended ──
+// ============================================================
+// SCHEDULE INSTANCES — extended
+// ============================================================
 
 func (r *scheduleRepository) GetScheduleInstancesByUser(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error) {
-	query := `
-		SELECT schedule_instance_id, company_id, user_id, schedule_date, schedule_template_id,
-		       expected_start, expected_end, timezone, metadata, work_center_code,
-		       generated_at, status, cancel_reason, cancelled_at
+	query := `SELECT ` + scheduleInstanceCols + `
 		FROM attendance.schedule_instances
 		WHERE user_id = $1 AND schedule_date BETWEEN $2 AND $3
-		ORDER BY schedule_date, expected_start
-	`
+		ORDER BY schedule_date, expected_start`
 	rows, err := r.client.Query(ctx, query, userID, startDate, endDate)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var instances []*models.ScheduleInstance
-	for rows.Next() {
-		inst, err := r.scanScheduleInstanceFromRows(rows)
-		if err != nil {
-			return nil, err
-		}
-		instances = append(instances, inst)
-	}
-	return instances, nil
+	return r.scanScheduleInstances(rows)
 }
 
-func (r *scheduleRepository) GetScheduleInstancesByCompany(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error) {
-	query := `
-		SELECT schedule_instance_id, company_id, user_id, schedule_date, schedule_template_id,
-		       expected_start, expected_end, timezone, metadata, work_center_code,
-		       generated_at, status, cancel_reason, cancelled_at
+// GetScheduleInstancesByCompany — locationID == nil means no filter.
+func (r *scheduleRepository) GetScheduleInstancesByCompany(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+	startDate, endDate time.Time,
+) ([]*models.ScheduleInstance, error) {
+	var locArg interface{}
+	if locationID != nil {
+		locArg = *locationID
+	}
+	query := `SELECT ` + scheduleInstanceCols + `
 		FROM attendance.schedule_instances
-		WHERE company_id = $1 AND schedule_date BETWEEN $2 AND $3
-		ORDER BY schedule_date, user_id
-	`
-	rows, err := r.client.Query(ctx, query, companyID, startDate, endDate)
+		WHERE company_id = $1
+		  AND ($2::uuid IS NULL OR location_id = $2)
+		  AND schedule_date BETWEEN $3 AND $4
+		ORDER BY schedule_date, user_id`
+	rows, err := r.client.Query(ctx, query, companyID, locArg, startDate, endDate)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var instances []*models.ScheduleInstance
-	for rows.Next() {
-		inst, err := r.scanScheduleInstanceFromRows(rows)
-		if err != nil {
-			return nil, err
-		}
-		instances = append(instances, inst)
-	}
-	return instances, nil
+	return r.scanScheduleInstances(rows)
 }
 
 func (r *scheduleRepository) GetScheduleInstancesByTemplate(ctx context.Context, templateID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error) {
-	query := `
-		SELECT schedule_instance_id, company_id, user_id, schedule_date, schedule_template_id,
-		       expected_start, expected_end, timezone, metadata, work_center_code,
-		       generated_at, status, cancel_reason, cancelled_at
+	query := `SELECT ` + scheduleInstanceCols + `
 		FROM attendance.schedule_instances
 		WHERE schedule_template_id = $1 AND schedule_date BETWEEN $2 AND $3
-		ORDER BY schedule_date, user_id
-	`
+		ORDER BY schedule_date, user_id`
 	rows, err := r.client.Query(ctx, query, templateID, startDate, endDate)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var instances []*models.ScheduleInstance
-	for rows.Next() {
-		inst, err := r.scanScheduleInstanceFromRows(rows)
-		if err != nil {
-			return nil, err
-		}
-		instances = append(instances, inst)
-	}
-	return instances, nil
+	return r.scanScheduleInstances(rows)
 }
 
 func (r *scheduleRepository) GetScheduleInstancesByWorkCenter(ctx context.Context, companyID uuid.UUID, workCenterCode string, startDate, endDate time.Time) ([]*models.ScheduleInstance, error) {
-	query := `
-		SELECT schedule_instance_id, company_id, user_id, schedule_date, schedule_template_id,
-		       expected_start, expected_end, timezone, metadata, work_center_code,
-		       generated_at, status, cancel_reason, cancelled_at
+	query := `SELECT ` + scheduleInstanceCols + `
 		FROM attendance.schedule_instances
-		WHERE company_id = $1 AND work_center_code = $2 AND schedule_date BETWEEN $3 AND $4
-		ORDER BY schedule_date, user_id
-	`
+		WHERE company_id = $1 AND work_center_code = $2
+		  AND schedule_date BETWEEN $3 AND $4
+		ORDER BY schedule_date, user_id`
 	rows, err := r.client.Query(ctx, query, companyID, workCenterCode, startDate, endDate)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var instances []*models.ScheduleInstance
-	for rows.Next() {
-		inst, err := r.scanScheduleInstanceFromRows(rows)
-		if err != nil {
-			return nil, err
-		}
-		instances = append(instances, inst)
-	}
-	return instances, nil
+	return r.scanScheduleInstances(rows)
 }
 
 func (r *scheduleRepository) UpdateScheduleInstance(ctx context.Context, instance *models.ScheduleInstance) error {
 	metadataJSON, _ := json.Marshal(instance.Metadata)
 	query := `
 		UPDATE attendance.schedule_instances
-		SET expected_start = $1, expected_end = $2, timezone = $3, metadata = $4,
-		    status = $5, cancel_reason = $6, cancelled_at = $7
-		WHERE schedule_instance_id = $8
-	`
+		SET location_id = $1, expected_start = $2, expected_end = $3,
+		    timezone = $4, metadata = $5, status = $6,
+		    cancel_reason = $7, cancelled_at = $8
+		WHERE schedule_instance_id = $9`
 	_, err := r.client.Exec(ctx, query,
+		instance.LocationID,
 		instance.ExpectedStart,
 		instance.ExpectedEnd,
 		instance.Timezone,
@@ -1195,8 +1212,8 @@ func (r *scheduleRepository) UpdateScheduleInstance(ctx context.Context, instanc
 }
 
 func (r *scheduleRepository) DeleteScheduleInstance(ctx context.Context, instanceID uuid.UUID) error {
-	query := `DELETE FROM attendance.schedule_instances WHERE schedule_instance_id = $1`
-	_, err := r.client.Exec(ctx, query, instanceID)
+	_, err := r.client.Exec(ctx,
+		`DELETE FROM attendance.schedule_instances WHERE schedule_instance_id = $1`, instanceID)
 	return err
 }
 
@@ -1204,8 +1221,7 @@ func (r *scheduleRepository) CancelScheduleInstance(ctx context.Context, instanc
 	query := `
 		UPDATE attendance.schedule_instances
 		SET status = 'cancelled', cancel_reason = $1, cancelled_at = NOW()
-		WHERE schedule_instance_id = $2
-	`
+		WHERE schedule_instance_id = $2`
 	_, err := r.client.Exec(ctx, query, reason, instanceID)
 	return err
 }
@@ -1215,14 +1231,16 @@ func (r *scheduleRepository) HasActiveSchedule(ctx context.Context, companyID, u
 	query := `
 		SELECT EXISTS (
 			SELECT 1 FROM attendance.schedule_instances
-			WHERE company_id = $1 AND user_id = $2 AND schedule_date = $3 AND status = 'active'
-		)
-	`
+			WHERE company_id = $1 AND user_id = $2
+			  AND schedule_date = $3 AND status = 'active'
+		)`
 	err := r.client.QueryRow(ctx, query, companyID, userID, date).Scan(&exists)
 	return exists, err
 }
 
-// ── Schedule Overrides CRUD ──
+// ============================================================
+// SCHEDULE OVERRIDES — CRUD (extended)
+// ============================================================
 
 func (r *scheduleRepository) CreateScheduleOverride(ctx context.Context, override *models.ScheduleOverride) error {
 	if override.OverrideID == uuid.Nil {
@@ -1233,9 +1251,9 @@ func (r *scheduleRepository) CreateScheduleOverride(ctx context.Context, overrid
 	}
 	query := `
 		INSERT INTO attendance.schedule_overrides (
-			override_id, company_id, user_id, override_date, override_type, reason, created_by, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-	`
+			override_id, company_id, user_id, override_date, override_type,
+			reason, created_by, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
 	_, err := r.client.Exec(ctx, query,
 		override.OverrideID,
 		override.CompanyID,
@@ -1251,20 +1269,20 @@ func (r *scheduleRepository) CreateScheduleOverride(ctx context.Context, overrid
 
 func (r *scheduleRepository) GetScheduleOverrideByID(ctx context.Context, overrideID uuid.UUID) (*models.ScheduleOverride, error) {
 	query := `
-		SELECT override_id, company_id, user_id, override_date, override_type, reason, created_by, created_at
+		SELECT override_id, company_id, user_id, override_date, override_type,
+		       reason, created_by, created_at
 		FROM attendance.schedule_overrides
-		WHERE override_id = $1
-	`
+		WHERE override_id = $1`
 	row := r.client.QueryRow(ctx, query, overrideID)
 	return r.scanScheduleOverride(row)
 }
 
 func (r *scheduleRepository) GetScheduleOverridesByUser(ctx context.Context, userID uuid.UUID, startDate, endDate *time.Time, overrideType *string) ([]*models.ScheduleOverride, error) {
 	query := `
-		SELECT override_id, company_id, user_id, override_date, override_type, reason, created_by, created_at
+		SELECT override_id, company_id, user_id, override_date, override_type,
+		       reason, created_by, created_at
 		FROM attendance.schedule_overrides
-		WHERE user_id = $1
-	`
+		WHERE user_id = $1`
 	args := []interface{}{userID}
 	argPos := 2
 	if startDate != nil {
@@ -1301,10 +1319,10 @@ func (r *scheduleRepository) GetScheduleOverridesByUser(ctx context.Context, use
 
 func (r *scheduleRepository) GetScheduleOverridesByCompany(ctx context.Context, companyID uuid.UUID, startDate, endDate *time.Time, overrideType *string) ([]*models.ScheduleOverride, error) {
 	query := `
-		SELECT override_id, company_id, user_id, override_date, override_type, reason, created_by, created_at
+		SELECT override_id, company_id, user_id, override_date, override_type,
+		       reason, created_by, created_at
 		FROM attendance.schedule_overrides
-		WHERE company_id = $1
-	`
+		WHERE company_id = $1`
 	args := []interface{}{companyID}
 	argPos := 2
 	if startDate != nil {
@@ -1341,10 +1359,10 @@ func (r *scheduleRepository) GetScheduleOverridesByCompany(ctx context.Context, 
 
 func (r *scheduleRepository) GetScheduleOverrideByUserDate(ctx context.Context, userID uuid.UUID, date time.Time) (*models.ScheduleOverride, error) {
 	query := `
-		SELECT override_id, company_id, user_id, override_date, override_type, reason, created_by, created_at
+		SELECT override_id, company_id, user_id, override_date, override_type,
+		       reason, created_by, created_at
 		FROM attendance.schedule_overrides
-		WHERE user_id = $1 AND override_date = $2
-	`
+		WHERE user_id = $1 AND override_date = $2`
 	row := r.client.QueryRow(ctx, query, userID, date)
 	return r.scanScheduleOverride(row)
 }
@@ -1353,8 +1371,7 @@ func (r *scheduleRepository) UpdateScheduleOverride(ctx context.Context, overrid
 	query := `
 		UPDATE attendance.schedule_overrides
 		SET override_type = $1, reason = $2
-		WHERE override_id = $3
-	`
+		WHERE override_id = $3`
 	_, err := r.client.Exec(ctx, query,
 		override.OverrideType,
 		override.Reason,
@@ -1364,21 +1381,22 @@ func (r *scheduleRepository) UpdateScheduleOverride(ctx context.Context, overrid
 }
 
 func (r *scheduleRepository) DeleteScheduleOverride(ctx context.Context, overrideID uuid.UUID) error {
-	query := `DELETE FROM attendance.schedule_overrides WHERE override_id = $1`
-	_, err := r.client.Exec(ctx, query, overrideID)
+	_, err := r.client.Exec(ctx,
+		`DELETE FROM attendance.schedule_overrides WHERE override_id = $1`, overrideID)
 	return err
 }
 
 func (r *scheduleRepository) DeleteScheduleOverridesByReason(ctx context.Context, companyID, userID uuid.UUID, reason string) error {
 	query := `
 		DELETE FROM attendance.schedule_overrides
-		WHERE company_id = $1 AND user_id = $2 AND reason = $3
-	`
+		WHERE company_id = $1 AND user_id = $2 AND reason = $3`
 	_, err := r.client.Exec(ctx, query, companyID, userID, reason)
 	return err
 }
 
-// ── Work Center Shift Mappings ──
+// ============================================================
+// WORK CENTER SHIFT MAPPINGS
+// ============================================================
 
 func (r *scheduleRepository) CreateWorkCenterShiftMapping(ctx context.Context, mapping *models.WorkCenterShift) error {
 	if mapping.MappingID == uuid.Nil {
@@ -1389,9 +1407,9 @@ func (r *scheduleRepository) CreateWorkCenterShiftMapping(ctx context.Context, m
 	}
 	query := `
 		INSERT INTO attendance.work_center_shifts (
-			mapping_id, company_id, work_center_code, shift_id, effective_from, effective_to, is_active, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-	`
+			mapping_id, company_id, work_center_code, shift_id,
+			effective_from, effective_to, is_active, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
 	_, err := r.client.Exec(ctx, query,
 		mapping.MappingID,
 		mapping.CompanyID,
@@ -1406,7 +1424,6 @@ func (r *scheduleRepository) CreateWorkCenterShiftMapping(ctx context.Context, m
 	return err
 }
 
-// GetWorkCenterShiftByCode – FIXED with date casting for production reliability.
 func (r *scheduleRepository) GetWorkCenterShiftByCode(ctx context.Context, companyID uuid.UUID, workCenterCode string, date time.Time) (*models.WorkCenterShift, error) {
 	r.logger.Info("GetWorkCenterShiftByCode",
 		zap.String("company_id", companyID.String()),
@@ -1414,42 +1431,26 @@ func (r *scheduleRepository) GetWorkCenterShiftByCode(ctx context.Context, compa
 		zap.Time("date", date),
 	)
 	query := `
-		SELECT mapping_id, company_id, work_center_code, shift_id, effective_from, effective_to, is_active, created_at, updated_at
+		SELECT mapping_id, company_id, work_center_code, shift_id,
+		       effective_from, effective_to, is_active, created_at, updated_at
 		FROM attendance.work_center_shifts
 		WHERE company_id = $1 AND work_center_code = $2
 		  AND effective_from::date <= $3::date
 		  AND (effective_to IS NULL OR effective_to::date >= $3::date)
 		  AND is_active = true
 		ORDER BY effective_from DESC
-		LIMIT 1
-	`
+		LIMIT 1`
 	row := r.client.QueryRow(ctx, query, companyID, workCenterCode, date)
-	mapping, err := r.scanWorkCenterShiftMapping(row)
-	if err != nil {
-		return nil, err
-	}
-	if mapping == nil {
-		r.logger.Info("No work center shift mapping found (date-casted)",
-			zap.String("work_center", workCenterCode),
-			zap.String("date", date.Format("2006-01-02")),
-		)
-	} else {
-		r.logger.Info("Work center shift mapping found (date-casted)",
-			zap.String("work_center", workCenterCode),
-			zap.String("shift_id", mapping.ShiftID.String()),
-			zap.Time("effective_from", mapping.EffectiveFrom),
-		)
-	}
-	return mapping, nil
+	return r.scanWorkCenterShiftMapping(row)
 }
 
 func (r *scheduleRepository) GetWorkCenterShiftMappingsByShift(ctx context.Context, shiftID uuid.UUID) ([]*models.WorkCenterShift, error) {
 	query := `
-		SELECT mapping_id, company_id, work_center_code, shift_id, effective_from, effective_to, is_active, created_at, updated_at
+		SELECT mapping_id, company_id, work_center_code, shift_id,
+		       effective_from, effective_to, is_active, created_at, updated_at
 		FROM attendance.work_center_shifts
 		WHERE shift_id = $1
-		ORDER BY effective_from DESC
-	`
+		ORDER BY effective_from DESC`
 	rows, err := r.client.Query(ctx, query, shiftID)
 	if err != nil {
 		return nil, err
@@ -1471,8 +1472,7 @@ func (r *scheduleRepository) UpdateWorkCenterShiftMapping(ctx context.Context, m
 	query := `
 		UPDATE attendance.work_center_shifts
 		SET shift_id = $1, effective_to = $2, is_active = $3, updated_at = $4
-		WHERE mapping_id = $5
-	`
+		WHERE mapping_id = $5`
 	_, err := r.client.Exec(ctx, query,
 		mapping.ShiftID,
 		mapping.EffectiveTo,
@@ -1482,8 +1482,6 @@ func (r *scheduleRepository) UpdateWorkCenterShiftMapping(ctx context.Context, m
 	)
 	return err
 }
-
-// Helper scan functions for the new types
 
 func (r *scheduleRepository) scanWorkCenterShiftMapping(row *sql.Row) (*models.WorkCenterShift, error) {
 	var m models.WorkCenterShift

@@ -55,15 +55,16 @@ type ResolutionService interface {
 }
 
 type resolutionService struct {
-	eventRepo     repository.EventRepository
-	summaryRepo   repository.SummaryRepository
-	scheduleRepo  repository.ScheduleRepository
-	policyRepo    repository.PolicyRepository
-	subjectRes    resolver.SubjectResolver
-	adminSvc      admin.AdminService
-	exemptionRepo repository.AttendanceExemptionRepository
-	logger        *zap.Logger
-	audit         *auditservice.AuditService
+	eventRepo        repository.EventRepository
+	summaryRepo      repository.SummaryRepository
+	scheduleRepo     repository.ScheduleRepository
+	policyRepo       repository.PolicyRepository
+	subjectRes       resolver.SubjectResolver
+	locationResolver resolver.SubjectLocationResolver
+	adminSvc         admin.AdminService
+	exemptionRepo    repository.AttendanceExemptionRepository
+	logger           *zap.Logger
+	audit            *auditservice.AuditService
 }
 
 // NewResolutionService creates a new resolution service.
@@ -73,21 +74,23 @@ func NewResolutionService(
 	scheduleRepo repository.ScheduleRepository,
 	policyRepo repository.PolicyRepository,
 	subjectRes resolver.SubjectResolver,
+	locationResolver resolver.SubjectLocationResolver,
 	adminSvc admin.AdminService,
 	exemptionRepo repository.AttendanceExemptionRepository,
 	logger *zap.Logger,
 	audit *auditservice.AuditService,
 ) ResolutionService {
 	return &resolutionService{
-		eventRepo:     eventRepo,
-		summaryRepo:   summaryRepo,
-		scheduleRepo:  scheduleRepo,
-		policyRepo:    policyRepo,
-		subjectRes:    subjectRes,
-		adminSvc:      adminSvc,
-		exemptionRepo: exemptionRepo,
-		logger:        logger,
-		audit:         audit,
+		eventRepo:        eventRepo,
+		summaryRepo:      summaryRepo,
+		scheduleRepo:     scheduleRepo,
+		policyRepo:       policyRepo,
+		subjectRes:       subjectRes,
+		locationResolver: locationResolver,
+		adminSvc:         adminSvc,
+		exemptionRepo:    exemptionRepo,
+		logger:           logger,
+		audit:            audit,
 	}
 }
 
@@ -260,7 +263,6 @@ func (s *resolutionService) resolveSubjectDay(ctx context.Context, companyID, su
 		return fmt.Errorf("fetch events: %w", err)
 	}
 
-	// FIX: added subjectType as 4th argument
 	rules, err := s.adminSvc.ResolveAttendanceRules(
 		ctx,
 		subjectID,
@@ -277,7 +279,10 @@ func (s *resolutionService) resolveSubjectDay(ctx context.Context, companyID, su
 	return s.applyAttendanceRules(ctx, events, companyID, subjectID, subjectType, businessDate, resolved, rules)
 }
 
-// applyAttendanceRules does the heavy lifting: exemptions, pairing, overrides, metrics, status, upsert
+// applyAttendanceRules does the heavy lifting: exemptions, pairing, overrides, metrics, status, upsert.
+//
+// EmploymentLocationID is resolved once at the top and stamped on every
+// summary this function writes.
 func (s *resolutionService) applyAttendanceRules(
 	ctx context.Context,
 	events []*models.AttendanceEvent,
@@ -287,6 +292,17 @@ func (s *resolutionService) applyAttendanceRules(
 	resolved *resolver.ResolvedSubject,
 	rules *models.ResolvedAttendanceRules,
 ) error {
+	// 👇 NEW: resolve the subject's employment location once for this day.
+	subjectLocation, locErr := s.locationResolver.ResolveLocation(ctx, companyID, subjectType, subjectID)
+	if locErr != nil {
+		s.logger.Warn("Failed to resolve subject location, proceeding without",
+			zap.String("subject_type", subjectType),
+			zap.String("subject_id", subjectID.String()),
+			zap.Error(locErr),
+		)
+		subjectLocation = nil
+	}
+
 	// ── Helper to upsert a summary with a given status and anomalies ──
 	upsertStatus := func(status string, anomalies []string) error {
 		isPayable := status != models.StatusAbsent &&
@@ -295,16 +311,17 @@ func (s *resolutionService) applyAttendanceRules(
 			status != models.StatusExcused
 
 		summary := &models.AttendanceDailySummary{
-			AttendanceSummaryID: uuid.New(),
-			CompanyID:           companyID,
-			SubjectType:         subjectType,
-			SubjectID:           subjectID,
-			AttendanceDate:      businessDate,
-			Status:              status,
-			IsPayrollLocked:     false,
-			IsPayable:           isPayable,
-			GeneratedAt:         time.Now().UTC(),
-			GeneratedBy:         "attendance_resolution_service",
+			AttendanceSummaryID:  uuid.New(),
+			CompanyID:            companyID,
+			SubjectType:          subjectType,
+			SubjectID:            subjectID,
+			EmploymentLocationID: subjectLocation,
+			AttendanceDate:       businessDate,
+			Status:               status,
+			IsPayrollLocked:      false,
+			IsPayable:            isPayable,
+			GeneratedAt:          time.Now().UTC(),
+			GeneratedBy:          "attendance_resolution_service",
 			Metadata: models.SummaryMetadata{
 				ScheduleStatus: &resolved.ScheduleStatus,
 				Timezone:       &resolved.Timezone,
@@ -404,7 +421,7 @@ func (s *resolutionService) applyAttendanceRules(
 		policy = s.defaultPolicy()
 	}
 
-	// 10. Compute metrics (pass businessDate for end-of-day fallback)
+	// 10. Compute metrics
 	metrics := s.calculateMetrics(dayPairs, resolved, policy, anomalies, businessDate)
 
 	// 11. Determine final status
@@ -417,20 +434,21 @@ func (s *resolutionService) applyAttendanceRules(
 		status != models.StatusExcused
 
 	summary := &models.AttendanceDailySummary{
-		AttendanceSummaryID: uuid.New(),
-		CompanyID:           companyID,
-		SubjectType:         subjectType,
-		SubjectID:           subjectID,
-		AttendanceDate:      businessDate,
-		Status:              status,
-		IsPayrollLocked:     false,
-		IsPayable:           isPayable,
-		WorkedMinutes:       metrics.WorkedMinutes,
-		ExpectedMinutes:     metrics.ExpectedMinutes,
-		OvertimeMinutes:     metrics.OvertimeMinutes,
-		LateMinutes:         metrics.LateMinutes,
-		GeneratedAt:         time.Now().UTC(),
-		GeneratedBy:         "attendance_resolution_service",
+		AttendanceSummaryID:  uuid.New(),
+		CompanyID:            companyID,
+		SubjectType:          subjectType,
+		SubjectID:            subjectID,
+		EmploymentLocationID: subjectLocation,
+		AttendanceDate:       businessDate,
+		Status:               status,
+		IsPayrollLocked:      false,
+		IsPayable:            isPayable,
+		WorkedMinutes:        metrics.WorkedMinutes,
+		ExpectedMinutes:      metrics.ExpectedMinutes,
+		OvertimeMinutes:      metrics.OvertimeMinutes,
+		LateMinutes:          metrics.LateMinutes,
+		GeneratedAt:          time.Now().UTC(),
+		GeneratedBy:          "attendance_resolution_service",
 		Metadata: models.SummaryMetadata{
 			CheckInTime:    metrics.FirstCheckIn,
 			CheckOutTime:   metrics.LastCheckOut,
@@ -468,7 +486,7 @@ func (s *resolutionService) applyAttendanceRules(
 }
 
 // ─────────────────────────────────────────────────────────────
-// Helper methods
+// Helper methods (unchanged from original)
 // ─────────────────────────────────────────────────────────────
 
 func (s *resolutionService) pairCheckInCheckOut(events []*models.AttendanceEvent) []PairedEvent {
@@ -591,15 +609,12 @@ func (s *resolutionService) detectAnomaliesFromPairs(pairs []PairedEvent) []stri
 	return anomalies
 }
 
-// calculateMetrics computes worked minutes, late, overtime, etc. from all pairs.
-// It uses the earliest check-in for late minutes and latest check-out for overtime.
-// Unmatched check-ins are closed at expected end (or end of day).
 func (s *resolutionService) calculateMetrics(
 	pairs []PairedEvent,
 	resolved *resolver.ResolvedSubject,
 	policy *models.AttendancePolicy,
 	anomalies []string,
-	businessDate time.Time, // added to avoid using resolved.Date
+	businessDate time.Time,
 ) *DailyMetrics {
 	metrics := &DailyMetrics{
 		Status:       models.StatusPresent,
@@ -666,7 +681,6 @@ func (s *resolutionService) calculateMetrics(
 		}
 	}
 
-	// Handle unmatched check-ins (no checkout): close them at expected end (or end-of-day)
 	for _, p := range pairs {
 		if p.CheckIn != nil && p.CheckOut == nil {
 			closeTime := expectedEndLocal
@@ -697,7 +711,6 @@ func (s *resolutionService) calculateMetrics(
 		metrics.BreakMinutes = &breakMin
 	}
 
-	// Late minutes: earliest check-in compared to expected start
 	if expectedStartLocal != nil && earliestCheckIn != nil {
 		if earliestCheckIn.After(*expectedStartLocal) {
 			lateSec := earliestCheckIn.Sub(*expectedStartLocal).Seconds()
@@ -713,7 +726,6 @@ func (s *resolutionService) calculateMetrics(
 		metrics.LateMinutes = &zero
 	}
 
-	// Overtime: latest checkout compared to expected end
 	if expectedEndLocal != nil && latestCheckOut != nil {
 		if latestCheckOut.After(*expectedEndLocal) {
 			otSec := latestCheckOut.Sub(*expectedEndLocal).Seconds()
@@ -740,13 +752,11 @@ func (s *resolutionService) calculateMetrics(
 	return metrics
 }
 
-// determineStatus decides final status using metrics, resolved subject, and policy.
 func (s *resolutionService) determineStatus(
 	metrics *DailyMetrics,
 	resolved *resolver.ResolvedSubject,
 	policy *models.AttendancePolicy,
 ) string {
-	// Respect schedule overrides (already handled earlier, but double-check)
 	if resolved.ScheduleStatus != "" {
 		switch resolved.ScheduleStatus {
 		case "weekly_off":
@@ -761,12 +771,10 @@ func (s *resolutionService) determineStatus(
 		}
 	}
 
-	// No check-ins → absent
 	if metrics.CheckIns == 0 {
 		return models.StatusAbsent
 	}
 
-	// Late logic
 	if metrics.LateMinutes != nil && *metrics.LateMinutes > 0 {
 		if policy != nil && policy.Rules.MaxLateAllowed != nil && *metrics.LateMinutes > *policy.Rules.MaxLateAllowed {
 			return models.StatusAbsent
@@ -774,33 +782,28 @@ func (s *resolutionService) determineStatus(
 		return models.StatusLate
 	}
 
-	// Half-day: if worked < half-day threshold (and policy has threshold)
 	if policy != nil && policy.Rules.HalfDayAfter != nil && metrics.WorkedMinutes != nil && metrics.ExpectedMinutes != nil {
 		if *metrics.WorkedMinutes < *policy.Rules.HalfDayAfter {
 			return models.StatusHalfDay
 		}
 	}
 
-	// If there is at least one check-in, but no check-outs, and auto-checkout is allowed
 	if metrics.CheckIns > 0 && metrics.CheckOuts == 0 {
 		if policy != nil && policy.Rules.AutoCheckout != nil && *policy.Rules.AutoCheckout {
-			if metrics.WorkedMinutes != nil && *metrics.WorkedMinutes >= 240 { // 4 hours minimum to be considered present
+			if metrics.WorkedMinutes != nil && *metrics.WorkedMinutes >= 240 {
 				return models.StatusPresent
 			}
 		}
-		// Otherwise, it's a half-day or absent (if no work)
 		if metrics.WorkedMinutes != nil && *metrics.WorkedMinutes > 0 {
 			return models.StatusHalfDay
 		}
 		return models.StatusAbsent
 	}
 
-	// If some work was done, mark present
 	if metrics.WorkedMinutes != nil && *metrics.WorkedMinutes > 0 {
 		return models.StatusPresent
 	}
 
-	// Fallback
 	return models.StatusAbsent
 }
 
@@ -811,13 +814,11 @@ func (s *resolutionService) resolvePolicy(
 	date time.Time,
 	resolved *resolver.ResolvedSubject,
 ) (*models.AttendancePolicy, error) {
-	// 1. Try subject-specific policy (polymorphic – works for any subject type)
 	policy, err := s.policyRepo.GetActivePolicyBySubject(ctx, subjectType, subjectID, date)
 	if err == nil && policy != nil {
 		return policy, nil
 	}
 
-	// 2. For employees only, fallback to position/work center policies (legacy)
 	if subjectType == models.SubjectTypeEmployee {
 		if resolved.PositionID != nil {
 			posPolicy, err := s.policyRepo.GetPositionPolicy(ctx, *resolved.PositionID)
@@ -835,6 +836,7 @@ func (s *resolutionService) resolvePolicy(
 
 	return s.defaultPolicy(), nil
 }
+
 func (s *resolutionService) defaultPolicy() *models.AttendancePolicy {
 	return &models.AttendancePolicy{
 		PolicyID:   uuid.New(),

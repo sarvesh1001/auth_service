@@ -55,3 +55,12 @@ type LedgerEntryPayload struct {
 	FiscalYear    int    `json:"fiscal_year"`
 	Period        int    `json:"period"`
 }
+
+// ============================================================
+// Cost center events
+// ============================================================
+const (
+	EventCostCenterCreated = "accounting.cost_center.created"
+	EventCostCenterUpdated = "accounting.cost_center.updated"
+	EventCostCenterDeleted = "accounting.cost_center.deleted"
+)

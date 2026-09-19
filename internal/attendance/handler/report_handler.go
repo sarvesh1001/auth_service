@@ -13,6 +13,7 @@ import (
 
 	"auth-service/internal/attendance/service/query"
 	"auth-service/internal/attendance/service/report"
+	"auth-service/internal/locationctx"
 )
 
 // AttendanceReportHandler handles report generation and streaming.
@@ -36,6 +37,8 @@ func NewAttendanceReportHandler(
 }
 
 // GenerateReport generates a report (CSV or JSON) for events or summaries.
+//
+// Location scope: reads X-Location-ID from the request context.
 func (h *AttendanceReportHandler) GenerateReport(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -81,6 +84,9 @@ func (h *AttendanceReportHandler) GenerateReport(w http.ResponseWriter, r *http.
 		EndDate:       endDate,
 		ReportType:    reportType,
 		IncludeEvents: includeEvents,
+
+		// 👇 Location scope from the request context.
+		LocationID: locationctx.Filter(ctx),
 	}
 
 	data, contentType, err := h.reportService.GenerateReport(ctx, req)
@@ -107,6 +113,8 @@ func (h *AttendanceReportHandler) GenerateReport(w http.ResponseWriter, r *http.
 }
 
 // StreamEvents streams attendance events in CSV or JSONL format.
+//
+// Location scope: reads X-Location-ID from the request context.
 func (h *AttendanceReportHandler) StreamEvents(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -160,7 +168,6 @@ func (h *AttendanceReportHandler) StreamEvents(w http.ResponseWriter, r *http.Re
 		filter.DeviceID = &v
 	}
 
-	// Fix: Replace ternary with if/else
 	if format == "csv" {
 		w.Header().Set("Content-Type", "text/csv")
 		filename := fmt.Sprintf("attendance_events_%s_to_%s.csv", startDate.Format("20060102"), endDate.Format("20060102"))
@@ -169,11 +176,13 @@ func (h *AttendanceReportHandler) StreamEvents(w http.ResponseWriter, r *http.Re
 		w.Header().Set("Content-Type", "application/x-ndjson")
 	}
 
-	if err := h.reportService.StreamEvents(ctx, companyID, filter, w, format); err != nil {
+	// 👇 Location scope from the request context.
+	locFilter := locationctx.Filter(ctx)
+
+	if err := h.reportService.StreamEvents(ctx, companyID, locFilter, filter, w, format); err != nil {
 		h.logger.Error("Failed to stream events",
 			zap.String("company_id", companyID.String()),
 			zap.Error(err))
-		// Since headers may already be written, we can't return JSON
 		http.Error(w, "failed to stream events", http.StatusInternalServerError)
 		return
 	}

@@ -1,41 +1,33 @@
 package repository
 
 import (
+	"auth-service/internal/client"
+	hrErrors "auth-service/internal/hr/errors"
+	"auth-service/internal/hr/payroll/models"
 	"context"
 	"database/sql"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
-	"go.uber.org/zap"
-
-	"auth-service/internal/client"
-	"auth-service/internal/hr/payroll/models"
-	"auth-service/internal/util"
 )
 
 // ArrearsRepository defines operations for payroll arrears.
 type ArrearsRepository interface {
-	// Create inserts a new arrears record.
 	Create(ctx context.Context, arrears *models.Arrears) error
-	// GetUnprocessedByUser retrieves all unprocessed arrears for a specific user.
 	GetUnprocessedByUser(ctx context.Context, companyID, userID uuid.UUID) ([]models.Arrears, error)
-	// GetUnprocessedForPayrollRun retrieves all unprocessed arrears for a company within a period.
 	GetUnprocessedForPayrollRun(ctx context.Context, companyID uuid.UUID, periodStart, periodEnd time.Time) ([]models.Arrears, error)
-	// MarkAsProcessed updates an arrears record to processed and links it to a payroll run.
 	MarkAsProcessed(ctx context.Context, arrearsID uuid.UUID, payrollRunID uuid.UUID) error
 }
 
 type arrearsRepository struct {
 	client *client.PostgresClient
-	logger *zap.Logger
 }
 
 // NewArrearsRepository creates a new arrears repository.
-func NewArrearsRepository(postgresClient *client.PostgresClient, logger *zap.Logger) ArrearsRepository {
+func NewArrearsRepository(postgresClient *client.PostgresClient) ArrearsRepository {
 	return &arrearsRepository{
 		client: postgresClient,
-		logger: logger.Named("arrears_repo"),
 	}
 }
 
@@ -66,16 +58,9 @@ func (r *arrearsRepository) Create(ctx context.Context, arrears *models.Arrears)
 		nullString(arrears.Reason),
 		arrears.Processed,
 		arrears.CreatedAt,
-		arrears.ComponentCode, // new column
+		arrears.ComponentCode,
 	)
 	if err != nil {
-		r.logger.Error("Failed to create arrears",
-			util.String("arrears_id", arrears.ArrearsID.String()),
-			util.String("company_id", arrears.CompanyID.String()),
-			util.String("user_id", arrears.UserID.String()),
-			util.String("component_code", arrears.ComponentCode),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to create arrears: %w", err)
 	}
 	return nil
@@ -94,12 +79,7 @@ func (r *arrearsRepository) GetUnprocessedByUser(ctx context.Context, companyID,
 	`
 	rows, err := r.client.Query(ctx, query, companyID, userID)
 	if err != nil {
-		r.logger.Error("Failed to get unprocessed arrears by user",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.ErrorField(err),
-		)
-		return nil, fmt.Errorf("failed to get unprocessed arrears: %w", err)
+		return nil, fmt.Errorf("failed to get unprocessed arrears by user: %w", err)
 	}
 	defer rows.Close()
 
@@ -153,19 +133,13 @@ func (r *arrearsRepository) GetUnprocessedForPayrollRun(ctx context.Context, com
 		FROM payroll.arrears
 		WHERE company_id = $1
 			AND processed = false
-			AND effective_from <= $3   -- arrears start on or before period end
-			AND effective_to >= $2      -- arrears end on or after period start
+			AND effective_from <= $3
+			AND effective_to >= $2
 		ORDER BY user_id, effective_from
 	`
 	rows, err := r.client.Query(ctx, query, companyID, periodStart, periodEnd)
 	if err != nil {
-		r.logger.Error("Failed to get unprocessed arrears for payroll run",
-			util.String("company_id", companyID.String()),
-			util.Time("period_start", periodStart),
-			util.Time("period_end", periodEnd),
-			util.ErrorField(err),
-		)
-		return nil, fmt.Errorf("failed to get unprocessed arrears: %w", err)
+		return nil, fmt.Errorf("failed to get unprocessed arrears for payroll run: %w", err)
 	}
 	defer rows.Close()
 
@@ -217,16 +191,11 @@ func (r *arrearsRepository) MarkAsProcessed(ctx context.Context, arrearsID uuid.
 	`
 	result, err := r.client.Exec(ctx, query, arrearsID, payrollRunID)
 	if err != nil {
-		r.logger.Error("Failed to mark arrears as processed",
-			util.String("arrears_id", arrearsID.String()),
-			util.String("payroll_run_id", payrollRunID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to mark arrears as processed: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("arrears not found or already processed")
+		return hrErrors.ErrArrearsNotFound
 	}
 	return nil
 }

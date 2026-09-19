@@ -10,22 +10,33 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
-	"auth-service/internal/util"
+	"auth-service/internal/client"
+	"auth-service/internal/infrastructure/outbox"
 )
 
+// AuditService now uses outbox.Repository to reliably publish events.
+// It holds a PostgresClient to create transactions if none is provided.
 type AuditService struct {
-	repo   AuditRepository
-	logger *zap.Logger
+	outboxRepo outbox.Repository
+	pgClient   *client.PostgresClient
+	logger     *zap.Logger
 }
 
-func NewAuditService(repo AuditRepository, logger *zap.Logger) *AuditService {
+// NewAuditService creates a new audit service with outbox repository and PostgreSQL client.
+func NewAuditService(
+	outboxRepo outbox.Repository,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+) *AuditService {
 	return &AuditService{
-		repo:   repo,
-		logger: logger,
+		outboxRepo: outboxRepo,
+		pgClient:   pgClient,
+		logger:     logger.Named("audit_service"),
 	}
 }
 
-// ✅ LogAction now accepts a transaction pointer
+// LogAction stores an outbox event for the audit log.
+// If tx is nil, it creates its own transaction.
 func (s *AuditService) LogAction(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -44,11 +55,12 @@ func (s *AuditService) LogAction(
 		return fmt.Errorf("missing required audit fields")
 	}
 
+	// Build the audit log struct (will be serialised as payload)
 	var metadataBytes []byte
 	if metadata != nil {
 		jsonBytes, err := json.Marshal(metadata)
 		if err != nil {
-			s.logger.Warn("Failed to marshal metadata", util.ErrorField(err))
+			s.logger.Warn("failed to marshal metadata", zap.Error(err))
 		} else {
 			metadataBytes = jsonBytes
 		}
@@ -69,15 +81,66 @@ func (s *AuditService) LogAction(
 		CreatedAt:   time.Now().UTC(),
 	}
 
-	// ✅ Use transaction‑aware repository method
-	if tx == nil {
-		// Fallback to non‑transactional (e.g., for background jobs)
-		return s.repo.CreateAuditLog(ctx, auditLog)
+	// Marshal entire audit log as JSON payload
+	payload, err := json.Marshal(auditLog)
+	if err != nil {
+		return fmt.Errorf("failed to marshal audit log: %w", err)
 	}
-	return s.repo.CreateAuditLogWithTx(ctx, tx, auditLog)
+
+	getUUIDString := func(id *uuid.UUID) string {
+		if id == nil {
+			return ""
+		}
+		return id.String()
+	}
+
+	// Build outbox event
+	event := &outbox.Event{
+		EventID:       auditLog.AuditID.String(),
+		AggregateType: entityType,
+		AggregateID:   getUUIDString(entityID),
+		EventType:     fmt.Sprintf("%s.%s", module, action),
+		Topic:         "audit-logs",
+		Payload:       payload,
+		Headers: map[string]string{
+			"audit_id":   auditLog.AuditID.String(),
+			"company_id": getUUIDString(companyID),
+			"module":     module,
+			"action":     action,
+			"event_type": fmt.Sprintf("%s.%s", module, action),
+		},
+	}
+
+	// If no transaction is provided, create one.
+	if tx == nil {
+		tx, err = s.pgClient.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("failed to begin transaction for outbox: %w", err)
+		}
+		defer tx.Rollback() // ignored if commit succeeds
+
+		if err := s.outboxRepo.Store(ctx, tx, event); err != nil {
+			return fmt.Errorf("failed to store outbox event: %w", err)
+		}
+		return tx.Commit()
+	}
+
+	// Use the provided transaction.
+	if err := s.outboxRepo.Store(ctx, tx, event); err != nil {
+		return fmt.Errorf("failed to store outbox event: %w", err)
+	}
+
+	s.logger.Debug("Audit event stored in outbox",
+		zap.String("audit_id", auditLog.AuditID.String()),
+		zap.String("module", module),
+		zap.String("action", action),
+	)
+
+	return nil
 }
 
-// Helper methods also updated to accept tx
+// Helper methods remain unchanged – they call LogAction.
+
 func (s *AuditService) LogDeviceEnrollment(
 	ctx context.Context,
 	tx *sql.Tx,

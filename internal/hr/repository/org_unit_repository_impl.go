@@ -2,8 +2,8 @@ package repository
 
 import (
 	"auth-service/internal/client"
+	hrErrors "auth-service/internal/hr/errors"
 	"auth-service/internal/hr/models/orgunit"
-	"auth-service/internal/util"
 	"context"
 	"database/sql"
 	"fmt"
@@ -13,23 +13,19 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/lib/pq"
-	"go.uber.org/zap"
 )
 
 type OrgUnitRepositoryImpl struct {
 	client    *client.PostgresClient
-	logger    *zap.Logger
 	stmtCache map[string]*sql.Stmt
 	stmtMutex sync.RWMutex
 }
 
 func NewOrgUnitRepository(
 	postgresClient *client.PostgresClient,
-	logger *zap.Logger,
 ) OrgUnitRepository {
 	repo := &OrgUnitRepositoryImpl{
 		client:    postgresClient,
-		logger:    logger,
 		stmtCache: make(map[string]*sql.Stmt),
 	}
 
@@ -59,7 +55,7 @@ func (r *OrgUnitRepositoryImpl) CreateOrgUnit(ctx context.Context, orgUnit *orgu
 
 	if err != nil {
 		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23505" {
-			return fmt.Errorf("org unit with this name already exists")
+			return hrErrors.ErrOrgUnitAlreadyExists
 		}
 		return fmt.Errorf("failed to create org unit: %w", err)
 	}
@@ -83,7 +79,7 @@ func (r *OrgUnitRepositoryImpl) GetOrgUnitByID(ctx context.Context, companyID, o
 		return r.scanOrgUnit(rows)
 	}
 
-	return nil, fmt.Errorf("org unit not found: %s", orgUnitID)
+	return nil, hrErrors.ErrOrgUnitNotFound
 }
 
 func (r *OrgUnitRepositoryImpl) GetOrgUnitWithDetails(
@@ -135,7 +131,7 @@ func (r *OrgUnitRepositoryImpl) GetOrgUnitWithDetails(
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("org unit not found")
+			return nil, hrErrors.ErrOrgUnitNotFound
 		}
 		return nil, fmt.Errorf("failed to get org unit: %w", err)
 	}
@@ -267,7 +263,7 @@ func (r *OrgUnitRepositoryImpl) UpdateOrgUnit(ctx context.Context, orgUnit *orgu
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("org unit not found")
+		return hrErrors.ErrOrgUnitNotFound
 	}
 
 	return nil
@@ -305,7 +301,7 @@ func (r *OrgUnitRepositoryImpl) DeleteOrgUnit(ctx context.Context, companyID, or
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("org unit not found")
+		return hrErrors.ErrOrgUnitNotFound
 	}
 
 	return nil
@@ -516,7 +512,7 @@ func (r *OrgUnitRepositoryImpl) RemoveMember(ctx context.Context, orgUnitID, use
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("active membership not found")
+		return hrErrors.ErrOrgUnitMemberNotFound
 	}
 
 	return nil
@@ -541,7 +537,7 @@ func (r *OrgUnitRepositoryImpl) GetMember(ctx context.Context, orgUnitID, userID
 
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, nil
+			return nil, hrErrors.ErrOrgUnitMemberNotFound
 		}
 		return nil, fmt.Errorf("failed to get member: %w", err)
 	}
@@ -729,7 +725,7 @@ func (r *OrgUnitRepositoryImpl) RemoveRole(ctx context.Context, orgUnitID, userI
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("active role not found")
+		return hrErrors.ErrOrgUnitRoleNotFound
 	}
 
 	return nil
@@ -757,7 +753,7 @@ func (r *OrgUnitRepositoryImpl) GetRole(ctx context.Context, orgUnitID, userID u
 
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, nil
+			return nil, hrErrors.ErrOrgUnitRoleNotFound
 		}
 		return nil, fmt.Errorf("failed to get role: %w", err)
 	}
@@ -923,18 +919,13 @@ func (r *OrgUnitRepositoryImpl) initializePreparedStatements(ctx context.Context
 	for name, query := range statements {
 		stmt, err := r.client.DB.PrepareContext(ctx, query)
 		if err != nil {
-			r.logger.Warn("Failed to prepare statement",
-				util.String("statement", name),
-				util.ErrorField(err))
+			// silently skip; statement will be missing but caught later
 			continue
 		}
 		r.stmtMutex.Lock()
 		r.stmtCache[name] = stmt
 		r.stmtMutex.Unlock()
 	}
-
-	r.logger.Info("Org unit prepared statements initialized",
-		util.Int("statements", len(r.stmtCache)))
 }
 
 func (r *OrgUnitRepositoryImpl) getStmt(name string) (*sql.Stmt, bool) {
@@ -952,6 +943,7 @@ func (r *OrgUnitRepositoryImpl) HealthCheck(ctx context.Context) error {
 	}
 	return nil
 }
+
 func (r *OrgUnitRepositoryImpl) MemberExists(
 	ctx context.Context,
 	orgUnitID uuid.UUID,
@@ -1000,6 +992,7 @@ func (r *OrgUnitRepositoryImpl) EndActiveMembership(
 	_, err := r.client.Exec(ctx, query, effectiveTo, orgUnitID, userID)
 	return err
 }
+
 func (r *OrgUnitRepositoryImpl) GetActiveUsersByOrgUnit(
 	ctx context.Context,
 	orgUnitID uuid.UUID,

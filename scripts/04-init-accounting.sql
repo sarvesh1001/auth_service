@@ -32,6 +32,50 @@ CREATE TABLE IF NOT EXISTS accounting.accounts (
 );
 
 -- =====================================================
+-- 1.5 COST CENTERS (accounting dimension + HR linkage)   👈 ADDED
+-- =====================================================
+-- Lives in accounting because it's an accounting dimension first:
+-- the ledger is its primary consumer, and finance owns the reporting.
+-- HR references it as the employee's cost center; payroll snapshots
+-- it onto ledger rows so departmental P&L works.
+CREATE TABLE IF NOT EXISTS accounting.cost_centers (
+    cost_center_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id       UUID NOT NULL,
+    cost_center_code VARCHAR(50)  NOT NULL,
+    cost_center_name VARCHAR(255) NOT NULL,
+    description      TEXT,
+    parent_id        UUID,                       -- hierarchy: BU -> dept -> sub
+    account_id       UUID,                       -- default GL account (expense)
+    is_active        BOOLEAN NOT NULL DEFAULT true,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID,
+    updated_by       UUID,
+    deleted_at       TIMESTAMPTZ,
+    CONSTRAINT fk_cost_centers_company
+        FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
+    CONSTRAINT fk_cost_centers_parent
+        FOREIGN KEY (parent_id) REFERENCES accounting.cost_centers(cost_center_id),
+    CONSTRAINT fk_cost_centers_account
+        FOREIGN KEY (account_id) REFERENCES accounting.accounts(account_id) ON DELETE SET NULL,
+    CONSTRAINT fk_cost_centers_created_by
+        FOREIGN KEY (created_by) REFERENCES users(user_id),
+    CONSTRAINT fk_cost_centers_updated_by
+        FOREIGN KEY (updated_by) REFERENCES users(user_id),
+    CONSTRAINT uniq_cost_centers_code
+        UNIQUE (company_id, cost_center_code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cost_centers_company_active
+    ON accounting.cost_centers (company_id) WHERE is_active = true AND deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_cost_centers_parent
+    ON accounting.cost_centers (parent_id) WHERE parent_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_cost_centers_account
+    ON accounting.cost_centers (account_id) WHERE account_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_cost_centers_deleted
+    ON accounting.cost_centers (deleted_at) WHERE deleted_at IS NOT NULL;
+
+-- =====================================================
 -- 2. JOURNAL ENTRIES (source linkage + idempotency)
 -- =====================================================
 CREATE TABLE IF NOT EXISTS accounting.journal_entries (
@@ -63,6 +107,7 @@ CREATE TABLE IF NOT EXISTS accounting.journal_entries (
     CONSTRAINT fk_journal_entries_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id),
     CONSTRAINT unique_source UNIQUE (company_id, source_type, source_id)
 );
+
 -- =====================================================
 -- 3. JOURNAL LINES (with immutability after posting)
 -- =====================================================
@@ -97,9 +142,9 @@ CREATE TABLE IF NOT EXISTS accounting.ledger_entries (
     entry_date        DATE NOT NULL,
     debit_amount      NUMERIC(14,2) NOT NULL DEFAULT 0,
     credit_amount     NUMERIC(14,2) NOT NULL DEFAULT 0,
-    fiscal_year       INT NOT NULL,                    -- 👈 NOW NOT NULL
-    period            INT NOT NULL,                    -- 👈 NOW NOT NULL
-    running_balance   NUMERIC(14,2),                   -- optional, remains nullable
+    fiscal_year       INT NOT NULL,
+    period            INT NOT NULL,
+    running_balance   NUMERIC(14,2),
     cost_center_id    UUID,
     department_id     UUID,
     is_reversal       BOOLEAN DEFAULT FALSE,
@@ -110,6 +155,42 @@ CREATE TABLE IF NOT EXISTS accounting.ledger_entries (
     CONSTRAINT fk_le_account FOREIGN KEY (account_id) REFERENCES accounting.accounts(account_id),
     CONSTRAINT unique_ledger_line UNIQUE (journal_line_id)
 );
+
+-- =====================================================
+-- 4.5 LEDGER DIMENSION FKs   👈 ADDED
+-- =====================================================
+-- `cost_center_id` and `department_id` existed as bare UUID columns
+-- with no FK. Wire them so ledger rows can't point at nonexistent
+-- dimensions. This is what makes departmental and cost-center rollups
+-- reliable.
+ALTER TABLE accounting.ledger_entries
+    DROP CONSTRAINT IF EXISTS fk_le_cost_center;
+ALTER TABLE accounting.ledger_entries
+    ADD CONSTRAINT fk_le_cost_center
+        FOREIGN KEY (cost_center_id)
+        REFERENCES accounting.cost_centers(cost_center_id)
+        ON DELETE SET NULL;
+
+ALTER TABLE accounting.ledger_entries
+    DROP CONSTRAINT IF EXISTS fk_le_department;
+ALTER TABLE accounting.ledger_entries
+    ADD CONSTRAINT fk_le_department
+        FOREIGN KEY (department_id)
+        REFERENCES departments(department_id)
+        ON DELETE SET NULL;
+
+CREATE INDEX IF NOT EXISTS idx_ledger_cost_center
+    ON accounting.ledger_entries (company_id, cost_center_id)
+    WHERE cost_center_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_ledger_department
+    ON accounting.ledger_entries (company_id, department_id)
+    WHERE department_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_ledger_cc_fiscal
+    ON accounting.ledger_entries (company_id, cost_center_id, fiscal_year, period)
+    WHERE cost_center_id IS NOT NULL;
+
 -- =====================================================
 -- 5. ACCOUNT BALANCES (CACHE ONLY)
 -- =====================================================
@@ -261,7 +342,7 @@ CREATE TABLE IF NOT EXISTS accounting.compliance_returns (
     updated_by         UUID,
     filed_by           UUID,
     filed_at           TIMESTAMPTZ,
-    amended_from       UUID,                                      -- now present
+    amended_from       UUID,
     deleted_at         TIMESTAMPTZ,
     CONSTRAINT fk_returns_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
     CONSTRAINT fk_returns_created_by FOREIGN KEY (created_by) REFERENCES users(user_id),
@@ -424,7 +505,7 @@ CREATE TABLE IF NOT EXISTS accounting.reconciliation_items (
     item_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     batch_id           UUID NOT NULL,
     source_type        VARCHAR(30) NOT NULL,
-    source_id          TEXT,                           -- changed from UUID to TEXT
+    source_id          TEXT,
     journal_entry_id   UUID,
     amount             NUMERIC(14,2),
     currency           VARCHAR(3) NOT NULL DEFAULT 'USD',
@@ -444,7 +525,7 @@ CREATE TABLE IF NOT EXISTS accounting.reconciliation_differences (
     issue_type         VARCHAR(50) NOT NULL CHECK (issue_type IN ('missing_entry', 'amount_mismatch', 'duplicate', 'timing_difference')),
     expected_amount    NUMERIC(14,2),
     actual_amount      NUMERIC(14,2),
-    source_id          TEXT,            -- changed from UUID to TEXT
+    source_id          TEXT,
     journal_entry_id   UUID,
     description        TEXT,
     resolved           BOOLEAN NOT NULL DEFAULT false,
@@ -555,6 +636,12 @@ CREATE TRIGGER update_compliance_returns_updated_at BEFORE UPDATE ON accounting.
 CREATE TRIGGER update_accounting_settings_updated_at BEFORE UPDATE ON accounting.accounting_settings FOR EACH ROW EXECUTE FUNCTION accounting.update_updated_at_column();
 CREATE TRIGGER update_reconciliation_items_updated_at BEFORE UPDATE ON accounting.reconciliation_items FOR EACH ROW EXECUTE FUNCTION accounting.update_updated_at_column();
 
+-- 👇 ADDED: updated_at trigger for cost_centers
+DROP TRIGGER IF EXISTS update_cost_centers_updated_at ON accounting.cost_centers;
+CREATE TRIGGER update_cost_centers_updated_at
+    BEFORE UPDATE ON accounting.cost_centers
+    FOR EACH ROW EXECUTE FUNCTION accounting.update_updated_at_column();
+
 -- Fiscal year computation
 CREATE OR REPLACE FUNCTION accounting.compute_fiscal_fields(p_date DATE, p_start_month INT)
 RETURNS TABLE(fiscal_year INT, period INT) LANGUAGE plpgsql IMMUTABLE AS $$
@@ -583,8 +670,6 @@ $$;
 DROP TRIGGER IF EXISTS trg_set_ledger_fiscal ON accounting.ledger_entries;
 CREATE TRIGGER trg_set_ledger_fiscal BEFORE INSERT ON accounting.ledger_entries FOR EACH ROW EXECUTE FUNCTION accounting.set_ledger_fiscal_fields();
 
--- Prevent update/delete of journal lines after posting
-
 -- Prevent update/delete of journal lines after posting (fixed for DELETE)
 CREATE OR REPLACE FUNCTION accounting.prevent_update_posted_lines()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
@@ -592,14 +677,12 @@ DECLARE
     je_status TEXT;
     je_id UUID;
 BEGIN
-    -- Determine the journal_entry_id based on operation
     IF TG_OP = 'DELETE' THEN
         je_id := OLD.journal_entry_id;
     ELSE
         je_id := NEW.journal_entry_id;
     END IF;
 
-    -- Get the status of the parent journal entry
     SELECT status INTO je_status
     FROM accounting.journal_entries
     WHERE journal_entry_id = je_id;
@@ -608,7 +691,6 @@ BEGIN
         RAISE EXCEPTION 'Cannot modify or delete journal lines of a posted entry (JE: %)', je_id;
     END IF;
 
-    -- Return appropriate row for the operation
     IF TG_OP = 'DELETE' THEN
         RETURN OLD;
     ELSE
@@ -617,12 +699,12 @@ BEGIN
 END;
 $$;
 
--- Recreate the trigger (unchanged)
 DROP TRIGGER IF EXISTS trg_no_update_posted_lines ON accounting.journal_lines;
 CREATE TRIGGER trg_no_update_posted_lines
     BEFORE UPDATE OR DELETE ON accounting.journal_lines
     FOR EACH ROW
     EXECUTE FUNCTION accounting.prevent_update_posted_lines();
+
 -- Ensure ledger entries exist before allowing post
 CREATE OR REPLACE FUNCTION accounting.ensure_ledger_on_post()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
@@ -640,7 +722,7 @@ $$;
 DROP TRIGGER IF EXISTS trg_ensure_ledger_on_post ON accounting.journal_entries;
 CREATE TRIGGER trg_ensure_ledger_on_post AFTER UPDATE ON accounting.journal_entries FOR EACH ROW EXECUTE FUNCTION accounting.ensure_ledger_on_post();
 
--- Validate journal balance before posting (existing)
+-- Validate journal balance before posting
 CREATE OR REPLACE FUNCTION accounting.validate_journal_before_post()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 DECLARE total_debit NUMERIC; total_credit NUMERIC;
@@ -671,7 +753,7 @@ $$;
 DROP TRIGGER IF EXISTS trg_no_delete_posted ON accounting.journal_entries;
 CREATE TRIGGER trg_no_delete_posted BEFORE DELETE ON accounting.journal_entries FOR EACH ROW EXECUTE FUNCTION accounting.prevent_posted_delete();
 
--- (Optional) Ledger balance validation – deferred until end of transaction
+-- Ledger balance validation – deferred until end of transaction
 CREATE OR REPLACE FUNCTION accounting.validate_ledger_balance()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 DECLARE total_debit NUMERIC; total_credit NUMERIC;
@@ -687,6 +769,7 @@ $$;
 DROP TRIGGER IF EXISTS trg_validate_ledger_balance ON accounting.ledger_entries;
 CREATE CONSTRAINT TRIGGER trg_validate_ledger_balance AFTER INSERT OR UPDATE ON accounting.ledger_entries DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION accounting.validate_ledger_balance();
 
+-- Reconciliation batch metrics
 CREATE OR REPLACE FUNCTION accounting.update_reconciliation_batch_metrics()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -730,56 +813,9 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
-CREATE OR REPLACE FUNCTION accounting.update_reconciliation_batch_metrics()
-RETURNS TRIGGER AS $$
-BEGIN
-    INSERT INTO accounting.analytics_reconciliation_batch_metrics (
-        batch_id, company_id, reconciliation_type,
-        total_items, matched_items, unmatched_items, ignored_items,
-        started_at, completed_at,
-        total_differences, resolved_differences, total_adjustments, adjustment_amount
-    )
-    SELECT
-        b.batch_id,
-        b.company_id,
-        b.reconciliation_type,
-        COALESCE(SUM(CASE WHEN i.match_status IN ('matched', 'unmatched', 'ignored') THEN 1 ELSE 0 END), 0),
-        COALESCE(SUM(CASE WHEN i.match_status = 'matched' THEN 1 ELSE 0 END), 0),
-        COALESCE(SUM(CASE WHEN i.match_status = 'unmatched' THEN 1 ELSE 0 END), 0),
-        COALESCE(SUM(CASE WHEN i.match_status = 'ignored' THEN 1 ELSE 0 END), 0),
-        CASE WHEN b.status IN ('in_progress', 'completed') THEN LEAST(b.created_at, NOW()) ELSE NULL END,
-        b.completed_at,
-        (SELECT COUNT(*) FROM accounting.reconciliation_differences d WHERE d.batch_id = b.batch_id),
-        (SELECT COUNT(*) FROM accounting.reconciliation_differences d WHERE d.batch_id = b.batch_id AND d.resolved = true),
-        (SELECT COUNT(*) FROM accounting.reconciliation_adjustments a WHERE a.batch_id = b.batch_id),
-        COALESCE((SELECT SUM(adjustment_amount) FROM accounting.reconciliation_adjustments a WHERE a.batch_id = b.batch_id), 0)
-    FROM accounting.reconciliation_batches b
-    LEFT JOIN accounting.reconciliation_items i ON i.batch_id = b.batch_id
-    WHERE b.batch_id = NEW.batch_id
-    GROUP BY b.batch_id, b.company_id, b.reconciliation_type, b.status, b.created_at, b.completed_at
-    ON CONFLICT (batch_id) DO UPDATE SET
-        total_items = EXCLUDED.total_items,
-        matched_items = EXCLUDED.matched_items,
-        unmatched_items = EXCLUDED.unmatched_items,
-        ignored_items = EXCLUDED.ignored_items,
-        started_at = EXCLUDED.started_at,
-        completed_at = EXCLUDED.completed_at,
-        total_differences = EXCLUDED.total_differences,
-        resolved_differences = EXCLUDED.resolved_differences,
-        total_adjustments = EXCLUDED.total_adjustments,
-        adjustment_amount = EXCLUDED.adjustment_amount,
-        updated_at = NOW();
-
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-
--- (the exact functions are long; they are already in your original schema – we keep them unchanged)
 
 -- =====================================================
--- INDEXES (all critical)
+-- INDEXES
 -- =====================================================
 CREATE INDEX IF NOT EXISTS idx_accounts_company ON accounting.accounts(company_id);
 CREATE INDEX IF NOT EXISTS idx_accounts_type ON accounting.accounts(account_type);
@@ -797,7 +833,7 @@ CREATE INDEX IF NOT EXISTS idx_ledger_account_date ON accounting.ledger_entries(
 CREATE INDEX IF NOT EXISTS idx_ledger_company_date ON accounting.ledger_entries(company_id, entry_date);
 CREATE INDEX IF NOT EXISTS idx_ledger_journal ON accounting.ledger_entries(journal_entry_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_fiscal_period ON accounting.ledger_entries(company_id, fiscal_year, period);
-CREATE INDEX IF NOT EXISTS idx_ledger_account_fiscal ON accounting.ledger_entries(account_id, fiscal_year, period);  -- critical for balance aggregation
+CREATE INDEX IF NOT EXISTS idx_ledger_account_fiscal ON accounting.ledger_entries(account_id, fiscal_year, period);
 
 CREATE INDEX IF NOT EXISTS idx_account_balances_lookup ON accounting.account_balances(company_id, account_id, fiscal_year, period);
 CREATE INDEX IF NOT EXISTS idx_account_balances_dirty ON accounting.account_balances(is_recomputed) WHERE is_recomputed = false;
@@ -859,19 +895,21 @@ INSERT INTO accounting.accounting_settings (company_id, fiscal_year_start_month,
 SELECT company_id, 4, 'USD', NULL FROM companies
 ON CONFLICT (company_id) DO NOTHING;
 
-
-CREATE TABLE accounting.processed_events (
+-- =====================================================
+-- PROCESSED EVENTS (idempotency for consumers)
+-- =====================================================
+CREATE TABLE IF NOT EXISTS accounting.processed_events (
     event_id        TEXT NOT NULL,
     consumer_group  VARCHAR(100) NOT NULL,
     processed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (event_id, consumer_group)
 );
-CREATE INDEX idx_processed_events_consumer 
+CREATE INDEX IF NOT EXISTS idx_processed_events_consumer
 ON accounting.processed_events(consumer_group);
 
-
-
--- Table for period locking (prevents posting to closed periods)
+-- =====================================================
+-- PERIOD LOCKS (prevents posting to closed periods)
+-- =====================================================
 CREATE TABLE IF NOT EXISTS accounting.period_locks (
     lock_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id       UUID NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
@@ -886,14 +924,11 @@ CREATE TABLE IF NOT EXISTS accounting.period_locks (
     UNIQUE(company_id, fiscal_year, period)
 );
 
--- Indexes for period_locks
 CREATE INDEX IF NOT EXISTS idx_period_locks_company ON accounting.period_locks(company_id);
 CREATE INDEX IF NOT EXISTS idx_period_locks_locked ON accounting.period_locks(is_locked) WHERE is_locked = true;
 CREATE INDEX IF NOT EXISTS idx_period_locks_fiscal_period ON accounting.period_locks(fiscal_year, period);
 
--- Fast lookup index for accounts by ID and type (critical for rule engine)
 CREATE INDEX IF NOT EXISTS idx_accounts_id_type ON accounting.accounts(account_id, account_type);
-
 
 CREATE OR REPLACE FUNCTION accounting.check_period_lock()
 RETURNS TRIGGER AS $$
@@ -905,26 +940,100 @@ BEGIN
           AND period = NEW.period
           AND is_locked = true
     ) THEN
-        RAISE EXCEPTION 'Cannot insert ledger entry for locked period %-% (company %)', 
+        RAISE EXCEPTION 'Cannot insert ledger entry for locked period %-% (company %)',
                         NEW.fiscal_year, NEW.period, NEW.company_id;
     END IF;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS trg_check_period_lock ON accounting.ledger_entries;
 CREATE TRIGGER trg_check_period_lock
 BEFORE INSERT ON accounting.ledger_entries
 FOR EACH ROW
 EXECUTE FUNCTION accounting.check_period_lock();
 
-
 ALTER TABLE accounting.reconciliation_batches
-ADD COLUMN failure_reason TEXT;
+ADD COLUMN IF NOT EXISTS failure_reason TEXT;
 
-
-
-
-
-
-ALTER TABLE accounting.journal_entries 
+ALTER TABLE accounting.journal_entries
 ALTER COLUMN source_id TYPE TEXT;
+
+-- =====================================================
+-- 11. CROSS-SCHEMA LINKS — HR employees -> cost centers   👈 ADDED
+-- =====================================================
+-- The legacy `employee_profiles.cost_center VARCHAR(50)` column is
+-- kept for backward compatibility. New writes use `cost_center_id`.
+-- Once every reader is migrated, the text column can be dropped in
+-- a later release.
+ALTER TABLE employee_profiles
+    ADD COLUMN IF NOT EXISTS cost_center_id UUID;
+
+ALTER TABLE employee_profiles
+    DROP CONSTRAINT IF EXISTS fk_employee_profile_cost_center;
+ALTER TABLE employee_profiles
+    ADD CONSTRAINT fk_employee_profile_cost_center
+        FOREIGN KEY (cost_center_id)
+        REFERENCES accounting.cost_centers(cost_center_id)
+        ON DELETE SET NULL;
+
+CREATE INDEX IF NOT EXISTS idx_employee_profiles_cost_center
+    ON employee_profiles (company_id, cost_center_id)
+    WHERE cost_center_id IS NOT NULL;
+
+-- =====================================================
+-- 12. BACKFILL — legacy free-text cost_center -> cost_center_id   👈 ADDED
+-- =====================================================
+-- Link employees whose string value already matches a real cost-center
+-- code. This migration does NOT auto-create cost centers from free text
+-- (typos would become real budgets). Unmatched rows are surfaced via a
+-- NOTICE so HR can clean them up manually.
+UPDATE employee_profiles ep
+SET cost_center_id = cc.cost_center_id
+FROM accounting.cost_centers cc
+WHERE ep.cost_center_id IS NULL
+  AND ep.cost_center IS NOT NULL
+  AND ep.cost_center <> ''
+  AND cc.company_id = ep.company_id
+  AND cc.cost_center_code = ep.cost_center;
+
+DO $$
+DECLARE
+    unmapped_count INTEGER;
+BEGIN
+    SELECT COUNT(*) INTO unmapped_count
+    FROM employee_profiles
+    WHERE cost_center IS NOT NULL
+      AND cost_center <> ''
+      AND cost_center_id IS NULL;
+
+    IF unmapped_count > 0 THEN
+        RAISE NOTICE
+            'Migration note: % employee_profiles rows have a legacy cost_center string with no matching accounting.cost_centers row. Create the cost centers or update those rows manually.',
+            unmapped_count;
+    END IF;
+END $$;
+
+
+ALTER TABLE accounting.journal_lines
+    ADD COLUMN IF NOT EXISTS cost_center_id UUID,
+    ADD COLUMN IF NOT EXISTS department_id  UUID;
+
+ALTER TABLE accounting.journal_lines
+    DROP CONSTRAINT IF EXISTS fk_jl_cost_center;
+ALTER TABLE accounting.journal_lines
+    ADD CONSTRAINT fk_jl_cost_center
+        FOREIGN KEY (cost_center_id)
+        REFERENCES accounting.cost_centers(cost_center_id)
+        ON DELETE SET NULL;
+
+ALTER TABLE accounting.journal_lines
+    DROP CONSTRAINT IF EXISTS fk_jl_department;
+ALTER TABLE accounting.journal_lines
+    ADD CONSTRAINT fk_jl_department
+        FOREIGN KEY (department_id)
+        REFERENCES departments(department_id)
+        ON DELETE SET NULL;
+
+CREATE INDEX IF NOT EXISTS idx_journal_lines_cost_center
+    ON accounting.journal_lines (cost_center_id) WHERE cost_center_id IS NOT NULL;

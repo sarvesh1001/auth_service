@@ -1,12 +1,22 @@
 package postgres
 
 import (
+	"auth-service/internal/client"
 	"auth-service/internal/models"
 	"context"
 
 	"github.com/google/uuid"
 )
 
+// CompanyRepository defines the persistence contract for companies,
+// departments, roles, employees, permissions, and positions.
+//
+// Convention:
+//   - Methods that take `db client.DBTX` can be called with either
+//     r.client.Pool() (auto-commit) or an active *sql.Tx (transactional).
+//   - Methods WITHOUT `db client.DBTX` either call r.client directly
+//     (read-only pool access) or manage their own transaction internally
+//     via r.client.BeginTx.
 type CompanyRepository interface {
 	// ============================================================
 	// Company Operations
@@ -19,6 +29,7 @@ type CompanyRepository interface {
 		positionDetails *models.Position,
 		workCenterDetails *models.WorkCenter,
 	) error
+
 	GetCompany(ctx context.Context, companyID uuid.UUID) (*models.Company, error)
 	GetCompaniesByOwner(ctx context.Context, ownerUserID uuid.UUID) ([]*models.Company, error)
 	UpdateCompany(ctx context.Context, company *models.Company) error
@@ -31,49 +42,44 @@ type CompanyRepository interface {
 	DeleteCompany(ctx context.Context, companyID uuid.UUID) error
 	ListCompanies(ctx context.Context, limit, offset int) ([]*models.Company, int, error)
 	CheckCompanyExists(ctx context.Context, companyName string, ownerUserID uuid.UUID) (bool, error)
-	GetSystemDepartment(ctx context.Context, systemDeptID uuid.UUID) (*models.SystemDepartment, error)
-
-	// Department operations
-	GetDepartmentBySystemID(ctx context.Context, companyID, systemDepartmentID uuid.UUID) (*models.Department, error)
-
-	// Permission operations
-	GetPermissionsByNames(ctx context.Context, permissionNames []string) ([]*models.Permission, error)
-	GetUserPermissionNames(ctx context.Context, userID uuid.UUID) ([]string, error)
-
-	// Role operations
-	CreateRoleWithDetails(ctx context.Context, role *models.Role, departmentID uuid.UUID, permissionIDs []uuid.UUID, createdBy uuid.UUID) error
-
-	// Employee hierarchy
 
 	// ============================================================
 	// System Department Operations
 	// ============================================================
-	GetSystemDepartments(ctx context.Context) ([]*models.SystemDepartment, error)
-	GetSystemDepartmentByModule(ctx context.Context, module string) (*models.SystemDepartment, error)
+	GetSystemDepartment(ctx context.Context, db client.DBTX, systemDeptID uuid.UUID) (*models.SystemDepartment, error)
+	GetSystemDepartments(ctx context.Context, db client.DBTX) ([]*models.SystemDepartment, error)
+	GetSystemDepartmentByModule(ctx context.Context, db client.DBTX, module string) (*models.SystemDepartment, error)
+	GetSystemDepartmentsWithBitmask(ctx context.Context, db client.DBTX) ([]*models.SystemDepartment, error)
+	GetDepartmentBitmask(ctx context.Context, db client.DBTX, departmentName string) (uint64, error)
 
 	// ============================================================
 	// Department Operations
 	// ============================================================
 	CreateDepartment(ctx context.Context, department *models.Department) error
-	GetDepartmentsByCompany(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]*models.Department, int, error)
+	GetDepartmentsByCompany(ctx context.Context, db client.DBTX, companyID uuid.UUID, limit, offset int) ([]*models.Department, int, error)
 	UpdateDepartment(ctx context.Context, department *models.Department) error
 	DeactivateDepartment(ctx context.Context, departmentID uuid.UUID) error
-	GetDepartmentHierarchy(ctx context.Context, companyID uuid.UUID) ([]*models.Department, error)
+	GetDepartmentHierarchy(ctx context.Context, db client.DBTX, companyID uuid.UUID) ([]*models.Department, error)
 	GetDepartmentLoad(ctx context.Context, companyID uuid.UUID) (map[string]int, error)
+	GetDepartmentBySystemID(ctx context.Context, companyID, systemDepartmentID uuid.UUID) (*models.Department, error)
+	DeleteDepartment(ctx context.Context, db client.DBTX, departmentID uuid.UUID) error
 
 	// ============================================================
 	// Role-Department Mapping Operations
 	// ============================================================
-	DeleteDepartment(ctx context.Context, departmentID uuid.UUID) error
 	CreateRoleDepartment(ctx context.Context, roleID, departmentID uuid.UUID) error
 	RemoveRoleDepartment(ctx context.Context, roleID, departmentID uuid.UUID) error
 	GetRoleDepartments(ctx context.Context, roleID uuid.UUID) ([]*models.Department, error)
-	RemoveAllRoleDepartments(ctx context.Context, departmentID uuid.UUID) error
+	RemoveAllRoleDepartments(ctx context.Context, db client.DBTX, departmentID uuid.UUID) error
+	GetRoleDepartmentsForPermission(ctx context.Context, db client.DBTX, roleID uuid.UUID) ([]*models.Department, error)
+	AddRoleDepartments(ctx context.Context, db client.DBTX, roleID uuid.UUID, departmentIDs []uuid.UUID) error
+	RemoveRoleDepartments(ctx context.Context, db client.DBTX, roleID uuid.UUID, departmentIDs []uuid.UUID) error
 
 	// ============================================================
 	// Role & Permission Operations
 	// ============================================================
 	CreateRole(ctx context.Context, role *models.Role, departmentIDs []uuid.UUID) error
+	CreateRoleWithDetails(ctx context.Context, role *models.Role, departmentID uuid.UUID, permissionIDs []uuid.UUID, createdBy uuid.UUID) error
 	GetRole(ctx context.Context, roleID uuid.UUID) (*models.Role, error)
 	GetRolesByCompany(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]*models.Role, int, error)
 	GetSystemRoleByLevel(ctx context.Context, companyID uuid.UUID, roleLevel int) (*models.Role, error)
@@ -90,44 +96,50 @@ type CompanyRepository interface {
 	CheckRolePermission(ctx context.Context, roleID, permissionID uuid.UUID) (bool, error)
 	CopyRolePermissions(ctx context.Context, sourceRoleID, targetRoleID, grantedBy uuid.UUID) error
 	InitializeDefaultPermissions(ctx context.Context, companyID uuid.UUID, createdBy uuid.UUID) error
+	ClearRolePermissions(ctx context.Context, db client.DBTX, roleID uuid.UUID) error
+	AddRolePermissions(ctx context.Context, db client.DBTX, roleID uuid.UUID, permissionIDs []uuid.UUID, grantedBy uuid.UUID) error
+	RemoveRolePermissions(ctx context.Context, db client.DBTX, roleID uuid.UUID, permissionIDs []uuid.UUID) error
 
 	// ============================================================
 	// Employee Operations
 	// ============================================================
-	CreateEmployee(ctx context.Context, employee *models.CompanyEmployee) error
-	GetEmployee(ctx context.Context, companyID, userID uuid.UUID) (*models.CompanyEmployee, error)
+	CreateEmployee(ctx context.Context, db client.DBTX, employee *models.CompanyEmployee) error
+	GetEmployee(ctx context.Context, db client.DBTX, companyID, userID uuid.UUID) (*models.CompanyEmployee, error)
 	GetEmployeesByUser(ctx context.Context, userID uuid.UUID) ([]*models.CompanyEmployee, error)
 	UpdateEmployee(ctx context.Context, employee *models.CompanyEmployee) error
 	UpdateEmployeeRole(ctx context.Context, companyID, userID, roleID uuid.UUID) error
-	// UpdateEmployeeDepartment(ctx context.Context, companyID, userID, departmentID uuid.UUID) error
 	DeactivateEmployee(ctx context.Context, companyID, userID uuid.UUID) error
 	ReactivateEmployee(ctx context.Context, companyID, userID uuid.UUID) error
-	UpdateEmployeeOfCompany(ctx context.Context, companyID, userID uuid.UUID, updates map[string]interface{}) error
+	UpdateEmployeeOfCompany(ctx context.Context, db client.DBTX, companyID, userID uuid.UUID, updates map[string]interface{}) error
+	UpdateEmployeePosition(ctx context.Context, db client.DBTX, companyID uuid.UUID, userID uuid.UUID, positionID *uuid.UUID) error
 
 	// Employee Queries
 	GetEmployeeCount(ctx context.Context, companyID uuid.UUID) (int, error)
 	GetActiveEmployeeCount(ctx context.Context, companyID uuid.UUID) (int, error)
-	GetEmployeesByDepartment(ctx context.Context, departmentID uuid.UUID, limit, offset int) ([]*models.CompanyEmployee, int, error)
-	GetEmployeesByRole(ctx context.Context, roleID uuid.UUID, limit, offset int) ([]*models.CompanyEmployee, int, error)
+	GetEmployeesByDepartment(ctx context.Context, db client.DBTX, departmentID uuid.UUID, limit, offset int) ([]*models.CompanyEmployee, int, error)
+	GetEmployeesByRole(ctx context.Context, db client.DBTX, roleID uuid.UUID, limit, offset int) ([]*models.CompanyEmployee, int, error)
 	ListActiveEmployees(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]*models.CompanyEmployee, int, error)
 	IsUserActiveEmployee(ctx context.Context, companyID, userID uuid.UUID) (bool, error)
-	GetUsersByRoleLevel(ctx context.Context, companyID uuid.UUID, minLevel, maxLevel int) ([]*models.CompanyEmployee, error)
-	GetEmployeeDepartment(ctx context.Context, companyID, userID uuid.UUID) (*models.Department, error)
-	GetEmployeeDepartments(ctx context.Context, companyID, userID uuid.UUID) ([]*models.Department, error)
-	GetEmployeeWithPosition(ctx context.Context, companyID, userID uuid.UUID) (*models.EmployeeWithPositionDetails, error)
-	GetEmployeeSummariesByCompany(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]models.EmployeeSummary, int, error)
-	// GetEmployeesByCompany returns a list of employee summaries (only user_id, employee_id, username, full_name).
-	GetEmployeesByCompany(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]*models.CompanyEmployee, int, error)
+	GetUsersByRoleLevel(ctx context.Context, db client.DBTX, companyID uuid.UUID, minLevel, maxLevel int) ([]*models.CompanyEmployee, error)
+	GetEmployeeDepartment(ctx context.Context, db client.DBTX, companyID, userID uuid.UUID) (*models.Department, error)
+	GetEmployeeDepartments(ctx context.Context, db client.DBTX, companyID, userID uuid.UUID) ([]*models.Department, error)
+	GetEmployeeWithPosition(ctx context.Context, db client.DBTX, companyID, userID uuid.UUID) (*models.EmployeeWithPositionDetails, error)
+	GetEmployeeSummariesByCompany(ctx context.Context, db client.DBTX, companyID uuid.UUID, limit, offset int) ([]models.EmployeeSummary, int, error)
+	GetEmployeesByCompany(ctx context.Context, db client.DBTX, companyID uuid.UUID, limit, offset int) ([]*models.CompanyEmployee, int, error)
+	GetDepartmentsByUserID(ctx context.Context, db client.DBTX, companyID, userID uuid.UUID) ([]*models.Department, error)
+
 	// ============================================================
 	// Permission & RBAC Queries
 	// ============================================================
 	GetAllPermissions(ctx context.Context) ([]*models.Permission, error)
 	GetPermissionsByCategory(ctx context.Context, category string) ([]*models.Permission, error)
 	GetPermissionsByModule(ctx context.Context, module string) ([]*models.Permission, error)
+	GetPermissionsByNames(ctx context.Context, permissionNames []string) ([]*models.Permission, error)
 	CheckUserPermission(ctx context.Context, companyID, userID uuid.UUID, permissionName string) (bool, error)
 	CheckUserPermissionDetailed(ctx context.Context, companyID, userID uuid.UUID, permissionName string) (*models.PermissionCheckResult, error)
 	GetUserPermissions(ctx context.Context, companyID, userID uuid.UUID) ([]*models.Permission, error)
-	GetUsersWithPermission(ctx context.Context, companyID uuid.UUID, permissionName string, limit int) ([]*models.CompanyEmployee, error)
+	GetUserPermissionNames(ctx context.Context, userID uuid.UUID) ([]string, error)
+	GetUsersWithPermission(ctx context.Context, db client.DBTX, companyID uuid.UUID, permissionName string, limit int) ([]*models.CompanyEmployee, error)
 
 	// Permission Management
 	CreatePermission(ctx context.Context, permission *models.Permission) error
@@ -150,9 +162,12 @@ type CompanyRepository interface {
 	GetEmployeeHierarchy(ctx context.Context, companyID uuid.UUID) ([]*models.EmployeeHierarchy, error)
 	GetRoleDistribution(ctx context.Context, companyID uuid.UUID) (map[string]int, error)
 	GetPermissionsBySystemDepartments(ctx context.Context, systemDeptIDs []uuid.UUID, module, category, tier string) ([]*models.Permission, error)
+	GetPermissionsByCompanyModules(ctx context.Context, companyID uuid.UUID, module, category, tier string) ([]*models.Permission, error)
+	GetModulePermissions(ctx context.Context, modules []string, category, tier string) ([]*models.Permission, error)
+	GetPermissionsByModules(ctx context.Context, db client.DBTX, modules []string) ([]*models.Permission, error)
 
 	// ============================================================
-	// 🔍 ADVANCED COMPANY SEARCH METHODS (NEW)
+	// Advanced Company Search
 	// ============================================================
 	SearchCompaniesByName(
 		ctx context.Context,
@@ -170,264 +185,67 @@ type CompanyRepository interface {
 		limit, offset int,
 	) ([]*models.Company, int, error)
 
-	GetCompanySuggestions(
-		ctx context.Context,
-		prefix string,
-		limit int,
-	) ([]string, error)
-
-	GetCompanySearchStats(
-		ctx context.Context,
-	) (map[string]interface{}, error)
+	GetCompanySuggestions(ctx context.Context, prefix string, limit int) ([]string, error)
+	GetCompanySearchStats(ctx context.Context) (map[string]interface{}, error)
 
 	// ============================================================
-	// Utility Methods
+	// Department — Read Operations
+	// ============================================================
+	GetDepartment(ctx context.Context, db client.DBTX, departmentID uuid.UUID) (*models.Department, error)
+	GetDepartmentByID(ctx context.Context, db client.DBTX, departmentID uuid.UUID) (*models.Department, error)
+	GetDepartmentByName(ctx context.Context, db client.DBTX, companyID uuid.UUID, departmentName string) (*models.Department, error)
+	GetRootDepartments(ctx context.Context, db client.DBTX, companyID uuid.UUID) ([]*models.Department, error)
+	GetDepartmentChildren(ctx context.Context, db client.DBTX, departmentID uuid.UUID) ([]*models.Department, error)
+	GetSubDepartments(ctx context.Context, db client.DBTX, parentDepartmentID uuid.UUID) ([]*models.Department, error)
+	GetDepartmentParents(ctx context.Context, db client.DBTX, departmentID uuid.UUID) ([]*models.Department, error)
+	GetDepartmentTree(ctx context.Context, db client.DBTX, departmentID uuid.UUID) ([]*models.DepartmentTree, error)
+	GetDeactivatedDepartments(ctx context.Context, db client.DBTX, companyID uuid.UUID) ([]*models.Department, error)
+	GetDepartmentSuggestions(ctx context.Context, db client.DBTX, companyID uuid.UUID, prefix string, limit int) ([]*models.Department, error)
+	SearchDepartments(ctx context.Context, db client.DBTX, companyID uuid.UUID, searchQuery string, limit int, offset int, includeInactive bool) ([]*models.DepartmentSearchResult, int, error)
+
+	// ============================================================
+	// Department — Write Operations
+	// ============================================================
+	UpdateDepartmentName(ctx context.Context, departmentID uuid.UUID, newName string) error
+	UpdateDepartmentParent(ctx context.Context, db client.DBTX, departmentID uuid.UUID, parentDepartmentID *uuid.UUID) error
+	MoveDepartmentWithEmployees(ctx context.Context, departmentID uuid.UUID, newParentDepartmentID *uuid.UUID) error
+	CreateSubDepartment(ctx context.Context, companyID uuid.UUID, parentDepartmentID uuid.UUID, departmentName string, systemDepartmentID uuid.UUID) (*models.Department, error)
+	CreateCompanyDepartment(ctx context.Context, db client.DBTX, companyID uuid.UUID, departmentName string, systemDepartmentID uuid.UUID) (*models.Department, error)
+	SoftDeleteDepartment(ctx context.Context, companyID, departmentID uuid.UUID) error
+	ActivateDepartment(ctx context.Context, companyID uuid.UUID, departmentID uuid.UUID) error
+
+	// ============================================================
+	// Department Quotas
+	// ============================================================
+	GetCompanyByID(ctx context.Context, db client.DBTX, companyID uuid.UUID) (*models.Company, error)
+	GetActiveDepartmentCount(ctx context.Context, db client.DBTX, companyID uuid.UUID) (int, error)
+	CheckDepartmentLimit(ctx context.Context, db client.DBTX, companyID uuid.UUID) error
+	GetCompanyDepartmentInfo(ctx context.Context, db client.DBTX, companyID uuid.UUID) (*models.CompanyDepartmentInfo, error)
+
+	// ============================================================
+	// Position Operations
+	// ============================================================
+	CreatePosition(ctx context.Context, db client.DBTX, position *models.Position) error
+	UpdatePosition(ctx context.Context, db client.DBTX, position *models.Position) error
+	UpdatePositionStatus(ctx context.Context, db client.DBTX, positionID uuid.UUID, isOpen bool) error
+	DeletePosition(ctx context.Context, db client.DBTX, positionID uuid.UUID) error
+	GetPosition(ctx context.Context, db client.DBTX, positionID uuid.UUID) (*models.Position, error)
+	GetPositionsByCompany(ctx context.Context, db client.DBTX, companyID uuid.UUID, limit int, offset int, onlyOpen bool) ([]*models.Position, int, error)
+	GetPositionsByDepartment(ctx context.Context, db client.DBTX, departmentID uuid.UUID, limit int, offset int, onlyOpen bool) ([]*models.Position, int, error)
+	GetOpenPositions(ctx context.Context, db client.DBTX, companyID uuid.UUID, isOpen *bool, limit, offset int) ([]*models.Position, int, error)
+	PositionExists(ctx context.Context, db client.DBTX, companyID, departmentID uuid.UUID, title string) (bool, error)
+	WorkCenterExists(ctx context.Context, db client.DBTX, companyID uuid.UUID, workCenterCode string) (bool, error)
+
+	// ============================================================
+	// Employee Location Settings
+	// ============================================================
+	UpdateEmployeeLocationSettings(ctx context.Context, db client.DBTX, companyID, userID uuid.UUID, primaryLocationID *uuid.UUID, accessScope string) error
+	SetWorkCenterLocation(ctx context.Context, db client.DBTX, companyID uuid.UUID, workCenterCode string, locationID uuid.UUID) error
+
+	// ============================================================
+	// Utility
 	// ============================================================
 	HealthCheck(ctx context.Context) error
 	GetRepositoryStats(ctx context.Context) (map[string]interface{}, error)
 	Close() error
-
-	GetPermissionsByCompanyModules(
-		ctx context.Context,
-		companyID uuid.UUID,
-		module, category, tier string,
-	) ([]*models.Permission, error)
-	GetSystemDepartmentsWithBitmask(ctx context.Context) ([]*models.SystemDepartment, error)
-	GetDepartmentBitmask(ctx context.Context, departmentName string) (uint64, error)
-	// Keep only one of these:
-	// Add this method to the CompanyRepository interface
-	GetModulePermissions(
-		ctx context.Context,
-		modules []string,
-		category, tier string,
-	) ([]*models.Permission, error) // OR rename the second one:
-	GetPermissionsByModules(ctx context.Context, modules []string) ([]*models.Permission, error)
-	CreateSubDepartment(
-		ctx context.Context,
-		companyID uuid.UUID,
-		parentDepartmentID uuid.UUID,
-		departmentName string,
-		systemDepartmentID uuid.UUID,
-	) (*models.Department, error)
-
-	// UpdateDepartmentName updates only the department name
-	UpdateDepartmentName(
-		ctx context.Context,
-		departmentID uuid.UUID,
-		newName string,
-	) error
-
-	// UpdateDepartmentParent changes the parent of a department
-	UpdateDepartmentParent(
-		ctx context.Context,
-		departmentID uuid.UUID,
-		parentDepartmentID *uuid.UUID,
-	) error
-
-	// MoveDepartmentWithEmployees moves a department under a new parent
-	// (transactional operation)
-	MoveDepartmentWithEmployees(
-		ctx context.Context,
-		departmentID uuid.UUID,
-		newParentDepartmentID *uuid.UUID,
-	) error
-
-	// =====================================================
-	// DEPARTMENT — READ OPERATIONS
-	// =====================================================
-
-	// GetDepartment retrieves a department by ID
-	GetDepartment(
-		ctx context.Context,
-		departmentID uuid.UUID,
-	) (*models.Department, error)
-
-	// GetRootDepartments returns all root-level departments for a company
-	GetRootDepartments(
-		ctx context.Context,
-		companyID uuid.UUID,
-	) ([]*models.Department, error)
-
-	// GetDepartmentChildren returns immediate child departments
-	GetDepartmentChildren(
-		ctx context.Context,
-		departmentID uuid.UUID,
-	) ([]*models.Department, error)
-
-	// GetSubDepartments returns all active sub-departments
-	GetSubDepartments(
-		ctx context.Context,
-		parentDepartmentID uuid.UUID,
-	) ([]*models.Department, error)
-
-	// GetDepartmentParents returns all parents up to root
-	GetDepartmentParents(
-		ctx context.Context,
-		departmentID uuid.UUID,
-	) ([]*models.Department, error)
-
-	// GetDepartmentTree returns the entire subtree starting from a department
-	GetDepartmentTree(
-		ctx context.Context,
-		departmentID uuid.UUID,
-	) ([]*models.DepartmentTree, error)
-
-	// =====================================================
-	// POSITION — WRITE OPERATIONS
-	// =====================================================
-
-	// CreatePosition creates a new position
-	CreatePosition(
-		ctx context.Context,
-		position *models.Position,
-	) error
-
-	// UpdatePosition updates position details
-	UpdatePosition(
-		ctx context.Context,
-		position *models.Position,
-	) error
-
-	// UpdatePositionStatus opens or closes a position
-	UpdatePositionStatus(
-		ctx context.Context,
-		positionID uuid.UUID,
-		isOpen bool,
-	) error
-
-	// DeletePosition permanently deletes a position
-	DeletePosition(
-		ctx context.Context,
-		positionID uuid.UUID,
-	) error
-
-	// =====================================================
-	// POSITION — READ OPERATIONS
-	// =====================================================
-
-	// GetPosition retrieves a position by ID
-	GetPosition(
-		ctx context.Context,
-		positionID uuid.UUID,
-	) (*models.Position, error)
-
-	// GetPositionsByCompany returns paginated positions for a company
-	GetPositionsByCompany(
-		ctx context.Context,
-		companyID uuid.UUID,
-		limit int,
-		offset int,
-		onlyOpen bool,
-	) ([]*models.Position, int, error)
-	// GetCompanyByID returns company with max_departments included
-	GetCompanyByID(ctx context.Context, companyID uuid.UUID) (*models.Company, error)
-
-	// GetActiveDepartmentCount returns active department count for a company
-	GetActiveDepartmentCount(ctx context.Context, companyID uuid.UUID) (int, error)
-
-	// GetCompanyDepartmentInfo returns quota & usage info
-	GetCompanyDepartmentInfo(ctx context.Context, companyID uuid.UUID) (*CompanyDepartmentInfo, error)
-
-	// CheckDepartmentLimit validates if a new department can be created
-	CheckDepartmentLimit(ctx context.Context, companyID uuid.UUID) error
-	GetRoleDepartmentsForPermission(ctx context.Context, roleID uuid.UUID) ([]*models.Department, error)
-	// UpdateMaxDepartments updates department quota safely
-	UpdateMaxDepartments(ctx context.Context, companyID uuid.UUID, newMaxDepartments int) error
-	// GetPositionsByDepartment returns paginated positions for a department
-	GetPositionsByDepartment(
-		ctx context.Context,
-		departmentID uuid.UUID,
-		limit int,
-		offset int,
-		onlyOpen bool,
-	) ([]*models.Position, int, error)
-	SoftDeleteDepartment(ctx context.Context, companyID, departmentID uuid.UUID) error
-	CreateCompanyDepartment(
-		ctx context.Context,
-		companyID uuid.UUID,
-		departmentName string,
-		systemDepartmentID uuid.UUID,
-	) (*models.Department, error)
-	GetDepartmentByID(
-		ctx context.Context,
-		departmentID uuid.UUID,
-	) (*models.Department, error)
-	PositionExists(
-		ctx context.Context,
-		companyID, departmentID uuid.UUID,
-		title string,
-	) (bool, error)
-	// In the interface definition
-	SearchDepartments(
-		ctx context.Context,
-		companyID uuid.UUID,
-		searchQuery string,
-		limit int,
-		offset int,
-		includeInactive bool,
-	) ([]*models.DepartmentSearchResult, int, error)
-	ActivateDepartment(
-		ctx context.Context,
-		companyID uuid.UUID,
-		departmentID uuid.UUID,
-	) error
-	GetDepartmentSuggestions(
-		ctx context.Context,
-		companyID uuid.UUID,
-		prefix string,
-		limit int,
-	) ([]*models.Department, error)
-
-	// UpdateEmployeePosition assigns or removes a position for an employee
-	// positionID == nil means "remove position"
-	UpdateEmployeePosition(
-		ctx context.Context,
-		companyID uuid.UUID,
-		userID uuid.UUID,
-		positionID *uuid.UUID,
-	) error
-
-	// GetEmployeeWithPosition retrieves employee details along with position (if any)
-	WorkCenterExists(ctx context.Context, companyID uuid.UUID, workCenterCode string) (bool, error)
-	GetOpenPositions(ctx context.Context, companyID uuid.UUID, isOpen *bool, limit, offset int) ([]*models.Position, int, error)
-	AddRoleDepartments(
-		ctx context.Context,
-		roleID uuid.UUID,
-		departmentIDs []uuid.UUID,
-	) error
-
-	RemoveRoleDepartments(
-		ctx context.Context,
-		roleID uuid.UUID,
-		departmentIDs []uuid.UUID,
-	) error
-
-	// Role ↔ Permission mapping
-	ClearRolePermissions(
-		ctx context.Context,
-		roleID uuid.UUID,
-	) error
-
-	AddRolePermissions(
-		ctx context.Context,
-		roleID uuid.UUID,
-		permissionIDs []uuid.UUID,
-		grantedBy uuid.UUID,
-	) error
-
-	RemoveRolePermissions(
-		ctx context.Context,
-		roleID uuid.UUID,
-		permissionIDs []uuid.UUID,
-	) error
-
-	// Lookups
-
-	GetDepartmentByName(
-		ctx context.Context,
-		companyID uuid.UUID,
-		departmentName string,
-	) (*models.Department, error)
-	GetDeactivatedDepartments(ctx context.Context, companyID uuid.UUID) ([]*models.Department, error)
-	// Queries
 }

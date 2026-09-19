@@ -6,31 +6,29 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+
 	"auth-service/internal/hr/payroll/models"
 	"auth-service/internal/hr/payroll/service"
-
-	"github.com/go-chi/chi/v5"
-	"go.uber.org/zap"
 )
 
 // ComponentHandler handles HTTP requests for payroll components.
 type ComponentHandler struct {
 	componentService service.ComponentService
-	logger           *zap.Logger
 }
 
 // NewComponentHandler creates a new component handler.
-func NewComponentHandler(componentService service.ComponentService, logger *zap.Logger) *ComponentHandler {
+func NewComponentHandler(componentService service.ComponentService) *ComponentHandler {
 	return &ComponentHandler{
 		componentService: componentService,
-		logger:           logger.Named("component_handler"),
 	}
 }
 
 // ListComponents returns all components for a given company.
 // GET /companies/{companyID}/components
 func (h *ComponentHandler) ListComponents(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -39,14 +37,10 @@ func (h *ComponentHandler) ListComponents(w http.ResponseWriter, r *http.Request
 
 	components, err := h.componentService.GetComponents(ctx, companyID)
 	if err != nil {
-		h.logger.Error("failed to get components",
-			zap.Error(err),
-			zap.String("company_id", companyID.String()))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve components")
 		return
 	}
 
-	// Ensure we always return a JSON object, even if empty
 	if components == nil {
 		components = make(map[string]*models.PayrollComponent)
 	}
@@ -60,7 +54,8 @@ func (h *ComponentHandler) ListComponents(w http.ResponseWriter, r *http.Request
 // GetComponent returns a single component by its code.
 // GET /companies/{companyID}/components/{code}
 func (h *ComponentHandler) GetComponent(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -74,10 +69,6 @@ func (h *ComponentHandler) GetComponent(w http.ResponseWriter, r *http.Request) 
 
 	component, err := h.componentService.GetComponent(ctx, companyID, code)
 	if err != nil {
-		h.logger.Error("failed to get component",
-			zap.Error(err),
-			zap.String("company_id", companyID.String()),
-			zap.String("code", code))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve component")
 		return
 	}
@@ -95,7 +86,8 @@ func (h *ComponentHandler) GetComponent(w http.ResponseWriter, r *http.Request) 
 // GetDefaultComponent returns the default component code for a given purpose.
 // GET /companies/{companyID}/components/default?purpose={fine|arrears|loan|basic}
 func (h *ComponentHandler) GetDefaultComponent(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -107,7 +99,6 @@ func (h *ComponentHandler) GetDefaultComponent(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Validate purpose against allowed values
 	allowedPurposes := map[string]bool{"fine": true, "arrears": true, "loan": true, "basic": true}
 	if !allowedPurposes[purpose] {
 		h.respondWithError(w, http.StatusBadRequest,
@@ -117,14 +108,10 @@ func (h *ComponentHandler) GetDefaultComponent(w http.ResponseWriter, r *http.Re
 
 	code, err := h.componentService.GetDefaultComponent(ctx, companyID, purpose)
 	if err != nil {
-		h.logger.Error("failed to get default component",
-			zap.Error(err),
-			zap.String("company_id", companyID.String()),
-			zap.String("purpose", purpose))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve default component")
 		return
 	}
-	// code may be empty if no default is configured – that's a valid response
+
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    code,
@@ -133,17 +120,14 @@ func (h *ComponentHandler) GetDefaultComponent(w http.ResponseWriter, r *http.Re
 
 // ClearCache clears the in‑memory component cache for a company.
 // POST /companies/{companyID}/components/clear-cache
-// This endpoint should be protected (admin only).
 func (h *ComponentHandler) ClearCache(w http.ResponseWriter, r *http.Request) {
-	_ = r.Context()
+
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	// Optional: verify that the authenticated user has admin rights.
-	// The middleware should have already done that; we just call the service.
 	h.componentService.ClearCache(companyID)
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
@@ -153,7 +137,7 @@ func (h *ComponentHandler) ClearCache(w http.ResponseWriter, r *http.Request) {
 }
 
 // ----------------------------------------------------------------------
-// Helper functions (reused from other handlers)
+// Helper functions
 // ----------------------------------------------------------------------
 
 func (h *ComponentHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {

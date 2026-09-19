@@ -3,7 +3,6 @@ package factory
 import (
 	"time"
 
-	"auth-service/internal/accounting"
 	"auth-service/internal/accounting/handler"
 	"auth-service/internal/accounting/repository"
 	"auth-service/internal/accounting/service"
@@ -13,7 +12,6 @@ import (
 	"auth-service/internal/infrastructure/outbox"
 	mainservice "auth-service/internal/service"
 
-	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 )
 
@@ -24,7 +22,7 @@ type AccountingInfraFactory struct {
 	eventPublisher   EventPublisher
 	auditService     *audit.AuditService
 	idempotencyStore idempotency.Store
-	outboxRepo       outbox.Repository // ✅ shared outbox repository (no local processor)
+	outboxRepo       outbox.Repository // shared outbox repository (no local processor)
 
 	// Repositories
 	accountRepo        repository.AccountRepository
@@ -39,9 +37,13 @@ type AccountingInfraFactory struct {
 	taxRateRepo        repository.TaxRateRepository
 	taxRuleRepo        repository.TaxRuleRepository
 	taxTransactionRepo repository.TaxTransactionRepository
-	analyticsHandler   *handler.AnalyticsHandler
-	periodLockService  service.PeriodLockService
-	periodLockHandler  *handler.PeriodLockHandler
+
+	// 👇 ADDED
+	costCenterRepo repository.CostCenterRepository
+
+	analyticsHandler  *handler.AnalyticsHandler
+	periodLockService service.PeriodLockService
+	periodLockHandler *handler.PeriodLockHandler
 
 	// Services
 	accountingSvc              service.AccountingService
@@ -58,6 +60,9 @@ type AccountingInfraFactory struct {
 	taxAnalyticsSvc            service.TaxAnalyticsService
 	taxEngineSvc               service.TaxEngineService
 
+	// 👇 ADDED
+	costCenterSvc service.CostCenterService
+
 	// Handlers
 	accountHandler            *handler.AccountHandler
 	accountingSettingsHandler *handler.AccountingSettingsHandler
@@ -67,14 +72,17 @@ type AccountingInfraFactory struct {
 	reconciliationHandler     *handler.ReconciliationHandler
 	reportHandler             *handler.ReportHandler
 	taxHandler                *handler.TaxHandler
+
+	// 👇 ADDED
+	costCenterHandler *handler.CostCenterHandler
 }
 
 // NewAccountingInfraFactory creates a new accounting infrastructure factory.
-// It now receives the shared outbox repository from the main factory.
+// It receives the shared outbox repository from the main factory.
 func NewAccountingInfraFactory(
 	postgresClient *client.PostgresClient,
 	redisClient *client.RedisClient,
-	sharedOutboxRepo outbox.Repository, // ✅ shared outbox repository
+	sharedOutboxRepo outbox.Repository,
 	eventPublisher EventPublisher,
 	auditService *audit.AuditService,
 	sessionService *mainservice.SessionService,
@@ -85,15 +93,13 @@ func NewAccountingInfraFactory(
 		postgresClient: postgresClient,
 		eventPublisher: eventPublisher,
 		auditService:   auditService,
-		outboxRepo:     sharedOutboxRepo, // ✅ use the shared repository
+		outboxRepo:     sharedOutboxRepo,
 	}
 
 	// Idempotency store (hybrid)
 	pgStore := idempotency.NewPostgresStore(postgresClient.DB)
 	redisCache := idempotency.NewRedisCache(redisClient, 24*time.Hour)
 	af.idempotencyStore = idempotency.NewHybridStore(pgStore, redisCache)
-
-	// ❌ Outbox processor creation removed – the central processor handles it
 
 	// Initialize repositories
 	af.accountRepo = repository.NewAccountRepository(af.log)
@@ -117,8 +123,10 @@ func NewAccountingInfraFactory(
 	af.taxRuleRepo = repository.NewTaxRuleRepository(af.log)
 	af.taxTransactionRepo = repository.NewTaxTransactionRepository(af.log)
 
-	// 👇 Services that are independent first
-	// LedgerService now requires periodLockRepo
+	// 👇 ADDED — cost-center repo
+	af.costCenterRepo = repository.NewCostCenterRepository(af.log)
+
+	// Services that are independent first
 	af.ledgerSvc = service.NewLedgerService(
 		af.ledgerRepo,
 		af.journalRepo,
@@ -131,7 +139,7 @@ func NewAccountingInfraFactory(
 		af.auditService,
 	)
 
-	// 👇 Rule engine (needs periodLockRepo, ledgerRepo, journalRepo, settingsRepo)
+	// Rule engine
 	af.ruleEngineSvc = service.NewRuleEngine(
 		af.ledgerRepo,
 		af.journalRepo,
@@ -141,11 +149,21 @@ func NewAccountingInfraFactory(
 		af.log,
 	)
 
-	// JournalService now requires ruleEngine
+	// JournalService
 	af.journalSvc = service.NewJournalService(
 		af.journalRepo,
 		af.ledgerSvc,
 		af.ruleEngineSvc,
+		af.postgresClient,
+		af.log,
+		af.outboxRepo,
+		af.idempotencyStore,
+		af.auditService,
+	)
+
+	// 👇 ADDED — cost-center service
+	af.costCenterSvc = service.NewCostCenterService(
+		af.costCenterRepo,
 		af.postgresClient,
 		af.log,
 		af.outboxRepo,
@@ -264,19 +282,31 @@ func NewAccountingInfraFactory(
 	af.reportHandler = handler.NewReportHandler(af.accountingQuerySvc, af.log)
 	af.taxHandler = handler.NewTaxHandler(af.taxEngineSvc, af.log)
 
+	// 👇 ADDED — cost-center handler
+	af.costCenterHandler = handler.NewCostCenterHandler(af.costCenterSvc, af.log)
+
 	return af, nil
 }
 
-// Getters for repositories
-func (af *AccountingInfraFactory) AccountRepo() repository.AccountRepository { return af.accountRepo }
+// ============================================================
+// Repositories
+// ============================================================
+
+func (af *AccountingInfraFactory) AccountRepo() repository.AccountRepository {
+	return af.accountRepo
+}
 func (af *AccountingInfraFactory) AnalyticsRepo() repository.AnalyticsRepository {
 	return af.analyticsRepo
 }
 func (af *AccountingInfraFactory) ComplianceRepo() repository.ComplianceRepository {
 	return af.complianceRepo
 }
-func (af *AccountingInfraFactory) JournalRepo() repository.JournalRepository { return af.journalRepo }
-func (af *AccountingInfraFactory) LedgerRepo() repository.LedgerRepository   { return af.ledgerRepo }
+func (af *AccountingInfraFactory) JournalRepo() repository.JournalRepository {
+	return af.journalRepo
+}
+func (af *AccountingInfraFactory) LedgerRepo() repository.LedgerRepository {
+	return af.ledgerRepo
+}
 func (af *AccountingInfraFactory) PeriodLockRepo() repository.PeriodLockRepository {
 	return af.periodLockRepo
 }
@@ -289,13 +319,25 @@ func (af *AccountingInfraFactory) SettingsRepo() repository.AccountingSettingsRe
 func (af *AccountingInfraFactory) TaxProfileRepo() repository.TaxProfileRepository {
 	return af.taxProfileRepo
 }
-func (af *AccountingInfraFactory) TaxRateRepo() repository.TaxRateRepository { return af.taxRateRepo }
-func (af *AccountingInfraFactory) TaxRuleRepo() repository.TaxRuleRepository { return af.taxRuleRepo }
+func (af *AccountingInfraFactory) TaxRateRepo() repository.TaxRateRepository {
+	return af.taxRateRepo
+}
+func (af *AccountingInfraFactory) TaxRuleRepo() repository.TaxRuleRepository {
+	return af.taxRuleRepo
+}
 func (af *AccountingInfraFactory) TaxTransactionRepo() repository.TaxTransactionRepository {
 	return af.taxTransactionRepo
 }
 
-// Getters for services
+// 👇 ADDED
+func (af *AccountingInfraFactory) CostCenterRepo() repository.CostCenterRepository {
+	return af.costCenterRepo
+}
+
+// ============================================================
+// Services
+// ============================================================
+
 func (af *AccountingInfraFactory) AccountService() service.AccountService {
 	return af.accountSvc
 }
@@ -314,8 +356,12 @@ func (af *AccountingInfraFactory) ComplianceService() service.ComplianceService 
 func (af *AccountingInfraFactory) ComplianceAnalyticsService() service.ComplianceAnalyticsService {
 	return af.complianceAnalyticsSvc
 }
-func (af *AccountingInfraFactory) JournalService() service.JournalService { return af.journalSvc }
-func (af *AccountingInfraFactory) LedgerService() service.LedgerService   { return af.ledgerSvc }
+func (af *AccountingInfraFactory) JournalService() service.JournalService {
+	return af.journalSvc
+}
+func (af *AccountingInfraFactory) LedgerService() service.LedgerService {
+	return af.ledgerSvc
+}
 func (af *AccountingInfraFactory) RuleEngine() service.AccountingRuleEngine {
 	return af.ruleEngineSvc
 }
@@ -328,9 +374,19 @@ func (af *AccountingInfraFactory) ReconciliationAnalyticsService() service.Recon
 func (af *AccountingInfraFactory) TaxAnalyticsService() service.TaxAnalyticsService {
 	return af.taxAnalyticsSvc
 }
-func (af *AccountingInfraFactory) TaxEngineService() service.TaxEngineService { return af.taxEngineSvc }
+func (af *AccountingInfraFactory) TaxEngineService() service.TaxEngineService {
+	return af.taxEngineSvc
+}
 
-// Getters for handlers
+// 👇 ADDED
+func (af *AccountingInfraFactory) CostCenterService() service.CostCenterService {
+	return af.costCenterSvc
+}
+
+// ============================================================
+// Handlers
+// ============================================================
+
 func (af *AccountingInfraFactory) AccountHandler() *handler.AccountHandler {
 	return af.accountHandler
 }
@@ -346,27 +402,25 @@ func (af *AccountingInfraFactory) AnalyticsHandler() *handler.AnalyticsHandler {
 func (af *AccountingInfraFactory) PeriodLockHandler() *handler.PeriodLockHandler {
 	return af.periodLockHandler
 }
-func (af *AccountingInfraFactory) JournalHandler() *handler.JournalHandler { return af.journalHandler }
-func (af *AccountingInfraFactory) LedgerHandler() *handler.LedgerHandler   { return af.ledgerHandler }
+func (af *AccountingInfraFactory) JournalHandler() *handler.JournalHandler {
+	return af.journalHandler
+}
+func (af *AccountingInfraFactory) LedgerHandler() *handler.LedgerHandler {
+	return af.ledgerHandler
+}
 func (af *AccountingInfraFactory) ReconciliationHandler() *handler.ReconciliationHandler {
 	return af.reconciliationHandler
 }
-func (af *AccountingInfraFactory) ReportHandler() *handler.ReportHandler { return af.reportHandler }
-func (af *AccountingInfraFactory) TaxHandler() *handler.TaxHandler       { return af.taxHandler }
+func (af *AccountingInfraFactory) ReportHandler() *handler.ReportHandler {
+	return af.reportHandler
+}
+func (af *AccountingInfraFactory) TaxHandler() *handler.TaxHandler {
+	return af.taxHandler
+}
 
-// RegisterRoutes mounts accounting routes on the given router.
-func (af *AccountingInfraFactory) RegisterRoutes(r chi.Router, jwtService *mainservice.JWTService, logger *zap.Logger) {
-	accountingHandlers := &accounting.AccountingHandlers{
-		AccountHandler:            af.accountHandler,
-		LedgerHandler:             af.ledgerHandler,
-		ReconciliationHandler:     af.reconciliationHandler,
-		ReportHandler:             af.reportHandler,
-		ComplianceHandler:         af.complianceHandler,
-		JournalHandler:            af.journalHandler,
-		TaxHandler:                af.taxHandler,
-		AccountingSettingsHandler: af.accountingSettingsHandler,
-	}
-	accounting.RegisterAccountingRoutes(r, accountingHandlers, jwtService)
+// 👇 ADDED
+func (af *AccountingInfraFactory) CostCenterHandler() *handler.CostCenterHandler {
+	return af.costCenterHandler
 }
 
 // Close is a no-op because the outbox processor is managed centrally.

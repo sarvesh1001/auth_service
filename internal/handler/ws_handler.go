@@ -1,4 +1,3 @@
-// internal/handler/ws_handler.go
 package handler
 
 import (
@@ -7,12 +6,13 @@ import (
 	"net/http"
 	"strings"
 
-	"auth-service/internal/contextkeys" // our shared package
+	"auth-service/internal/contextkeys"
 	customErrors "auth-service/internal/errors"
 	"auth-service/internal/service"
 	"auth-service/internal/util"
 
 	"github.com/gorilla/websocket"
+	"go.uber.org/zap"
 )
 
 // WebSocketHandler handles WebSocket connections for real-time communication.
@@ -29,27 +29,42 @@ var wsUpgrader = websocket.Upgrader{
 	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
 		origin := r.Header.Get("Origin")
-		return origin == "https://yourapp.com" || origin == "http://localhost:3000"
+		allowed := origin == "https://yourapp.com" || origin == "http://localhost:3000"
+		if !allowed {
+			zap.L().Warn("WebSocket origin not allowed", zap.String("origin", origin))
+		}
+		return allowed
 	},
 }
 
 // HandleConnection upgrades the HTTP connection to WebSocket and registers the client.
 func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Request) {
-	// Use the exported constant from contextkeys
-	ctx := context.WithValue(r.Context(), contextkeys.ClientIP, getClientIP(r))
+	logger := zap.L().With(
+		zap.String("remote_addr", r.RemoteAddr),
+		zap.String("user_agent", r.UserAgent()),
+	)
+	logger.Info("WebSocket connection attempt")
+
+	// Inject client IP into context
+	clientIP := getClientIP(r)
+	ctx := context.WithValue(r.Context(), contextkeys.ClientIP, clientIP)
 	r = r.WithContext(ctx)
 
 	sessionID := r.URL.Query().Get("session_id")
 	if sessionID == "" {
+		logger.Warn("WebSocket connection rejected: missing session_id")
 		util.JSONError(w, http.StatusBadRequest, customErrors.ErrInvalidInput.Error()+" session_id is required")
 		return
 	}
+	logger = logger.With(zap.String("session_id", sessionID))
 
 	conn, err := wsUpgrader.Upgrade(w, r, nil)
 	if err != nil {
-		// Upgrade failed; response already sent by the upgrader.
+		logger.Error("WebSocket upgrade failed", zap.Error(err))
+		// Upgrade already sent a response, no further action needed.
 		return
 	}
+	logger.Info("WebSocket connection upgraded successfully")
 
 	client := &service.WebSocketClient{
 		SessionID: sessionID,
@@ -58,6 +73,7 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	}
 
 	h.wsService.Register(client)
+	logger.Info("WebSocket client registered")
 }
 
 // getClientIP extracts the client IP from the request.

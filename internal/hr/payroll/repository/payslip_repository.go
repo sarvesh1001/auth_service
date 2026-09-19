@@ -1,6 +1,9 @@
 package repository
 
 import (
+	"auth-service/internal/client"
+	hrErrors "auth-service/internal/hr/errors"
+	"auth-service/internal/hr/payroll/models"
 	"context"
 	"database/sql"
 	"errors"
@@ -9,11 +12,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"go.uber.org/zap"
-
-	"auth-service/internal/client"
-	"auth-service/internal/hr/payroll/models"
-	"auth-service/internal/util"
 )
 
 type PayslipRepository interface {
@@ -24,14 +22,12 @@ type PayslipRepository interface {
 }
 
 type payslipRepository struct {
-	db     *client.PostgresClient
-	logger *zap.Logger
+	db *client.PostgresClient
 }
 
-func NewPayslipRepository(db *client.PostgresClient, logger *zap.Logger) PayslipRepository {
+func NewPayslipRepository(db *client.PostgresClient) PayslipRepository {
 	return &payslipRepository{
-		db:     db,
-		logger: logger.Named("payslip_repo"),
+		db: db,
 	}
 }
 
@@ -83,12 +79,8 @@ func (r *payslipRepository) GetPayslipData(ctx context.Context, runID, userID uu
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrPayslipNotFound
 		}
-		r.logger.Error("failed to fetch payslip data",
-			util.String("run_id", runID.String()),
-			util.String("user_id", userID.String()),
-			util.ErrorField(err))
 		return nil, fmt.Errorf("get payslip data: %w", err)
 	}
 	if footerDecl.Valid {
@@ -145,9 +137,9 @@ func (r *payslipRepository) GetPayslipData(ctx context.Context, runID, userID uu
 
 	bank, err := r.getActiveBankDetails(ctx, data.CompanyID, userID, data.PeriodEnd)
 	if err != nil {
-		r.logger.Warn("failed to fetch bank details, continuing without",
-			util.String("user_id", userID.String()),
-			util.ErrorField(err))
+		// We don't fail the entire payslip if bank details are missing – just skip them
+		// (no logging, but we can ignore the error)
+		_ = err
 	} else if bank != nil {
 		data.BankDetails = &struct {
 			AccountHolder string
@@ -244,11 +236,8 @@ func (r *payslipRepository) GetPayslipTemplate(ctx context.Context, companyID uu
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrPayslipTemplateNotFound
 		}
-		r.logger.Error("failed to get payslip template",
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err))
 		return nil, fmt.Errorf("get payslip template: %w", err)
 	}
 	if footer.Valid {
@@ -297,10 +286,6 @@ func (r *payslipRepository) ListPayrollRunsForUser(ctx context.Context, companyI
 
 	rows, err := r.db.Query(ctx, query, args...)
 	if err != nil {
-		r.logger.Error("failed to list payroll runs for user",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.ErrorField(err))
 		return nil, fmt.Errorf("list payroll runs: %w", err)
 	}
 	defer rows.Close()
@@ -308,7 +293,6 @@ func (r *payslipRepository) ListPayrollRunsForUser(ctx context.Context, companyI
 	var summaries []models.PayrollRunSummary
 	for rows.Next() {
 		var s models.PayrollRunSummary
-		// payable_days and unpaid_days are scanned into placeholders (we ignore them)
 		var payableDays, unpaidDays float64
 		if err := rows.Scan(
 			&s.PayrollRunID,
@@ -330,29 +314,18 @@ func (r *payslipRepository) ListPayrollRunsForUser(ctx context.Context, companyI
 	}
 	return summaries, nil
 }
-func (r *payslipRepository) GetEmployeeEmail(ctx context.Context, companyID, userID uuid.UUID) (string, error) {
-	logger := r.logger.With(
-		zap.String("method", "GetEmployeeEmail"),
-		zap.String("company_id", companyID.String()),
-		zap.String("user_id", userID.String()),
-	)
-	query := `SELECT email FROM employee_profiles WHERE company_id = $1 AND user_id = $2`
-	logger.Debug("executing query", zap.String("query", query))
 
+func (r *payslipRepository) GetEmployeeEmail(ctx context.Context, companyID, userID uuid.UUID) (string, error) {
+	query := `SELECT email FROM employee_profiles WHERE company_id = $1 AND user_id = $2`
 	var email string
 	err := r.db.QueryRow(ctx, query, companyID, userID).Scan(&email)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			logger.Warn("employee profile not found")
-			return "", fmt.Errorf("employee profile not found for company %s user %s", companyID, userID)
+			return "", hrErrors.ErrEmployeeProfileNotFound
 		}
-		logger.Error("failed to scan email", zap.Error(err))
 		return "", fmt.Errorf("get employee email: %w", err)
 	}
-
-	logger.Debug("retrieved email", zap.String("email", email))
 	if email == "" {
-		logger.Warn("email address is empty")
 		return "", fmt.Errorf("email address not set for employee")
 	}
 	return email, nil

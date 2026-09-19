@@ -13,6 +13,7 @@ import (
 
 	"auth-service/internal/attendance/models"
 	"auth-service/internal/attendance/service/scheduling"
+	"auth-service/internal/locationctx"
 )
 
 // SchedulingHandler handles all scheduling-related HTTP endpoints.
@@ -37,7 +38,6 @@ func NewSchedulingHandler(
 
 // ---- Helper functions ----
 
-// normalizeBusinessDateFromString parses a date string in the given timezone and returns a normalized date (midnight).
 func normalizeBusinessDateFromString(dateStr, tz string) (time.Time, error) {
 	loc, err := time.LoadLocation(tz)
 	if err != nil {
@@ -50,7 +50,6 @@ func normalizeBusinessDateFromString(dateStr, tz string) (time.Time, error) {
 	return time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, loc), nil
 }
 
-// normalizeBusinessDate normalizes a time to midnight in the given timezone.
 func normalizeBusinessDate(t time.Time, tz string) (time.Time, error) {
 	loc, err := time.LoadLocation(tz)
 	if err != nil {
@@ -62,19 +61,19 @@ func normalizeBusinessDate(t time.Time, tz string) (time.Time, error) {
 
 // getUserTimezone attempts to resolve a user's timezone from their schedule.
 func (h *SchedulingHandler) getUserTimezone(ctx context.Context, userID uuid.UUID) string {
-	// Try to get timezone from today's schedule instance.
 	today := time.Now().UTC().Truncate(24 * time.Hour)
 	instances, err := h.schedulingQueryService.GetScheduleInstancesByUser(ctx, userID, today, today)
 	if err == nil && len(instances) > 0 && instances[0].Timezone != "" {
 		return instances[0].Timezone
 	}
-	// Fallback to UTC
 	return "UTC"
 }
 
-// getCompanyDefaultTimezone returns the timezone of the first work calendar for the company.
+// getCompanyDefaultTimezone returns the timezone of the newest work calendar
+// for the company. Passes nil for locationID because this is a fallback —
+// it looks for any calendar, not a specific location's calendar.
 func (h *SchedulingHandler) getCompanyDefaultTimezone(ctx context.Context, companyID uuid.UUID) string {
-	calendars, err := h.schedulingQueryService.GetWorkCalendarsByCompany(ctx, companyID)
+	calendars, err := h.schedulingQueryService.GetWorkCalendarsByCompany(ctx, companyID, nil)
 	if err != nil || len(calendars) == 0 {
 		return "UTC"
 	}
@@ -83,7 +82,6 @@ func (h *SchedulingHandler) getCompanyDefaultTimezone(ctx context.Context, compa
 
 // ---- Work Calendar Handlers ----
 
-// CreateWorkCalendar creates a new work calendar.
 func (h *SchedulingHandler) CreateWorkCalendar(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -113,7 +111,6 @@ func (h *SchedulingHandler) CreateWorkCalendar(w http.ResponseWriter, r *http.Re
 	h.respondWithJSON(w, http.StatusCreated, result)
 }
 
-// GetWorkCalendar returns a work calendar by ID.
 func (h *SchedulingHandler) GetWorkCalendar(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	calendarIDStr := chi.URLParam(r, "calendarID")
@@ -130,7 +127,6 @@ func (h *SchedulingHandler) GetWorkCalendar(w http.ResponseWriter, r *http.Reque
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// UpdateWorkCalendar updates an existing work calendar.
 func (h *SchedulingHandler) UpdateWorkCalendar(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	calendarIDStr := chi.URLParam(r, "calendarID")
@@ -160,7 +156,6 @@ func (h *SchedulingHandler) UpdateWorkCalendar(w http.ResponseWriter, r *http.Re
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// DeleteWorkCalendar deletes a work calendar.
 func (h *SchedulingHandler) DeleteWorkCalendar(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	calendarIDStr := chi.URLParam(r, "calendarID")
@@ -183,7 +178,7 @@ func (h *SchedulingHandler) DeleteWorkCalendar(w http.ResponseWriter, r *http.Re
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Work calendar deleted successfully"})
 }
 
-// ListWorkCalendars lists all work calendars for a company.
+// ListWorkCalendars — location scope read from X-Location-ID.
 func (h *SchedulingHandler) ListWorkCalendars(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -192,7 +187,11 @@ func (h *SchedulingHandler) ListWorkCalendars(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
-	result, err := h.schedulingQueryService.GetWorkCalendarsByCompany(ctx, companyID)
+
+	// 👇 Location scope from the request context.
+	locFilter := locationctx.Filter(ctx)
+
+	result, err := h.schedulingQueryService.GetWorkCalendarsByCompany(ctx, companyID, locFilter)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -200,7 +199,6 @@ func (h *SchedulingHandler) ListWorkCalendars(w http.ResponseWriter, r *http.Req
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// GetCalendarAvailability returns working days and holidays for a calendar.
 func (h *SchedulingHandler) GetCalendarAvailability(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	calendarIDStr := chi.URLParam(r, "calendarID")
@@ -240,7 +238,6 @@ func (h *SchedulingHandler) GetCalendarAvailability(w http.ResponseWriter, r *ht
 
 // ---- Schedule Template Handlers ----
 
-// CreateScheduleTemplate creates a new schedule template.
 func (h *SchedulingHandler) CreateScheduleTemplate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -270,7 +267,6 @@ func (h *SchedulingHandler) CreateScheduleTemplate(w http.ResponseWriter, r *htt
 	h.respondWithJSON(w, http.StatusCreated, result)
 }
 
-// GetScheduleTemplate returns a schedule template by ID.
 func (h *SchedulingHandler) GetScheduleTemplate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	templateIDStr := chi.URLParam(r, "templateID")
@@ -287,7 +283,6 @@ func (h *SchedulingHandler) GetScheduleTemplate(w http.ResponseWriter, r *http.R
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// UpdateScheduleTemplate updates an existing schedule template.
 func (h *SchedulingHandler) UpdateScheduleTemplate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	templateIDStr := chi.URLParam(r, "templateID")
@@ -317,7 +312,6 @@ func (h *SchedulingHandler) UpdateScheduleTemplate(w http.ResponseWriter, r *htt
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// DeleteScheduleTemplate deletes a schedule template.
 func (h *SchedulingHandler) DeleteScheduleTemplate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	templateIDStr := chi.URLParam(r, "templateID")
@@ -340,7 +334,7 @@ func (h *SchedulingHandler) DeleteScheduleTemplate(w http.ResponseWriter, r *htt
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Schedule template deleted successfully"})
 }
 
-// ListScheduleTemplates lists all schedule templates for a company.
+// ListScheduleTemplates — location scope read from X-Location-ID.
 func (h *SchedulingHandler) ListScheduleTemplates(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -350,7 +344,11 @@ func (h *SchedulingHandler) ListScheduleTemplates(w http.ResponseWriter, r *http
 		return
 	}
 	activeOnly := r.URL.Query().Get("active_only") != "false"
-	result, err := h.schedulingQueryService.GetScheduleTemplatesByCompany(ctx, companyID, activeOnly)
+
+	// 👇 Location scope from the request context.
+	locFilter := locationctx.Filter(ctx)
+
+	result, err := h.schedulingQueryService.GetScheduleTemplatesByCompany(ctx, companyID, locFilter, activeOnly)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -368,7 +366,6 @@ type CreateScheduleInstanceRequest struct {
 	Metadata           *models.InstanceMetadata `json:"metadata,omitempty"`
 }
 
-// CreateScheduleInstance manually creates a schedule instance.
 func (h *SchedulingHandler) CreateScheduleInstance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -420,7 +417,6 @@ func (h *SchedulingHandler) CreateScheduleInstance(w http.ResponseWriter, r *htt
 	h.respondWithJSON(w, http.StatusCreated, result)
 }
 
-// CreateScheduleInstanceFromPosition creates a schedule instance based on position resolution.
 func (h *SchedulingHandler) CreateScheduleInstanceFromPosition(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -474,7 +470,6 @@ func (h *SchedulingHandler) CreateScheduleInstanceFromPosition(w http.ResponseWr
 	h.respondWithJSON(w, http.StatusCreated, result)
 }
 
-// GetScheduleInstance returns a schedule instance by ID.
 func (h *SchedulingHandler) GetScheduleInstance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	instanceIDStr := chi.URLParam(r, "instanceID")
@@ -491,7 +486,6 @@ func (h *SchedulingHandler) GetScheduleInstance(w http.ResponseWriter, r *http.R
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// UpdateScheduleInstance updates a schedule instance (metadata only).
 func (h *SchedulingHandler) UpdateScheduleInstance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	instanceIDStr := chi.URLParam(r, "instanceID")
@@ -520,7 +514,6 @@ func (h *SchedulingHandler) UpdateScheduleInstance(w http.ResponseWriter, r *htt
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// DeleteScheduleInstance deletes a schedule instance.
 func (h *SchedulingHandler) DeleteScheduleInstance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	instanceIDStr := chi.URLParam(r, "instanceID")
@@ -543,7 +536,9 @@ func (h *SchedulingHandler) DeleteScheduleInstance(w http.ResponseWriter, r *htt
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Schedule instance deleted successfully"})
 }
 
-// ListScheduleInstances lists schedule instances with various filters.
+// ListScheduleInstances — location scope applies only to the company-wide
+// branch (default case). Per-user, per-template, per-position, and
+// per-work-center lookups are already narrow enough.
 func (h *SchedulingHandler) ListScheduleInstances(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -564,7 +559,6 @@ func (h *SchedulingHandler) ListScheduleInstances(w http.ResponseWriter, r *http
 		return
 	}
 
-	// Determine timezone for date parsing
 	timezone := "UTC"
 	if userIDStr != "" {
 		userID, err := uuid.Parse(userIDStr)
@@ -623,7 +617,9 @@ func (h *SchedulingHandler) ListScheduleInstances(w http.ResponseWriter, r *http
 	case workCenterCode != "":
 		result, err = h.schedulingQueryService.GetScheduleInstancesByWorkCenter(ctx, companyID, workCenterCode, startDate, endDate)
 	default:
-		result, err = h.schedulingQueryService.GetScheduleInstancesByCompany(ctx, companyID, startDate, endDate)
+		// 👇 Location scope applies only to the company-wide branch.
+		locFilter := locationctx.Filter(ctx)
+		result, err = h.schedulingQueryService.GetScheduleInstancesByCompany(ctx, companyID, locFilter, startDate, endDate)
 	}
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -643,8 +639,6 @@ type GenerateScheduleRequest struct {
 	BatchSize       int    `json:"batch_size"`
 }
 
-// GenerateScheduleForUser generates schedule instances for a specific user.
-// GenerateScheduleForUser generates schedule instances for a specific user.
 func (h *SchedulingHandler) GenerateScheduleForUser(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userIDStr := chi.URLParam(r, "userID")
@@ -653,7 +647,6 @@ func (h *SchedulingHandler) GenerateScheduleForUser(w http.ResponseWriter, r *ht
 		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
 		return
 	}
-	// Get company ID from context
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
@@ -704,7 +697,6 @@ func (h *SchedulingHandler) GenerateScheduleForUser(w http.ResponseWriter, r *ht
 		Overwrite:       req.Overwrite,
 		BatchSize:       req.BatchSize,
 	}
-	// Pass companyID to service
 	result, err := h.schedulingService.GenerateScheduleForUser(ctx, companyID, userID, config, actorType, actorID)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -717,7 +709,6 @@ func (h *SchedulingHandler) GenerateScheduleForUser(w http.ResponseWriter, r *ht
 	})
 }
 
-// GenerateScheduleForCompany generates schedule instances for all employees in a company.
 func (h *SchedulingHandler) GenerateScheduleForCompany(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -791,7 +782,6 @@ type CreateScheduleOverrideRequest struct {
 	Reason       *string   `json:"reason,omitempty"`
 }
 
-// CreateScheduleOverride creates a schedule override for a user.
 func (h *SchedulingHandler) CreateScheduleOverride(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -825,7 +815,6 @@ func (h *SchedulingHandler) CreateScheduleOverride(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusBadRequest, "override_date must be in YYYY-MM-DD format")
 		return
 	}
-	// Check if override already exists
 	existing, _ := h.schedulingQueryService.GetScheduleOverrideByUserDate(ctx, req.UserID, overrideDate)
 	if existing != nil {
 		h.respondWithError(w, http.StatusConflict, "Schedule override already exists for this date")
@@ -849,7 +838,6 @@ func (h *SchedulingHandler) CreateScheduleOverride(w http.ResponseWriter, r *htt
 	h.respondWithJSON(w, http.StatusCreated, result)
 }
 
-// GetScheduleOverrides returns schedule overrides for a user or company.
 func (h *SchedulingHandler) GetScheduleOverrides(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -867,7 +855,6 @@ func (h *SchedulingHandler) GetScheduleOverrides(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusBadRequest, "start_date and end_date are required")
 		return
 	}
-	// Determine timezone
 	timezone := "UTC"
 	if userIDStr != "" {
 		userID, err := uuid.Parse(userIDStr)
@@ -912,7 +899,6 @@ func (h *SchedulingHandler) GetScheduleOverrides(w http.ResponseWriter, r *http.
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// GetScheduleOverrideByID returns a specific override.
 func (h *SchedulingHandler) GetScheduleOverrideByID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	overrideIDStr := chi.URLParam(r, "overrideID")
@@ -929,7 +915,6 @@ func (h *SchedulingHandler) GetScheduleOverrideByID(w http.ResponseWriter, r *ht
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// UpdateScheduleOverride updates an existing override.
 func (h *SchedulingHandler) UpdateScheduleOverride(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	overrideIDStr := chi.URLParam(r, "overrideID")
@@ -950,7 +935,6 @@ func (h *SchedulingHandler) UpdateScheduleOverride(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
-	// Validate override type if provided
 	if update.OverrideType != nil && *update.OverrideType != "" {
 		valid := map[string]bool{"off": true, "force_work": true, "holiday_override": true}
 		if !valid[*update.OverrideType] {
@@ -966,7 +950,6 @@ func (h *SchedulingHandler) UpdateScheduleOverride(w http.ResponseWriter, r *htt
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// DeleteScheduleOverride deletes an override.
 func (h *SchedulingHandler) DeleteScheduleOverride(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	overrideIDStr := chi.URLParam(r, "overrideID")
@@ -990,7 +973,6 @@ func (h *SchedulingHandler) DeleteScheduleOverride(w http.ResponseWriter, r *htt
 
 // ---- Work Center Handlers ----
 
-// GetWorkCenter returns a work center by code.
 func (h *SchedulingHandler) GetWorkCenter(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -1008,7 +990,6 @@ func (h *SchedulingHandler) GetWorkCenter(w http.ResponseWriter, r *http.Request
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// ListWorkCenters lists work centers for a company.
 func (h *SchedulingHandler) ListWorkCenters(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -1026,7 +1007,6 @@ func (h *SchedulingHandler) ListWorkCenters(w http.ResponseWriter, r *http.Reque
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// GetWorkCenterShifts returns the active shift mapping for a work center.
 func (h *SchedulingHandler) GetWorkCenterShifts(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -1066,7 +1046,6 @@ func (h *SchedulingHandler) GetWorkCenterShifts(w http.ResponseWriter, r *http.R
 
 // ---- Work Center Shift Mapping Handlers ----
 
-// CreateWorkCenterShiftMapping creates a new work center shift mapping.
 func (h *SchedulingHandler) CreateWorkCenterShiftMapping(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -1094,7 +1073,6 @@ func (h *SchedulingHandler) CreateWorkCenterShiftMapping(w http.ResponseWriter, 
 	h.respondWithJSON(w, http.StatusCreated, map[string]string{"message": "Work center shift mapping created successfully"})
 }
 
-// UpdateWorkCenterShiftMapping updates an existing work center shift mapping by key.
 func (h *SchedulingHandler) UpdateWorkCenterShiftMapping(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -1133,7 +1111,6 @@ func (h *SchedulingHandler) UpdateWorkCenterShiftMapping(w http.ResponseWriter, 
 
 // ---- Position & Assignment Handlers ----
 
-// GetUserScheduledPosition returns the position a user is scheduled for on a date.
 func (h *SchedulingHandler) GetUserScheduledPosition(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userIDStr := chi.URLParam(r, "userID")
@@ -1175,7 +1152,6 @@ func (h *SchedulingHandler) GetUserScheduledPosition(w http.ResponseWriter, r *h
 	h.respondWithJSON(w, http.StatusOK, response)
 }
 
-// GetUserCurrentAssignment returns the user's current work center assignment.
 func (h *SchedulingHandler) GetUserCurrentAssignment(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userIDStr := chi.URLParam(r, "userID")
@@ -1218,7 +1194,6 @@ func (h *SchedulingHandler) GetUserCurrentAssignment(w http.ResponseWriter, r *h
 
 // ---- Holiday Handlers ----
 
-// AddHolidayToCalendar adds a holiday to an existing calendar.
 func (h *SchedulingHandler) AddHolidayToCalendar(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -1250,7 +1225,6 @@ func (h *SchedulingHandler) AddHolidayToCalendar(w http.ResponseWriter, r *http.
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Holiday added to calendar successfully"})
 }
 
-// ProcessHolidayForDate processes a holiday for a specific date (cancels schedules).
 func (h *SchedulingHandler) ProcessHolidayForDate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -1286,7 +1260,7 @@ func (h *SchedulingHandler) ProcessHolidayForDate(w http.ResponseWriter, r *http
 
 // ---- Stats & Query Handlers ----
 
-// GetScheduleStats returns aggregated scheduling statistics.
+// GetScheduleStats — location scope read from X-Location-ID.
 func (h *SchedulingHandler) GetScheduleStats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -1318,7 +1292,11 @@ func (h *SchedulingHandler) GetScheduleStats(w http.ResponseWriter, r *http.Requ
 	} else {
 		endDate, _ = normalizeBusinessDate(time.Now(), timezone)
 	}
-	result, err := h.schedulingQueryService.GetScheduleStats(ctx, companyID, startDate, endDate)
+
+	// 👇 Location scope from the request context.
+	locFilter := locationctx.Filter(ctx)
+
+	result, err := h.schedulingQueryService.GetScheduleStats(ctx, companyID, locFilter, startDate, endDate)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1326,7 +1304,6 @@ func (h *SchedulingHandler) GetScheduleStats(w http.ResponseWriter, r *http.Requ
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// CheckScheduleAvailability returns the expected start/end times for a user on a date.
 func (h *SchedulingHandler) CheckScheduleAvailability(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userIDParam := r.URL.Query().Get("user_id")
@@ -1371,7 +1348,6 @@ func (h *SchedulingHandler) CheckScheduleAvailability(w http.ResponseWriter, r *
 	})
 }
 
-// ValidateScheduleConflict checks if a proposed time range conflicts with existing schedules.
 func (h *SchedulingHandler) ValidateScheduleConflict(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userIDStr := r.URL.Query().Get("user_id")
@@ -1429,7 +1405,6 @@ func (h *SchedulingHandler) ValidateScheduleConflict(w http.ResponseWriter, r *h
 
 // ---- Health Check ----
 
-// HealthCheck returns the health status of the scheduling service.
 func (h *SchedulingHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	if err := h.schedulingQueryService.HealthCheck(ctx); err != nil {

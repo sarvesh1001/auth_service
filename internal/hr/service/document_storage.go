@@ -1,7 +1,6 @@
 package service
 
 import (
-	"auth-service/internal/util"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -16,7 +15,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 )
 
 // ============================================================================
@@ -63,11 +61,10 @@ type LocalDocumentStorage struct {
 	basePath     string
 	maxFileSize  int64
 	allowedTypes map[string]struct{}
-	logger       *zap.Logger
 	mu           sync.RWMutex
 }
 
-func NewLocalDocumentStorage(basePath string, maxFileSizeMB int, logger *zap.Logger) (*LocalDocumentStorage, error) {
+func NewLocalDocumentStorage(basePath string, maxFileSizeMB int) (*LocalDocumentStorage, error) {
 	if basePath == "" {
 		basePath = "/tmp/employee_documents"
 	}
@@ -97,7 +94,6 @@ func NewLocalDocumentStorage(basePath string, maxFileSizeMB int, logger *zap.Log
 		basePath:     basePath,
 		maxFileSize:  int64(maxFileSizeMB) * 1024 * 1024,
 		allowedTypes: allowed,
-		logger:       logger,
 	}, nil
 }
 
@@ -111,8 +107,6 @@ func (s *LocalDocumentStorage) UploadDocument(
 	header *multipart.FileHeader,
 	companyID, userID uuid.UUID,
 ) (*UploadResult, error) {
-
-	start := time.Now()
 
 	if header.Size > s.maxFileSize {
 		return nil, fmt.Errorf("file size %d exceeds max %d", header.Size, s.maxFileSize)
@@ -166,14 +160,6 @@ func (s *LocalDocumentStorage) UploadDocument(
 	}
 
 	checksum := hex.EncodeToString(hasher.Sum(nil))
-
-	s.logger.Info("Document uploaded",
-		util.String("object_key", objectKey),
-		util.String("company_id", companyID.String()),
-		util.String("user_id", userID.String()),
-		util.Int64("size", written),
-		util.Duration("duration", time.Since(start)),
-	)
 
 	return &UploadResult{
 		ObjectKey:    objectKey,

@@ -44,7 +44,8 @@ type ChatInput struct {
 	Message        string
 	AuthHeader     string
 	DeviceID       string
-	Arguments      map[string]interface{} // NEW
+	Arguments      map[string]interface{}
+	IdempotencyKey string // <-- NEW
 }
 
 func (s *ChatService) Handle(ctx context.Context, input ChatInput) (*models.ChatResponse, error) {
@@ -82,7 +83,7 @@ func (s *ChatService) Handle(ctx context.Context, input ChatInput) (*models.Chat
 		UserID:    input.UserID,
 		Message:   input.Message,
 		History:   history,
-		Arguments: input.Arguments, // NEW: pass arguments
+		Arguments: input.Arguments,
 	}
 
 	llmResp, err := s.llmClient.Process(ctx, llmReq)
@@ -108,6 +109,7 @@ func (s *ChatService) Handle(ctx context.Context, input ChatInput) (*models.Chat
 				Name:      llmResp.ToolCall.Name,
 				Arguments: llmResp.ToolCall.Arguments,
 			},
+			IdempotencyKey: input.IdempotencyKey, // <-- NEW
 		})
 		if err != nil {
 			return nil, err

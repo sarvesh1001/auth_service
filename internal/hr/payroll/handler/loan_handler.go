@@ -11,18 +11,15 @@ import (
 	"auth-service/internal/hr/payroll/service"
 
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 )
 
 type LoanHandler struct {
 	loanService service.LoanService
-	logger      *zap.Logger
 }
 
-func NewLoanHandler(loanService service.LoanService, logger *zap.Logger) *LoanHandler {
+func NewLoanHandler(loanService service.LoanService) *LoanHandler {
 	return &LoanHandler{
 		loanService: loanService,
-		logger:      logger.Named("loan_handler"),
 	}
 }
 
@@ -34,13 +31,13 @@ type createLoanRequest struct {
 	UserID          uuid.UUID `json:"user_id"`
 	LoanType        string    `json:"loan_type"`
 	PrincipalAmount float64   `json:"principal_amount"`
-	EmiAmount       float64   `json:"emi_amount"` // optional
+	EmiAmount       float64   `json:"emi_amount"`
 	InterestRate    *float64  `json:"interest_rate,omitempty"`
-	InterestType    *string   `json:"interest_type,omitempty"` // "flat" or "compound"
+	InterestType    *string   `json:"interest_type,omitempty"`
 	TotalEmis       int       `json:"total_emis"`
 	DisbursedAt     time.Time `json:"disbursed_at"`
 	FirstEmiDate    time.Time `json:"first_emi_date"`
-	ComponentCode   string    `json:"component_code"` // optional
+	ComponentCode   string    `json:"component_code"`
 	MaxCTCPercent   float64   `json:"max_ctc_percent"`
 }
 
@@ -69,13 +66,12 @@ func (r *createLoanRequest) validate() error {
 	return nil
 }
 
-// emiPreviewRequest – MODIFIED to include interestRate and interestType
 type emiPreviewRequest struct {
 	UserID        uuid.UUID `json:"user_id"`
 	Principal     float64   `json:"principal"`
 	TotalEmis     int       `json:"total_emis"`
-	InterestRate  *float64  `json:"interest_rate,omitempty"` // NEW
-	InterestType  *string   `json:"interest_type,omitempty"` // NEW
+	InterestRate  *float64  `json:"interest_rate,omitempty"`
+	InterestType  *string   `json:"interest_type,omitempty"`
 	MaxCTCPercent float64   `json:"max_ctc_percent"`
 }
 
@@ -109,21 +105,40 @@ type manualPaymentRequest struct {
 }
 
 // ----------------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------------
+
+func (h *LoanHandler) getActorID(ctx context.Context) (uuid.UUID, error) {
+	if v := ctx.Value("current_user_id"); v != nil {
+		if id, ok := v.(uuid.UUID); ok {
+			return id, nil
+		}
+	}
+	if v := ctx.Value("user_id"); v != nil {
+		switch raw := v.(type) {
+		case uuid.UUID:
+			return raw, nil
+		case string:
+			return uuid.Parse(raw)
+		default:
+			return uuid.Nil, errors.New("invalid user_id type")
+		}
+	}
+	return uuid.Nil, errors.New("user not authenticated")
+}
+
+// ----------------------------------------------------------------------
 // Handlers
 // ----------------------------------------------------------------------
 
 // CreateLoan godoc
 // POST /api/v1/companies/{companyId}/payroll/loans
 func (h *LoanHandler) CreateLoan(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	actorID, err := h.getActorID(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
@@ -149,12 +164,16 @@ func (h *LoanHandler) CreateLoan(w http.ResponseWriter, r *http.Request) {
 		DisbursedAt:     req.DisbursedAt,
 		FirstEmiDate:    req.FirstEmiDate,
 		ComponentCode:   req.ComponentCode,
-		CreatedBy:       &actorID,
 	}
+
+	actorID, _ := h.getActorID(ctx)
+	loan.CreatedBy = &actorID
 
 	createdLoan, err := h.loanService.CreateLoan(ctx, loan, req.MaxCTCPercent)
 	if err != nil {
-		h.logger.Error("failed to create loan", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -170,10 +189,11 @@ func (h *LoanHandler) CreateLoan(w http.ResponseWriter, r *http.Request) {
 	h.respondWithJSON(w, http.StatusCreated, response)
 }
 
-// PreviewEMI godoc – MODIFIED to accept interest fields
+// PreviewEMI godoc
 // POST /api/v1/companies/{companyId}/payroll/loans/preview-emi
 func (h *LoanHandler) PreviewEMI(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -186,7 +206,6 @@ func (h *LoanHandler) PreviewEMI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// MODIFIED: pass interestRate and interestType to service
 	result, err := h.loanService.CalculateEMI(
 		ctx,
 		companyID,
@@ -198,6 +217,9 @@ func (h *LoanHandler) PreviewEMI(w http.ResponseWriter, r *http.Request) {
 		req.InterestType,
 	)
 	if err != nil {
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -208,10 +230,11 @@ func (h *LoanHandler) PreviewEMI(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GetLoan godoc (unchanged)
+// GetLoan godoc
 // GET /api/v1/companies/{companyId}/payroll/loans/{loanId}
 func (h *LoanHandler) GetLoan(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -222,9 +245,12 @@ func (h *LoanHandler) GetLoan(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	loan, err := h.loanService.GetLoan(ctx, loanID)
 	if err != nil {
-		h.logger.Error("failed to get loan", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -242,10 +268,11 @@ func (h *LoanHandler) GetLoan(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ListUserLoans godoc (unchanged)
+// ListUserLoans godoc
 // GET /api/v1/companies/{companyId}/payroll/loans/user/{userId}?includeClosed=true
 func (h *LoanHandler) ListUserLoans(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -260,7 +287,9 @@ func (h *LoanHandler) ListUserLoans(w http.ResponseWriter, r *http.Request) {
 
 	loans, err := h.loanService.ListUserLoans(ctx, companyID, userID, includeClosed)
 	if err != nil {
-		h.logger.Error("failed to list user loans", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -270,10 +299,11 @@ func (h *LoanHandler) ListUserLoans(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GetPendingEMIsForLoan godoc (unchanged)
+// GetPendingEMIsForLoan godoc
 // GET /api/v1/companies/{companyId}/payroll/loans/{loanId}/pending-emis
 func (h *LoanHandler) GetPendingEMIsForLoan(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	loanID, err := parseUUIDParam(r, "loanID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -281,7 +311,9 @@ func (h *LoanHandler) GetPendingEMIsForLoan(w http.ResponseWriter, r *http.Reque
 	}
 	emis, err := h.loanService.GetPendingEMIsForLoan(ctx, loanID)
 	if err != nil {
-		h.logger.Error("failed to get pending EMIs", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -291,10 +323,11 @@ func (h *LoanHandler) GetPendingEMIsForLoan(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// GetPendingEMIsForPayrollRun godoc (unchanged)
+// GetPendingEMIsForPayrollRun godoc
 // GET /api/v1/companies/{companyId}/payroll/runs/{payrollRunId}/pending-emis
 func (h *LoanHandler) GetPendingEMIsForPayrollRun(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	payrollRunID, err := parseUUIDParam(r, "payrollRunID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -302,7 +335,9 @@ func (h *LoanHandler) GetPendingEMIsForPayrollRun(w http.ResponseWriter, r *http
 	}
 	emis, err := h.loanService.GetPendingEMIsForPayrollRun(ctx, payrollRunID)
 	if err != nil {
-		h.logger.Error("failed to get pending EMIs for payroll run", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -312,16 +347,16 @@ func (h *LoanHandler) GetPendingEMIsForPayrollRun(w http.ResponseWriter, r *http
 	})
 }
 
-// MarkEMIAsPaid godoc (unchanged)
+// MarkEMIAsPaid godoc
 // POST /api/v1/companies/{companyId}/payroll/emis/{emiId}/paid
 func (h *LoanHandler) MarkEMIAsPaid(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	emiID, err := parseUUIDParam(r, "emiID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	actorID, _ := h.getActorID(ctx) // optional
 
 	var req markEmiPaidRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -334,27 +369,28 @@ func (h *LoanHandler) MarkEMIAsPaid(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.loanService.MarkEMIAsPaid(ctx, emiID, req.PaidDate, req.PayrollRunID); err != nil {
-		h.logger.Error("failed to mark EMI as paid", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "EMI marked as paid",
-		"actor":   actorID,
 	})
 }
 
-// CloseLoan godoc (unchanged)
+// CloseLoan godoc
 // POST /api/v1/companies/{companyId}/payroll/loans/{loanId}/close
 func (h *LoanHandler) CloseLoan(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	loanID, err := parseUUIDParam(r, "loanID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	actorID, _ := h.getActorID(ctx)
 
 	var req closeLoanRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -367,26 +403,29 @@ func (h *LoanHandler) CloseLoan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.loanService.CloseLoan(ctx, loanID, req.ClosureDate); err != nil {
-		h.logger.Error("failed to close loan", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "loan closed",
-		"actor":   actorID,
 	})
 }
 
-// RecordManualPayment godoc (unchanged)
+// RecordManualPayment godoc
 // POST /api/v1/companies/{companyId}/payroll/loans/{loanId}/manual-payment
 func (h *LoanHandler) RecordManualPayment(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	loanID, err := parseUUIDParam(r, "loanID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	actorID, err := h.getActorID(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
@@ -399,15 +438,10 @@ func (h *LoanHandler) RecordManualPayment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	err = h.loanService.RecordManualPayment(
-		ctx,
-		loanID,
-		req.Amount,
-		req.Penalty,
-		req.PaidAt,
-		actorID,
-	)
-	if err != nil {
+	if err := h.loanService.RecordManualPayment(ctx, loanID, req.Amount, req.Penalty, req.PaidAt, actorID); err != nil {
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -418,10 +452,11 @@ func (h *LoanHandler) RecordManualPayment(w http.ResponseWriter, r *http.Request
 	})
 }
 
-// ListLoanPayments godoc (unchanged)
+// ListLoanPayments godoc
 // GET /api/v1/companies/{companyId}/payroll/loans/{loanId}/payments
 func (h *LoanHandler) ListLoanPayments(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	loanID, err := parseUUIDParam(r, "loanID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -429,6 +464,9 @@ func (h *LoanHandler) ListLoanPayments(w http.ResponseWriter, r *http.Request) {
 	}
 	payments, err := h.loanService.ListLoanPayments(ctx, loanID)
 	if err != nil {
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -439,20 +477,8 @@ func (h *LoanHandler) ListLoanPayments(w http.ResponseWriter, r *http.Request) {
 }
 
 // ----------------------------------------------------------------------
-// Helper functions (unchanged)
+// Response helpers
 // ----------------------------------------------------------------------
-
-func (h *LoanHandler) getActorID(ctx context.Context) (uuid.UUID, error) {
-	userIDStr, ok := ctx.Value("user_id").(string)
-	if !ok || userIDStr == "" {
-		return uuid.Nil, errors.New("unauthenticated user")
-	}
-	userID, err := uuid.Parse(userIDStr)
-	if err != nil {
-		return uuid.Nil, errors.New("invalid user_id in context")
-	}
-	return userID, nil
-}
 
 func (h *LoanHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")

@@ -1,82 +1,128 @@
 
-# File: docker-compose.dev.yml
-
 services:
   # ===============================
-  # ClickHouse Database
+  # ClickHouse – ✅ FIXED healthcheck (clickhouse-client)
   # ===============================
   clickhouse:
-    image: clickhouse/clickhouse-server:24.8
+    image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION:-24.8}
     container_name: clickhouse-dev
     ports:
-      - "8123:8123"
-      - "9000:9000"
-    env_file:
-      - .env
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+      - "${CLICKHOUSE_NATIVE_PORT:-9000}:9000"
     environment:
-      - CLICKHOUSE_DB=${CLICKHOUSE_DATABASE}
-      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
     volumes:
       - clickhouse_data:/var/lib/clickhouse
-      - ./scripts/init-clickhouse.sh:/docker-entrypoint-initdb.d/init-clickhouse.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "clickhouse-client --user ${CLICKHOUSE_USER} --password ${CLICKHOUSE_PASSWORD} --query 'SELECT 1' || exit 1"]
+      test:
+        [
+          "CMD-SHELL",
+          "clickhouse-client -u $$CLICKHOUSE_USER --password $$CLICKHOUSE_PASSWORD --query 'SELECT 1'"
+        ]
       interval: 10s
       timeout: 5s
-      retries: 12
+      retries: 20
       start_period: 30s
     networks:
       - dev-net
+    restart: unless-stopped
 
   # ===============================
-  # ScyllaDB (Cassandra-compatible)
+  # ClickHouse Init – one‑shot container that runs after ClickHouse is healthy
   # ===============================
-  scylla:
-    image: scylladb/scylla:5.2.0
-    ports:
-      - "9042:9042"
-    command: --memory 2G --smp 2 --developer-mode 1
+  clickhouse-init:
+    image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION:-24.8}
+    container_name: clickhouse-init
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: ${CLICKHOUSE_NATIVE_PORT:-9000}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE}
     volumes:
-      - scylla_data:/var/lib/scylla
-    healthcheck:
-      test: ["CMD-SHELL", "until cqlsh -u ${SCYLLA_USERNAME:-cassandra} -p ${SCYLLA_PASSWORD:-cassandra} -e 'describe keyspaces'; do echo waiting for Scylla; sleep 5; done"]
-      interval: 15s
-      timeout: 60s
-      retries: 10
-      start_period: 60s
+      - ./scripts/init-clickhouse.sh:/init-clickhouse.sh:ro
+    entrypoint:
+      - /bin/bash
+      - /init-clickhouse.sh
     networks:
       - dev-net
+    restart: "no"
 
   # ===============================
-  # Redis (NON-TLS)
+  # Redis – ✅ FIXED healthcheck with environment variable
   # ===============================
   redis:
-    image: redis:7-alpine
+    image: redis:${REDIS_VERSION:-7-alpine}
     container_name: redis
-    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD}
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      test:
+        [
+          "CMD-SHELL",
+          "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG"
+        ]
       interval: 5s
       timeout: 3s
       retries: 5
     networks:
       - dev-net
+    restart: unless-stopped
 
   # ===============================
-  # Kafka + Zookeeper
+  # ScyllaDB
+  # ===============================
+  scylla:
+    image: scylladb/scylla:${SCYLLA_VERSION:-5.2.0}
+    ports:
+      - "${SCYLLA_PORT:-9042}:9042"
+    command:
+      - --memory
+      - ${SCYLLA_MEMORY:-2G}
+      - --smp
+      - ${SCYLLA_SMP:-2}
+      - --developer-mode
+      - "1"
+    volumes:
+      - scylla_data:/var/lib/scylla
+    environment:
+      SCYLLA_USERNAME: ${SCYLLA_USERNAME}
+      SCYLLA_PASSWORD: ${SCYLLA_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -u $$SCYLLA_USERNAME -p $$SCYLLA_PASSWORD -e 'describe keyspaces'"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    networks:
+      - dev-net
+    restart: unless-stopped
+
+  # ===============================
+  # Zookeeper
   # ===============================
   zookeeper:
-    image: confluentinc/cp-zookeeper:7.4.0
+    image: confluentinc/cp-zookeeper:${ZOOKEEPER_VERSION:-7.4.0}
     container_name: auth-service-zookeeper-1
     ports:
-      - "2181:2181"
+      - "${ZOOKEEPER_PORT:-2181}:2181"
     environment:
-      - ZOOKEEPER_CLIENT_PORT=2181
-      - ZOOKEEPER_TICK_TIME=2000
-      - ZOOKEEPER_SYNC_LIMIT=2
-      - ZOOKEEPER_4LW_COMMANDS_WHITELIST=ruok,stat,conf,cons
+      ZOOKEEPER_CLIENT_PORT: ${ZOOKEEPER_CLIENT_PORT:-2181}
+      ZOOKEEPER_TICK_TIME: ${ZOOKEEPER_TICK_TIME:-2000}
+      ZOOKEEPER_SYNC_LIMIT: ${ZOOKEEPER_SYNC_LIMIT:-2}
+      ZOOKEEPER_4LW_COMMANDS_WHITELIST: ${ZOOKEEPER_4LW_COMMANDS_WHITELIST:-ruok,stat,conf,cons}
     healthcheck:
       test: ["CMD-SHELL", "echo ruok | nc localhost 2181 || exit 1"]
       interval: 15s
@@ -85,37 +131,44 @@ services:
       start_period: 60s
     networks:
       - dev-net
+    restart: unless-stopped
 
+  # ===============================
+  # Kafka
+  # ===============================
   kafka:
-    image: confluentinc/cp-kafka:7.4.0
+    image: confluentinc/cp-kafka:${KAFKA_VERSION:-7.4.0}
     hostname: kafka
     ports:
-      - "9092:9092"
-      - "9093:9093"
+      - "${KAFKA_INTERNAL_PORT:-9092}:9092"
+      - "${KAFKA_EXTERNAL_PORT:-9093}:9093"
     environment:
-      - KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181
-      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9093
-      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
-      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
-      - KAFKA_AUTO_CREATE_TOPICS_ENABLE=false
+      KAFKA_ZOOKEEPER_CONNECT: ${KAFKA_ZOOKEEPER_CONNECT:-zookeeper:2181}
+      KAFKA_ADVERTISED_LISTENERS: >-
+        PLAINTEXT://${KAFKA_HOSTNAME:-kafka}:${KAFKA_INTERNAL_PORT:-9092},
+        PLAINTEXT_HOST://${KAFKA_EXTERNAL_HOST:-localhost}:${KAFKA_EXTERNAL_PORT:-9093}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: ${KAFKA_LISTENER_SECURITY_PROTOCOL_MAP:-PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT}
+      KAFKA_INTER_BROKER_LISTENER_NAME: ${KAFKA_INTER_BROKER_LISTENER_NAME:-PLAINTEXT}
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: ${KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR:-1}
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: ${KAFKA_AUTO_CREATE_TOPICS_ENABLE:-false}
     depends_on:
       zookeeper:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "kafka-topics", "--list", "--bootstrap-server", "kafka:9092"]
+      test: ["CMD", "kafka-topics", "--list", "--bootstrap-server", "${KAFKA_HOSTNAME:-kafka}:${KAFKA_INTERNAL_PORT:-9092}"]
       interval: 15s
       timeout: 10s
       retries: 8
       start_period: 40s
     networks:
       - dev-net
+    restart: unless-stopped
 
   # ===============================
-  # Kafka Topic Initialization
+  # Kafka Topic Init
   # ===============================
   kafka-topic-init:
-    image: confluentinc/cp-kafka:7.4.0
+    image: confluentinc/cp-kafka:${KAFKA_VERSION:-7.4.0}
     container_name: kafka-topic-init
     depends_on:
       kafka:
@@ -128,80 +181,194 @@ services:
     volumes:
       - ./scripts/init-kafka-topics.sh:/scripts/init-kafka-topics.sh:ro
     environment:
-      - KAFKA_HOST=kafka
-      - KAFKA_PORT=9092
-      - KAFKA_BOOTSTRAP_SERVER=kafka:9092
+      KAFKA_HOST: ${KAFKA_HOSTNAME:-kafka}
+      KAFKA_PORT: ${KAFKA_INTERNAL_PORT:-9092}
+      KAFKA_BOOTSTRAP_SERVER: ${KAFKA_BOOTSTRAP_SERVER:-kafka:9092}
     networks:
       - dev-net
 
   # ===============================
-  # Elasticsearch + Kibana
+  # Elasticsearch
   # ===============================
   elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.9.0
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ELASTICSEARCH_VERSION:-8.9.0}
     environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      discovery.type: ${ELASTICSEARCH_DISCOVERY_TYPE:-single-node}
+      xpack.security.enabled: ${ELASTIC_XPACK_SECURITY:-true}
+      ELASTIC_PASSWORD: ${ELASTICSEARCH_PASSWORD}
+      xpack.security.transport.ssl.enabled: ${ELASTIC_TRANSPORT_SSL_ENABLED:-false}
+      xpack.security.http.ssl.enabled: ${ELASTIC_HTTP_SSL_ENABLED:-false}
+      ES_JAVA_OPTS: ${ELASTICSEARCH_JAVA_OPTS:--Xms512m -Xmx512m}
     ports:
-      - "9200:9200"
+      - "${ELASTICSEARCH_PORT:-9200}:9200"
     volumes:
       - elasticsearch_data:/usr/share/elasticsearch/data
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS -u elastic:$$ELASTIC_PASSWORD http://localhost:9200/_cluster/health || exit 1"]
       interval: 10s
       timeout: 30s
       retries: 20
       start_period: 60s
     networks:
       - dev-net
+    restart: unless-stopped
 
-  kibana:
-    image: docker.elastic.co/kibana/kibana:8.9.0
-    ports:
-      - "5601:5601"
+  # ===============================
+  # Elasticsearch Init (creates kibana_system user)
+  # ===============================
+  elasticsearch-init:
+    image: alpine/curl:latest
+    container_name: elasticsearch-init
+    volumes:
+      - ./scripts/init-elasticsearch.sh:/init.sh:ro
+    entrypoint: ["/bin/sh", "/init.sh"]
     environment:
-      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      ELASTICSEARCH_PASSWORD: ${ELASTICSEARCH_PASSWORD}
+      KIBANA_SYSTEM_PASSWORD: ${KIBANA_SYSTEM_PASSWORD}
+      KIBANA_IMPORT_USER: ${KIBANA_IMPORT_USER}
+      KIBANA_IMPORT_PASSWORD: ${KIBANA_IMPORT_PASSWORD}
     depends_on:
       elasticsearch:
         condition: service_healthy
     networks:
       - dev-net
+    restart: "no"
 
   # ===============================
-  # PostgreSQL Database
+  # Kibana
+  # ===============================
+  kibana:
+    image: docker.elastic.co/kibana/kibana:${ELASTICSEARCH_VERSION:-8.9.0}
+    container_name: auth_service-kibana-1
+    ports:
+      - "${KIBANA_PORT:-5601}:5601"
+    environment:
+      ELASTICSEARCH_HOSTS: ${ELASTICSEARCH_HOSTS:-http://elasticsearch:9200}
+      ELASTICSEARCH_USERNAME: ${KIBANA_SYSTEM_USER:-kibana_system}
+      ELASTICSEARCH_PASSWORD: ${KIBANA_SYSTEM_PASSWORD:-${ELASTICSEARCH_PASSWORD}}
+      XPACK_SECURITY_ENCRYPTIONKEY: ${KIBANA_SECURITY_ENCRYPTION_KEY}
+      XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY: ${KIBANA_SAVED_OBJECTS_ENCRYPTION_KEY}
+      XPACK_REPORTING_ENCRYPTIONKEY: ${KIBANA_REPORTING_ENCRYPTION_KEY}
+    volumes:
+      - ./kibana/config/kibana.yml:/usr/share/kibana/config/kibana.yml:ro
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      elasticsearch-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5601/api/status || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      start_period: 120s
+    networks:
+      - dev-net
+    restart: unless-stopped
+
+  # ===============================
+  # Kibana Setup (imports dashboards)
+  # ===============================
+  kibana-setup:
+    image: alpine/curl:${ALPINE_CURL_VERSION:-latest}
+    container_name: kibana-setup
+    volumes:
+      - ./scripts/init-kibana.sh:/init-kibana.sh:ro
+      - ./kibana/export.ndjson:/kibana-export/export.ndjson:ro
+    entrypoint: ["/bin/sh", "/init-kibana.sh"]
+    environment:
+      KIBANA_URL: ${KIBANA_URL:-http://kibana:5601}
+      KIBANA_USER: ${KIBANA_IMPORT_USER:-kibana_import}
+      KIBANA_PASSWORD: ${KIBANA_IMPORT_PASSWORD:-ImportSecure2026}
+    depends_on:
+      kibana:
+        condition: service_healthy
+    networks:
+      - dev-net
+    restart: "no"
+
+  # ===============================
+  # Grafana
+  # ===============================
+  grafana:
+    image: grafana/grafana:${GRAFANA_VERSION:-10.4.0}
+    container_name: grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_INSTALL_PLUGINS: ${GRAFANA_INSTALL_PLUGINS:-grafana-clickhouse-datasource}
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL}
+      GF_SERVER_DOMAIN: ${GRAFANA_DOMAIN}
+      GF_SMTP_ENABLED: ${SMTP_ENABLED:-false}
+      GF_SMTP_HOST: ${SMTP_HOST}:${SMTP_PORT}
+      GF_SMTP_USER: ${SMTP_USERNAME}
+      GF_SMTP_PASSWORD: ${SMTP_PASSWORD}
+      GF_SMTP_FROM_ADDRESS: ${SMTP_FROM_ADDRESS}
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST}
+      CLICKHOUSE_HTTP_PORT: ${CLICKHOUSE_HTTP_PORT}
+      CLICKHOUSE_HTTP_URL: ${CLICKHOUSE_HTTP_URL}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      ELASTICSEARCH_URL: ${ELASTICSEARCH_URL}
+      ELASTICSEARCH_INDEX: ${ELASTICSEARCH_INDEX}
+      ELASTICSEARCH_VERSION: ${ELASTICSEARCH_VERSION}
+      ELASTICSEARCH_USERNAME: ${ELASTICSEARCH_USERNAME}
+      ELASTICSEARCH_PASSWORD: ${ELASTICSEARCH_PASSWORD}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - dev-net
+    restart: unless-stopped
+
+  # ===============================
+  # PostgreSQL
   # ===============================
   postgres:
-    image: postgres:15-alpine
+    image: postgres:${POSTGRES_VERSION:-15-alpine}
     container_name: postgres-dev
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     environment:
-      - POSTGRES_DB=${POSTGRES_DATABASE:-auth_service}
-      - POSTGRES_USER=${POSTGRES_USER:-auth_user}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres_password}
-      - POSTGRES_INITDB_ARGS=--encoding=UTF8 --lc-collate=C --lc-ctype=C
+      POSTGRES_DB: ${POSTGRES_DATABASE}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: ${POSTGRES_INITDB_ARGS:--E UTF8 --lc-collate=C --lc-ctype=C}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./scripts/01-init-postgres.sh:/docker-entrypoint-initdb.d/01-init-postgres.sh:ro
       - ./scripts/03-init-academics.sql:/docker-entrypoint-initdb.d/03-init-academics.sql:ro
-      - ./scripts/04-init-accounting.sql:/docker-entrypoint-initdb.d/04-init-accounting.sql:ro  
+      - ./scripts/04-init-accounting.sql:/docker-entrypoint-initdb.d/04-init-accounting.sql:ro
       - ./scripts/05-init-inventory.sql:/docker-entrypoint-initdb.d/05-init-inventory.sql:ro
-      - ./scripts/06-init-sales.sql:/docker-entrypoint-initdb.d/06-init-sales.sql:ro    
-      - ./scripts/07-init-subscriptions.sql:/docker-entrypoint-initdb.d/07-init-subscriptions.sql:ro   # ← ADD THIS
+      - ./scripts/06-init-sales.sql:/docker-entrypoint-initdb.d/06-init-sales.sql:ro
+      - ./scripts/07-init-subscriptions.sql:/docker-entrypoint-initdb.d/07-init-subscriptions.sql:ro
       - ./scripts/08-init-biometric.sh:/docker-entrypoint-initdb.d/08-init-biometric.sh:ro
-
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-auth_user} -d ${POSTGRES_DATABASE:-auth_service}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DATABASE}"]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 30s
     networks:
       - dev-net
+    restart: unless-stopped
 
   # ===============================
-  # Schema Initialization Service
+  # Schema Init (Scylla, etc.)
   # ===============================
   schema-init:
     build:
@@ -212,7 +379,7 @@ services:
       scylla:
         condition: service_healthy
       clickhouse:
-        condition: service_started
+        condition: service_started   # not critical for schema-init
       postgres:
         condition: service_healthy
     volumes:
@@ -222,7 +389,7 @@ services:
       - dev-net
 
   # ===============================
-  # Application Service (HTTP NO TLS)
+  # Application Service
   # ===============================
   app:
     build:
@@ -230,46 +397,79 @@ services:
       dockerfile: Dockerfile
     container_name: auth-service-app
     ports:
-      - "8080:8080"
+      - "${APP_PORT:-8080}:8080"
     env_file:
       - .env
     environment:
-      - ENVIRONMENT=development
-      - SERVER_ENABLE_TLS=false
-      - SERVER_PORT=8080
-      - SERVER_TLS_PORT=8443
-      - REDIS_URL=redis://redis:6379
-      - REDIS_PASSWORD=${REDIS_PASSWORD}
-      - HR_DOCUMENT_BASE_PATH=/data
-      - SCYLLA_NODES=scylla:9042
-      - SCYLLA_USERNAME=${SCYLLA_USERNAME}
-      - SCYLLA_PASSWORD=${SCYLLA_PASSWORD}
-      - SCYLLA_KEYSPACE=${SCYLLA_KEYSPACE}
-      - KAFKA_BROKERS=kafka:9092
-      - AUDIT_OUTBOX_ENABLED=true
-      - AUDIT_OUTBOX_TOPIC=audit-logs
-      - AUDIT_OUTBOX_BATCH_SIZE=100
-      - AUDIT_OUTBOX_POLL_INTERVAL=5s
-      - ELASTICSEARCH_URL=http://elasticsearch:9200
-      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
-      - CLICKHOUSE_URL=clickhouse:9000
-      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
-      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PORT=5432
-      - POSTGRES_DATABASE=${POSTGRES_DATABASE:-auth_service}
-      - POSTGRES_USER=${POSTGRES_USER:-auth_user}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres_password}
-      - POSTGRES_SSLMODE=disable
-      - ENCRYPTION_MASTER_KEY=${ENCRYPTION_MASTER_KEY}
-      - JWT_SECRET=${JWT_SECRET}
-      - API_KEY=${API_KEY}
-      - LOG_LEVEL=${LOG_LEVEL:-debug}
-      - LOG_FORMAT=${LOG_FORMAT:-console}
-      - CLICKHOUSE_CA_FILE=
-      - TLS_CA_FILE=
-      - TLS_CERT_FILE=
-      - TLS_KEY_FILE=
+      # All environment variables from .env – expand as needed
+      ENVIRONMENT: ${ENVIRONMENT}
+      LOG_LEVEL: ${LOG_LEVEL}
+      LOG_FORMAT: ${LOG_FORMAT}
+      SERVER_ENABLE_TLS: ${SERVER_ENABLE_TLS}
+      SERVER_PORT: ${SERVER_PORT}
+      SERVER_TLS_PORT: ${SERVER_TLS_PORT}
+      SERVER_PUBLIC_BASE_URL: ${SERVER_PUBLIC_BASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      SCYLLA_NODES: ${SCYLLA_NODES}
+      SCYLLA_USERNAME: ${SCYLLA_USERNAME}
+      SCYLLA_PASSWORD: ${SCYLLA_PASSWORD}
+      SCYLLA_KEYSPACE: ${SCYLLA_KEYSPACE}
+      SCYLLA_CONSISTENCY: ${SCYLLA_CONSISTENCY}
+      KAFKA_BROKERS: ${KAFKA_BROKERS}
+      AUDIT_OUTBOX_ENABLED: ${AUDIT_OUTBOX_ENABLED}
+      AUDIT_OUTBOX_TOPIC: ${AUDIT_OUTBOX_TOPIC}
+      AUDIT_OUTBOX_BATCH_SIZE: ${AUDIT_OUTBOX_BATCH_SIZE}
+      AUDIT_OUTBOX_POLL_INTERVAL: ${AUDIT_OUTBOX_POLL_INTERVAL}
+      ELASTICSEARCH_URL: ${ELASTICSEARCH_URL}
+      ELASTICSEARCH_USERNAME: ${ELASTICSEARCH_USERNAME}
+      ELASTICSEARCH_PASSWORD: ${ELASTICSEARCH_PASSWORD}
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST}
+      CLICKHOUSE_URL: ${CLICKHOUSE_URL}
+      CLICKHOUSE_HTTP_URL: ${CLICKHOUSE_HTTP_URL}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE}
+      CLICKHOUSE_CA_FILE: ${CLICKHOUSE_CA_FILE}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DATABASE: ${POSTGRES_DATABASE}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_SSLMODE: ${POSTGRES_SSLMODE}
+      ENCRYPTION_MASTER_KEY: ${ENCRYPTION_MASTER_KEY}
+      JWT_SECRET: ${JWT_SECRET}
+      API_KEY: ${API_KEY}
+      TLS_CA_FILE: ${TLS_CA_FILE}
+      TLS_CERT_FILE: ${TLS_CERT_FILE}
+      TLS_KEY_FILE: ${TLS_KEY_FILE}
+      HR_DOCUMENT_BASE_PATH: ${HR_DOCUMENT_BASE_PATH}
+      HR_DOCUMENT_MAX_SIZE_MB: ${HR_DOCUMENT_MAX_SIZE_MB}
+      HR_ATTENDANCE_DEVICE_TOKEN_PREFIX: ${HR_ATTENDANCE_DEVICE_TOKEN_PREFIX}
+      HR_ATTENDANCE_DEVICE_TOKEN_SECRET: ${HR_ATTENDANCE_DEVICE_TOKEN_SECRET}
+      HR_ATTENDANCE_DEVICE_TOKEN_VALIDITY: ${HR_ATTENDANCE_DEVICE_TOKEN_VALIDITY}
+      OTP_LENGTH: ${OTP_LENGTH}
+      OTP_EXPIRY_DURATION: ${OTP_EXPIRY_DURATION}
+      OTP_MAX_ATTEMPTS: ${OTP_MAX_ATTEMPTS}
+      OTP_RESEND_COOLDOWN: ${OTP_RESEND_COOLDOWN}
+      SMS_PROVIDER: ${SMS_PROVIDER}
+      SMS_ENABLED: ${SMS_ENABLED}
+      SMS_API_KEY: ${SMS_API_KEY}
+      SMS_API_SECRET: ${SMS_API_SECRET}
+      SMS_FROM_NUMBER: ${SMS_FROM_NUMBER}
+      SMS_TEMPLATE_ID: ${SMS_TEMPLATE_ID}
+      MPIN_MIN_LENGTH: ${MPIN_MIN_LENGTH}
+      MPIN_MAX_LENGTH: ${MPIN_MAX_LENGTH}
+      MPIN_MAX_ATTEMPTS: ${MPIN_MAX_ATTEMPTS}
+      MPIN_LOCK_DURATION: ${MPIN_LOCK_DURATION}
+      MPIN_REQUIRE_DEVICE_BINDING: ${MPIN_REQUIRE_DEVICE_BINDING}
+      MPIN_AUTO_UNLOCK_EXPIRED: ${MPIN_AUTO_UNLOCK_EXPIRED}
+      MPIN_ENFORCE_COMPLEXITY: ${MPIN_ENFORCE_COMPLEXITY}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_USERNAME: ${SMTP_USERNAME}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      SMTP_FROM_ADDRESS: ${SMTP_FROM_ADDRESS}
     depends_on:
       redis:
         condition: service_healthy
@@ -281,12 +481,12 @@ services:
         condition: service_completed_successfully
       elasticsearch:
         condition: service_healthy
-      clickhouse:
-        condition: service_healthy
+      clickhouse-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${SERVER_PORT}/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -295,9 +495,10 @@ services:
       - auth_documents:/data
     networks:
       - dev-net
+    restart: unless-stopped
 
-# =============================== 
-# Volumes & Networks
+# ===============================
+# Volumes
 # ===============================
 volumes:
   redis_data:
@@ -306,8 +507,11 @@ volumes:
   clickhouse_data:
   postgres_data:
   auth_documents:
-  
+  grafana_data:
 
+# ===============================
+# Networks
+# ===============================
 networks:
   dev-net:
     driver: bridge

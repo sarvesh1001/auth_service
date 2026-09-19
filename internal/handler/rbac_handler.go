@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"auth-service/internal/contextkeys"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,6 +15,8 @@ import (
 	"github.com/google/uuid"
 
 	customErrors "auth-service/internal/errors"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
 	"auth-service/internal/models"
 	"auth-service/internal/service"
 	"auth-service/internal/util"
@@ -23,13 +24,24 @@ import (
 
 // RBACHandler handles Role-Based Access Control operations.
 type RBACHandler struct {
-	companyService *service.CompanyService
+	companyService   *service.CompanyService
+	userService      *service.UserService
+	auditService     *audit.AuditService
+	idempotencyStore idempotency.Store
 }
 
 // NewRBACHandler creates a new RBACHandler.
-func NewRBACHandler(companyService *service.CompanyService) *RBACHandler {
+func NewRBACHandler(
+	companyService *service.CompanyService,
+	userService *service.UserService,
+	auditService *audit.AuditService,
+	idempotencyStore idempotency.Store,
+) *RBACHandler {
 	return &RBACHandler{
-		companyService: companyService,
+		companyService:   companyService,
+		userService:      userService,
+		auditService:     auditService,
+		idempotencyStore: idempotencyStore,
 	}
 }
 
@@ -43,8 +55,7 @@ func (h *RBACHandler) getIdempotencyKey(r *http.Request) string {
 func (h *RBACHandler) injectIdempotencyKey(ctx context.Context, r *http.Request) context.Context {
 	key := h.getIdempotencyKey(r)
 	if key != "" {
-		// Use the shared context key type
-		return context.WithValue(ctx, "idempotency_key", key) // plain string
+		return context.WithValue(ctx, "idempotency_key", key)
 	}
 	return ctx
 }
@@ -52,7 +63,7 @@ func (h *RBACHandler) injectIdempotencyKey(ctx context.Context, r *http.Request)
 // injectClientIP adds the client IP to the request context.
 func (h *RBACHandler) injectClientIP(ctx context.Context, r *http.Request) context.Context {
 	ip := h.getClientIP(r)
-	return context.WithValue(ctx, contextkeys.ClientIP, ip)
+	return context.WithValue(ctx, "ip_address", ip)
 }
 
 // ---------- Error mapping ----------
@@ -77,10 +88,7 @@ func (h *RBACHandler) mapServiceError(err error) (int, string) {
 		return http.StatusUnauthorized, err.Error()
 	case errors.Is(err, customErrors.ErrInternal):
 		return http.StatusInternalServerError, "internal server error"
-
-	// RBAC specific errors can be added here if defined
 	default:
-		// Fallback to string-based detection for any untyped errors
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "not found") || strings.Contains(errMsg, "does not exist") {
 			return http.StatusNotFound, errMsg
@@ -96,6 +104,71 @@ func (h *RBACHandler) mapServiceError(err error) (int, string) {
 		}
 		return http.StatusInternalServerError, "internal server error"
 	}
+}
+
+// ---------- Response helpers ----------
+
+func (h *RBACHandler) respondWithJSON(w http.ResponseWriter, statusCode int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(data)
+}
+
+func (h *RBACHandler) respondWithError(w http.ResponseWriter, statusCode int, err error, message string) {
+	h.respondWithJSON(w, statusCode, errorResponse(err, message))
+}
+
+// ---------- Utility helpers ----------
+
+func (h *RBACHandler) getCompanyIDFromContext(ctx context.Context) (uuid.UUID, error) {
+	raw := ctx.Value("company_id")
+	if raw == nil {
+		return uuid.Nil, customErrors.ErrInvalidInput
+	}
+	switch v := raw.(type) {
+	case uuid.UUID:
+		return v, nil
+	case string:
+		return uuid.Parse(v)
+	default:
+		return uuid.Nil, customErrors.ErrInvalidInput
+	}
+}
+
+func (h *RBACHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
+	raw := ctx.Value("user_id")
+	if raw == nil {
+		return uuid.Nil, customErrors.ErrUnauthorized
+	}
+	switch v := raw.(type) {
+	case uuid.UUID:
+		return v, nil
+	case string:
+		return uuid.Parse(v)
+	default:
+		return uuid.Nil, customErrors.ErrInvalidInput
+	}
+}
+
+func (h *RBACHandler) getClientIP(r *http.Request) string {
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		if ips := strings.Split(forwarded, ","); len(ips) > 0 {
+			ip := strings.TrimSpace(ips[0])
+			if net.ParseIP(ip) != nil {
+				return ip
+			}
+		}
+	}
+	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+		if net.ParseIP(realIP) != nil {
+			return realIP
+		}
+	}
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if host == "" {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // ---------- Role CRUD ----------
@@ -642,7 +715,6 @@ func (h *RBACHandler) AssignPermissionsToRole(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Validate permissions exist
 	allPermissions, err := h.companyService.GetAllPermissions(ctx, "", "", "")
 	if err != nil {
 		status, msg := h.mapServiceError(err)
@@ -1630,70 +1702,6 @@ func (h *RBACHandler) BulkAssignRoles(w http.ResponseWriter, r *http.Request) {
 	h.respondWithJSON(w, http.StatusOK, successResponse(results, "Bulk role assignment completed"))
 }
 
-// ---------- Utility helpers ----------
-
-func (h *RBACHandler) getCompanyIDFromContext(ctx context.Context) (uuid.UUID, error) {
-	raw := ctx.Value("company_id")
-	if raw == nil {
-		return uuid.Nil, customErrors.ErrInvalidInput
-	}
-	switch v := raw.(type) {
-	case uuid.UUID:
-		return v, nil
-	case string:
-		return uuid.Parse(v)
-	default:
-		return uuid.Nil, customErrors.ErrInvalidInput
-	}
-}
-
-func (h *RBACHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
-	raw := ctx.Value("user_id")
-	if raw == nil {
-		return uuid.Nil, customErrors.ErrUnauthorized
-	}
-	switch v := raw.(type) {
-	case uuid.UUID:
-		return v, nil
-	case string:
-		return uuid.Parse(v)
-	default:
-		return uuid.Nil, customErrors.ErrInvalidInput
-	}
-}
-
-func (h *RBACHandler) getClientIP(r *http.Request) string {
-	// Simplified IP extraction; can be shared with admin handler
-	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-		if ips := strings.Split(forwarded, ","); len(ips) > 0 {
-			ip := strings.TrimSpace(ips[0])
-			if net.ParseIP(ip) != nil {
-				return ip
-			}
-		}
-	}
-	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
-		if net.ParseIP(realIP) != nil {
-			return realIP
-		}
-	}
-	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	if host == "" {
-		return r.RemoteAddr
-	}
-	return host
-}
-
-func (h *RBACHandler) respondWithJSON(w http.ResponseWriter, statusCode int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(statusCode)
-	_ = json.NewEncoder(w).Encode(data)
-}
-
-func (h *RBACHandler) respondWithError(w http.ResponseWriter, statusCode int, err error, message string) {
-	h.respondWithJSON(w, statusCode, errorResponse(err, message))
-}
-
 // GetRoleDepartments handles GET /roles/{roleID}/departments
 func (h *RBACHandler) GetRoleDepartments(w http.ResponseWriter, r *http.Request) {
 	ctx := h.injectClientIP(r.Context(), r)
@@ -1740,7 +1748,7 @@ func (h *RBACHandler) GetRoleDepartments(w http.ResponseWriter, r *http.Request)
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Role departments retrieved successfully"))
 }
 
-// GetRoleDepartments returns the departments assigned to a role.
+// GetRoleDepartmentsForPermission returns the departments assigned to a role.
 func (h *RBACHandler) GetRoleDepartmentsForPermission(w http.ResponseWriter, r *http.Request) {
 	ctx := h.injectClientIP(r.Context(), r)
 
@@ -1784,26 +1792,10 @@ func (h *RBACHandler) GetRoleDepartmentsForPermission(w http.ResponseWriter, r *
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Role departments retrieved successfully"))
 }
 
-// UpdateEmployee updates an existing employee's role, position, reports_to, employee_id, or status.
-// @Summary Update employee
-// @Tags rbac
-// @Accept json
-// @Produce json
-// @Param companyID path string true "Company UUID"
-// @Param userID path string true "User UUID (employee identifier)"
-// @Param body body object true "Employee fields to update" example({"role_id":"...","reports_to":"..."})
-// @Success 200 {object} map[string]interface{} "Employee updated"
-// @Failure 400 {object} map[string]interface{} "Invalid input"
-// @Failure 403 {object} map[string]interface{} "Permission denied"
-// @Failure 404 {object} map[string]interface{} "Employee not found"
-// @Failure 409 {object} map[string]interface{} "Conflict"
-// @Router /api/v1/companies/{companyID}/rbac/employees/{userID} [patch]
+// GetUserDepartments handles GET /companies/{companyID}/users/{userID}/departments
+func (h *RBACHandler) GetUserDepartments(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
 
-// UpdateEmployee handles PATCH requests to update an employee.
-func (h *RBACHandler) UpdateEmployee(w http.ResponseWriter, r *http.Request) {
-	ctx := context.WithValue(r.Context(), "ip_address", getClientIP(r)) // helper to get client IP
-
-	// Extract company ID from URL
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -1811,7 +1803,6 @@ func (h *RBACHandler) UpdateEmployee(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract user ID from URL
 	userIDStr := chi.URLParam(r, "userID")
 	userID, err := uuid.Parse(userIDStr)
 	if err != nil {
@@ -1819,15 +1810,85 @@ func (h *RBACHandler) UpdateEmployee(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse request body
+	departments, err := h.companyService.GetUserDepartments(ctx, companyID, userID)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	type DepartmentResponse struct {
+		DepartmentID       uuid.UUID  `json:"department_id"`
+		DepartmentName     string     `json:"department_name"`
+		SystemDepartmentID *uuid.UUID `json:"system_department_id,omitempty"`
+		ParentDepartmentID *uuid.UUID `json:"parent_department_id,omitempty"`
+		IsActive           bool       `json:"is_active"`
+		CreatedAt          string     `json:"created_at"`
+		UpdatedAt          string     `json:"updated_at"`
+	}
+
+	response := make([]DepartmentResponse, len(departments))
+	for i, dept := range departments {
+		response[i] = DepartmentResponse{
+			DepartmentID:       dept.DepartmentID,
+			DepartmentName:     dept.DepartmentName,
+			SystemDepartmentID: dept.SystemDepartmentID,
+			ParentDepartmentID: dept.ParentDepartmentID,
+			IsActive:           dept.IsActive,
+			CreatedAt:          dept.CreatedAt.Format(time.RFC3339),
+			UpdatedAt:          dept.UpdatedAt.Format(time.RFC3339),
+		}
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(response, "User departments retrieved successfully"))
+}
+
+// ---------- Update Employee (FULLY FIXED) ----------
+
+// UpdateEmployee updates an existing employee's details (including user and employee fields).
+// @Summary Update employee
+// @Tags rbac
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param userID path string true "User UUID"
+// @Param body body object true "Fields to update" example({"phone":"+919876540005","username":"finance_emp2","full_name":"Neha FinanceEmp2","employee_id":"FE002","role_id":"...","reports_to":"...","position_id":"..."})
+// @Success 200 {object} map[string]interface{} "Employee updated"
+// @Failure 400 {object} map[string]interface{} "Invalid input or role/position mismatch"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Failure 404 {object} map[string]interface{} "Employee not found"
+// @Failure 409 {object} map[string]interface{} "Conflict (duplicate phone/username)"
+// @Router /api/v1/companies/{companyID}/rbac/employees/{userID} [patch]
+func (h *RBACHandler) UpdateEmployee(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
+
+	// 1. Parse path parameters
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	userIDStr := chi.URLParam(r, "userID")
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
+		return
+	}
+
+	// 2. Decode request body (all fields optional)
 	var req struct {
+		Phone      *string    `json:"phone,omitempty"`
+		Username   *string    `json:"username,omitempty"`
+		FullName   *string    `json:"full_name,omitempty"`
 		EmployeeID *string    `json:"employee_id,omitempty"`
 		RoleID     *uuid.UUID `json:"role_id,omitempty"`
 		PositionID *uuid.UUID `json:"position_id,omitempty"`
 		ReportsTo  *uuid.UUID `json:"reports_to,omitempty"`
 		IsActive   *bool      `json:"is_active,omitempty"`
+		HireDate   *time.Time `json:"hire_date,omitempty"`
 	}
-
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&req); err != nil {
@@ -1835,14 +1896,134 @@ func (h *RBACHandler) UpdateEmployee(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Ensure at least one field is provided
-	if req.EmployeeID == nil && req.RoleID == nil && req.PositionID == nil && req.ReportsTo == nil && req.IsActive == nil {
-		h.respondWithError(w, http.StatusBadRequest, nil, "No fields to update")
+	// 3. Idempotency – check once at handler level
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("update_employee:%s:%s", companyID.String(), userID.String())
+	}
+	var processed bool
+	if err := h.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Employee already updated (idempotent)"))
 		return
 	}
 
-	// Build service request
-	updateReq := &service.UpdateEmployeeRequest{
+	// 4. Create a service context WITHOUT the idempotency key to skip internal checks.
+	serviceCtx := context.WithValue(ctx, "idempotency_key", "")
+
+	// 5. Fetch existing employee to validate existence and get current state
+	existing, err := h.companyService.GetEmployee(serviceCtx, companyID, userID)
+	if err != nil {
+		if errors.Is(err, customErrors.ErrNotFound) {
+			h.respondWithError(w, http.StatusNotFound, err, "Employee not found")
+		} else {
+			h.respondWithError(w, http.StatusInternalServerError, err, "Failed to fetch employee")
+		}
+		return
+	}
+
+	// 6. Update user fields (phone, username, full_name) if provided
+	if req.Phone != nil {
+		if err := h.userService.UpdatePhoneNumber(serviceCtx, userID, *req.Phone); err != nil {
+			if errors.Is(err, customErrors.ErrDuplicate) {
+				h.respondWithError(w, http.StatusConflict, err, "Phone number already in use")
+			} else {
+				h.respondWithError(w, http.StatusInternalServerError, err, "Failed to update phone number")
+			}
+			return
+		}
+	}
+
+	if req.Username != nil || req.FullName != nil {
+		userUpdateReq := &service.UserUpdateRequest{
+			Username: req.Username,
+			FullName: req.FullName,
+		}
+		if _, err := h.userService.UpdateUser(serviceCtx, userID, userUpdateReq); err != nil {
+			if errors.Is(err, customErrors.ErrDuplicate) {
+				h.respondWithError(w, http.StatusConflict, err, "Username already taken")
+			} else {
+				h.respondWithError(w, http.StatusInternalServerError, err, "Failed to update user details")
+			}
+			return
+		}
+	}
+
+	// 7. Validate employee fields (role, position, reports_to) if provided
+
+	// 7a. Role validation
+	if req.RoleID != nil {
+		role, err := h.companyService.GetRole(serviceCtx, *req.RoleID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, err, "Invalid role ID")
+			return
+		}
+		if role.CompanyID != companyID {
+			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Role does not belong to this company")
+			return
+		}
+		roleDepts, err := h.companyService.GetRoleDepartments(serviceCtx, *req.RoleID)
+		if err != nil || len(roleDepts) == 0 {
+			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidState, "Role is not assigned to any department")
+			return
+		}
+	}
+
+	// 7b. Position validation
+	if req.PositionID != nil {
+		position, err := h.companyService.GetPosition(serviceCtx, *req.PositionID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, err, "Invalid position ID")
+			return
+		}
+		if position.CompanyID != companyID {
+			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Position does not belong to this company")
+			return
+		}
+		if !position.IsOpen {
+			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidState, "Position is not open for assignment")
+			return
+		}
+
+		// Determine role for department compatibility
+		var roleID uuid.UUID
+		if req.RoleID != nil {
+			roleID = *req.RoleID
+		} else {
+			roleID = existing.RoleID
+		}
+		roleDepts, err := h.companyService.GetRoleDepartments(serviceCtx, roleID)
+		if err != nil {
+			h.respondWithError(w, http.StatusInternalServerError, err, "Failed to fetch role departments")
+			return
+		}
+		found := false
+		for _, rd := range roleDepts {
+			if rd.DepartmentID == position.DepartmentID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Position's department is not assigned to the role")
+			return
+		}
+	}
+
+	// 7c. ReportsTo validation
+	if req.ReportsTo != nil {
+		if *req.ReportsTo == userID {
+			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Employee cannot report to themselves")
+			return
+		}
+		isActive, err := h.companyService.IsUserActiveEmployee(serviceCtx, companyID, *req.ReportsTo)
+		if err != nil || !isActive {
+			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Reports-to employee not found or not active")
+			return
+		}
+	}
+
+	// 8. Update employee fields
+	empReq := &service.UpdateEmployeeRequest{
 		CompanyID:  companyID,
 		UserID:     userID,
 		EmployeeID: req.EmployeeID,
@@ -1850,14 +2031,149 @@ func (h *RBACHandler) UpdateEmployee(w http.ResponseWriter, r *http.Request) {
 		PositionID: req.PositionID,
 		ReportsTo:  req.ReportsTo,
 		IsActive:   req.IsActive,
+		HireDate:   req.HireDate,
 	}
-
-	// Call service
-	if err := h.companyService.UpdateEmployee(ctx, updateReq); err != nil {
+	if err := h.companyService.UpdateEmployee(serviceCtx, empReq); err != nil {
 		status, msg := h.mapServiceError(err)
 		h.respondWithError(w, status, err, msg)
 		return
 	}
 
+	// 9. Success – store the idempotency key (only now)
+	_ = h.idempotencyStore.Store(ctx, nil, idempKey, true)
+
+	// 10. Audit log
+	if h.auditService != nil {
+		ip, _ := ctx.Value("ip_address").(string)
+		_ = h.auditService.LogAction(ctx, nil, nil, "employee", "update_employee", "admin",
+			nil, "admin", nil, nil, nil, map[string]interface{}{
+				"company_id": companyID.String(),
+				"user_id":    userID.String(),
+				"updated_fields": map[string]interface{}{
+					"phone":       req.Phone,
+					"username":    req.Username,
+					"full_name":   req.FullName,
+					"employee_id": req.EmployeeID,
+					"role_id":     req.RoleID,
+					"position_id": req.PositionID,
+					"reports_to":  req.ReportsTo,
+					"is_active":   req.IsActive,
+					"hire_date":   req.HireDate,
+				},
+				"ip_address": ip,
+			})
+	}
+
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Employee updated successfully"))
+}
+
+// GetEmployee retrieves the full profile of an employee.
+// @Summary Get employee profile
+// @Tags rbac
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param userID path string true "User UUID"
+// @Success 200 {object} EmployeeProfileResponse "Employee profile"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Failure 404 {object} map[string]interface{} "Employee not found"
+// @Router /api/v1/companies/{companyID}/rbac/employees/{userID} [get]
+func (h *RBACHandler) GetEmployee(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+	userIDStr := chi.URLParam(r, "userID")
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
+		return
+	}
+
+	profile, err := h.companyService.GetEmployeeProfile(ctx, companyID, userID)
+	if err != nil {
+		if errors.Is(err, customErrors.ErrNotFound) {
+			h.respondWithError(w, http.StatusNotFound, err, "Employee not found")
+		} else {
+			h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get employee profile")
+		}
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, successResponse(profile, "Employee profile retrieved"))
+}
+
+// AddMember — unified endpoint for POST /companies/{companyId}/rbac/members
+//
+// Combines employee + manager creation with optional location assignment.
+func (h *RBACHandler) AddMember(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	var req service.AddMemberRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body: unknown fields not allowed")
+		return
+	}
+	req.CompanyID = companyID
+
+	// Pre-flight validations mirroring AddEmployee / AddManager
+	if req.RoleID != uuid.Nil {
+		role, err := h.companyService.GetRole(ctx, req.RoleID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, err, "Invalid role ID")
+			return
+		}
+		if role.CompanyID != companyID {
+			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Role does not belong to this company")
+			return
+		}
+		if req.MemberType == "manager" && role.RoleLevel < 500 {
+			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Role level must be 500 or higher for managers")
+			return
+		}
+	}
+
+	if req.PositionID != nil {
+		position, err := h.companyService.GetPosition(ctx, *req.PositionID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, err, "Invalid position ID")
+			return
+		}
+		if position.CompanyID != companyID {
+			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Position does not belong to this company")
+			return
+		}
+		if !position.IsOpen {
+			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Position is not open for assignment")
+			return
+		}
+	}
+
+	if req.ReportsTo != nil {
+		isActive, err := h.companyService.IsUserActiveEmployee(ctx, companyID, *req.ReportsTo)
+		if err != nil || !isActive {
+			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Reports-to employee not found or not active")
+			return
+		}
+	}
+
+	if err := h.companyService.AddMember(ctx, &req); err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, successResponse(nil, "Member added successfully"))
 }

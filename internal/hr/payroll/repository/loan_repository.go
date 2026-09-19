@@ -1,4 +1,3 @@
-// File: internal/repository/loan.go
 package repository
 
 import (
@@ -10,11 +9,10 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/lib/pq"
-	"go.uber.org/zap"
 
 	"auth-service/internal/client"
+	hrErrors "auth-service/internal/hr/errors"
 	"auth-service/internal/hr/payroll/models"
-	"auth-service/internal/util"
 )
 
 // LoanRepository defines methods for managing employee loans, EMIs, and loan payments.
@@ -24,10 +22,17 @@ type LoanRepository interface {
 	UpdateEMI(ctx context.Context, emi *models.EmiTransaction) error
 	CreateEMI(ctx context.Context, emi *models.EmiTransaction) error
 	GetPendingEMIsForLoan(ctx context.Context, loanID uuid.UUID) ([]models.EmiTransaction, error)
-	GetEMIsForPayrollRun(ctx context.Context, payrollRunID uuid.UUID) ([]models.EmiTransaction, error)
-	// MarkEMIAsPaid marks an EMI as fully paid, recording the paid amount, penalty, and remaining balance.
+
+	// GetEMIsForPayrollRun — location filter applies when locationID != nil.
+	GetEMIsForPayrollRun(
+		ctx context.Context,
+		payrollRunID uuid.UUID,
+		locationID *uuid.UUID,
+	) ([]models.EmiTransaction, error)
+
 	MarkEMIAsPaid(ctx context.Context, emiID uuid.UUID, paidDate time.Time, paidAmount, penalty float64, payrollRunID *uuid.UUID) error
 	BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
+
 	// Legacy method – returns only EMI data (no component code)
 	GetPendingEMIsForEmployeeInPeriod(ctx context.Context, companyID, userID uuid.UUID, startDate, endDate time.Time) ([]models.EmiTransaction, error)
 	// New method – returns EMI data together with the loan’s component code for efficient payroll processing
@@ -38,17 +43,24 @@ type LoanRepository interface {
 	UpdateLoan(ctx context.Context, loan *models.EmployeeLoan) error
 	GetLoanByID(ctx context.Context, loanID uuid.UUID) (*models.EmployeeLoan, error)
 	ListLoansByUser(ctx context.Context, companyID, userID uuid.UUID, includeClosed bool) ([]models.EmployeeLoan, error)
-	ListActiveLoans(ctx context.Context, companyID uuid.UUID, asOf time.Time) ([]models.EmployeeLoan, error)
+
+	// ListActiveLoans — location filter applies when locationID != nil.
+	ListActiveLoans(
+		ctx context.Context,
+		companyID uuid.UUID,
+		asOf time.Time,
+		locationID *uuid.UUID,
+	) ([]models.EmployeeLoan, error)
 
 	// Loan Payment ledger methods
 	CreateLoanPayment(ctx context.Context, payment *models.LoanPayment) error
 	ListLoanPayments(ctx context.Context, loanID uuid.UUID) ([]models.LoanPayment, error)
 	ListLoanPaymentsByPayrollRun(ctx context.Context, payrollRunID uuid.UUID) ([]models.LoanPayment, error)
 
-	// NEW: Apply a payment to the loan (reduce outstanding balance, increment emis_paid)
+	// Apply a payment to the loan (reduce outstanding balance, increment emis_paid)
 	ApplyLoanPayment(ctx context.Context, loanID uuid.UUID, amount float64) error
 
-	// NEW: Atomic processing of an EMI payment – updates EMI, creates ledger, and updates loan in one transaction
+	// Atomic processing of an EMI payment – updates EMI, creates ledger, and updates loan in one transaction
 	ProcessEMIPaymentTx(
 		ctx context.Context,
 		tx *sql.Tx,
@@ -65,19 +77,17 @@ type LoanRepository interface {
 // loanRepository is the Postgres implementation of LoanRepository.
 type loanRepository struct {
 	client *client.PostgresClient
-	logger *zap.Logger
 }
 
 // NewLoanRepository creates a new loan repository.
-func NewLoanRepository(postgresClient *client.PostgresClient, logger *zap.Logger) LoanRepository {
+func NewLoanRepository(postgresClient *client.PostgresClient) LoanRepository {
 	return &loanRepository{
 		client: postgresClient,
-		logger: logger,
 	}
 }
 
 // ---------------------------------------------------------------------
-// Loan methods (with new fields: interest_type, outstanding_balance)
+// Loan methods
 // ---------------------------------------------------------------------
 
 func (r *loanRepository) CreateLoan(ctx context.Context, loan *models.EmployeeLoan) error {
@@ -135,12 +145,6 @@ func (r *loanRepository) CreateLoan(ctx context.Context, loan *models.EmployeeLo
 		nullUUID(loan.CreatedBy),
 	)
 	if err != nil {
-		r.logger.Error("Failed to create employee loan",
-			util.String("loan_id", loan.LoanID.String()),
-			util.String("company_id", loan.CompanyID.String()),
-			util.String("user_id", loan.UserID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to create loan: %w", err)
 	}
 	return nil
@@ -183,16 +187,12 @@ func (r *loanRepository) UpdateLoan(ctx context.Context, loan *models.EmployeeLo
 		loan.LoanID,
 	)
 	if err != nil {
-		r.logger.Error("Failed to update employee loan",
-			util.String("loan_id", loan.LoanID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to update loan: %w", err)
 	}
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("loan not found")
+		return hrErrors.ErrLoanNotFound
 	}
 	return nil
 }
@@ -217,7 +217,14 @@ func (r *loanRepository) GetLoanByID(ctx context.Context, loanID uuid.UUID) (*mo
 	`
 
 	row := r.client.QueryRow(ctx, query, loanID)
-	return r.scanLoan(row)
+	loan, err := r.scanLoan(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, hrErrors.ErrLoanNotFound
+		}
+		return nil, err
+	}
+	return loan, nil
 }
 
 func (r *loanRepository) ListLoansByUser(ctx context.Context, companyID, userID uuid.UUID, includeClosed bool) ([]models.EmployeeLoan, error) {
@@ -246,18 +253,22 @@ func (r *loanRepository) ListLoansByUser(ctx context.Context, companyID, userID 
 
 	rows, err := r.client.Query(ctx, query, args...)
 	if err != nil {
-		r.logger.Error("Failed to list loans by user",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to list loans: %w", err)
 	}
 	defer rows.Close()
 	return r.scanLoans(rows)
 }
 
-func (r *loanRepository) ListActiveLoans(ctx context.Context, companyID uuid.UUID, asOf time.Time) ([]models.EmployeeLoan, error) {
+// ListActiveLoans returns active loans for a company as of a date.
+//
+// Location: when locationID is non-nil, only loans for employees whose
+// current employment_location_id matches are returned.
+func (r *loanRepository) ListActiveLoans(
+	ctx context.Context,
+	companyID uuid.UUID,
+	asOf time.Time,
+	locationID *uuid.UUID,
+) ([]models.EmployeeLoan, error) {
 	query := `
 		SELECT
 			loan_id, company_id, user_id, loan_type,
@@ -277,16 +288,15 @@ func (r *loanRepository) ListActiveLoans(ctx context.Context, companyID uuid.UUI
 		  AND status = 'active'
 		  AND disbursed_at <= $2
 		  AND (closure_date IS NULL OR closure_date >= $2)
+		  AND ($3::uuid IS NULL OR user_id IN (
+			  SELECT user_id FROM company_employees
+			  WHERE company_id = $1 AND employment_location_id = $3 AND is_active = true
+		  ))
 		ORDER BY user_id, disbursed_at
 	`
 
-	rows, err := r.client.Query(ctx, query, companyID, asOf)
+	rows, err := r.client.Query(ctx, query, companyID, asOf, locationID)
 	if err != nil {
-		r.logger.Error("Failed to list active loans",
-			util.String("company_id", companyID.String()),
-			util.Time("as_of", asOf),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to list active loans: %w", err)
 	}
 	defer rows.Close()
@@ -294,7 +304,7 @@ func (r *loanRepository) ListActiveLoans(ctx context.Context, companyID uuid.UUI
 }
 
 // ---------------------------------------------------------------------
-// Loan Payment application (new method)
+// Loan Payment application
 // ---------------------------------------------------------------------
 
 func (r *loanRepository) ApplyLoanPayment(ctx context.Context, loanID uuid.UUID, amount float64) error {
@@ -308,23 +318,18 @@ func (r *loanRepository) ApplyLoanPayment(ctx context.Context, loanID uuid.UUID,
 
 	result, err := r.client.Exec(ctx, query, amount, loanID)
 	if err != nil {
-		r.logger.Error("Failed to apply loan payment",
-			util.String("loan_id", loanID.String()),
-			util.Float64("amount", amount),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to apply loan payment: %w", err)
 	}
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("loan not found")
+		return hrErrors.ErrLoanNotFound
 	}
 	return nil
 }
 
 // ---------------------------------------------------------------------
-// Atomic EMI Payment Processing (UPDATED with GREATEST and auto‑closure)
+// Atomic EMI Payment Processing
 // ---------------------------------------------------------------------
 
 func (r *loanRepository) ProcessEMIPaymentTx(
@@ -338,8 +343,6 @@ func (r *loanRepository) ProcessEMIPaymentTx(
 	payrollRunID *uuid.UUID,
 	source string,
 ) error {
-
-	// 1️⃣ Update EMI
 	emiUpdate := `
 	UPDATE payroll.emi_transaction
 	SET
@@ -366,9 +369,7 @@ func (r *loanRepository) ProcessEMIPaymentTx(
 		return fmt.Errorf("failed to update EMI: %w", err)
 	}
 
-	// 2️⃣ Insert payment ledger
 	paymentID := uuid.New()
-
 	paymentInsert := `
 	INSERT INTO payroll.loan_payment (
 		payment_id,
@@ -396,12 +397,10 @@ func (r *loanRepository) ProcessEMIPaymentTx(
 		nullUUID(payrollRunID),
 		time.Now().UTC(),
 	)
-
 	if err != nil {
 		return fmt.Errorf("failed to create loan payment: %w", err)
 	}
 
-	// 3️⃣ Update loan balance
 	loanUpdate := `
 	UPDATE payroll.employee_loan
 	SET
@@ -415,7 +414,6 @@ func (r *loanRepository) ProcessEMIPaymentTx(
 		return fmt.Errorf("failed to apply loan payment: %w", err)
 	}
 
-	// 4️⃣ Auto close loan
 	autoClose := `
 	UPDATE payroll.employee_loan
 	SET
@@ -424,17 +422,13 @@ func (r *loanRepository) ProcessEMIPaymentTx(
 	WHERE loan_id = $1
 	AND outstanding_balance <= 0
 	`
-
-	_, err = tx.ExecContext(ctx, autoClose, loanID)
-	if err != nil {
-		r.logger.Warn("auto close loan failed", zap.Error(err))
-	}
+	_, _ = tx.ExecContext(ctx, autoClose, loanID)
 
 	return nil
 }
 
 // ---------------------------------------------------------------------
-// EMI methods (now include all new fields)
+// EMI methods
 // ---------------------------------------------------------------------
 
 func (r *loanRepository) CreateEMI(ctx context.Context, emi *models.EmiTransaction) error {
@@ -460,7 +454,6 @@ func (r *loanRepository) CreateEMI(ctx context.Context, emi *models.EmiTransacti
 	if emi.Status == "" {
 		emi.Status = models.EmiStatusPending
 	}
-	// payment_status is NOT set – let DB default to 'pending'
 
 	_, err := r.client.Exec(ctx, query,
 		emi.EmiID,
@@ -471,16 +464,11 @@ func (r *loanRepository) CreateEMI(ctx context.Context, emi *models.EmiTransacti
 		emi.PaidAmount,
 		emi.PenaltyAmount,
 		emi.OutstandingAmount,
-		emi.PaymentStatus, // may be empty, DB will set default 'pending'
+		emi.PaymentStatus,
 		nullUUID(emi.PayrollRunID),
 		emi.Status,
 	)
 	if err != nil {
-		r.logger.Error("Failed to create EMI transaction",
-			util.String("emi_id", emi.EmiID.String()),
-			util.String("loan_id", emi.LoanID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to create EMI: %w", err)
 	}
 	return nil
@@ -500,17 +488,21 @@ func (r *loanRepository) GetPendingEMIsForLoan(ctx context.Context, loanID uuid.
 
 	rows, err := r.client.Query(ctx, query, loanID)
 	if err != nil {
-		r.logger.Error("Failed to get pending EMIs for loan",
-			util.String("loan_id", loanID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get pending EMIs: %w", err)
 	}
 	defer rows.Close()
 	return r.scanEMIs(rows)
 }
 
-func (r *loanRepository) GetEMIsForPayrollRun(ctx context.Context, payrollRunID uuid.UUID) ([]models.EmiTransaction, error) {
+// GetEMIsForPayrollRun returns pending EMIs due within the run's period.
+//
+// Location: when locationID is non-nil, only EMIs for employees whose
+// current employment_location_id matches are returned.
+func (r *loanRepository) GetEMIsForPayrollRun(
+	ctx context.Context,
+	payrollRunID uuid.UUID,
+	locationID *uuid.UUID,
+) ([]models.EmiTransaction, error) {
 	query := `
 		SELECT
 			e.emi_id, e.loan_id, e.due_date, e.paid_date,
@@ -523,15 +515,15 @@ func (r *loanRepository) GetEMIsForPayrollRun(ctx context.Context, payrollRunID 
 		WHERE r.payroll_run_id = $1
 		  AND e.status = 'pending'
 		  AND e.due_date BETWEEN r.period_start AND r.period_end
+		  AND ($2::uuid IS NULL OR l.user_id IN (
+			  SELECT user_id FROM company_employees
+			  WHERE company_id = l.company_id AND employment_location_id = $2 AND is_active = true
+		  ))
 	`
 
-	rows, err := r.client.Query(ctx, query, payrollRunID)
+	rows, err := r.client.Query(ctx, query, payrollRunID, locationID)
 	if err != nil {
-		r.logger.Error("Failed to get EMIs for payroll run",
-			util.String("payroll_run_id", payrollRunID.String()),
-			util.ErrorField(err),
-		)
-		return nil, fmt.Errorf("failed to get EMIs for run: %w", err)
+		return nil, fmt.Errorf("failed to get EMIs for payroll run: %w", err)
 	}
 	defer rows.Close()
 	return r.scanEMIs(rows)
@@ -553,25 +545,20 @@ func (r *loanRepository) MarkEMIAsPaid(ctx context.Context, emiID uuid.UUID, pai
 
 	result, err := r.client.Exec(ctx, query, paidDate, paidAmount, penalty, nullUUID(payrollRunID), emiID)
 	if err != nil {
-		r.logger.Error("Failed to mark EMI as paid",
-			util.String("emi_id", emiID.String()),
-			util.ErrorField(err),
-		)
-		return fmt.Errorf("failed to update EMI: %w", err)
+		return fmt.Errorf("failed to mark EMI as paid: %w", err)
 	}
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("EMI not found")
+		return hrErrors.ErrEMINotFound
 	}
 	return nil
 }
 
 // ---------------------------------------------------------------------
-// EMI retrieval with loan details (new method, now includes all EMI fields)
+// EMI retrieval with loan details
 // ---------------------------------------------------------------------
 
-// LoanEmiDetail is returned by GetPendingEMIsForEmployeeInPeriodWithDetails.
 type LoanEmiDetail struct {
 	Emi           models.EmiTransaction
 	ComponentCode string
@@ -600,13 +587,6 @@ func (r *loanRepository) GetPendingEMIsForEmployeeInPeriodWithDetails(
 
 	rows, err := r.client.Query(ctx, query, companyID, userID, startDate, endDate)
 	if err != nil {
-		r.logger.Error("Failed to get pending EMIs with details for employee",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.Time("start_date", startDate),
-			util.Time("end_date", endDate),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get pending EMIs with details: %w", err)
 	}
 	defer rows.Close()
@@ -671,7 +651,7 @@ func (r *loanRepository) GetPendingEMIsForEmployeeInPeriodWithDetails(
 }
 
 // ---------------------------------------------------------------------
-// Legacy method (returns only EMIs, no component code, but now includes new EMI fields)
+// Legacy EMI retrieval (no component code)
 // ---------------------------------------------------------------------
 
 func (r *loanRepository) GetPendingEMIsForEmployeeInPeriod(
@@ -679,7 +659,6 @@ func (r *loanRepository) GetPendingEMIsForEmployeeInPeriod(
 	companyID, userID uuid.UUID,
 	startDate, endDate time.Time,
 ) ([]models.EmiTransaction, error) {
-	// First get all active loans for the user
 	loans, err := r.ListLoansByUser(ctx, companyID, userID, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list loans for user: %w", err)
@@ -707,13 +686,6 @@ func (r *loanRepository) GetPendingEMIsForEmployeeInPeriod(
     `
 	rows, err := r.client.Query(ctx, query, pq.Array(loanIDs), startDate, endDate)
 	if err != nil {
-		r.logger.Error("Failed to get pending EMIs for employee in period",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.Time("start_date", startDate),
-			util.Time("end_date", endDate),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get pending EMIs: %w", err)
 	}
 	defer rows.Close()
@@ -721,7 +693,7 @@ func (r *loanRepository) GetPendingEMIsForEmployeeInPeriod(
 }
 
 // ---------------------------------------------------------------------
-// Basic EMI retrieval by ID and update (UpdateEMI now includes all fields)
+// Basic EMI retrieval and update
 // ---------------------------------------------------------------------
 
 func (r *loanRepository) GetEMIByID(ctx context.Context, emiID uuid.UUID) (*models.EmiTransaction, error) {
@@ -735,7 +707,14 @@ func (r *loanRepository) GetEMIByID(ctx context.Context, emiID uuid.UUID) (*mode
 		WHERE emi_id = $1
 	`
 	row := r.client.QueryRow(ctx, query, emiID)
-	return r.scanEMI(row)
+	emi, err := r.scanEMI(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, hrErrors.ErrEMINotFound
+		}
+		return nil, err
+	}
+	return emi, nil
 }
 
 func (r *loanRepository) UpdateEMI(ctx context.Context, emi *models.EmiTransaction) error {
@@ -751,7 +730,7 @@ func (r *loanRepository) UpdateEMI(ctx context.Context, emi *models.EmiTransacti
 			status = $7
 		WHERE emi_id = $8
 	`
-	_, err := r.client.Exec(ctx, query,
+	result, err := r.client.Exec(ctx, query,
 		nullTime(emi.PaidDate),
 		emi.PaidAmount,
 		emi.PenaltyAmount,
@@ -761,7 +740,14 @@ func (r *loanRepository) UpdateEMI(ctx context.Context, emi *models.EmiTransacti
 		emi.Status,
 		emi.EmiID,
 	)
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to update EMI: %w", err)
+	}
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return hrErrors.ErrEMINotFound
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------
@@ -802,11 +788,6 @@ func (r *loanRepository) CreateLoanPayment(ctx context.Context, p *models.LoanPa
 		p.CreatedAt,
 	)
 	if err != nil {
-		r.logger.Error("Failed to create loan payment",
-			util.String("payment_id", p.PaymentID.String()),
-			util.String("loan_id", p.LoanID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to create loan payment: %w", err)
 	}
 	return nil
@@ -823,10 +804,6 @@ func (r *loanRepository) ListLoanPayments(ctx context.Context, loanID uuid.UUID)
 
 	rows, err := r.client.Query(ctx, query, loanID)
 	if err != nil {
-		r.logger.Error("Failed to list loan payments",
-			util.String("loan_id", loanID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to list loan payments: %w", err)
 	}
 	defer rows.Close()
@@ -877,10 +854,6 @@ func (r *loanRepository) ListLoanPaymentsByPayrollRun(ctx context.Context, payro
 
 	rows, err := r.client.Query(ctx, query, payrollRunID)
 	if err != nil {
-		r.logger.Error("Failed to list loan payments by payroll run",
-			util.String("payroll_run_id", payrollRunID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to list loan payments by payroll run: %w", err)
 	}
 	defer rows.Close()
@@ -921,7 +894,7 @@ func (r *loanRepository) ListLoanPaymentsByPayrollRun(ctx context.Context, payro
 }
 
 // ---------------------------------------------------------------------
-// Scanning helpers (updated)
+// Scanning helpers
 // ---------------------------------------------------------------------
 
 func (r *loanRepository) scanLoan(row scanner) (*models.EmployeeLoan, error) {
@@ -953,9 +926,6 @@ func (r *loanRepository) scanLoan(row scanner) (*models.EmployeeLoan, error) {
 		&createdBy,
 	)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
 		return nil, err
 	}
 
@@ -1017,9 +987,6 @@ func (r *loanRepository) scanEMI(row scanner) (*models.EmiTransaction, error) {
 		&e.Status,
 	)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
 		return nil, err
 	}
 
@@ -1062,7 +1029,7 @@ func (r *loanRepository) scanEMIs(rows *sql.Rows) ([]models.EmiTransaction, erro
 }
 
 // ---------------------------------------------------------------------
-// Helper null converters (unchanged)4
+// Helper null converters
 // ---------------------------------------------------------------------
 
 func nullFloat64(f *float64) sql.NullFloat64 {
@@ -1071,6 +1038,11 @@ func nullFloat64(f *float64) sql.NullFloat64 {
 	}
 	return sql.NullFloat64{Float64: *f, Valid: true}
 }
+
+// ---------------------------------------------------------------------
+// Transaction support
+// ---------------------------------------------------------------------
+
 func (r *loanRepository) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
 	return r.client.BeginTx(ctx, opts)
 }

@@ -11,31 +11,24 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-playground/validator/v10"
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 
 	"auth-service/internal/hr/payroll/models"
 	"auth-service/internal/hr/payroll/service"
 )
 
-// AttendanceRuleHandler handles HTTP requests for attendance rules.
 type AttendanceRuleHandler struct {
 	ruleService service.AttendanceRuleService
-	logger      *zap.Logger
 	validate    *validator.Validate
 }
 
-// NewAttendanceRuleHandler creates a new attendance rule handler.
-func NewAttendanceRuleHandler(ruleService service.AttendanceRuleService, logger *zap.Logger) *AttendanceRuleHandler {
+func NewAttendanceRuleHandler(ruleService service.AttendanceRuleService) *AttendanceRuleHandler {
 	return &AttendanceRuleHandler{
 		ruleService: ruleService,
-		logger:      logger,
 		validate:    validator.New(),
 	}
 }
 
-// ---------------------------------------------------------------------
-// Request / Response Types
-// ---------------------------------------------------------------------
+// ----- request/response types -----
 
 type createAttendanceRuleRequest struct {
 	RuleType         string  `json:"rule_type" validate:"required,oneof=overtime late absent"`
@@ -43,7 +36,7 @@ type createAttendanceRuleRequest struct {
 	Value            float64 `json:"value" validate:"required,gt=0"`
 	BasedOn          *string `json:"based_on,omitempty" validate:"omitempty,oneof=daily hourly"`
 	ThresholdMinutes int     `json:"threshold_minutes" validate:"min=0"`
-	ComponentCode    string  `json:"component_code" validate:"required"` // Added missing field
+	ComponentCode    string  `json:"component_code" validate:"required"`
 }
 
 type updateAttendanceRuleVersionRequest struct {
@@ -52,19 +45,27 @@ type updateAttendanceRuleVersionRequest struct {
 	Value            float64 `json:"value" validate:"required,gt=0"`
 	BasedOn          *string `json:"based_on,omitempty" validate:"omitempty,oneof=daily hourly"`
 	ThresholdMinutes int     `json:"threshold_minutes" validate:"min=0"`
-	ComponentCode    string  `json:"component_code" validate:"required"` // Added missing field
+	ComponentCode    string  `json:"component_code" validate:"required"`
 }
 
 type bulkDeactivateByTypeRequest struct {
 	RuleType string `json:"rule_type" validate:"required"`
 }
 
-// ---------------------------------------------------------------------
-// Create Rule (POST /companies/{companyID}/attendance/rules)
-// ---------------------------------------------------------------------
+// ----- helpers -----
+
+func (h *AttendanceRuleHandler) getActorID(ctx context.Context) (uuid.UUID, error) {
+	userIDStr, ok := ctx.Value("user_id").(string)
+	if !ok || userIDStr == "" {
+		return uuid.Nil, errors.New("unauthenticated user")
+	}
+	return uuid.Parse(userIDStr)
+}
+
+// ----- handlers -----
 
 func (h *AttendanceRuleHandler) CreateRule(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -102,10 +103,6 @@ func (h *AttendanceRuleHandler) CreateRule(w http.ResponseWriter, r *http.Reques
 
 	rule, err := h.ruleService.CreateRule(ctx, input)
 	if err != nil {
-		h.logger.Error("Failed to create attendance rule",
-			zap.String("company_id", companyID.String()),
-			zap.String("actor_id", actorID.String()),
-			zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -116,12 +113,8 @@ func (h *AttendanceRuleHandler) CreateRule(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-// ---------------------------------------------------------------------
-// Update Rule Version (POST /companies/{companyID}/attendance/rules/{ruleID}/versions)
-// ---------------------------------------------------------------------
-
 func (h *AttendanceRuleHandler) UpdateRuleVersion(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -166,10 +159,6 @@ func (h *AttendanceRuleHandler) UpdateRuleVersion(w http.ResponseWriter, r *http
 
 	rule, err := h.ruleService.UpdateRuleVersion(ctx, input)
 	if err != nil {
-		h.logger.Error("Failed to update attendance rule version",
-			zap.String("company_id", companyID.String()),
-			zap.String("rule_id", ruleID.String()),
-			zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -180,12 +169,8 @@ func (h *AttendanceRuleHandler) UpdateRuleVersion(w http.ResponseWriter, r *http
 	})
 }
 
-// ---------------------------------------------------------------------
-// Activate Rule (PUT /companies/{companyID}/attendance/rules/{ruleID}/activate)
-// ---------------------------------------------------------------------
-
 func (h *AttendanceRuleHandler) ActivateRule(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -207,10 +192,6 @@ func (h *AttendanceRuleHandler) ActivateRule(w http.ResponseWriter, r *http.Requ
 
 	err = h.ruleService.ActivateRule(ctx, companyID, ruleID, actorID)
 	if err != nil {
-		h.logger.Error("Failed to activate attendance rule",
-			zap.String("company_id", companyID.String()),
-			zap.String("rule_id", ruleID.String()),
-			zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -221,12 +202,8 @@ func (h *AttendanceRuleHandler) ActivateRule(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-// ---------------------------------------------------------------------
-// Deactivate Rule (PUT /companies/{companyID}/attendance/rules/{ruleID}/deactivate)
-// ---------------------------------------------------------------------
-
 func (h *AttendanceRuleHandler) DeactivateRule(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -248,10 +225,6 @@ func (h *AttendanceRuleHandler) DeactivateRule(w http.ResponseWriter, r *http.Re
 
 	err = h.ruleService.DeactivateRule(ctx, companyID, ruleID, actorID)
 	if err != nil {
-		h.logger.Error("Failed to deactivate attendance rule",
-			zap.String("company_id", companyID.String()),
-			zap.String("rule_id", ruleID.String()),
-			zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -262,12 +235,8 @@ func (h *AttendanceRuleHandler) DeactivateRule(w http.ResponseWriter, r *http.Re
 	})
 }
 
-// ---------------------------------------------------------------------
-// Bulk Deactivate by Type (POST /companies/{companyID}/attendance/rules/bulk-deactivate-by-type)
-// ---------------------------------------------------------------------
-
 func (h *AttendanceRuleHandler) BulkDeactivateByType(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -293,10 +262,6 @@ func (h *AttendanceRuleHandler) BulkDeactivateByType(w http.ResponseWriter, r *h
 
 	err = h.ruleService.BulkDeactivateByType(ctx, companyID, req.RuleType, actorID)
 	if err != nil {
-		h.logger.Error("Failed to bulk deactivate attendance rules by type",
-			zap.String("company_id", companyID.String()),
-			zap.String("rule_type", req.RuleType),
-			zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -307,12 +272,8 @@ func (h *AttendanceRuleHandler) BulkDeactivateByType(w http.ResponseWriter, r *h
 	})
 }
 
-// ---------------------------------------------------------------------
-// Get Rule by ID (GET /companies/{companyID}/attendance/rules/{ruleID})
-// ---------------------------------------------------------------------
-
 func (h *AttendanceRuleHandler) GetRuleByID(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -328,10 +289,6 @@ func (h *AttendanceRuleHandler) GetRuleByID(w http.ResponseWriter, r *http.Reque
 
 	rule, err := h.ruleService.GetRuleByID(ctx, companyID, ruleID)
 	if err != nil {
-		h.logger.Error("Failed to get attendance rule by ID",
-			zap.String("company_id", companyID.String()),
-			zap.String("rule_id", ruleID.String()),
-			zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -346,13 +303,8 @@ func (h *AttendanceRuleHandler) GetRuleByID(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// ---------------------------------------------------------------------
-// Get Rules (GET /companies/{companyID}/attendance/rules)
-// Supports filtering by rule_type, is_active, based_on, min_threshold, pagination.
-// ---------------------------------------------------------------------
-
 func (h *AttendanceRuleHandler) GetRules(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -371,8 +323,6 @@ func (h *AttendanceRuleHandler) GetRules(w http.ResponseWriter, r *http.Request)
 		isActive, err := strconv.ParseBool(isActiveStr)
 		if err == nil {
 			filter.IsActive = &isActive
-		} else {
-			h.logger.Warn("Invalid is_active parameter", zap.String("value", isActiveStr))
 		}
 	}
 	if basedOn := r.URL.Query().Get("based_on"); basedOn != "" {
@@ -382,12 +332,9 @@ func (h *AttendanceRuleHandler) GetRules(w http.ResponseWriter, r *http.Request)
 		minThreshold, err := strconv.Atoi(minThresholdStr)
 		if err == nil && minThreshold >= 0 {
 			filter.MinThreshold = &minThreshold
-		} else {
-			h.logger.Warn("Invalid min_threshold parameter", zap.String("value", minThresholdStr))
 		}
 	}
 
-	// Pagination defaults
 	page := 1
 	size := 20
 	if pageStr := r.URL.Query().Get("page"); pageStr != "" {
@@ -405,9 +352,6 @@ func (h *AttendanceRuleHandler) GetRules(w http.ResponseWriter, r *http.Request)
 
 	rules, total, err := h.ruleService.GetRulesByFilter(ctx, filter)
 	if err != nil {
-		h.logger.Error("Failed to get attendance rules",
-			zap.String("company_id", companyID.String()),
-			zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -421,13 +365,8 @@ func (h *AttendanceRuleHandler) GetRules(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// ---------------------------------------------------------------------
-// Get Active Rules (GET /companies/{companyID}/attendance/rules/active)
-// Query param: as_of (ISO date or YYYY-MM-DD)
-// ---------------------------------------------------------------------
-
 func (h *AttendanceRuleHandler) GetActiveRules(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -439,22 +378,15 @@ func (h *AttendanceRuleHandler) GetActiveRules(w http.ResponseWriter, r *http.Re
 	if asOfStr := r.URL.Query().Get("as_of"); asOfStr != "" {
 		parsed, err := time.Parse(time.RFC3339, asOfStr)
 		if err != nil {
-			// Try YYYY-MM-DD
 			parsed, err = time.Parse("2006-01-02", asOfStr)
 		}
 		if err == nil {
 			asOf = parsed
-		} else {
-			h.logger.Warn("Invalid as_of parameter, using current time", zap.String("value", asOfStr))
 		}
 	}
 
 	rules, err := h.ruleService.GetActiveRules(ctx, companyID, asOf)
 	if err != nil {
-		h.logger.Error("Failed to get active attendance rules",
-			zap.String("company_id", companyID.String()),
-			zap.Time("as_of", asOf),
-			zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -465,12 +397,8 @@ func (h *AttendanceRuleHandler) GetActiveRules(w http.ResponseWriter, r *http.Re
 	})
 }
 
-// ---------------------------------------------------------------------
-// Get Rules by Type (GET /companies/{companyID}/attendance/rules/types/{ruleType})
-// ---------------------------------------------------------------------
-
 func (h *AttendanceRuleHandler) GetRulesByType(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -486,10 +414,6 @@ func (h *AttendanceRuleHandler) GetRulesByType(w http.ResponseWriter, r *http.Re
 
 	rules, err := h.ruleService.GetRulesByType(ctx, companyID, ruleType)
 	if err != nil {
-		h.logger.Error("Failed to get attendance rules by type",
-			zap.String("company_id", companyID.String()),
-			zap.String("rule_type", ruleType),
-			zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -500,13 +424,8 @@ func (h *AttendanceRuleHandler) GetRulesByType(w http.ResponseWriter, r *http.Re
 	})
 }
 
-// ---------------------------------------------------------------------
-// Check Exists Active Rule of Type (GET /companies/{companyID}/attendance/rules/exists-active)
-// Query param: rule_type
-// ---------------------------------------------------------------------
-
 func (h *AttendanceRuleHandler) ExistsActiveRuleOfType(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -522,10 +441,6 @@ func (h *AttendanceRuleHandler) ExistsActiveRuleOfType(w http.ResponseWriter, r 
 
 	exists, err := h.ruleService.ExistsActiveRuleOfType(ctx, companyID, ruleType)
 	if err != nil {
-		h.logger.Error("Failed to check existence of active rule",
-			zap.String("company_id", companyID.String()),
-			zap.String("rule_type", ruleType),
-			zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -536,28 +451,12 @@ func (h *AttendanceRuleHandler) ExistsActiveRuleOfType(w http.ResponseWriter, r 
 	})
 }
 
-// ---------------------------------------------------------------------
-// Helper: get actor ID from context
-// ---------------------------------------------------------------------
-
-func (h *AttendanceRuleHandler) getActorID(ctx context.Context) (uuid.UUID, error) {
-	userIDStr, ok := ctx.Value("user_id").(string)
-	if !ok || userIDStr == "" {
-		return uuid.Nil, errors.New("unauthenticated user")
-	}
-	return uuid.Parse(userIDStr)
-}
-
-// ---------------------------------------------------------------------
-// Standard JSON responses
-// ---------------------------------------------------------------------
+// ----- response helpers -----
 
 func (h *AttendanceRuleHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		h.logger.Error("Failed to encode JSON response", zap.Error(err))
-	}
+	_ = json.NewEncoder(w).Encode(data)
 }
 
 func (h *AttendanceRuleHandler) respondWithError(w http.ResponseWriter, status int, message string) {

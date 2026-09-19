@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -9,6 +10,8 @@ import (
 	"go.uber.org/zap"
 
 	"auth-service/internal/hr/repository"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
 )
 
 // ClassAttendanceRequest defines the request for marking class attendance.
@@ -24,8 +27,8 @@ type ClassAttendanceRequest struct {
 
 // ClassAttendanceResult contains the result.
 type ClassAttendanceResult struct {
-	SuccessUserIDs []uuid.UUID
-	FailedUsers    map[uuid.UUID]string
+	SuccessUserIDs []uuid.UUID          `json:"success_user_ids"`
+	FailedUsers    map[uuid.UUID]string `json:"failed_users"`
 }
 
 // ClassAttendanceService defines the class attendance marking service.
@@ -37,21 +40,27 @@ type ClassAttendanceService interface {
 }
 
 type classAttendanceService struct {
-	orgUnitRepo repository.OrgUnitRepository
-	bulkService AttendanceBulkService // refactored bulk service
-	logger      *zap.Logger
+	orgUnitRepo      repository.OrgUnitRepository
+	bulkService      AttendanceBulkService
+	idempotencyStore idempotency.Store
+	auditService     *audit.AuditService
+	logger           *zap.Logger
 }
 
 // NewClassAttendanceService creates a new class attendance service.
 func NewClassAttendanceService(
 	orgUnitRepo repository.OrgUnitRepository,
 	bulkService AttendanceBulkService,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
 	logger *zap.Logger,
 ) ClassAttendanceService {
 	return &classAttendanceService{
-		orgUnitRepo: orgUnitRepo,
-		bulkService: bulkService,
-		logger:      logger,
+		orgUnitRepo:      orgUnitRepo,
+		bulkService:      bulkService,
+		idempotencyStore: idempotencyStore,
+		auditService:     auditService,
+		logger:           logger,
 	}
 }
 
@@ -59,22 +68,39 @@ func (s *classAttendanceService) MarkClassAttendance(
 	ctx context.Context,
 	req *ClassAttendanceRequest,
 ) (*ClassAttendanceResult, error) {
+	// 1️⃣ Idempotency: key based on class + date
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("class_attendance-%s-%s",
+			req.OrgUnitID.String(),
+			req.Date.Format("2006-01-02"),
+		)
+	}
 
+	var cachedResult ClassAttendanceResult
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cachedResult); err == nil {
+		// Return cached result (idempotent)
+		return &cachedResult, nil
+	}
+
+	// 2️⃣ Validation
 	if req.OrgUnitID == uuid.Nil {
 		return nil, fmt.Errorf("org_unit_id is required")
 	}
 
-	// 1️⃣ Expand class → users
+	// 3️⃣ Expand class → users
 	userIDs, err := s.orgUnitRepo.GetActiveUsersByOrgUnit(ctx, req.OrgUnitID)
 	if err != nil {
 		return nil, err
 	}
-
 	if len(userIDs) == 0 {
 		return nil, fmt.Errorf("no active users in class")
 	}
 
-	// 2️⃣ Delegate to bulk service (which uses unified correction + resolution)
+	// 4️⃣ Before state
+	beforeJSON, _ := json.Marshal(req)
+
+	// 5️⃣ Delegate to bulk service
 	reason := req.Reason
 	bulkReq := &BulkAttendanceRequest{
 		CompanyID:     req.CompanyID,
@@ -91,16 +117,46 @@ func (s *classAttendanceService) MarkClassAttendance(
 		return nil, err
 	}
 
-	s.logger.Info("Class attendance marked",
-		zap.String("company_id", req.CompanyID.String()),
-		zap.String("org_unit_id", req.OrgUnitID.String()),
-		zap.Int("total_users", len(userIDs)),
-		zap.Int("success_count", len(bulkResult.SuccessUserIDs)),
-		zap.Int("failure_count", len(bulkResult.FailedUsers)),
-	)
-
-	return &ClassAttendanceResult{
+	result := &ClassAttendanceResult{
 		SuccessUserIDs: bulkResult.SuccessUserIDs,
 		FailedUsers:    bulkResult.FailedUsers,
-	}, nil
+	}
+
+	// 6️⃣ Audit with IP
+	afterJSON, _ := json.Marshal(result)
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMetadata := map[string]interface{}{
+		"org_unit_id":   req.OrgUnitID.String(),
+		"date":          req.Date.Format("2006-01-02"),
+		"status":        req.Status,
+		"reason":        req.Reason,
+		"total_users":   len(userIDs),
+		"success_count": len(result.SuccessUserIDs),
+		"failure_count": len(result.FailedUsers),
+		"ip":            ip,
+	}
+
+	if s.auditService != nil {
+		actorID := req.ActorID
+		companyID := req.CompanyID
+		_ = s.auditService.LogAction(
+			ctx,
+			nil,
+			&companyID,
+			"attendance",
+			"class_mark",
+			"class_attendance",
+			nil, // entity_id (class not a single entity)
+			req.ActorType,
+			&actorID,
+			beforeJSON,
+			afterJSON,
+			auditMetadata,
+		)
+	}
+
+	// 7️⃣ Store idempotency result
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, result)
+
+	return result, nil
 }

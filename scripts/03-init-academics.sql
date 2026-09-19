@@ -121,10 +121,12 @@ CREATE TABLE IF NOT EXISTS academics.subject_course_mapping (
 -- STUDENT DOMAIN
 -- =====================================================
 
--- UPDATED students table with encrypted fields
 CREATE TABLE IF NOT EXISTS academics.students (
     student_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id      UUID NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
+
+    -- 👇 NEW — the campus/branch this student belongs to
+    location_id     UUID NOT NULL REFERENCES public.locations(location_id) ON DELETE RESTRICT,
 
     first_name      VARCHAR(100) NOT NULL,
     last_name       VARCHAR(100),
@@ -172,6 +174,17 @@ CREATE TABLE IF NOT EXISTS academics.students (
     updated_by      UUID REFERENCES users(user_id),
     deleted_at      TIMESTAMPTZ
 );
+-- 👇 NEW — location-scoped queries
+CREATE INDEX IF NOT EXISTS idx_students_company_location
+    ON academics.students(company_id, location_id)
+    WHERE deleted_at IS NULL;
+
+-- 👇 NEW — makes the resolver lookup O(log n)
+CREATE INDEX IF NOT EXISTS idx_students_id_location
+    ON academics.students(student_id)
+    INCLUDE (location_id, company_id)
+    WHERE deleted_at IS NULL;
+
 -- Indexes for students (new and updated)
 CREATE UNIQUE INDEX IF NOT EXISTS idx_students_admission_no_active 
     ON academics.students(company_id, admission_no) 

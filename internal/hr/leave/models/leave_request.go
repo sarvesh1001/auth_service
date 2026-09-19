@@ -40,14 +40,15 @@ type LeaveRequestUpdate struct {
 	ApprovedAt *time.Time `json:"approved_at,omitempty"`
 }
 
-// LeaveRequestFilter for searching leave requests
+// In models package, LeaveRequestFilter struct:
 type LeaveRequestFilter struct {
-	CompanyID   uuid.UUID  `json:"company_id"`
-	UserID      *uuid.UUID `json:"user_id,omitempty"`
-	LeaveTypeID *uuid.UUID `json:"leave_type_id,omitempty"`
-	Status      *string    `json:"status,omitempty"`
-	StartDate   *time.Time `json:"start_date,omitempty"`
-	EndDate     *time.Time `json:"end_date,omitempty"`
-	Page        int        `json:"page"`
-	PageSize    int        `json:"page_size"`
+	CompanyID   uuid.UUID
+	UserID      *uuid.UUID
+	LeaveTypeID *uuid.UUID
+	Status      *string
+	StartDate   *time.Time
+	EndDate     *time.Time
+	Page        int
+	PageSize    int
+	LocationID  *uuid.UUID `json:"location_id,omitempty"` // 👈 new — nil = no filter
 }

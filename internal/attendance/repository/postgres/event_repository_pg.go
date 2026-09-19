@@ -23,13 +23,22 @@ type eventRepository struct {
 	logger *zap.Logger
 }
 
-// NewEventRepository creates a new event repository
 func NewEventRepository(pg *client.PostgresClient, logger *zap.Logger) repository.EventRepository {
 	return &eventRepository{
 		client: pg,
 		logger: logger.Named("event_repo"),
 	}
 }
+
+// eventColumns is the canonical SELECT list. Used everywhere.
+const eventColumns = `
+	attendance_event_id, company_id, subject_type, subject_id,
+	event_type, event_time,
+	employment_location_id, geofence_id,
+	source_type, source_id,
+	device_id, device_user_code, ip_address,
+	context, metadata, raw_event_payload, created_at, created_by
+`
 
 func (r *eventRepository) CreateEvent(ctx context.Context, tx *sql.Tx, event *models.AttendanceEvent) error {
 	if event.AttendanceEventID == uuid.Nil {
@@ -42,12 +51,16 @@ func (r *eventRepository) CreateEvent(ctx context.Context, tx *sql.Tx, event *mo
 	query := `
 		INSERT INTO attendance.attendance_events (
 			attendance_event_id, company_id, subject_type, subject_id,
-			event_type, event_time, source_type, source_id,
+			event_type, event_time,
+			employment_location_id, geofence_id,
+			source_type, source_id,
 			device_id, device_user_code, ip_address,
 			context, metadata, raw_event_payload, created_at, created_by
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8,
-			$9, $10, $11, $12, $13, $14, $15, $16
+			$1, $2, $3, $4, $5, $6,
+			$7, $8,
+			$9, $10, $11, $12, $13,
+			$14, $15, $16, $17, $18
 		)
 	`
 
@@ -67,6 +80,8 @@ func (r *eventRepository) CreateEvent(ctx context.Context, tx *sql.Tx, event *mo
 		event.SubjectID,
 		event.EventType,
 		event.EventTime,
+		event.EmploymentLocationID,
+		event.GeofenceID,
 		event.SourceType,
 		event.SourceID,
 		event.DeviceID,
@@ -92,19 +107,16 @@ func (r *eventRepository) CreateBulkEvents(ctx context.Context, events []*models
 	if len(events) == 0 {
 		return nil
 	}
-
 	tx, err := r.client.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
 	for _, ev := range events {
 		if err := r.CreateEvent(ctx, tx, ev); err != nil {
 			return err
 		}
 	}
-
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
@@ -112,33 +124,21 @@ func (r *eventRepository) CreateBulkEvents(ctx context.Context, events []*models
 }
 
 func (r *eventRepository) GetEventByID(ctx context.Context, eventID uuid.UUID) (*models.AttendanceEvent, error) {
-	query := `
-		SELECT
-			attendance_event_id, company_id, subject_type, subject_id,
-			event_type, event_time, source_type, source_id,
-			device_id, device_user_code, ip_address,
-			context, metadata, raw_event_payload, created_at, created_by
+	query := `SELECT ` + eventColumns + `
 		FROM attendance.attendance_events
-		WHERE attendance_event_id = $1
-	`
+		WHERE attendance_event_id = $1`
 	row := r.client.QueryRow(ctx, query, eventID)
 	return r.scanEvent(row)
 }
 
 func (r *eventRepository) GetEventsBySubject(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, from, to time.Time) ([]*models.AttendanceEvent, error) {
-	query := `
-		SELECT
-			attendance_event_id, company_id, subject_type, subject_id,
-			event_type, event_time, source_type, source_id,
-			device_id, device_user_code, ip_address,
-			context, metadata, raw_event_payload, created_at, created_by
+	query := `SELECT ` + eventColumns + `
 		FROM attendance.attendance_events
 		WHERE company_id = $1
 			AND subject_type = $2
 			AND subject_id = $3
 			AND event_time BETWEEN $4 AND $5
-		ORDER BY event_time ASC
-	`
+		ORDER BY event_time ASC`
 	rows, err := r.client.Query(ctx, query, companyID, subjectType, subjectID, from, to)
 	if err != nil {
 		return nil, fmt.Errorf("query events by subject: %w", err)
@@ -149,35 +149,22 @@ func (r *eventRepository) GetEventsBySubject(ctx context.Context, companyID, sub
 
 func (r *eventRepository) GetEventsByCompany(ctx context.Context, companyID uuid.UUID, from, to time.Time, page, pageSize int) ([]*models.AttendanceEvent, int64, error) {
 	offset := (page - 1) * pageSize
-
-	// Count total
-	countQuery := `
-		SELECT COUNT(*) FROM attendance.attendance_events
-		WHERE company_id = $1 AND event_time BETWEEN $2 AND $3
-	`
+	countQuery := `SELECT COUNT(*) FROM attendance.attendance_events
+		WHERE company_id = $1 AND event_time BETWEEN $2 AND $3`
 	var total int64
-	err := r.client.QueryRow(ctx, countQuery, companyID, from, to).Scan(&total)
-	if err != nil {
+	if err := r.client.QueryRow(ctx, countQuery, companyID, from, to).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count events: %w", err)
 	}
-
-	query := `
-		SELECT
-			attendance_event_id, company_id, subject_type, subject_id,
-			event_type, event_time, source_type, source_id,
-			device_id, device_user_code, ip_address,
-			context, metadata, raw_event_payload, created_at, created_by
+	query := `SELECT ` + eventColumns + `
 		FROM attendance.attendance_events
 		WHERE company_id = $1 AND event_time BETWEEN $2 AND $3
 		ORDER BY event_time DESC
-		LIMIT $4 OFFSET $5
-	`
+		LIMIT $4 OFFSET $5`
 	rows, err := r.client.Query(ctx, query, companyID, from, to, pageSize, offset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("query events: %w", err)
 	}
 	defer rows.Close()
-
 	events, err := r.scanEvents(rows)
 	if err != nil {
 		return nil, 0, err
@@ -186,18 +173,12 @@ func (r *eventRepository) GetEventsByCompany(ctx context.Context, companyID uuid
 }
 
 func (r *eventRepository) GetEventsByDevice(ctx context.Context, companyID uuid.UUID, deviceID string, from, to time.Time) ([]*models.AttendanceEvent, error) {
-	query := `
-		SELECT
-			attendance_event_id, company_id, subject_type, subject_id,
-			event_type, event_time, source_type, source_id,
-			device_id, device_user_code, ip_address,
-			context, metadata, raw_event_payload, created_at, created_by
+	query := `SELECT ` + eventColumns + `
 		FROM attendance.attendance_events
 		WHERE company_id = $1
 			AND device_id = $2
 			AND event_time BETWEEN $3 AND $4
-		ORDER BY event_time ASC
-	`
+		ORDER BY event_time ASC`
 	rows, err := r.client.Query(ctx, query, companyID, deviceID, from, to)
 	if err != nil {
 		return nil, fmt.Errorf("query events by device: %w", err)
@@ -207,7 +188,6 @@ func (r *eventRepository) GetEventsByDevice(ctx context.Context, companyID uuid.
 }
 
 func (r *eventRepository) CheckDuplicateRecent(ctx context.Context, companyID, subjectID uuid.UUID, subjectType, eventType string, eventTime time.Time, windowMinutes int) (bool, error) {
-	_ = time.Duration(windowMinutes) * time.Minute
 	query := `
 		SELECT EXISTS (
 			SELECT 1
@@ -219,8 +199,7 @@ func (r *eventRepository) CheckDuplicateRecent(ctx context.Context, companyID, s
 				AND source_type != 'correction'
 				AND ABS(EXTRACT(EPOCH FROM (event_time - $5))) <= $6
 			LIMIT 1
-		)
-	`
+		)`
 	var exists bool
 	err := r.client.QueryRow(ctx, query,
 		companyID, subjectType, subjectID, eventType, eventTime, windowMinutes*60,
@@ -233,7 +212,6 @@ func (r *eventRepository) CheckDuplicateRecent(ctx context.Context, companyID, s
 
 func (r *eventRepository) ListEvents(ctx context.Context, filter repository.EventFilter) ([]*models.AttendanceEvent, int64, error) {
 	where, args := r.buildEventFilter(filter)
-	orderBy := "ORDER BY event_time DESC"
 	limit := filter.PageSize
 	if limit <= 0 {
 		limit = 50
@@ -246,25 +224,15 @@ func (r *eventRepository) ListEvents(ctx context.Context, filter repository.Even
 		offset = 0
 	}
 
-	// Count
 	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM attendance.attendance_events %s", where)
 	var total int64
-	err := r.client.QueryRow(ctx, countQuery, args...).Scan(&total)
-	if err != nil {
+	if err := r.client.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count events: %w", err)
 	}
 
-	query := fmt.Sprintf(`
-		SELECT
-			attendance_event_id, company_id, subject_type, subject_id,
-			event_type, event_time, source_type, source_id,
-			device_id, device_user_code, ip_address,
-			context, metadata, raw_event_payload, created_at, created_by
-		FROM attendance.attendance_events
-		%s
-		%s
-		LIMIT $%d OFFSET $%d
-	`, where, orderBy, len(args)+1, len(args)+2)
+	query := fmt.Sprintf(`SELECT %s FROM attendance.attendance_events %s
+		ORDER BY event_time DESC
+		LIMIT $%d OFFSET $%d`, eventColumns, where, len(args)+1, len(args)+2)
 
 	args = append(args, limit, offset)
 	rows, err := r.client.Query(ctx, query, args...)
@@ -272,7 +240,6 @@ func (r *eventRepository) ListEvents(ctx context.Context, filter repository.Even
 		return nil, 0, fmt.Errorf("list events: %w", err)
 	}
 	defer rows.Close()
-
 	events, err := r.scanEvents(rows)
 	if err != nil {
 		return nil, 0, err
@@ -284,8 +251,7 @@ func (r *eventRepository) CountEvents(ctx context.Context, filter repository.Eve
 	where, args := r.buildEventFilter(filter)
 	query := fmt.Sprintf("SELECT COUNT(*) FROM attendance.attendance_events %s", where)
 	var total int64
-	err := r.client.QueryRow(ctx, query, args...).Scan(&total)
-	if err != nil {
+	if err := r.client.QueryRow(ctx, query, args...).Scan(&total); err != nil {
 		return 0, fmt.Errorf("count events: %w", err)
 	}
 	return total, nil
@@ -295,15 +261,12 @@ func (r *eventRepository) GetDistinctSubjects(ctx context.Context, companyID uui
 	query := `
 		SELECT DISTINCT subject_type, subject_id
 		FROM attendance.attendance_events
-		WHERE company_id = $1
-			AND event_time BETWEEN $2 AND $3
-	`
+		WHERE company_id = $1 AND event_time BETWEEN $2 AND $3`
 	rows, err := r.client.Query(ctx, query, companyID, from, to)
 	if err != nil {
 		return nil, fmt.Errorf("query distinct subjects: %w", err)
 	}
 	defer rows.Close()
-
 	var refs []repository.SubjectRef
 	for rows.Next() {
 		var ref repository.SubjectRef
@@ -315,29 +278,55 @@ func (r *eventRepository) GetDistinctSubjects(ctx context.Context, companyID uui
 	return refs, nil
 }
 
+func (r *eventRepository) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
+	return r.client.BeginTx(ctx, opts)
+}
+
+func (r *eventRepository) FindCorrection(ctx context.Context, companyID, subjectID uuid.UUID, subjectType, correctionType string, eventTime time.Time) (*models.AttendanceEvent, error) {
+	query := `SELECT ` + eventColumns + `
+		FROM attendance.attendance_events
+		WHERE company_id = $1
+			AND subject_type = $2
+			AND subject_id = $3
+			AND event_type = $4
+			AND source_type = 'correction'
+			AND event_time = $5
+		LIMIT 1`
+	row := r.client.QueryRow(ctx, query, companyID, subjectType, subjectID, correctionType, eventTime)
+	return r.scanEvent(row)
+}
+
+func (r *eventRepository) HealthCheck(ctx context.Context) error {
+	_, err := r.client.Exec(ctx, `SELECT 1 FROM attendance.attendance_events LIMIT 1`)
+	return err
+}
+
 // --- helpers ---
 
 func (r *eventRepository) scanEvent(row *sql.Row) (*models.AttendanceEvent, error) {
-	var event models.AttendanceEvent
+	var e models.AttendanceEvent
 	var contextJSON, metadataJSON, rawPayloadJSON []byte
+	var employmentLocID, geofenceID sql.NullString
 
 	err := row.Scan(
-		&event.AttendanceEventID,
-		&event.CompanyID,
-		&event.SubjectType,
-		&event.SubjectID,
-		&event.EventType,
-		&event.EventTime,
-		&event.SourceType,
-		&event.SourceID,
-		&event.DeviceID,
-		&event.DeviceUserCode,
-		&event.IPAddress,
+		&e.AttendanceEventID,
+		&e.CompanyID,
+		&e.SubjectType,
+		&e.SubjectID,
+		&e.EventType,
+		&e.EventTime,
+		&employmentLocID,
+		&geofenceID,
+		&e.SourceType,
+		&e.SourceID,
+		&e.DeviceID,
+		&e.DeviceUserCode,
+		&e.IPAddress,
 		&contextJSON,
 		&metadataJSON,
 		&rawPayloadJSON,
-		&event.CreatedAt,
-		&event.CreatedBy,
+		&e.CreatedAt,
+		&e.CreatedBy,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -345,17 +334,8 @@ func (r *eventRepository) scanEvent(row *sql.Row) (*models.AttendanceEvent, erro
 		}
 		return nil, fmt.Errorf("scan event: %w", err)
 	}
-
-	if len(contextJSON) > 0 {
-		_ = json.Unmarshal(contextJSON, &event.Context)
-	}
-	if len(metadataJSON) > 0 {
-		_ = json.Unmarshal(metadataJSON, &event.Metadata)
-	}
-	if len(rawPayloadJSON) > 0 {
-		event.RawEventPayload = rawPayloadJSON
-	}
-	return &event, nil
+	r.assignEventNulls(&e, employmentLocID, geofenceID, contextJSON, metadataJSON, rawPayloadJSON)
+	return &e, nil
 }
 
 func (r *eventRepository) scanEvents(rows *sql.Rows) ([]*models.AttendanceEvent, error) {
@@ -363,6 +343,8 @@ func (r *eventRepository) scanEvents(rows *sql.Rows) ([]*models.AttendanceEvent,
 	for rows.Next() {
 		var e models.AttendanceEvent
 		var contextJSON, metadataJSON, rawPayloadJSON []byte
+		var employmentLocID, geofenceID sql.NullString
+
 		err := rows.Scan(
 			&e.AttendanceEventID,
 			&e.CompanyID,
@@ -370,6 +352,8 @@ func (r *eventRepository) scanEvents(rows *sql.Rows) ([]*models.AttendanceEvent,
 			&e.SubjectID,
 			&e.EventType,
 			&e.EventTime,
+			&employmentLocID,
+			&geofenceID,
 			&e.SourceType,
 			&e.SourceID,
 			&e.DeviceID,
@@ -384,21 +368,40 @@ func (r *eventRepository) scanEvents(rows *sql.Rows) ([]*models.AttendanceEvent,
 		if err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
-		if len(contextJSON) > 0 {
-			_ = json.Unmarshal(contextJSON, &e.Context)
-		}
-		if len(metadataJSON) > 0 {
-			_ = json.Unmarshal(metadataJSON, &e.Metadata)
-		}
-		if len(rawPayloadJSON) > 0 {
-			e.RawEventPayload = rawPayloadJSON
-		}
+		r.assignEventNulls(&e, employmentLocID, geofenceID, contextJSON, metadataJSON, rawPayloadJSON)
 		events = append(events, &e)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("rows iteration: %w", err)
 	}
 	return events, nil
+}
+
+// assignEventNulls attaches nullable columns to the struct.
+func (r *eventRepository) assignEventNulls(
+	e *models.AttendanceEvent,
+	employmentLoc, geofenceID sql.NullString,
+	contextJSON, metadataJSON, rawPayloadJSON []byte,
+) {
+	if employmentLoc.Valid && employmentLoc.String != "" {
+		if id, err := uuid.Parse(employmentLoc.String); err == nil {
+			e.EmploymentLocationID = &id
+		}
+	}
+	if geofenceID.Valid && geofenceID.String != "" {
+		if id, err := uuid.Parse(geofenceID.String); err == nil {
+			e.GeofenceID = &id
+		}
+	}
+	if len(contextJSON) > 0 {
+		_ = json.Unmarshal(contextJSON, &e.Context)
+	}
+	if len(metadataJSON) > 0 {
+		_ = json.Unmarshal(metadataJSON, &e.Metadata)
+	}
+	if len(rawPayloadJSON) > 0 {
+		e.RawEventPayload = rawPayloadJSON
+	}
 }
 
 func (r *eventRepository) buildEventFilter(filter repository.EventFilter) (string, []interface{}) {
@@ -426,7 +429,6 @@ func (r *eventRepository) buildEventFilter(filter repository.EventFilter) (strin
 		args = append(args, *filter.SubjectType)
 		idx++
 	} else if filter.SubjectID != nil {
-		// subject_id without type is not allowed – we'll add a condition that fails
 		conditions = append(conditions, "1=0")
 	}
 
@@ -435,16 +437,22 @@ func (r *eventRepository) buildEventFilter(filter repository.EventFilter) (strin
 		args = append(args, pq.Array(filter.EventTypes))
 		idx++
 	}
-
 	if filter.SourceType != nil {
 		conditions = append(conditions, fmt.Sprintf("source_type = $%d", idx))
 		args = append(args, *filter.SourceType)
 		idx++
 	}
-
 	if filter.DeviceID != nil {
 		conditions = append(conditions, fmt.Sprintf("device_id = $%d", idx))
 		args = append(args, *filter.DeviceID)
+		idx++
+	}
+
+	// 👇 NEW — location scope
+	if filter.LocationID != nil {
+		conditions = append(conditions, fmt.Sprintf(
+			"($%d::uuid IS NULL OR employment_location_id = $%d)", idx, idx))
+		args = append(args, *filter.LocationID)
 		idx++
 	}
 
@@ -453,32 +461,4 @@ func (r *eventRepository) buildEventFilter(filter repository.EventFilter) (strin
 		whereClause = "WHERE " + strings.Join(conditions, " AND ")
 	}
 	return whereClause, args
-}
-func (r *eventRepository) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
-	return r.client.BeginTx(ctx, opts)
-}
-
-func (r *eventRepository) FindCorrection(ctx context.Context, companyID, subjectID uuid.UUID, subjectType, correctionType string, eventTime time.Time) (*models.AttendanceEvent, error) {
-	query := `
-		SELECT
-			attendance_event_id, company_id, subject_type, subject_id,
-			event_type, event_time, source_type, source_id,
-			device_id, device_user_code, ip_address,
-			context, metadata, raw_event_payload, created_at, created_by
-		FROM attendance.attendance_events
-		WHERE company_id = $1
-			AND subject_type = $2
-			AND subject_id = $3
-			AND event_type = $4
-			AND source_type = 'correction'
-			AND event_time = $5
-		LIMIT 1
-	`
-	row := r.client.QueryRow(ctx, query, companyID, subjectType, subjectID, correctionType, eventTime)
-	return r.scanEvent(row)
-}
-
-func (r *eventRepository) HealthCheck(ctx context.Context) error {
-	_, err := r.client.Exec(ctx, `SELECT 1 FROM attendance.attendance_events LIMIT 1`)
-	return err
 }

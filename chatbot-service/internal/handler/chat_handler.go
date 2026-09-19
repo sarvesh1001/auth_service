@@ -47,6 +47,10 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 	permissionMask := ctx.Value("permission_mask")
 	deviceID, _ := ctx.Value("device_id").(string)
 
+	// ------------------- NEW: Extract Idempotency-Key -------------------
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	// --------------------------------------------------------------------
+
 	var req models.ChatRequest
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
@@ -70,7 +74,8 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 		Message:        req.Message,
 		AuthHeader:     r.Header.Get("Authorization"),
 		DeviceID:       deviceID,
-		Arguments:      req.Arguments, // NEW: pass arguments
+		Arguments:      req.Arguments,
+		IdempotencyKey: idempotencyKey, // <-- NEW
 	})
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to process chat request")

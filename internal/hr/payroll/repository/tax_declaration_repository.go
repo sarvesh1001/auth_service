@@ -1,6 +1,9 @@
 package repository
 
 import (
+	"auth-service/internal/client"
+	hrErrors "auth-service/internal/hr/errors"
+	"auth-service/internal/hr/payroll/models"
 	"context"
 	"database/sql"
 	"errors"
@@ -9,11 +12,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/lib/pq"
-	"go.uber.org/zap"
-
-	"auth-service/internal/client"
-	"auth-service/internal/hr/payroll/models"
-	"auth-service/internal/util"
 )
 
 // TaxDeclarationRepository defines operations for tax declaration types and employee declarations.
@@ -29,20 +27,27 @@ type TaxDeclarationRepository interface {
 	UpdateDeclaration(ctx context.Context, decl *models.TaxDeclaration) error
 	GetDeclarationByID(ctx context.Context, declarationID uuid.UUID) (*models.TaxDeclaration, error)
 	ListDeclarationsByUser(ctx context.Context, companyID, userID uuid.UUID, financialYear string) ([]models.TaxDeclaration, error)
-	ListDeclarationsByFinancialYear(ctx context.Context, companyID uuid.UUID, financialYear string, status *string) ([]models.TaxDeclaration, error)
+
+	// ListDeclarationsByFinancialYear — location filter applies when locationID != nil.
+	ListDeclarationsByFinancialYear(
+		ctx context.Context,
+		companyID uuid.UUID,
+		financialYear string,
+		status *string,
+		locationID *uuid.UUID,
+	) ([]models.TaxDeclaration, error)
+
 	VerifyDeclaration(ctx context.Context, declarationID uuid.UUID, verifiedBy uuid.UUID, status string) error
 }
 
 type taxDeclarationRepository struct {
 	client *client.PostgresClient
-	logger *zap.Logger
 }
 
 // NewTaxDeclarationRepository creates a new tax declaration repository.
-func NewTaxDeclarationRepository(postgresClient *client.PostgresClient, logger *zap.Logger) TaxDeclarationRepository {
+func NewTaxDeclarationRepository(postgresClient *client.PostgresClient) TaxDeclarationRepository {
 	return &taxDeclarationRepository{
 		client: postgresClient,
-		logger: logger.Named("tax_declaration_repo"),
 	}
 }
 
@@ -71,11 +76,6 @@ func (r *taxDeclarationRepository) CreateDeclarationType(ctx context.Context, dt
 		dt.UpdatedAt,
 	)
 	if err != nil {
-		r.logger.Error("Failed to create tax declaration type",
-			util.String("company_id", dt.CompanyID.String()),
-			util.String("type_code", dt.TypeCode),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to create tax declaration type: %w", err)
 	}
 	return nil
@@ -98,16 +98,11 @@ func (r *taxDeclarationRepository) UpdateDeclarationType(ctx context.Context, dt
 		dt.TypeCode,
 	)
 	if err != nil {
-		r.logger.Error("Failed to update tax declaration type",
-			util.String("company_id", dt.CompanyID.String()),
-			util.String("type_code", dt.TypeCode),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to update tax declaration type: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("tax declaration type not found")
+		return hrErrors.ErrTaxDeclarationTypeNotFound
 	}
 	return nil
 }
@@ -133,13 +128,8 @@ func (r *taxDeclarationRepository) GetDeclarationType(ctx context.Context, compa
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrTaxDeclarationTypeNotFound
 		}
-		r.logger.Error("Failed to get tax declaration type",
-			util.String("company_id", companyID.String()),
-			util.String("type_code", typeCode),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get tax declaration type: %w", err)
 	}
 	if maxLimit.Valid {
@@ -157,10 +147,6 @@ func (r *taxDeclarationRepository) ListDeclarationTypes(ctx context.Context, com
 	`
 	rows, err := r.client.Query(ctx, query, companyID)
 	if err != nil {
-		r.logger.Error("Failed to list tax declaration types",
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to list tax declaration types: %w", err)
 	}
 	defer rows.Close()
@@ -231,12 +217,6 @@ func (r *taxDeclarationRepository) CreateDeclaration(ctx context.Context, decl *
 		decl.UpdatedAt,
 	)
 	if err != nil {
-		r.logger.Error("Failed to create tax declaration",
-			util.String("declaration_id", decl.DeclarationID.String()),
-			util.String("company_id", decl.CompanyID.String()),
-			util.String("user_id", decl.UserID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to create tax declaration: %w", err)
 	}
 	return nil
@@ -258,15 +238,11 @@ func (r *taxDeclarationRepository) UpdateDeclaration(ctx context.Context, decl *
 		decl.DeclarationID,
 	)
 	if err != nil {
-		r.logger.Error("Failed to update tax declaration",
-			util.String("declaration_id", decl.DeclarationID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to update tax declaration: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("tax declaration not found")
+		return hrErrors.ErrTaxDeclarationNotFound
 	}
 	return nil
 }
@@ -303,12 +279,8 @@ func (r *taxDeclarationRepository) GetDeclarationByID(ctx context.Context, decla
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrTaxDeclarationNotFound
 		}
-		r.logger.Error("Failed to get tax declaration by ID",
-			util.String("declaration_id", declarationID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get tax declaration: %w", err)
 	}
 	decl.SupportingDocs = docs
@@ -333,13 +305,7 @@ func (r *taxDeclarationRepository) ListDeclarationsByUser(ctx context.Context, c
 	`
 	rows, err := r.client.Query(ctx, query, companyID, userID, financialYear)
 	if err != nil {
-		r.logger.Error("Failed to list declarations by user",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.String("financial_year", financialYear),
-			util.ErrorField(err),
-		)
-		return nil, fmt.Errorf("failed to list declarations: %w", err)
+		return nil, fmt.Errorf("failed to list declarations by user: %w", err)
 	}
 	defer rows.Close()
 
@@ -382,7 +348,17 @@ func (r *taxDeclarationRepository) ListDeclarationsByUser(ctx context.Context, c
 	return declarations, nil
 }
 
-func (r *taxDeclarationRepository) ListDeclarationsByFinancialYear(ctx context.Context, companyID uuid.UUID, financialYear string, status *string) ([]models.TaxDeclaration, error) {
+// ListDeclarationsByFinancialYear returns a list of declarations for a FY.
+//
+// Location: when locationID is non-nil, only declarations for employees whose
+// current employment_location_id matches are returned.
+func (r *taxDeclarationRepository) ListDeclarationsByFinancialYear(
+	ctx context.Context,
+	companyID uuid.UUID,
+	financialYear string,
+	status *string,
+	locationID *uuid.UUID,
+) ([]models.TaxDeclaration, error) {
 	query := `
 		SELECT
 			declaration_id, company_id, user_id, financial_year, declaration_type,
@@ -392,20 +368,28 @@ func (r *taxDeclarationRepository) ListDeclarationsByFinancialYear(ctx context.C
 		WHERE company_id = $1 AND financial_year = $2
 	`
 	args := []interface{}{companyID, financialYear}
+	argIdx := 3
+
 	if status != nil {
-		query += " AND status = $3"
+		query += fmt.Sprintf(" AND status = $%d", argIdx)
 		args = append(args, *status)
+		argIdx++
 	}
+
+	// 👇 Location filter — via company_employees (current assignment)
+	if locationID != nil {
+		query += fmt.Sprintf(
+			" AND user_id IN (SELECT user_id FROM company_employees WHERE company_id = $1 AND employment_location_id = $%d AND is_active = true)",
+			argIdx)
+		args = append(args, *locationID)
+		argIdx++
+	}
+
 	query += " ORDER BY user_id, declaration_type"
 
 	rows, err := r.client.Query(ctx, query, args...)
 	if err != nil {
-		r.logger.Error("Failed to list declarations by financial year",
-			util.String("company_id", companyID.String()),
-			util.String("financial_year", financialYear),
-			util.ErrorField(err),
-		)
-		return nil, fmt.Errorf("failed to list declarations: %w", err)
+		return nil, fmt.Errorf("failed to list declarations by financial year: %w", err)
 	}
 	defer rows.Close()
 
@@ -457,16 +441,11 @@ func (r *taxDeclarationRepository) VerifyDeclaration(ctx context.Context, declar
 	`
 	result, err := r.client.Exec(ctx, query, status, now, verifiedBy, declarationID)
 	if err != nil {
-		r.logger.Error("Failed to verify tax declaration",
-			util.String("declaration_id", declarationID.String()),
-			util.String("status", status),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to verify declaration: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("declaration not found")
+		return hrErrors.ErrTaxDeclarationNotFound
 	}
 	return nil
 }

@@ -1,6 +1,9 @@
 package repository
 
 import (
+	"auth-service/internal/client"
+	hrErrors "auth-service/internal/hr/errors"
+	"auth-service/internal/hr/payroll/models"
 	"context"
 	"database/sql"
 	"errors"
@@ -8,26 +11,18 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"go.uber.org/zap"
-
-	"auth-service/internal/client"
-	"auth-service/internal/hr/payroll/models"
-	"auth-service/internal/util"
 )
 
 type attendanceRuleRepository struct {
 	client *client.PostgresClient
-	logger *zap.Logger
 }
 
 // NewAttendanceRuleRepository creates a new AttendanceRuleRepository instance.
 func NewAttendanceRuleRepository(
 	postgresClient *client.PostgresClient,
-	logger *zap.Logger,
 ) AttendanceRuleRepository {
 	return &attendanceRuleRepository{
 		client: postgresClient,
-		logger: logger,
 	}
 }
 
@@ -36,7 +31,6 @@ func NewAttendanceRuleRepository(
 // ---------------------------------------------------------------------
 
 func (r *attendanceRuleRepository) Create(ctx context.Context, rule *models.AttendanceRule) error {
-	// Defensive: set ID if missing
 	if rule.RuleID == uuid.Nil {
 		rule.RuleID = uuid.New()
 	}
@@ -56,7 +50,7 @@ func (r *attendanceRuleRepository) Create(ctx context.Context, rule *models.Atte
 			value,
 			based_on,
 			threshold_minutes,
-			component_code,        -- new column
+			component_code,
 			is_active,
 			created_at,
 			created_by,
@@ -73,7 +67,7 @@ func (r *attendanceRuleRepository) Create(ctx context.Context, rule *models.Atte
 		rule.Value,
 		rule.BasedOn,
 		rule.ThresholdMinutes,
-		rule.ComponentCode, // new field
+		rule.ComponentCode,
 		rule.IsActive,
 		rule.CreatedAt,
 		rule.CreatedBy,
@@ -81,12 +75,6 @@ func (r *attendanceRuleRepository) Create(ctx context.Context, rule *models.Atte
 		rule.UpdatedBy,
 	)
 	if err != nil {
-		r.logger.Error("Failed to create attendance rule",
-			util.String("rule_id", rule.RuleID.String()),
-			util.String("company_id", rule.CompanyID.String()),
-			util.String("component_code", rule.ComponentCode),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to create attendance rule: %w", err)
 	}
 	return nil
@@ -104,7 +92,7 @@ func (r *attendanceRuleRepository) Update(ctx context.Context, rule *models.Atte
 			value = $3,
 			based_on = $4,
 			threshold_minutes = $5,
-			component_code = $6,        -- new column
+			component_code = $6,
 			is_active = $7,
 			updated_at = $8,
 			updated_by = $9
@@ -116,7 +104,7 @@ func (r *attendanceRuleRepository) Update(ctx context.Context, rule *models.Atte
 		rule.Value,
 		rule.BasedOn,
 		rule.ThresholdMinutes,
-		rule.ComponentCode, // new field
+		rule.ComponentCode,
 		rule.IsActive,
 		rule.UpdatedAt,
 		rule.UpdatedBy,
@@ -124,17 +112,11 @@ func (r *attendanceRuleRepository) Update(ctx context.Context, rule *models.Atte
 		rule.CompanyID,
 	)
 	if err != nil {
-		r.logger.Error("Failed to update attendance rule",
-			util.String("rule_id", rule.RuleID.String()),
-			util.String("company_id", rule.CompanyID.String()),
-			util.String("component_code", rule.ComponentCode),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to update attendance rule: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("attendance rule not found for company")
+		return hrErrors.ErrAttendanceRuleNotFound
 	}
 	return nil
 }
@@ -151,16 +133,11 @@ func (r *attendanceRuleRepository) SoftDeactivate(ctx context.Context, companyID
 	`
 	result, err := r.client.Exec(ctx, query, now, actorID, ruleID, companyID)
 	if err != nil {
-		r.logger.Error("Failed to soft‑deactivate attendance rule",
-			util.String("rule_id", ruleID.String()),
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to deactivate attendance rule: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("attendance rule not found")
+		return hrErrors.ErrAttendanceRuleNotFound
 	}
 	return nil
 }
@@ -175,7 +152,7 @@ func (r *attendanceRuleRepository) GetByID(ctx context.Context, companyID, ruleI
 			value,
 			based_on,
 			threshold_minutes,
-			component_code,        -- new column
+			component_code,
 			is_active,
 			created_at,
 			created_by,
@@ -194,7 +171,7 @@ func (r *attendanceRuleRepository) GetByID(ctx context.Context, companyID, ruleI
 		&rule.Value,
 		&rule.BasedOn,
 		&rule.ThresholdMinutes,
-		&rule.ComponentCode, // new field
+		&rule.ComponentCode,
 		&rule.IsActive,
 		&rule.CreatedAt,
 		&rule.CreatedBy,
@@ -203,13 +180,8 @@ func (r *attendanceRuleRepository) GetByID(ctx context.Context, companyID, ruleI
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrAttendanceRuleNotFound
 		}
-		r.logger.Error("Failed to get attendance rule by ID",
-			util.String("rule_id", ruleID.String()),
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get attendance rule: %w", err)
 	}
 	return &rule, nil
@@ -233,7 +205,7 @@ func (r *attendanceRuleRepository) GetActiveByCompany(
 			value,
 			based_on,
 			threshold_minutes,
-			component_code,        -- new column
+			component_code,
 			is_active,
 			created_at,
 			created_by,
@@ -246,10 +218,6 @@ func (r *attendanceRuleRepository) GetActiveByCompany(
 	`
 	rows, err := r.client.Query(ctx, query, companyID, asOf)
 	if err != nil {
-		r.logger.Error("Failed to get active attendance rules",
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get active attendance rules: %w", err)
 	}
 	defer rows.Close()
@@ -265,7 +233,7 @@ func (r *attendanceRuleRepository) GetActiveByCompany(
 			&rule.Value,
 			&rule.BasedOn,
 			&rule.ThresholdMinutes,
-			&rule.ComponentCode, // new field
+			&rule.ComponentCode,
 			&rule.IsActive,
 			&rule.CreatedAt,
 			&rule.CreatedBy,
@@ -286,7 +254,6 @@ func (r *attendanceRuleRepository) GetByFilter(
 	ctx context.Context,
 	filter models.AttendanceRuleFilter,
 ) ([]models.AttendanceRule, int, error) {
-	// Build WHERE clause dynamically
 	whereClause := "WHERE company_id = $1"
 	args := []interface{}{filter.CompanyID}
 	paramIdx := 2
@@ -311,17 +278,12 @@ func (r *attendanceRuleRepository) GetByFilter(
 		args = append(args, *filter.MinThreshold)
 		paramIdx++
 	}
-	// (Optional) filter by component_code if needed, but not part of current filter
 
 	// Count total
 	countQuery := `SELECT COUNT(*) FROM payroll.attendance_rule ` + whereClause
 	var total int
 	err := r.client.QueryRow(ctx, countQuery, args...).Scan(&total)
 	if err != nil {
-		r.logger.Error("Failed to count attendance rules by filter",
-			util.String("company_id", filter.CompanyID.String()),
-			util.ErrorField(err),
-		)
 		return nil, 0, fmt.Errorf("failed to count attendance rules: %w", err)
 	}
 	if total == 0 {
@@ -338,7 +300,7 @@ func (r *attendanceRuleRepository) GetByFilter(
 			value,
 			based_on,
 			threshold_minutes,
-			component_code,        -- new column
+			component_code,
 			is_active,
 			created_at,
 			created_by,
@@ -347,23 +309,17 @@ func (r *attendanceRuleRepository) GetByFilter(
 		FROM payroll.attendance_rule
 	` + whereClause + ` ORDER BY created_at DESC`
 
-	// Add pagination
 	if filter.Page > 0 && filter.PageSize > 0 {
 		offset := (filter.Page - 1) * filter.PageSize
 		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", paramIdx, paramIdx+1)
 		args = append(args, filter.PageSize, offset)
 	} else {
-		// default limit to avoid huge result sets
 		query += fmt.Sprintf(" LIMIT $%d", paramIdx)
 		args = append(args, 100)
 	}
 
 	rows, err := r.client.Query(ctx, query, args...)
 	if err != nil {
-		r.logger.Error("Failed to get attendance rules by filter",
-			util.String("company_id", filter.CompanyID.String()),
-			util.ErrorField(err),
-		)
 		return nil, 0, fmt.Errorf("failed to get attendance rules: %w", err)
 	}
 	defer rows.Close()
@@ -379,7 +335,7 @@ func (r *attendanceRuleRepository) GetByFilter(
 			&rule.Value,
 			&rule.BasedOn,
 			&rule.ThresholdMinutes,
-			&rule.ComponentCode, // new field
+			&rule.ComponentCode,
 			&rule.IsActive,
 			&rule.CreatedAt,
 			&rule.CreatedBy,
@@ -410,7 +366,7 @@ func (r *attendanceRuleRepository) GetByRuleType(
 			value,
 			based_on,
 			threshold_minutes,
-			component_code,        -- new column
+			component_code,
 			is_active,
 			created_at,
 			created_by,
@@ -422,11 +378,6 @@ func (r *attendanceRuleRepository) GetByRuleType(
 	`
 	rows, err := r.client.Query(ctx, query, companyID, ruleType)
 	if err != nil {
-		r.logger.Error("Failed to get attendance rules by type",
-			util.String("company_id", companyID.String()),
-			util.String("rule_type", ruleType),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get attendance rules by type: %w", err)
 	}
 	defer rows.Close()
@@ -442,7 +393,7 @@ func (r *attendanceRuleRepository) GetByRuleType(
 			&rule.Value,
 			&rule.BasedOn,
 			&rule.ThresholdMinutes,
-			&rule.ComponentCode, // new field
+			&rule.ComponentCode,
 			&rule.IsActive,
 			&rule.CreatedAt,
 			&rule.CreatedBy,
@@ -480,11 +431,6 @@ func (r *attendanceRuleRepository) BulkDeactivateByType(
 	`
 	_, err := r.client.Exec(ctx, query, now, actorID, companyID, ruleType)
 	if err != nil {
-		r.logger.Error("Failed to bulk deactivate attendance rules by type",
-			util.String("company_id", companyID.String()),
-			util.String("rule_type", ruleType),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to bulk deactivate attendance rules: %w", err)
 	}
 	return nil
@@ -505,11 +451,6 @@ func (r *attendanceRuleRepository) ExistsActiveRuleOfType(
 	var exists bool
 	err := r.client.QueryRow(ctx, query, companyID, ruleType).Scan(&exists)
 	if err != nil {
-		r.logger.Error("Failed to check existence of active rule",
-			util.String("company_id", companyID.String()),
-			util.String("rule_type", ruleType),
-			util.ErrorField(err),
-		)
 		return false, fmt.Errorf("failed to check active rule existence: %w", err)
 	}
 	return exists, nil

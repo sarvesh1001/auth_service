@@ -1,7 +1,9 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
@@ -10,19 +12,39 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 )
 
 type TaxDeclarationHandler struct {
 	taxService service.TaxDeclarationService
-	logger     *zap.Logger
 }
 
-func NewTaxDeclarationHandler(taxService service.TaxDeclarationService, logger *zap.Logger) *TaxDeclarationHandler {
+func NewTaxDeclarationHandler(taxService service.TaxDeclarationService) *TaxDeclarationHandler {
 	return &TaxDeclarationHandler{
 		taxService: taxService,
-		logger:     logger.Named("tax_declaration_handler"),
 	}
+}
+
+// ----------------------------------------------------------------------
+// Helper functions (local)
+// ----------------------------------------------------------------------
+
+func getActorID(ctx context.Context) (uuid.UUID, error) {
+	if v := ctx.Value("current_user_id"); v != nil {
+		if id, ok := v.(uuid.UUID); ok {
+			return id, nil
+		}
+	}
+	if v := ctx.Value("user_id"); v != nil {
+		switch raw := v.(type) {
+		case uuid.UUID:
+			return raw, nil
+		case string:
+			return uuid.Parse(raw)
+		default:
+			return uuid.Nil, errors.New("invalid user_id type")
+		}
+	}
+	return uuid.Nil, errors.New("user not authenticated")
 }
 
 // ----------------------------------------------------------------------
@@ -154,13 +176,13 @@ func mapDeclarationToResponse(d *models.TaxDeclaration) declarationResponse {
 // ----------------------------------------------------------------------
 
 func (h *TaxDeclarationHandler) CreateDeclarationType(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	actorID, err := getAdminActor(ctx)
+	actorID, err := getActorID(ctx)
 	if err != nil {
 		respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
@@ -178,7 +200,6 @@ func (h *TaxDeclarationHandler) CreateDeclarationType(w http.ResponseWriter, r *
 
 	dt, err := h.taxService.CreateDeclarationType(ctx, companyID, req.TypeCode, req.Description, req.MaxLimit, actorID)
 	if err != nil {
-		h.logger.Error("failed to create declaration type", zap.Error(err))
 		respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -198,7 +219,7 @@ func (h *TaxDeclarationHandler) CreateDeclarationType(w http.ResponseWriter, r *
 }
 
 func (h *TaxDeclarationHandler) UpdateDeclarationType(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, err.Error())
@@ -209,7 +230,7 @@ func (h *TaxDeclarationHandler) UpdateDeclarationType(w http.ResponseWriter, r *
 		respondWithError(w, http.StatusBadRequest, "type code required")
 		return
 	}
-	actorID, err := getAdminActor(ctx)
+	actorID, err := getActorID(ctx)
 	if err != nil {
 		respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
@@ -227,7 +248,6 @@ func (h *TaxDeclarationHandler) UpdateDeclarationType(w http.ResponseWriter, r *
 
 	dt, err := h.taxService.UpdateDeclarationType(ctx, companyID, typeCode, req.Description, req.MaxLimit, req.IsActive, actorID)
 	if err != nil {
-		h.logger.Error("failed to update declaration type", zap.Error(err))
 		respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -247,7 +267,7 @@ func (h *TaxDeclarationHandler) UpdateDeclarationType(w http.ResponseWriter, r *
 }
 
 func (h *TaxDeclarationHandler) ListDeclarationTypes(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, err.Error())
@@ -256,7 +276,6 @@ func (h *TaxDeclarationHandler) ListDeclarationTypes(w http.ResponseWriter, r *h
 
 	types, err := h.taxService.ListDeclarationTypes(ctx, companyID)
 	if err != nil {
-		h.logger.Error("failed to list declaration types", zap.Error(err))
 		respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -281,7 +300,7 @@ func (h *TaxDeclarationHandler) ListDeclarationTypes(w http.ResponseWriter, r *h
 }
 
 func (h *TaxDeclarationHandler) GetDeclarationType(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, err.Error())
@@ -295,7 +314,6 @@ func (h *TaxDeclarationHandler) GetDeclarationType(w http.ResponseWriter, r *htt
 
 	dt, err := h.taxService.GetDeclarationType(ctx, companyID, typeCode)
 	if err != nil {
-		h.logger.Error("failed to get declaration type", zap.Error(err))
 		respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -326,13 +344,13 @@ func (h *TaxDeclarationHandler) GetDeclarationType(w http.ResponseWriter, r *htt
 // ----------------------------------------------------------------------
 
 func (h *TaxDeclarationHandler) CreateDeclaration(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	actorID, err := getAdminActor(ctx) // assuming admin creates on behalf of employee; adjust if needed
+	actorID, err := getActorID(ctx)
 	if err != nil {
 		respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
@@ -355,12 +373,14 @@ func (h *TaxDeclarationHandler) CreateDeclaration(w http.ResponseWriter, r *http
 		DeclarationType: req.DeclarationType,
 		Amount:          req.Amount,
 		SupportingDocs:  req.SupportingDocs,
-		VerifiedBy:      &actorID, // creator is also verifier? The service uses VerifiedBy for audit.
+		VerifiedBy:      &actorID,
 	}
 
 	created, err := h.taxService.CreateDeclaration(ctx, declaration)
 	if err != nil {
-		h.logger.Error("failed to create tax declaration", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -372,13 +392,13 @@ func (h *TaxDeclarationHandler) CreateDeclaration(w http.ResponseWriter, r *http
 }
 
 func (h *TaxDeclarationHandler) UpdateDeclaration(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	declarationID, err := parseUUIDParam(r, "declarationID")
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	actorID, err := getAdminActor(ctx)
+	actorID, err := getActorID(ctx)
 	if err != nil {
 		respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
@@ -394,17 +414,18 @@ func (h *TaxDeclarationHandler) UpdateDeclaration(w http.ResponseWriter, r *http
 		return
 	}
 
-	// Construct a partial update object (only fields that can be updated)
 	declaration := &models.TaxDeclaration{
 		DeclarationID:  declarationID,
 		Amount:         req.Amount,
 		SupportingDocs: req.SupportingDocs,
-		VerifiedBy:     &actorID, // used as updater for audit
+		VerifiedBy:     &actorID,
 	}
 
 	updated, err := h.taxService.UpdateDeclaration(ctx, declaration)
 	if err != nil {
-		h.logger.Error("failed to update tax declaration", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -416,13 +437,13 @@ func (h *TaxDeclarationHandler) UpdateDeclaration(w http.ResponseWriter, r *http
 }
 
 func (h *TaxDeclarationHandler) VerifyDeclaration(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	declarationID, err := parseUUIDParam(r, "declarationID")
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	actorID, err := getAdminActor(ctx)
+	actorID, err := getActorID(ctx)
 	if err != nil {
 		respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
@@ -440,7 +461,9 @@ func (h *TaxDeclarationHandler) VerifyDeclaration(w http.ResponseWriter, r *http
 
 	updated, err := h.taxService.VerifyDeclaration(ctx, declarationID, actorID, req.Status)
 	if err != nil {
-		h.logger.Error("failed to verify tax declaration", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -452,7 +475,7 @@ func (h *TaxDeclarationHandler) VerifyDeclaration(w http.ResponseWriter, r *http
 }
 
 func (h *TaxDeclarationHandler) ListDeclarationsByUser(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, err.Error())
@@ -471,7 +494,9 @@ func (h *TaxDeclarationHandler) ListDeclarationsByUser(w http.ResponseWriter, r 
 
 	declarations, err := h.taxService.ListDeclarationsByUser(ctx, companyID, userID, financialYear)
 	if err != nil {
-		h.logger.Error("failed to list declarations by user", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -488,7 +513,7 @@ func (h *TaxDeclarationHandler) ListDeclarationsByUser(w http.ResponseWriter, r 
 }
 
 func (h *TaxDeclarationHandler) ListDeclarationsByFinancialYear(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, err.Error())
@@ -504,9 +529,12 @@ func (h *TaxDeclarationHandler) ListDeclarationsByFinancialYear(w http.ResponseW
 		status = &s
 	}
 
-	declarations, err := h.taxService.ListDeclarationsByFinancialYear(ctx, companyID, financialYear, status)
+	locFilter := locationFilterFromCtx(ctx)
+	declarations, err := h.taxService.ListDeclarationsByFinancialYear(ctx, companyID, financialYear, status, locFilter)
 	if err != nil {
-		h.logger.Error("failed to list declarations by financial year", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -523,7 +551,7 @@ func (h *TaxDeclarationHandler) ListDeclarationsByFinancialYear(w http.ResponseW
 }
 
 func (h *TaxDeclarationHandler) GetTotalDeclaredAmount(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, err.Error())
@@ -543,7 +571,9 @@ func (h *TaxDeclarationHandler) GetTotalDeclaredAmount(w http.ResponseWriter, r 
 
 	total, err := h.taxService.GetTotalDeclaredAmount(ctx, companyID, userID, financialYear, onlyVerified)
 	if err != nil {
-		h.logger.Error("failed to get total declared amount", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

@@ -1,0 +1,132 @@
+{
+    "title": "Admin Service Monitoring",
+    "uid": "admin-dashboard",
+    "tags": ["auth", "admin"],
+    "timezone": "browser",
+    "schemaVersion": 36,
+    "version": 2,
+    "refresh": "30s",
+    "time": {
+      "from": "now-7d",
+      "to": "now"
+    },
+    "panels": [
+      {
+        "id": 1,
+        "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+        "type": "stat",
+        "title": "Total Admin Actions (last 7d)",
+        "targets": [
+          {
+            "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+            "format": "table",
+            "queryType": "raw",
+            "rawSql": "SELECT sum(total_events) AS total FROM audit_events_daily WHERE $__timeFilter(event_date) AND module LIKE 'admin_%'",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "none",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                { "color": "green", "value": null }
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+        "type": "stat",
+        "title": "Unique Actors (last 7d)",
+        "targets": [
+          {
+            "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+            "format": "table",
+            "queryType": "raw",
+            "rawSql": "SELECT count(DISTINCT actor_id) AS actors FROM audit_events WHERE $__timeFilter(created_at) AND module LIKE 'admin_%' AND actor_id IS NOT NULL",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "none"
+          }
+        }
+      },
+      {
+        "id": 3,
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+        "type": "barchart",
+        "title": "Actions by Module",
+        "targets": [
+          {
+            "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+            "format": "table",
+            "queryType": "raw",
+            "rawSql": "SELECT module, sum(total_events) AS count FROM audit_events_daily WHERE $__timeFilter(event_date) AND module LIKE 'admin_%' GROUP BY module ORDER BY count DESC",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "none"
+          }
+        }
+      },
+      {
+        "id": 4,
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+        "type": "piechart",
+        "title": "Actions by Action (top 10)",
+        "targets": [
+          {
+            "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+            "format": "table",
+            "queryType": "raw",
+            "rawSql": "SELECT action, sum(total_events) AS count FROM audit_events_daily WHERE $__timeFilter(event_date) AND module LIKE 'admin_%' GROUP BY action ORDER BY count DESC LIMIT 10",
+            "refId": "A"
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+        "type": "timeseries",
+        "title": "Admin Actions Trend (last 7d)",
+        "targets": [
+          {
+            "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+            "format": "table",
+            "queryType": "raw",
+            "rawSql": "SELECT event_date AS time, sum(total_events) AS actions FROM audit_events_daily WHERE $__timeFilter(event_date) AND module LIKE 'admin_%' GROUP BY event_date ORDER BY time",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "none"
+          }
+        }
+      },
+      {
+        "id": 6,
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+        "type": "table",
+        "title": "Top Actors (last 7d)",
+        "targets": [
+          {
+            "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+            "format": "table",
+            "queryType": "raw",
+            "rawSql": "SELECT actor_id, count(*) AS actions FROM audit_events WHERE $__timeFilter(created_at) AND module LIKE 'admin_%' AND actor_id IS NOT NULL GROUP BY actor_id ORDER BY actions DESC LIMIT 20",
+            "refId": "A"
+          }
+        ]
+      }
+    ],
+    "templating": { "list": [] }
+  }

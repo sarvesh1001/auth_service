@@ -6,60 +6,66 @@
 # ✅ FIXED: Removed UNION from materialized views (not supported)
 # ✅ FIXED: Corrected port variable, improved timeout handling
 # ✅ FIXED: Corrected system.tables query for ClickHouse 24.8
+# ✅ ADDED: audit_events table – exact match to old PostgreSQL audit_logs
 # ============================================================
 
-set -e
+set -Eeuo pipefail
 
 echo "🔧 Starting ClickHouse initialization for time-series analytics..."
 
-# Use environment variables with proper defaults
-CLICKHOUSE_HOST="${CLICKHOUSE_HOST:-localhost}"
+# Use environment variables with proper defaults and required checks
+CLICKHOUSE_HOST="${CLICKHOUSE_HOST:-clickhouse}"
 CLICKHOUSE_PORT="${CLICKHOUSE_PORT:-9000}"
-CLICKHOUSE_USER="${CLICKHOUSE_USER:-default}"
-CLICKHOUSE_PASSWORD="${CLICKHOUSE_PASSWORD:-}"
+CLICKHOUSE_USER="${CLICKHOUSE_USER:?CLICKHOUSE_USER is required}"
+CLICKHOUSE_PASSWORD="${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD is required}"
+CLICKHOUSE_DATABASE="${CLICKHOUSE_DATABASE:-auth_analytics}"
 
-echo "📋 Connection details: $CLICKHOUSE_HOST:$CLICKHOUSE_PORT (user: $CLICKHOUSE_USER)"
+echo "📋 Target: ${CLICKHOUSE_HOST}:${CLICKHOUSE_PORT}"
+echo "📋 User: ${CLICKHOUSE_USER}"
+echo "📋 Database: ${CLICKHOUSE_DATABASE}"
 
-# Build connection string
-AUTH_STR=""
-if [ -n "$CLICKHOUSE_USER" ]; then
-    AUTH_STR="--user $CLICKHOUSE_USER"
-    if [ -n "$CLICKHOUSE_PASSWORD" ]; then
-        AUTH_STR="$AUTH_STR --password $CLICKHOUSE_PASSWORD"
-    fi
-fi
-
-# Wait for ClickHouse to be ready with improved retry logic
-echo "⏳ Waiting for ClickHouse to be ready at $CLICKHOUSE_HOST:$CLICKHOUSE_PORT..."
+# Wait for ClickHouse to be ready with exponential backoff
 MAX_ATTEMPTS=60
 ATTEMPT=1
 RETRY_INTERVAL=2
 
-while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
-    if clickhouse-client $AUTH_STR --host "$CLICKHOUSE_HOST" --port "$CLICKHOUSE_PORT" --query "SELECT 1" 2>/dev/null; then
+echo "⏳ Waiting for ClickHouse to be ready at ${CLICKHOUSE_HOST}:${CLICKHOUSE_PORT}..."
+while (( ATTEMPT <= MAX_ATTEMPTS )); do
+    if clickhouse-client \
+        --host "${CLICKHOUSE_HOST}" \
+        --port "${CLICKHOUSE_PORT}" \
+        --user "${CLICKHOUSE_USER}" \
+        --password "${CLICKHOUSE_PASSWORD}" \
+        --query "SELECT 1" >/dev/null 2>&1
+    then
         echo "✅ ClickHouse is ready!"
         break
     fi
 
     ELAPSED=$((ATTEMPT * RETRY_INTERVAL))
-    echo "   Attempt $ATTEMPT/$MAX_ATTEMPTS (${ELAPSED}s elapsed)..."
-    
-    if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+    echo "   Attempt ${ATTEMPT}/${MAX_ATTEMPTS} (${ELAPSED}s elapsed)..."
+
+    if (( ATTEMPT == MAX_ATTEMPTS )); then
         echo ""
-        echo "❌ Failed to connect to ClickHouse after $MAX_ATTEMPTS attempts"
+        echo "❌ Failed to connect to ClickHouse after ${MAX_ATTEMPTS} attempts"
         echo "🔍 Troubleshooting:"
         echo "   • Check ClickHouse logs: docker logs clickhouse-dev"
-        echo "   • Verify host/port: $CLICKHOUSE_HOST:$CLICKHOUSE_PORT"
+        echo "   • Verify host/port: ${CLICKHOUSE_HOST}:${CLICKHOUSE_PORT}"
         exit 1
     fi
 
-    sleep $RETRY_INTERVAL
-    ATTEMPT=$((ATTEMPT + 1))
+    sleep ${RETRY_INTERVAL}
+    ((ATTEMPT++))
 done
 
 # Create database and tables
 echo "🏗️ Creating database and time-series tables..."
-clickhouse-client $AUTH_STR --host "$CLICKHOUSE_HOST" --port "$CLICKHOUSE_PORT" --multiquery <<'EOL'
+clickhouse-client \
+    --host "${CLICKHOUSE_HOST}" \
+    --port "${CLICKHOUSE_PORT}" \
+    --user "${CLICKHOUSE_USER}" \
+    --password "${CLICKHOUSE_PASSWORD}" \
+    --multiquery <<'EOL'
 
 -- ========================================================================
 -- DATABASE SETUP
@@ -202,7 +208,12 @@ EOL
 echo "✅ Time-series tables created successfully!"
 echo "📊 Creating analytics views..."
 
-clickhouse-client $AUTH_STR --host "$CLICKHOUSE_HOST" --port "$CLICKHOUSE_PORT" --multiquery <<'EOL'
+clickhouse-client \
+    --host "${CLICKHOUSE_HOST}" \
+    --port "${CLICKHOUSE_PORT}" \
+    --user "${CLICKHOUSE_USER}" \
+    --password "${CLICKHOUSE_PASSWORD}" \
+    --multiquery <<'EOL'
 
 -- ========================================================================
 -- ANALYTICS VIEWS FOR TIME-SERIES DATA
@@ -390,10 +401,12 @@ FROM (
 )
 GROUP BY hour, event_type;
 
+-- ========================================================================
+-- AUDIT LOG TABLES
+-- ========================================================================
 
-
-
--- Add audit logs table to ClickHouse
+-- 1️⃣ Existing audit_logs table (includes extra fields)
+-- Kept for backward compatibility or future use
 CREATE TABLE IF NOT EXISTS auth_analytics.audit_logs (
     audit_id UUID,
     company_id Nullable(UUID),
@@ -417,7 +430,7 @@ ORDER BY (created_at, module, action)
 TTL created_at + INTERVAL 180 DAY
 SETTINGS index_granularity = 8192;
 
--- Create materialized view for daily aggregations
+-- Materialized view for daily aggregations (for existing table)
 CREATE MATERIALIZED VIEW IF NOT EXISTS auth_analytics.audit_logs_daily
 ENGINE = SummingMergeTree()
 PARTITION BY toYYYYMM(event_date)
@@ -434,10 +447,48 @@ SELECT
 FROM auth_analytics.audit_logs
 GROUP BY event_date, module, action, actor_type;
 
+-- 2️⃣ NEW: audit_events table – EXACT match to old PostgreSQL audit_logs
+-- This table has only the 12 original columns (no environment, version, etc.)
+-- JSON fields are stored as String, which works exactly like JSONB in PostgreSQL
+CREATE TABLE IF NOT EXISTS auth_analytics.audit_events (
+    audit_id UUID,
+    company_id Nullable(UUID),
+    module String,
+    action String,
+    entity_type String,
+    entity_id Nullable(UUID),
+    actor_type String,
+    actor_id Nullable(UUID),
+    before_state Nullable(String),   -- JSON stored as String
+    after_state Nullable(String),    -- JSON stored as String
+    metadata Nullable(String),       -- JSON stored as String
+    created_at DateTime
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(created_at)
+ORDER BY (created_at, module, action)
+TTL created_at + INTERVAL 180 DAY
+SETTINGS index_granularity = 8192;
 
+-- Materialized view for daily aggregations (for the new table)
+CREATE MATERIALIZED VIEW IF NOT EXISTS auth_analytics.audit_events_daily
+ENGINE = SummingMergeTree()
+PARTITION BY toYYYYMM(event_date)
+ORDER BY (event_date, module, action, actor_type)
+SETTINGS allow_nullable_key = 1 AS
+SELECT
+    toDate(created_at) AS event_date,
+    module,
+    action,
+    actor_type,
+    count() AS total_events,
+    uniq(company_id) AS unique_companies,
+    uniq(actor_id) AS unique_actors
+FROM auth_analytics.audit_events
+GROUP BY event_date, module, action, actor_type;
 
-
-
+-- ========================================================================
+-- RISK ANALYSIS VIEW (regular, not materialized)
+-- ========================================================================
 
 -- 🛡️ NEW: Risk Analysis View
 CREATE VIEW IF NOT EXISTS auth_analytics.risk_analysis_hourly AS
@@ -460,7 +511,12 @@ EOL
 echo "✅ Analytics views created successfully!"
 echo ""
 echo "📋 Verifying tables and views..."
-clickhouse-client $AUTH_STR --host "$CLICKHOUSE_HOST" --port "$CLICKHOUSE_PORT" --query "
+clickhouse-client \
+    --host "${CLICKHOUSE_HOST}" \
+    --port "${CLICKHOUSE_PORT}" \
+    --user "${CLICKHOUSE_USER}" \
+    --password "${CLICKHOUSE_PASSWORD}" \
+    --query "
 SELECT 
     name as object_name,
     engine
@@ -475,20 +531,25 @@ echo ""
 echo "✅ Summary:"
 echo "   • Device, MPIN, OTP, Security event tables created"
 echo "   • NEW: security_risk_events table for bot protection, IP reputation, risk scoring"
+echo "   • NEW: audit_events table – exact match to old PostgreSQL audit_logs"
+echo "   • Existing audit_logs table (with extra fields) kept for compatibility"
 echo "   • Materialized views created for daily aggregations:"
 echo "     - device_events_daily"
 echo "     - mpin_events_daily"
 echo "     - otp_events_daily"
 echo "     - security_events_daily"
 echo "     - security_risk_events_daily (NEW)"
+echo "     - audit_logs_daily (for existing table)"
+echo "     - audit_events_daily (for new table)"
 echo "   • Regular views for cross-event analytics:"
 echo "     - all_events_daily"
 echo "     - events_hourly"
 echo "     - risk_analysis_hourly (NEW)"
-echo "   • 30-day TTL for most events, 90-day for security events"
+echo "   • TTL: 30 days for most events, 90 days for security, 180 days for audit"
 echo ""
 echo "📝 Sample Queries:"
 echo "   clickhouse-client -u auth_svc_user -p <password> << 'SQL'"
-echo "   SELECT * FROM auth_analytics.security_risk_events_daily LIMIT 10;"
+echo "   SELECT * FROM auth_analytics.audit_events WHERE company_id = '...' LIMIT 10;"
+echo "   SELECT event_date, module, total_events FROM auth_analytics.audit_events_daily;"
 echo "   SELECT event_type_detail, count() FROM auth_analytics.security_risk_events WHERE action_taken = 'blocked' GROUP BY event_type_detail;"
 echo "   SQL"

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"time"
 
-	"auth-service/internal/academics"
 	"auth-service/internal/academics/handler"
 	"auth-service/internal/academics/repository"
 	academicsvc "auth-service/internal/academics/service"
@@ -19,7 +18,6 @@ import (
 	"auth-service/internal/infrastructure/outbox"
 	mainservice "auth-service/internal/service"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
@@ -1056,45 +1054,6 @@ func (af *AcademicsInfraFactory) CurriculumHandler() *handler.CurriculumHandler 
 // ================================
 // Routes Registration
 // ================================
-
-func (af *AcademicsInfraFactory) RegisterRoutes(r chi.Router, jwtService *mainservice.JWTService, logger *zap.Logger) {
-	af.log.Info("📌 Registering academic routes")
-
-	// Get the session generation handler specifically for logging
-	sessGenHandler := af.SessionGenerationHandler()
-	af.log.Info("🔍 SessionGenerationHandler before registration",
-		zap.Bool("is_nil", sessGenHandler == nil),
-		zap.String("address", fmt.Sprintf("%p", sessGenHandler)),
-	)
-
-	academics.RegisterAcademicRoutes(
-		r,
-		af.AcademicYearHandler(),
-		af.AdmissionHandler(),
-		af.AnalyticsHandler(),
-		af.AssignmentHandler(),
-		af.CourseHandler(),
-		af.CurriculumHandler(),
-		af.EnrollmentHandler(),
-		af.ExamHandler(),
-		af.FeeHandler(),
-		af.GradingHandler(),
-		af.GuardianHandler(),
-		af.LibraryHandler(),
-		af.NotificationHandler(),
-		af.RoomHandler(),
-		af.SectionHandler(),
-		af.StudentHandler(),
-		af.SubjectHandler(),
-		af.SubmissionHandler(),
-		af.TeacherHandler(),
-		af.TermHandler(),
-		af.TimetableHandler(),
-		af.TransportHandler(),
-		sessGenHandler,
-	)
-	af.log.Info("✅ Academic routes registered")
-}
 
 // Close is a no‑op because the outbox processor is managed centrally
 func (af *AcademicsInfraFactory) Close() {

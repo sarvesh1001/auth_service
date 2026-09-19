@@ -1857,65 +1857,6 @@ func (h *AdminHandler) handleOTPError(w http.ResponseWriter, err error) {
 // COMPANY HANDLERS
 // ============================
 
-// validateCreateCompanyRequest validates company creation input.
-func validateCreateCompanyRequest(req CreateCompanyRequest) error {
-	// (unchanged, keep as is)
-	if strings.TrimSpace(req.CompanyName) == "" {
-		return fmt.Errorf("company_name is required")
-	}
-	if strings.TrimSpace(req.OwnerPhone) == "" {
-		return fmt.Errorf("owner_phone is required")
-	}
-	if strings.TrimSpace(req.OwnerUsername) == "" {
-		return fmt.Errorf("owner_username is required")
-	}
-	if len(req.OwnerUsername) < 3 || len(req.OwnerUsername) > 100 {
-		return fmt.Errorf("owner_username must be between 3 and 100 characters")
-	}
-	if strings.TrimSpace(req.OwnerFullName) == "" {
-		return fmt.Errorf("owner_full_name is required")
-	}
-	if len(req.OwnerFullName) > 255 {
-		return fmt.Errorf("owner_full_name must be at most 255 characters")
-	}
-	if strings.TrimSpace(req.OwnerPositionTitle) == "" {
-		return fmt.Errorf("owner_position_title is required")
-	}
-	if len(req.OwnerPositionTitle) > 255 {
-		return fmt.Errorf("owner_position_title must be at most 255 characters")
-	}
-	validTiers := map[string]bool{
-		"basic": true, "premium": true, "enterprise": true,
-	}
-	if !validTiers[req.SubscriptionTier] {
-		return fmt.Errorf("subscription_tier must be one of: basic, premium, enterprise")
-	}
-	if req.MaxEmployees < 1 || req.MaxEmployees > 2000 {
-		return fmt.Errorf("max_employees must be between 1 and 2000")
-	}
-	if req.MaxDepartments < 1 || req.MaxDepartments > 100 {
-		return fmt.Errorf("max_departments must be between 1 and 100")
-	}
-	totalDepartments := len(req.Departments) + 1
-	if totalDepartments > req.MaxDepartments {
-		return fmt.Errorf(
-			"requested %d departments exceeds max_departments limit of %d",
-			totalDepartments,
-			req.MaxDepartments,
-		)
-	}
-	if strings.TrimSpace(req.DataRegion) == "" {
-		return fmt.Errorf("data_region is required")
-	}
-	if req.SubscriptionMonths < 1 || req.SubscriptionMonths > 36 {
-		return fmt.Errorf("subscription_months must be between 1 and 36")
-	}
-	if req.SubscriptionDays < 0 || req.SubscriptionDays > 30 {
-		return fmt.Errorf("subscription_days must be between 0 and 30")
-	}
-	return nil
-}
-
 // GetCompany retrieves a company by ID.
 // @Summary Get company by ID
 // @Tags admin-companies
@@ -6394,11 +6335,20 @@ func (h *AdminHandler) ValidateDepartmentHierarchy(w http.ResponseWriter, r *htt
 // @Failure 400 {object} map[string]interface{} "Invalid company ID"
 // @Failure 401 {object} map[string]interface{} "Unauthorized"
 // @Router /api/v1/admin/companies/{companyID}/info [get]
+// GetCompanyByID retrieves a company by ID (alias for admin use).
+// @Summary Get company by ID
+// @Tags admin-companies
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Success 200 {object} map[string]interface{} "Company details"
+// @Failure 400 {object} map[string]interface{} "Invalid company ID"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Failure 404 {object} map[string]interface{} "Company not found"
+// @Router /api/v1/admin/companies/{companyID}/info [get]
 func (h *AdminHandler) GetCompanyByID(w http.ResponseWriter, r *http.Request) {
 	ctx := h.injectClientIP(r.Context(), r)
 
-	_, err := h.getRequesterAdminID(r)
-	if err != nil {
+	if _, err := h.getRequesterAdminID(r); err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
 		return
 	}
@@ -6410,7 +6360,7 @@ func (h *AdminHandler) GetCompanyByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	company, err := h.companyService.GetCompanyByID(ctx, companyID)
+	view, err := h.companyService.GetCompanyDetail(ctx, companyID)
 	if err != nil {
 		status, msg := h.mapServiceError(err)
 		h.respondWithError(w, status, err, msg)
@@ -6419,7 +6369,7 @@ func (h *AdminHandler) GetCompanyByID(w http.ResponseWriter, r *http.Request) {
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
-		"data":    company,
+		"data":    view,
 	})
 }
 
@@ -6462,138 +6412,9 @@ func (h *AdminHandler) GetActiveDepartmentCount(w http.ResponseWriter, r *http.R
 	})
 }
 
-// GetCompanyDepartmentInfo retrieves department quota and usage info for a company.
-// @Summary Get company department info
-// @Tags admin-companies
-// @Produce json
-// @Param companyID path string true "Company UUID"
-// @Success 200 {object} map[string]interface{} "Department quota and usage"
-// @Failure 400 {object} map[string]interface{} "Invalid company ID"
-// @Failure 401 {object} map[string]interface{} "Unauthorized"
-// @Router /api/v1/admin/companies/{companyID}/department-info [get]
-func (h *AdminHandler) GetCompanyDepartmentInfo(w http.ResponseWriter, r *http.Request) {
-	ctx := h.injectClientIP(r.Context(), r)
-
-	_, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
-		return
-	}
-
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company_id")
-		return
-	}
-
-	info, err := h.companyService.GetCompanyDepartmentInfo(ctx, companyID)
-	if err != nil {
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, err, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"data":    info,
-	})
-}
-
-// CheckDepartmentLimit checks if a company can create more departments.
-// @Summary Check department limit
-// @Tags admin-companies
-// @Produce json
-// @Param companyID path string true "Company UUID"
-// @Success 200 {object} map[string]interface{} "Creation allowed"
-// @Failure 400 {object} map[string]interface{} "Invalid company ID"
-// @Failure 401 {object} map[string]interface{} "Unauthorized"
-// @Failure 409 {object} map[string]interface{} "Limit reached"
-// @Router /api/v1/admin/companies/{companyID}/check-department-limit [get]
-func (h *AdminHandler) CheckDepartmentLimit(w http.ResponseWriter, r *http.Request) {
-	ctx := h.injectClientIP(r.Context(), r)
-
-	_, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
-		return
-	}
-
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company_id")
-		return
-	}
-
-	if err := h.companyService.CheckDepartmentLimit(ctx, companyID); err != nil {
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, err, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "Department creation allowed",
-	})
-}
-
 // ============================
 // UPDATE MAX DEPARTMENTS
 // ============================
-
-// UpdateMaxDepartmentsRequest represents the request to update max departments.
-type UpdateMaxDepartmentsRequest struct {
-	MaxDepartments int `json:"max_departments"`
-}
-
-// UpdateMaxDepartments updates the maximum number of departments allowed for a company.
-// @Summary Update max departments
-// @Tags admin-companies
-// @Accept json
-// @Produce json
-// @Param companyID path string true "Company UUID"
-// @Param body body UpdateMaxDepartmentsRequest true "New max departments"
-// @Success 200 {object} map[string]interface{} "Updated successfully"
-// @Failure 400 {object} map[string]interface{} "Invalid input"
-// @Failure 401 {object} map[string]interface{} "Unauthorized"
-// @Failure 403 {object} map[string]interface{} "Permission denied"
-// @Router /api/v1/admin/companies/{companyID}/max-departments [put]
-func (h *AdminHandler) UpdateMaxDepartments(w http.ResponseWriter, r *http.Request) {
-	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
-
-	_, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
-		return
-	}
-
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company_id")
-		return
-	}
-
-	var req UpdateMaxDepartmentsRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
-
-	if req.MaxDepartments < 1 || req.MaxDepartments > 100 {
-		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "max_departments must be between 1 and 100")
-		return
-	}
-
-	if err := h.companyService.UpdateMaxDepartments(ctx, companyID, req.MaxDepartments); err != nil {
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, err, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "Max departments updated successfully",
-	})
-}
 
 // ============================
 // DEPARTMENT SOFT DELETE & ACTIVATE
@@ -7321,6 +7142,9 @@ func (h *AdminHandler) GetOpenPositions(w http.ResponseWriter, r *http.Request) 
 // ============================
 // CREATE COMPANY
 // ============================
+// =====================================================================
+// Handler-level request DTO + validation
+// =====================================================================
 
 // CreateCompanyRequest is the request payload for creating a company.
 type CreateCompanyRequest struct {
@@ -7329,12 +7153,14 @@ type CreateCompanyRequest struct {
 	OwnerUsername           string   `json:"owner_username" validate:"required,min=3,max=100,alphanum"`
 	OwnerFullName           string   `json:"owner_full_name" validate:"required,max=255"`
 	OwnerPositionTitle      string   `json:"owner_position_title" validate:"required,max=255"`
-	SubscriptionTier        string   `json:"subscription_tier" validate:"required,oneof=basic premium enterprise"`
+	SubscriptionTier        string   `json:"subscription_tier"`
+	SubscriptionPlanCode    string   `json:"subscription_plan_code"`
 	MaxEmployees            int      `json:"max_employees" validate:"required,min=1,max=2000"`
-	MaxDepartments          int      `json:"max_departments" validate:"required,min=1,max=100"`
-	DataRegion              string   `json:"data_region" validate:"required"`
-	SubscriptionMonths      int      `json:"subscription_months" validate:"required,min=1,max=36"`
-	SubscriptionDays        int      `json:"subscription_days" validate:"min=0,max=30"`
+	MaxLocations            int      `json:"max_locations" validate:"required,min=1,max=500"`
+	DataRegion              string   `json:"data_region"   validate:"required"`
+	SubscriptionMonths      int      `json:"subscription_months" validate:"min=0,max=36"`
+	SubscriptionDays        int      `json:"subscription_days"   validate:"min=0,max=30"`
+	TrialDays               int      `json:"trial_days"          validate:"min=0"`
 	Departments             []string `json:"departments"`
 	FinancialYearStartMonth int      `json:"financial_year_start_month" validate:"required,min=1,max=12"`
 	WorkCenterCode          string   `json:"work_center_code" validate:"required,max=100"`
@@ -7343,7 +7169,239 @@ type CreateCompanyRequest struct {
 	WorkCenterTZ            string   `json:"work_center_timezone" validate:"required"`
 	WorkCenterActive        bool     `json:"work_center_is_active"`
 	PositionWorkCenterCode  *string  `json:"position_work_center_code,omitempty"`
+	LocationCode            string   `json:"location_code" validate:"required"`
+	LocationName            string   `json:"location_name" validate:"required"`
+	AddressLine1            *string  `json:"address_line1,omitempty"`
+	AddressLine2            *string  `json:"address_line2,omitempty"`
+	City                    *string  `json:"city,omitempty"`
+	State                   *string  `json:"state,omitempty"`
+	Country                 *string  `json:"country,omitempty"`
+	Pincode                 *string  `json:"pincode,omitempty"`
+
+	// ============================================================
+	// 👇 Owner employee profile — mirrors AddMemberRequest.
+	//    All optional / nullable; missing values → NULL in DB.
+	//    CostCenter is nullable (cost_center can be null).
+	// ============================================================
+	OwnerDateOfBirth      *time.Time `json:"owner_date_of_birth,omitempty"`
+	OwnerGender           *string    `json:"owner_gender,omitempty"`
+	OwnerMaritalStatus    *string    `json:"owner_marital_status,omitempty"`
+	OwnerNationality      *string    `json:"owner_nationality,omitempty"`
+	OwnerEmploymentType   *string    `json:"owner_employment_type,omitempty"`
+	OwnerEmploymentStatus *string    `json:"owner_employment_status,omitempty"`
+	OwnerProbationEndDate *time.Time `json:"owner_probation_end_date,omitempty"`
+	OwnerConfirmationDate *time.Time `json:"owner_confirmation_date,omitempty"`
+	OwnerGrade            *string    `json:"owner_grade,omitempty"`
+	OwnerCostCenterID     *uuid.UUID `json:"owner_cost_center_id,omitempty"`
+	OwnerCostCenter       *string    `json:"owner_cost_center,omitempty"`
+	OwnerTaxID            *string    `json:"owner_tax_id,omitempty"`
+	OwnerSocialSecurityID *string    `json:"owner_social_security_id,omitempty"`
+	OwnerEmail            *string    `json:"owner_email,omitempty"`
 }
+
+// validateCreateCompanyRequest validates company creation input.
+//
+// Subscription-related fields are OPTIONAL here:
+//   - subscription_months == 0 and subscription_days == 0 and trial_days == 0
+//     → company is created with no subscription window (status = pending).
+//   - subscription_months > 0  → window extended by that many months.
+//   - subscription_days   > 0  → adds days on top of months.
+//   - trial_days          > 0  → trial window instead of a paid one.
+
+func validateCreateCompanyRequest(req CreateCompanyRequest) error {
+	if strings.TrimSpace(req.CompanyName) == "" {
+		return fmt.Errorf("company_name is required")
+	}
+	if strings.TrimSpace(req.OwnerPhone) == "" {
+		return fmt.Errorf("owner_phone is required")
+	}
+	if strings.TrimSpace(req.OwnerUsername) == "" {
+		return fmt.Errorf("owner_username is required")
+	}
+	if len(req.OwnerUsername) < 3 || len(req.OwnerUsername) > 100 {
+		return fmt.Errorf("owner_username must be between 3 and 100 characters")
+	}
+	if strings.TrimSpace(req.OwnerFullName) == "" {
+		return fmt.Errorf("owner_full_name is required")
+	}
+	if len(req.OwnerFullName) > 255 {
+		return fmt.Errorf("owner_full_name must be at most 255 characters")
+	}
+	if strings.TrimSpace(req.OwnerPositionTitle) == "" {
+		return fmt.Errorf("owner_position_title is required")
+	}
+	if len(req.OwnerPositionTitle) > 255 {
+		return fmt.Errorf("owner_position_title must be at most 255 characters")
+	}
+
+	// Tier is optional — only validate it if the caller supplied one.
+	if strings.TrimSpace(req.SubscriptionTier) != "" {
+		validTiers := map[string]bool{
+			"basic": true, "premium": true, "enterprise": true,
+		}
+		if !validTiers[req.SubscriptionTier] {
+			return fmt.Errorf("subscription_tier must be one of: basic, premium, enterprise")
+		}
+	}
+
+	if req.MaxEmployees < 1 || req.MaxEmployees > 2000 {
+		return fmt.Errorf("max_employees must be between 1 and 2000")
+	}
+	if req.MaxLocations < 1 || req.MaxLocations > 500 {
+		return fmt.Errorf("max_locations must be between 1 and 500")
+	}
+	if strings.TrimSpace(req.DataRegion) == "" {
+		return fmt.Errorf("data_region is required")
+	}
+
+	// ⚠️ 0 is a valid value here — it means "no subscription window".
+	if req.SubscriptionMonths < 0 || req.SubscriptionMonths > 36 {
+		return fmt.Errorf("subscription_months must be between 0 and 36")
+	}
+	if req.SubscriptionDays < 0 || req.SubscriptionDays > 30 {
+		return fmt.Errorf("subscription_days must be between 0 and 30")
+	}
+	if req.TrialDays < 0 {
+		return fmt.Errorf("trial_days cannot be negative")
+	}
+
+	// subscription_plan_code is now OPTIONAL at company creation.
+	// No "subscription_plan_code is required" check.
+
+	if req.FinancialYearStartMonth < 1 || req.FinancialYearStartMonth > 12 {
+		return fmt.Errorf("financial_year_start_month must be between 1 and 12")
+	}
+
+	// Location fields
+	if strings.TrimSpace(req.LocationCode) == "" {
+		return fmt.Errorf("location_code is required")
+	}
+	if strings.TrimSpace(req.LocationName) == "" {
+		return fmt.Errorf("location_name is required")
+	}
+
+	// ============================================================
+	// 👇 Owner employee profile — all optional / nullable.
+	//    Only validated when the caller supplies a value.
+	// ============================================================
+
+	// Email — RFC-shape check only; full RFC5322 validation belongs upstream.
+	if req.OwnerEmail != nil {
+		email := strings.TrimSpace(*req.OwnerEmail)
+		if email != "" {
+			if len(email) > 320 {
+				return fmt.Errorf("owner_email must be at most 320 characters")
+			}
+			if !strings.Contains(email, "@") || strings.HasPrefix(email, "@") || strings.HasSuffix(email, "@") {
+				return fmt.Errorf("owner_email must be a valid email address")
+			}
+		}
+	}
+
+	// Gender — enum when present.
+	if req.OwnerGender != nil && strings.TrimSpace(*req.OwnerGender) != "" {
+		validGenders := map[string]bool{
+			"male": true, "female": true, "other": true, "prefer_not_to_say": true,
+		}
+		if !validGenders[strings.ToLower(strings.TrimSpace(*req.OwnerGender))] {
+			return fmt.Errorf("owner_gender must be one of: male, female, other, prefer_not_to_say")
+		}
+	}
+
+	// Marital status — enum when present.
+	if req.OwnerMaritalStatus != nil && strings.TrimSpace(*req.OwnerMaritalStatus) != "" {
+		validMarital := map[string]bool{
+			"single": true, "married": true, "divorced": true,
+			"widowed": true, "separated": true,
+		}
+		if !validMarital[strings.ToLower(strings.TrimSpace(*req.OwnerMaritalStatus))] {
+			return fmt.Errorf("owner_marital_status must be one of: single, married, divorced, widowed, separated")
+		}
+	}
+
+	// Nationality — free text, only bound the length.
+	if req.OwnerNationality != nil && len(*req.OwnerNationality) > 100 {
+		return fmt.Errorf("owner_nationality must be at most 100 characters")
+	}
+
+	// Employment type — enum when present.
+	if req.OwnerEmploymentType != nil && strings.TrimSpace(*req.OwnerEmploymentType) != "" {
+		validTypes := map[string]bool{
+			"full_time": true, "part_time": true, "contract": true,
+			"intern": true, "consultant": true, "temporary": true,
+		}
+		if !validTypes[strings.ToLower(strings.TrimSpace(*req.OwnerEmploymentType))] {
+			return fmt.Errorf("owner_employment_type must be one of: full_time, part_time, contract, intern, consultant, temporary")
+		}
+	}
+
+	// Employment status — enum when present.
+	if req.OwnerEmploymentStatus != nil && strings.TrimSpace(*req.OwnerEmploymentStatus) != "" {
+		validStatuses := map[string]bool{
+			"active": true, "probation": true, "on_leave": true,
+			"suspended": true, "terminated": true, "resigned": true,
+		}
+		if !validStatuses[strings.ToLower(strings.TrimSpace(*req.OwnerEmploymentStatus))] {
+			return fmt.Errorf("owner_employment_status must be one of: active, probation, on_leave, suspended, terminated, resigned")
+		}
+	}
+
+	// Date of birth — sanity bounds (not in the future, not absurdly old).
+	if req.OwnerDateOfBirth != nil {
+		dob := req.OwnerDateOfBirth.UTC()
+		now := time.Now().UTC()
+		if dob.After(now) {
+			return fmt.Errorf("owner_date_of_birth cannot be in the future")
+		}
+		if dob.Before(now.AddDate(-120, 0, 0)) {
+			return fmt.Errorf("owner_date_of_birth is not a plausible date")
+		}
+	}
+
+	// Probation end date — only meaningful after DOB.
+	if req.OwnerProbationEndDate != nil {
+		probation := req.OwnerProbationEndDate.UTC()
+		if req.OwnerDateOfBirth != nil && probation.Before(req.OwnerDateOfBirth.UTC()) {
+			return fmt.Errorf("owner_probation_end_date cannot be before owner_date_of_birth")
+		}
+	}
+
+	// Confirmation date — only meaningful after DOB.
+	if req.OwnerConfirmationDate != nil {
+		confirmation := req.OwnerConfirmationDate.UTC()
+		if req.OwnerDateOfBirth != nil && confirmation.Before(req.OwnerDateOfBirth.UTC()) {
+			return fmt.Errorf("owner_confirmation_date cannot be before owner_date_of_birth")
+		}
+	}
+
+	// Grade — short free text.
+	if req.OwnerGrade != nil && len(*req.OwnerGrade) > 50 {
+		return fmt.Errorf("owner_grade must be at most 50 characters")
+	}
+
+	// Cost center — legacy text; nullable, only bound the length.
+	if req.OwnerCostCenter != nil && len(*req.OwnerCostCenter) > 100 {
+		return fmt.Errorf("owner_cost_center must be at most 100 characters")
+	}
+	// OwnerCostCenterID is a *uuid.UUID, so shape is enforced by the JSON
+	// decoder — no additional check needed here.
+
+	// Tax ID — bound the length.
+	if req.OwnerTaxID != nil && len(*req.OwnerTaxID) > 64 {
+		return fmt.Errorf("owner_tax_id must be at most 64 characters")
+	}
+
+	// Social security ID — bound the length.
+	if req.OwnerSocialSecurityID != nil && len(*req.OwnerSocialSecurityID) > 64 {
+		return fmt.Errorf("owner_social_security_id must be at most 64 characters")
+	}
+
+	return nil
+}
+
+// =====================================================================
+// CreateCompany handler
+// =====================================================================
 
 // CreateCompany creates a new company (admin only).
 // @Summary Create company
@@ -7359,7 +7417,6 @@ type CreateCompanyRequest struct {
 // @Router /api/v1/admin/companies [post]
 func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
 	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
-
 	adminID, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
@@ -7371,10 +7428,26 @@ func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
-
 	if err := validateCreateCompanyRequest(req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Validation failed")
 		return
+	}
+
+	// Normalize time fields to UTC at the boundary.
+	var ownerDOB *time.Time
+	if req.OwnerDateOfBirth != nil {
+		utc := req.OwnerDateOfBirth.UTC()
+		ownerDOB = &utc
+	}
+	var ownerProbation *time.Time
+	if req.OwnerProbationEndDate != nil {
+		utc := req.OwnerProbationEndDate.UTC()
+		ownerProbation = &utc
+	}
+	var ownerConfirmation *time.Time
+	if req.OwnerConfirmationDate != nil {
+		utc := req.OwnerConfirmationDate.UTC()
+		ownerConfirmation = &utc
 	}
 
 	companyReq := service.CreateCompanyRequest{
@@ -7384,11 +7457,13 @@ func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
 		OwnerFullName:           req.OwnerFullName,
 		OwnerPositionTitle:      req.OwnerPositionTitle,
 		SubscriptionTier:        req.SubscriptionTier,
+		SubscriptionPlanCode:    req.SubscriptionPlanCode,
 		MaxEmployees:            req.MaxEmployees,
-		MaxDepartments:          req.MaxDepartments,
+		MaxLocations:            req.MaxLocations,
 		DataRegion:              req.DataRegion,
 		SubscriptionMonths:      req.SubscriptionMonths,
 		SubscriptionDays:        req.SubscriptionDays,
+		TrialDays:               req.TrialDays,
 		Departments:             req.Departments,
 		FinancialYearStartMonth: req.FinancialYearStartMonth,
 		WorkCenterCode:          req.WorkCenterCode,
@@ -7397,6 +7472,30 @@ func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
 		WorkCenterTZ:            req.WorkCenterTZ,
 		WorkCenterActive:        req.WorkCenterActive,
 		PositionWorkCenterCode:  req.PositionWorkCenterCode,
+		LocationCode:            req.LocationCode,
+		LocationName:            req.LocationName,
+		AddressLine1:            req.AddressLine1,
+		AddressLine2:            req.AddressLine2,
+		City:                    req.City,
+		State:                   req.State,
+		Country:                 req.Country,
+		Pincode:                 req.Pincode,
+
+		// 👇 Owner employee profile
+		OwnerDateOfBirth:      ownerDOB,
+		OwnerGender:           req.OwnerGender,
+		OwnerMaritalStatus:    req.OwnerMaritalStatus,
+		OwnerNationality:      req.OwnerNationality,
+		OwnerEmploymentType:   req.OwnerEmploymentType,
+		OwnerEmploymentStatus: req.OwnerEmploymentStatus,
+		OwnerProbationEndDate: ownerProbation,
+		OwnerConfirmationDate: ownerConfirmation,
+		OwnerGrade:            req.OwnerGrade,
+		OwnerCostCenterID:     req.OwnerCostCenterID,
+		OwnerCostCenter:       req.OwnerCostCenter,
+		OwnerTaxID:            req.OwnerTaxID,
+		OwnerSocialSecurityID: req.OwnerSocialSecurityID,
+		OwnerEmail:            req.OwnerEmail,
 	}
 
 	company, err := h.companyService.CreateCompany(ctx, &companyReq, adminID)
@@ -7410,17 +7509,37 @@ func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	message := "Company created successfully"
+	switch {
+	case req.TrialDays > 0:
+		message = fmt.Sprintf("Company created with a %d-day trial", req.TrialDays)
+	case req.SubscriptionMonths > 0 || req.SubscriptionDays > 0:
+		message = "Company created and subscription activated"
+	default:
+		message = "Company created. Extend the subscription from the owner side to activate."
+	}
+
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
-		"message": "Company created successfully",
+		"message": message,
 		"data": map[string]interface{}{
-			"company_id":        company.CompanyID.String(),
-			"company_name":      company.CompanyName,
-			"owner_user_id":     company.OwnerUserID.String(),
-			"subscription_tier": company.SubscriptionTier,
-			"max_departments":   company.MaxDepartments,
-			"departments":       len(req.Departments) + 1,
-			"created_at":        company.CreatedAt,
+			"company_id":          company.CompanyID.String(),
+			"company_name":        company.CompanyName,
+			"owner_user_id":       company.OwnerUserID.String(),
+			"subscription_status": company.SubscriptionStatus,
+			"subscription_tier":   company.SubscriptionTier,
+			"subscription_plan":   req.SubscriptionPlanCode,
+			"subscription_start":  company.SubscriptionStartDate,
+			"subscription_end":    company.SubscriptionEndDate,
+			"trial_start":         company.TrialStartDate,
+			"trial_end":           company.TrialEndDate,
+			"subscription_months": req.SubscriptionMonths,
+			"subscription_days":   req.SubscriptionDays,
+			"trial_days":          req.TrialDays,
+			"max_locations":       company.MaxLocations,
+			"max_employees":       company.MaxEmployees,
+			"departments_created": len(req.Departments) + 1,
+			"created_at":          company.CreatedAt,
 		},
 	})
 }
@@ -7493,3 +7612,97 @@ func (h *AdminHandler) GetDeactivatedDepartments(w http.ResponseWriter, r *http.
 		"data":    departments,
 	})
 }
+
+// GetCompanySubscription returns subscription details for a company.
+// @Summary Get company subscription details
+// @Tags admin-companies
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Success 200 {object} map[string]interface{} "Subscription details"
+// @Failure 400 {object} map[string]interface{} "Invalid company ID"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Router /api/v1/admin/companies/{companyID}/subscription [get]
+func (h *AdminHandler) GetCompanySubscription(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	company, err := h.companyService.GetCompany(ctx, companyID)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	resp := map[string]interface{}{
+		"company_id":               company.CompanyID,
+		"company_name":             company.CompanyName,
+		"subscription_tier":        company.SubscriptionTier,
+		"subscription_status":      company.SubscriptionStatus,
+		"subscription_start_date":  company.SubscriptionStartDate,
+		"subscription_end_date":    company.SubscriptionEndDate,
+		"trial_start_date":         company.TrialStartDate,
+		"trial_end_date":           company.TrialEndDate,
+		"grace_period_days":        company.GracePeriodDays,
+		"subscription_plan_id":     company.SubscriptionPlanID,
+		"is_active":                company.IsActive,
+		"max_employees":            company.MaxEmployees,
+		"max_locations":            company.MaxLocations,
+		"subscription_amount":      company.SubscriptionAmount,
+		"stripe_customer_id":       company.StripeCustomerID,
+		"razorpay_subscription_id": company.RazorpaySubscriptionID,
+		"payment_provider_txn_id":  company.PaymentProviderTxnID,
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(resp, "Subscription details retrieved"))
+}
+
+// UpdateCompanyDetailsHandler handles PUT /admin/companies/{companyID}/details
+// @Summary Update company details and subscription
+// @Tags admin-companies
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company ID"
+// @Param body body service.UpdateCompanyRequest true "Update fields"
+// @Success 200 {object} map[string]interface{} "Company updated"
+// @Failure 400 {object} map[string]interface{} "Validation error"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Failure 404 {object} map[string]interface{} "Company not found"
+// @Router /api/v1/admin/companies/{companyID}/details [put]
+func (h *AdminHandler) UpdateCompanyDetailsHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
+
+	adminID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	var req service.UpdateCompanyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	if err := h.companyService.UpdateCompanyWithOptions(ctx, companyID, &req, adminID); err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Company updated successfully"))
+}
+
+//

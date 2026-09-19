@@ -1,8 +1,6 @@
 package handler
 
 import (
-	"auth-service/internal/hr/payroll/models"
-	"auth-service/internal/hr/payroll/service"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,23 +11,22 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
-	"go.uber.org/zap"
+
+	"auth-service/internal/hr/payroll/models"
+	"auth-service/internal/hr/payroll/service"
 )
 
 // PayrollAdjustmentHandler handles HTTP requests for payroll adjustments.
 type PayrollAdjustmentHandler struct {
 	adjustmentService service.PayrollAdjustmentService
-	logger            *zap.Logger
 }
 
 // NewPayrollAdjustmentHandler creates a new adjustment handler.
 func NewPayrollAdjustmentHandler(
 	adjustmentService service.PayrollAdjustmentService,
-	logger *zap.Logger,
 ) *PayrollAdjustmentHandler {
 	return &PayrollAdjustmentHandler{
 		adjustmentService: adjustmentService,
-		logger:            logger,
 	}
 }
 
@@ -43,7 +40,7 @@ type createPayrollAdjustmentRequest struct {
 	Amount          float64 `json:"amount"`
 	AdjustmentType  string  `json:"adjustment_type"`
 	Reason          string  `json:"reason,omitempty"`
-	ApplicableMonth string  `json:"applicable_month"` // e.g. "2024-01"
+	ApplicableMonth string  `json:"applicable_month"`
 }
 
 type updatePayrollAdjustmentRequest struct {
@@ -52,10 +49,33 @@ type updatePayrollAdjustmentRequest struct {
 }
 
 // ---------------------------------------------------------------------
+// Helper
+// ---------------------------------------------------------------------
+
+func (h *PayrollAdjustmentHandler) getActorID(ctx context.Context) (uuid.UUID, error) {
+	if v := ctx.Value("current_user_id"); v != nil {
+		if id, ok := v.(uuid.UUID); ok {
+			return id, nil
+		}
+	}
+	if v := ctx.Value("user_id"); v != nil {
+		switch raw := v.(type) {
+		case uuid.UUID:
+			return raw, nil
+		case string:
+			return uuid.Parse(raw)
+		default:
+			return uuid.Nil, errors.New("invalid user_id type")
+		}
+	}
+	return uuid.Nil, errors.New("user not authenticated")
+}
+
+// ---------------------------------------------------------------------
 // List Adjustments (GET /companies/{companyID}/payroll/adjustments)
 // ---------------------------------------------------------------------
 func (h *PayrollAdjustmentHandler) ListAdjustments(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -63,7 +83,6 @@ func (h *PayrollAdjustmentHandler) ListAdjustments(w http.ResponseWriter, r *htt
 		return
 	}
 
-	// Parse query filters
 	filter := models.PayrollAdjustmentFilter{
 		CompanyID: companyID,
 	}
@@ -101,9 +120,14 @@ func (h *PayrollAdjustmentHandler) ListAdjustments(w http.ResponseWriter, r *htt
 		}
 	}
 
+	// 👇 Populate location scope from request context.
+	filter.LocationID = locationFilterFromCtx(ctx)
+
 	adjustments, total, err := h.adjustmentService.List(ctx, filter)
 	if err != nil {
-		h.logger.Error("failed to list payroll adjustments", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -119,7 +143,7 @@ func (h *PayrollAdjustmentHandler) ListAdjustments(w http.ResponseWriter, r *htt
 // Create Adjustment (POST /companies/{companyID}/payroll/adjustments)
 // ---------------------------------------------------------------------
 func (h *PayrollAdjustmentHandler) CreateAdjustment(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -127,7 +151,7 @@ func (h *PayrollAdjustmentHandler) CreateAdjustment(w http.ResponseWriter, r *ht
 		return
 	}
 
-	actorID, err := h.getAdminActor(ctx)
+	actorID, err := h.getActorID(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
@@ -139,7 +163,6 @@ func (h *PayrollAdjustmentHandler) CreateAdjustment(w http.ResponseWriter, r *ht
 		return
 	}
 
-	// Basic validation
 	userID, err := uuid.Parse(req.UserID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid user_id")
@@ -177,6 +200,9 @@ func (h *PayrollAdjustmentHandler) CreateAdjustment(w http.ResponseWriter, r *ht
 
 	adjustment, err := h.adjustmentService.Create(ctx, input)
 	if err != nil {
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -191,7 +217,7 @@ func (h *PayrollAdjustmentHandler) CreateAdjustment(w http.ResponseWriter, r *ht
 // Bulk Create Adjustments (POST /companies/{companyID}/payroll/adjustments/bulk)
 // ---------------------------------------------------------------------
 func (h *PayrollAdjustmentHandler) BulkCreateAdjustments(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -199,7 +225,7 @@ func (h *PayrollAdjustmentHandler) BulkCreateAdjustments(w http.ResponseWriter, 
 		return
 	}
 
-	actorID, err := h.getAdminActor(ctx)
+	actorID, err := h.getActorID(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
@@ -255,6 +281,9 @@ func (h *PayrollAdjustmentHandler) BulkCreateAdjustments(w http.ResponseWriter, 
 	}
 
 	if err := h.adjustmentService.BulkCreate(ctx, inputs); err != nil {
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -269,7 +298,7 @@ func (h *PayrollAdjustmentHandler) BulkCreateAdjustments(w http.ResponseWriter, 
 // Get Adjustment (GET /companies/{companyID}/payroll/adjustments/{adjustmentID})
 // ---------------------------------------------------------------------
 func (h *PayrollAdjustmentHandler) GetAdjustment(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -283,10 +312,11 @@ func (h *PayrollAdjustmentHandler) GetAdjustment(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// Optional: verify company ID matches (service layer may already enforce)
 	adjustment, err := h.adjustmentService.Get(ctx, adjustmentID)
 	if err != nil {
-		h.logger.Error("failed to get payroll adjustment", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -309,7 +339,7 @@ func (h *PayrollAdjustmentHandler) GetAdjustment(w http.ResponseWriter, r *http.
 // Update Adjustment (PUT /companies/{companyID}/payroll/adjustments/{adjustmentID})
 // ---------------------------------------------------------------------
 func (h *PayrollAdjustmentHandler) UpdateAdjustment(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -323,15 +353,17 @@ func (h *PayrollAdjustmentHandler) UpdateAdjustment(w http.ResponseWriter, r *ht
 		return
 	}
 
-	actorID, err := h.getAdminActor(ctx)
+	actorID, err := h.getActorID(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
-	// Verify existence and company ownership before update
 	existing, err := h.adjustmentService.Get(ctx, adjustmentID)
 	if err != nil {
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -350,7 +382,6 @@ func (h *PayrollAdjustmentHandler) UpdateAdjustment(w http.ResponseWriter, r *ht
 		return
 	}
 
-	// At least one field must be provided
 	if req.Amount == nil && req.Reason == nil {
 		h.respondWithError(w, http.StatusBadRequest, "no fields to update")
 		return
@@ -365,6 +396,9 @@ func (h *PayrollAdjustmentHandler) UpdateAdjustment(w http.ResponseWriter, r *ht
 
 	updated, err := h.adjustmentService.Update(ctx, input)
 	if err != nil {
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -379,7 +413,7 @@ func (h *PayrollAdjustmentHandler) UpdateAdjustment(w http.ResponseWriter, r *ht
 // Delete Adjustment (DELETE /companies/{companyID}/payroll/adjustments/{adjustmentID})
 // ---------------------------------------------------------------------
 func (h *PayrollAdjustmentHandler) DeleteAdjustment(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -393,15 +427,17 @@ func (h *PayrollAdjustmentHandler) DeleteAdjustment(w http.ResponseWriter, r *ht
 		return
 	}
 
-	actorID, err := h.getAdminActor(ctx)
+	actorID, err := h.getActorID(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
-	// Verify ownership before deletion
 	existing, err := h.adjustmentService.Get(ctx, adjustmentID)
 	if err != nil {
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -415,6 +451,9 @@ func (h *PayrollAdjustmentHandler) DeleteAdjustment(w http.ResponseWriter, r *ht
 	}
 
 	if err := h.adjustmentService.Delete(ctx, adjustmentID, actorID); err != nil {
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -429,7 +468,7 @@ func (h *PayrollAdjustmentHandler) DeleteAdjustment(w http.ResponseWriter, r *ht
 // Get Employee Adjustments for Period (GET /companies/{companyID}/employees/{userID}/payroll-adjustments)
 // ---------------------------------------------------------------------
 func (h *PayrollAdjustmentHandler) GetEmployeeAdjustmentsForPeriod(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -443,7 +482,6 @@ func (h *PayrollAdjustmentHandler) GetEmployeeAdjustmentsForPeriod(w http.Respon
 		return
 	}
 
-	// Parse period from query params
 	fromStr := r.URL.Query().Get("from")
 	toStr := r.URL.Query().Get("to")
 	if fromStr == "" || toStr == "" {
@@ -463,7 +501,9 @@ func (h *PayrollAdjustmentHandler) GetEmployeeAdjustmentsForPeriod(w http.Respon
 
 	adjustments, err := h.adjustmentService.GetEmployeeAdjustmentsForPeriod(ctx, companyID, userID, from, to)
 	if err != nil {
-		h.logger.Error("failed to get employee adjustments for period", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -472,23 +512,6 @@ func (h *PayrollAdjustmentHandler) GetEmployeeAdjustmentsForPeriod(w http.Respon
 		"success": true,
 		"data":    adjustments,
 	})
-}
-
-// ---------------------------------------------------------------------
-// Helper: get admin actor from context
-// ---------------------------------------------------------------------
-func (h *PayrollAdjustmentHandler) getAdminActor(ctx context.Context) (uuid.UUID, error) {
-	userIDStr, ok := ctx.Value("user_id").(string)
-	if !ok || userIDStr == "" {
-		return uuid.Nil, errors.New("unauthenticated user")
-	}
-
-	userID, err := uuid.Parse(userIDStr)
-	if err != nil {
-		return uuid.Nil, errors.New("invalid user_id in context")
-	}
-
-	return userID, nil
 }
 
 // ---------------------------------------------------------------------

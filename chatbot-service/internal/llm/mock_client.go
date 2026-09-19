@@ -1237,6 +1237,308 @@ func (m *MockClient) Process(ctx context.Context, req Request) (*Response, error
 		}, nil
 	}
 
+	// ==================== NEW FRONTEND APIS ====================
+
+	// ----- Departments -----
+	if strings.Contains(lower, "list departments") || strings.Contains(lower, "show departments") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "list_departments"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "create department") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "create_department"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "get department") && strings.Contains(lower, "details") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "get_department"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "update department") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "update_department"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "delete department") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "delete_department"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "root departments") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "get_root_departments"}, req.Arguments),
+			},
+		}, nil
+	}
+
+	// ----- Employees (RBAC and search) -----
+	if strings.Contains(lower, "list employees") || strings.Contains(lower, "show employees") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "get_company_employees"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "search employees") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "search_employees"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "employee hierarchy") || strings.Contains(lower, "company hierarchy") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "get_company_hierarchy"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "employee suggestions") || strings.Contains(lower, "suggest employee") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "get_employee_suggestions"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "find employee") && strings.Contains(lower, "username") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "find_employee_by_username"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "add employee") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "add_employee"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "add manager") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "add_manager"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "employee details") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "get_employee_details"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "update employee") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "update_employee"}, req.Arguments),
+			},
+		}, nil
+	}
+
+	// ----- Positions -----
+	if strings.Contains(lower, "list positions") || strings.Contains(lower, "show positions") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "list_positions"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "create position") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "create_position"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "get position") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "get_position"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "update position") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "update_position"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "delete position") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "delete_position"}, req.Arguments),
+			},
+		}, nil
+	}
+
+	// ----- Roles (RBAC) -----
+	if strings.Contains(lower, "list roles") || strings.Contains(lower, "show roles") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "list_roles"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "create role") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "create_role"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "get role") && strings.Contains(lower, "details") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "get_role"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "update role") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "update_role"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "delete role") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "delete_role"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "assign permissions") && strings.Contains(lower, "role") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "assign_permissions"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "role permissions") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "get_role_permissions"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "user permissions") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "get_user_permissions"}, req.Arguments),
+			},
+		}, nil
+	}
+
+	// ----- Work Centers -----
+	if strings.Contains(lower, "list work centers") || strings.Contains(lower, "show work centers") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "list_work_centers"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "create work center") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "create_work_center"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "get work center") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "get_work_center_by_code"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "update work center") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "update_work_center"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "delete work center") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "delete_work_center"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "active work centers") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "get_active_work_centers"}, req.Arguments),
+			},
+		}, nil
+	}
+	if strings.Contains(lower, "work center health") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "work_center_health"}, req.Arguments),
+			},
+		}, nil
+	}
+
+	// ----- User phone -----
+	if strings.Contains(lower, "get user phone") || strings.Contains(lower, "user phone number") {
+		return &Response{
+			ToolCall: &ToolCall{
+				Name:      "payroll",
+				Arguments: mergeArgs(map[string]interface{}{"action": "get_user_phone"}, req.Arguments),
+			},
+		}, nil
+	}
+
 	// Default text response
 	return &Response{
 		Content: "I understand your request. How can I assist you further?",

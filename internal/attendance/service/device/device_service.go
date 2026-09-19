@@ -16,7 +16,7 @@ import (
 type DeviceFilter struct {
 	SourceType      *string
 	WorkCenterCode  *string
-	LocationID      *uuid.UUID
+	GeofenceID      *uuid.UUID
 	IsActive        *bool
 	IsTrusted       *bool
 	IncludeInactive bool
@@ -107,9 +107,13 @@ func (s *deviceService) ListDevices(ctx context.Context, companyID uuid.UUID, fi
 	var err error
 
 	activeOnly := !filter.IncludeInactive
-	if filter.SourceType != nil && filter.WorkCenterCode != nil {
+
+	switch {
+	case filter.GeofenceID != nil:
+		devices, err = s.deviceRepo.GetDevicesByGeofence(ctx, companyID, *filter.GeofenceID, activeOnly)
+	case filter.SourceType != nil && filter.WorkCenterCode != nil:
 		devices, err = s.deviceRepo.GetDevicesByWorkCenter(ctx, companyID, *filter.WorkCenterCode, activeOnly)
-		if err == nil && filter.SourceType != nil {
+		if err == nil {
 			filtered := make([]*models.AttendanceDevice, 0)
 			for _, d := range devices {
 				if d.SourceType == *filter.SourceType {
@@ -118,18 +122,18 @@ func (s *deviceService) ListDevices(ctx context.Context, companyID uuid.UUID, fi
 			}
 			devices = filtered
 		}
-	} else if filter.SourceType != nil {
+	case filter.SourceType != nil:
 		devices, err = s.deviceRepo.GetDevicesBySourceType(ctx, companyID, *filter.SourceType, activeOnly)
-	} else if filter.WorkCenterCode != nil {
+	case filter.WorkCenterCode != nil:
 		devices, err = s.deviceRepo.GetDevicesByWorkCenter(ctx, companyID, *filter.WorkCenterCode, activeOnly)
-	} else {
+	default:
 		devices, err = s.deviceRepo.GetDevicesByCompany(ctx, companyID, activeOnly)
 	}
 	if err != nil {
 		return nil, err
 	}
 
-	// Apply additional filters
+	// Apply additional in-memory filters
 	devices = s.applyFilters(devices, filter)
 
 	// Pagination
@@ -258,7 +262,7 @@ func (s *deviceService) validateDeviceRegistration(device *models.AttendanceDevi
 }
 
 func (s *deviceService) applyFilters(devices []*models.AttendanceDevice, filter DeviceFilter) []*models.AttendanceDevice {
-	if filter.IsActive == nil && filter.IsTrusted == nil && filter.LocationID == nil {
+	if filter.IsActive == nil && filter.IsTrusted == nil && filter.GeofenceID == nil {
 		return devices
 	}
 	result := make([]*models.AttendanceDevice, 0, len(devices))
@@ -269,7 +273,7 @@ func (s *deviceService) applyFilters(devices []*models.AttendanceDevice, filter 
 		if filter.IsTrusted != nil && d.IsTrusted != *filter.IsTrusted {
 			continue
 		}
-		if filter.LocationID != nil && (d.LocationID == nil || *d.LocationID != *filter.LocationID) {
+		if filter.GeofenceID != nil && (d.GeofenceID == nil || *d.GeofenceID != *filter.GeofenceID) {
 			continue
 		}
 		result = append(result, d)

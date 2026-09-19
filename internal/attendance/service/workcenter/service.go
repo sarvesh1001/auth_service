@@ -17,10 +17,23 @@ type Service interface {
 }
 
 // QueryService defines read operations for work centers.
+//
+// Location-scoped methods take a `locationID *uuid.UUID`:
+//
+//	nil      = no location filter (ALL scope, or route not location-scoped)
+//	non-nil  = return only work centers at that employment location
+//
+// Work centers may have a NULL location (company-wide). When locationID is
+// set, NULL-location work centers are excluded — they are not "at" any
+// specific location.
 type QueryService interface {
 	GetWorkCenter(ctx context.Context, companyID uuid.UUID, code string) (*models.WorkCenter, error)
-	ListWorkCenters(ctx context.Context, companyID uuid.UUID, page, pageSize int) ([]*models.WorkCenter, int, error)
-	SearchWorkCenters(ctx context.Context, companyID uuid.UUID, filters map[string]interface{}, page, pageSize int) ([]*models.WorkCenter, int, error)
-	GetActiveWorkCenters(ctx context.Context, companyID uuid.UUID) ([]*models.WorkCenter, error)
+
+	ListWorkCenters(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, page, pageSize int) ([]*models.WorkCenter, int, error)
+
+	SearchWorkCenters(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, filters map[string]interface{}, page, pageSize int) ([]*models.WorkCenter, int, error)
+
+	GetActiveWorkCenters(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID) ([]*models.WorkCenter, error)
+
 	HealthCheck(ctx context.Context) error
 }

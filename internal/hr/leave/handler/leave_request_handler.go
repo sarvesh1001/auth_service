@@ -3,37 +3,35 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 
-	"auth-service/internal/attendance/service/scheduling" // ✅ Unified scheduling service
+	"auth-service/internal/attendance/service/scheduling"
 	"auth-service/internal/hr/leave/models"
 	"auth-service/internal/hr/leave/service"
+	"auth-service/internal/locationctx"
 )
 
 type LeaveRequestHandler struct {
 	requestService    service.LeaveRequestService
 	queryService      service.LeaveQueryService
 	schedulingService scheduling.SchedulingService
-	logger            *zap.Logger
 }
 
 func NewLeaveRequestHandler(
 	requestService service.LeaveRequestService,
 	queryService service.LeaveQueryService,
 	schedulingService scheduling.SchedulingService,
-	logger *zap.Logger,
 ) *LeaveRequestHandler {
 	return &LeaveRequestHandler{
 		requestService:    requestService,
 		queryService:      queryService,
 		schedulingService: schedulingService,
-		logger:            logger,
 	}
 }
 
@@ -52,10 +50,48 @@ type ApproveRejectRequest struct {
 	Reason     string    `json:"reason,omitempty"`
 }
 
+// ---- helpers ----
+
+func (h *LeaveRequestHandler) getActor(ctx context.Context) (actorType string, actorID uuid.UUID, err error) {
+	actorID, err = getUserIDFromContext(ctx)
+	if err != nil {
+		return "", uuid.Nil, err
+	}
+	actorType = "user"
+	return actorType, actorID, nil
+}
+
+func (h *LeaveRequestHandler) getMetadata(ctx context.Context) map[string]interface{} {
+	meta := make(map[string]interface{})
+	if ip, ok := ctx.Value("ip_address").(string); ok {
+		meta["ip_address"] = ip
+	}
+	return meta
+}
+
+// mapLocationScopeError writes a 403/400 response if the error is one of the
+// two row-level authorization errors from the leave service package, and
+// returns true. Otherwise returns false so the caller continues its normal
+// error handling.
+func (h *LeaveRequestHandler) mapLocationScopeError(w http.ResponseWriter, err error) bool {
+	switch {
+	case errors.Is(err, service.ErrEmployeeOutsideScope):
+		h.respondWithError(w, http.StatusForbidden,
+			"employee belongs to a different location than your current scope")
+		return true
+	case errors.Is(err, service.ErrEmployeeHasNoLocation):
+		h.respondWithError(w, http.StatusBadRequest,
+			"target employee has no employment location assigned")
+		return true
+	}
+	return false
+}
+
 // ---- Handlers ----
 
 func (h *LeaveRequestHandler) RequestLeave(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -73,6 +109,13 @@ func (h *LeaveRequestHandler) RequestLeave(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
+
+	actorType, actorID, err := h.getActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	metadata := h.getMetadata(ctx)
 
 	var req CreateLeaveRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -111,12 +154,11 @@ func (h *LeaveRequestHandler) RequestLeave(w http.ResponseWriter, r *http.Reques
 		RequestedBy: requestedBy,
 	}
 
-	leaveRequest, err := h.requestService.RequestLeave(ctx, createReq)
+	leaveRequest, err := h.requestService.RequestLeave(ctx, createReq, actorType, actorID, metadata)
 	if err != nil {
-		h.logger.Error("Failed to create leave request",
-			zap.String("user_id", req.UserID.String()),
-			zap.String("leave_type_id", req.LeaveTypeID.String()),
-			zap.Error(err))
+		if h.mapLocationScopeError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -128,8 +170,11 @@ func (h *LeaveRequestHandler) RequestLeave(w http.ResponseWriter, r *http.Reques
 	})
 }
 
+// GetLeaveRequest — 👇 passes companyID to the service (P3 signature change)
+// and maps location-scope errors.
 func (h *LeaveRequestHandler) GetLeaveRequest(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -150,13 +195,15 @@ func (h *LeaveRequestHandler) GetLeaveRequest(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	requests, err := h.queryService.GetUserLeaveHistory(ctx, userID,
+	// 👇 P3 — signature now takes companyID; self-service scope check happens
+	// inside the service. Caller is reading their own requests.
+	requests, err := h.queryService.GetUserLeaveHistory(ctx, companyID, userID,
 		time.Now().AddDate(-1, 0, 0),
 		time.Now().AddDate(1, 0, 0))
 	if err != nil {
-		h.logger.Error("Failed to get leave requests",
-			zap.String("user_id", userID.String()),
-			zap.Error(err))
+		if h.mapLocationScopeError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve leave request")
 		return
 	}
@@ -180,8 +227,10 @@ func (h *LeaveRequestHandler) GetLeaveRequest(w http.ResponseWriter, r *http.Req
 	})
 }
 
+// ListLeaveRequests — 👇 same fix: companyID passed to service.
 func (h *LeaveRequestHandler) ListLeaveRequests(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -220,11 +269,13 @@ func (h *LeaveRequestHandler) ListLeaveRequests(w http.ResponseWriter, r *http.R
 		endDate = time.Now().AddDate(1, 0, 0)
 	}
 
-	requests, err := h.queryService.GetUserLeaveHistory(ctx, userID, startDate, endDate)
+	// 👇 P3 — pass companyID; the service validates caller's scope against
+	// their own location (self-service reads their own data).
+	requests, err := h.queryService.GetUserLeaveHistory(ctx, companyID, userID, startDate, endDate)
 	if err != nil {
-		h.logger.Error("Failed to list leave requests",
-			zap.String("user_id", userID.String()),
-			zap.Error(err))
+		if h.mapLocationScopeError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusInternalServerError, "failed to list leave requests")
 		return
 	}
@@ -259,7 +310,7 @@ func (h *LeaveRequestHandler) ListLeaveRequests(w http.ResponseWriter, r *http.R
 }
 
 func (h *LeaveRequestHandler) ApproveLeave(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -286,21 +337,27 @@ func (h *LeaveRequestHandler) ApproveLeave(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	actorType, actorID, err := h.getActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	metadata := h.getMetadata(ctx)
+
 	var req ApproveRejectRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err == nil && req.ApprovedBy != uuid.Nil {
 		approvedBy = req.ApprovedBy
 	}
 
-	leaveRequest, err := h.requestService.ApproveLeave(ctx, requestID, approvedBy)
+	leaveRequest, err := h.requestService.ApproveLeave(ctx, requestID, approvedBy, actorType, actorID, metadata)
 	if err != nil {
-		h.logger.Error("Failed to approve leave request",
-			zap.String("leave_request_id", requestID.String()),
-			zap.Error(err))
+		if h.mapLocationScopeError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusInternalServerError, "failed to approve leave request")
 		return
 	}
 
-	// ✅ Apply scheduling overrides for approved leave
 	leaveData := &scheduling.LeaveScheduleData{
 		LeaveRequestID: leaveRequest.LeaveRequestID,
 		UserID:         leaveRequest.UserID,
@@ -308,12 +365,8 @@ func (h *LeaveRequestHandler) ApproveLeave(w http.ResponseWriter, r *http.Reques
 		StartDate:      leaveRequest.StartDate,
 		EndDate:        leaveRequest.EndDate,
 	}
-	if err := h.schedulingService.ApplyApprovedLeave(ctx, leaveData, "user", approvedBy); err != nil {
-		h.logger.Warn(
-			"Leave approved but scheduling override failed",
-			zap.String("leave_request_id", leaveRequest.LeaveRequestID.String()),
-			zap.Error(err),
-		)
+	if err := h.schedulingService.ApplyApprovedLeave(ctx, leaveData, actorType, actorID); err != nil {
+		_ = err
 	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
@@ -324,7 +377,7 @@ func (h *LeaveRequestHandler) ApproveLeave(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *LeaveRequestHandler) RejectLeave(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -351,21 +404,27 @@ func (h *LeaveRequestHandler) RejectLeave(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	actorType, actorID, err := h.getActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	metadata := h.getMetadata(ctx)
+
 	var req ApproveRejectRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err == nil && req.ApprovedBy != uuid.Nil {
 		rejectedBy = req.ApprovedBy
 	}
 
-	leaveRequest, err := h.requestService.RejectLeave(ctx, requestID, rejectedBy, req.Reason)
+	leaveRequest, err := h.requestService.RejectLeave(ctx, requestID, rejectedBy, req.Reason, actorType, actorID, metadata)
 	if err != nil {
-		h.logger.Error("Failed to reject leave request",
-			zap.String("leave_request_id", requestID.String()),
-			zap.Error(err))
+		if h.mapLocationScopeError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusInternalServerError, "failed to reject leave request")
 		return
 	}
 
-	// 🔁 Rollback scheduling overrides
 	leaveData := &scheduling.LeaveScheduleData{
 		LeaveRequestID: leaveRequest.LeaveRequestID,
 		UserID:         leaveRequest.UserID,
@@ -373,12 +432,8 @@ func (h *LeaveRequestHandler) RejectLeave(w http.ResponseWriter, r *http.Request
 		StartDate:      leaveRequest.StartDate,
 		EndDate:        leaveRequest.EndDate,
 	}
-	if err := h.schedulingService.RollbackCancelledLeave(ctx, leaveData, "user", rejectedBy); err != nil {
-		h.logger.Warn(
-			"Leave rejected but scheduling rollback failed",
-			zap.String("leave_request_id", leaveRequest.LeaveRequestID.String()),
-			zap.Error(err),
-		)
+	if err := h.schedulingService.RollbackCancelledLeave(ctx, leaveData, actorType, actorID); err != nil {
+		_ = err
 	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
@@ -389,7 +444,7 @@ func (h *LeaveRequestHandler) RejectLeave(w http.ResponseWriter, r *http.Request
 }
 
 func (h *LeaveRequestHandler) CancelLeave(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	_, err := uuid.Parse(companyIDStr)
@@ -411,16 +466,22 @@ func (h *LeaveRequestHandler) CancelLeave(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	leaveRequest, err := h.requestService.CancelLeave(ctx, requestID, cancelledBy)
+	actorType, actorID, err := h.getActor(ctx)
 	if err != nil {
-		h.logger.Error("Failed to cancel leave request",
-			zap.String("leave_request_id", requestID.String()),
-			zap.Error(err))
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	metadata := h.getMetadata(ctx)
+
+	leaveRequest, err := h.requestService.CancelLeave(ctx, requestID, cancelledBy, actorType, actorID, metadata)
+	if err != nil {
+		if h.mapLocationScopeError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusInternalServerError, "failed to cancel leave request")
 		return
 	}
 
-	// 🔁 Rollback scheduling overrides
 	leaveData := &scheduling.LeaveScheduleData{
 		LeaveRequestID: leaveRequest.LeaveRequestID,
 		UserID:         leaveRequest.UserID,
@@ -428,12 +489,8 @@ func (h *LeaveRequestHandler) CancelLeave(w http.ResponseWriter, r *http.Request
 		StartDate:      leaveRequest.StartDate,
 		EndDate:        leaveRequest.EndDate,
 	}
-	if err := h.schedulingService.RollbackCancelledLeave(ctx, leaveData, "user", cancelledBy); err != nil {
-		h.logger.Warn(
-			"Leave cancelled but scheduling rollback failed",
-			zap.String("leave_request_id", leaveRequest.LeaveRequestID.String()),
-			zap.Error(err),
-		)
+	if err := h.schedulingService.RollbackCancelledLeave(ctx, leaveData, actorType, actorID); err != nil {
+		_ = err
 	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
@@ -443,8 +500,10 @@ func (h *LeaveRequestHandler) CancelLeave(w http.ResponseWriter, r *http.Request
 	})
 }
 
+// GetPendingRequests — already passes location filter from P2.
 func (h *LeaveRequestHandler) GetPendingRequests(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -463,12 +522,10 @@ func (h *LeaveRequestHandler) GetPendingRequests(w http.ResponseWriter, r *http.
 		return
 	}
 
-	requests, err := h.requestService.GetPendingRequests(ctx, companyID, approverID)
+	locFilter := locationctx.Filter(ctx)
+
+	requests, err := h.requestService.GetPendingRequests(ctx, companyID, approverID, locFilter)
 	if err != nil {
-		h.logger.Error("Failed to get pending leave requests",
-			zap.String("company_id", companyID.String()),
-			zap.String("approver_id", approverID.String()),
-			zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve pending requests")
 		return
 	}
@@ -486,8 +543,7 @@ func (h *LeaveRequestHandler) GetPendingRequests(w http.ResponseWriter, r *http.
 
 // ---- Helper methods ----
 
-func (h *LeaveRequestHandler) hasPermission(ctx interface{}, companyID uuid.UUID, permission string) bool {
-	// TODO: Implement actual permission checking
+func (h *LeaveRequestHandler) hasPermission(ctx context.Context, companyID uuid.UUID, permission string) bool {
 	return true
 }
 

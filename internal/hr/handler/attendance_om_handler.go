@@ -27,8 +27,11 @@ func NewAttendanceOMHandler(
 	}
 }
 
+// CanMarkAttendance checks if an actor can mark attendance for a target user.
 func (h *AttendanceOMHandler) CanMarkAttendance(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	// Inject idempotency key and client IP into context
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondError(w, http.StatusUnauthorized, err.Error())
@@ -48,7 +51,7 @@ func (h *AttendanceOMHandler) CanMarkAttendance(w http.ResponseWriter, r *http.R
 	}
 
 	allowed, reason := h.omService.CanMarkAttendance(
-		ctx,
+		ctx, // pass enriched context
 		companyID,
 		actorID,
 		targetUserID,
@@ -63,8 +66,11 @@ func (h *AttendanceOMHandler) CanMarkAttendance(w http.ResponseWriter, r *http.R
 	})
 }
 
+// CanCorrectAttendance checks if an actor can correct attendance for a target user.
 func (h *AttendanceOMHandler) CanCorrectAttendance(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	// Inject idempotency key and client IP into context
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondError(w, http.StatusUnauthorized, err.Error())
@@ -84,7 +90,7 @@ func (h *AttendanceOMHandler) CanCorrectAttendance(w http.ResponseWriter, r *htt
 	}
 
 	allowed, reason := h.omService.CanCorrectAttendance(
-		ctx,
+		ctx, // pass enriched context
 		companyID,
 		actorID,
 		targetUserID,
@@ -115,6 +121,8 @@ func (h *AttendanceOMHandler) respondError(w http.ResponseWriter, status int, ms
 		"error":   msg,
 	})
 }
+
+// ----- context helpers (should be in a shared base) -----
 func getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
 	// Try modern key first
 	if v := ctx.Value("current_user_id"); v != nil {
@@ -135,6 +143,7 @@ func getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
 	}
 	return uuid.Nil, errors.New("user not authenticated")
 }
+
 func getCompanyIDFromContext(ctx context.Context) (uuid.UUID, error) {
 	if v := ctx.Value("company_id"); v != nil {
 		if id, ok := v.(uuid.UUID); ok {

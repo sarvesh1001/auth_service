@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
+
 	"auth-service/internal/hr/payroll/models"
 	"auth-service/internal/hr/payroll/repository"
-	a "auth-service/internal/infrastructure/audit"
-
-	"github.com/google/uuid"
-	"go.uber.org/zap"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
 )
 
 type PayrollLockService interface {
@@ -20,11 +20,7 @@ type PayrollLockService interface {
 	IsPeriodLocked(ctx context.Context, companyID uuid.UUID, periodStart, periodEnd time.Time) (bool, error)
 	IsDateLocked(ctx context.Context, companyID uuid.UUID, date time.Time) (bool, error)
 	ValidateMutationAllowed(ctx context.Context, companyID uuid.UUID, effectiveFrom time.Time) error
-	ValidateMutationAllowedRange(
-		ctx context.Context,
-		companyID uuid.UUID,
-		startDate, endDate time.Time,
-	) error
+	ValidateMutationAllowedRange(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) error
 
 	// Control actions
 	LockPeriod(ctx context.Context, companyID uuid.UUID, periodStart, periodEnd time.Time, actorID uuid.UUID, reason string) error
@@ -44,102 +40,72 @@ type PayrollLockInfo struct {
 }
 
 type payrollLockService struct {
-	repo   repository.PayrollRepository
-	audit  *a.AuditService
-	logger *zap.Logger
+	repo             repository.PayrollRepository
+	audit            *audit.AuditService
+	idempotencyStore idempotency.Store
 }
 
 func NewPayrollLockService(
 	repo repository.PayrollRepository,
-	audit *a.AuditService,
-	logger *zap.Logger,
+	audit *audit.AuditService,
+	idempotencyStore idempotency.Store,
 ) PayrollLockService {
 	return &payrollLockService{
-		repo:   repo,
-		audit:  audit,
-		logger: logger.Named("payroll_lock_service"),
+		repo:             repo,
+		audit:            audit,
+		idempotencyStore: idempotencyStore,
 	}
 }
 
-//////////////////////////////////////////////////////////////
-// GOVERNANCE CHECKS
-//////////////////////////////////////////////////////////////
+// --------------------------------------------
+// GOVERNANCE CHECKS (no idempotency needed)
+// --------------------------------------------
 
-func (s *payrollLockService) IsPeriodLocked(
-	ctx context.Context,
-	companyID uuid.UUID,
-	periodStart, periodEnd time.Time,
-) (bool, error) {
+func (s *payrollLockService) IsPeriodLocked(ctx context.Context, companyID uuid.UUID, periodStart, periodEnd time.Time) (bool, error) {
 	if companyID == uuid.Nil {
 		return false, errors.New("invalid company_id")
 	}
 	return s.repo.IsPayrollPeriodLockedRange(ctx, companyID, periodStart, periodEnd)
 }
 
-func (s *payrollLockService) IsDateLocked(
-	ctx context.Context,
-	companyID uuid.UUID,
-	date time.Time,
-) (bool, error) {
+func (s *payrollLockService) IsDateLocked(ctx context.Context, companyID uuid.UUID, date time.Time) (bool, error) {
 	if companyID == uuid.Nil {
 		return false, errors.New("invalid company_id")
 	}
 	return s.repo.IsPayrollPeriodLockedRange(ctx, companyID, date, date)
 }
 
-// ValidateMutationAllowed prevents any backdated change
-// that touches a locked payroll period.
-func (s *payrollLockService) ValidateMutationAllowed(
-	ctx context.Context,
-	companyID uuid.UUID,
-	effectiveFrom time.Time,
-) error {
+func (s *payrollLockService) ValidateMutationAllowed(ctx context.Context, companyID uuid.UUID, effectiveFrom time.Time) error {
 	locked, err := s.IsDateLocked(ctx, companyID, effectiveFrom)
 	if err != nil {
 		return err
 	}
 	if locked {
-		return fmt.Errorf(
-			"mutation not allowed: payroll period containing %s is locked",
-			effectiveFrom.Format("2006-01-02"),
-		)
+		return fmt.Errorf("mutation not allowed: payroll period containing %s is locked", effectiveFrom.Format("2006-01-02"))
 	}
 	return nil
 }
 
-func (s *payrollLockService) ValidateMutationAllowedRange(
-	ctx context.Context,
-	companyID uuid.UUID,
-	startDate, endDate time.Time,
-) error {
+func (s *payrollLockService) ValidateMutationAllowedRange(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) error {
 	if companyID == uuid.Nil {
 		return errors.New("invalid company_id")
 	}
 	if endDate.Before(startDate) {
 		return errors.New("invalid date range")
 	}
-	locked, err := s.repo.IsPayrollPeriodLockedRange(
-		ctx,
-		companyID,
-		startDate,
-		endDate,
-	)
+	locked, err := s.repo.IsPayrollPeriodLockedRange(ctx, companyID, startDate, endDate)
 	if err != nil {
 		return err
 	}
 	if locked {
-		return fmt.Errorf(
-			"mutation not allowed: overlapping locked payroll period [%s - %s]",
-			startDate.Format("2006-01-02"),
-			endDate.Format("2006-01-02"),
-		)
+		return fmt.Errorf("mutation not allowed: overlapping locked payroll period [%s - %s]", startDate.Format("2006-01-02"), endDate.Format("2006-01-02"))
 	}
 	return nil
 }
 
-//////////////////////////////////////////////////////////////
-// CONTROL ACTIONS
-//////////////////////////////////////////////////////////////
+// --------------------------------------------
+// CONTROL ACTIONS (with idempotency)
+// --------------------------------------------
 
 func (s *payrollLockService) LockPeriod(
 	ctx context.Context,
@@ -148,6 +114,17 @@ func (s *payrollLockService) LockPeriod(
 	actorID uuid.UUID,
 	reason string,
 ) error {
+	// 1️⃣ Idempotency
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("payroll_lock-%s-%s-%s", companyID.String(), periodStart.Format("2006-01-02"), periodEnd.Format("2006-01-02"))
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	// 2️⃣ Validation
 	if companyID == uuid.Nil || actorID == uuid.Nil {
 		return errors.New("invalid company_id or actor_id")
 	}
@@ -155,20 +132,16 @@ func (s *payrollLockService) LockPeriod(
 		return errors.New("period_end cannot be before period_start")
 	}
 
-	// Idempotency check
+	// 3️⃣ Check if already locked
 	locked, err := s.repo.IsPayrollPeriodLockedRange(ctx, companyID, periodStart, periodEnd)
 	if err != nil {
 		return err
 	}
 	if locked {
-		s.logger.Warn("attempt to lock already locked period",
-			zap.String("company_id", companyID.String()),
-			zap.Time("start", periodStart),
-			zap.Time("end", periodEnd),
-		)
 		return fmt.Errorf("payroll period already locked")
 	}
 
+	// 4️⃣ Create lock
 	lock := &models.PayrollPeriodLock{
 		LockID:      uuid.New(),
 		CompanyID:   companyID,
@@ -179,13 +152,15 @@ func (s *payrollLockService) LockPeriod(
 		Reason:      &reason,
 	}
 
+	beforeJSON, _ := json.Marshal(lock) // for audit
 	if err := s.repo.CreatePayrollPeriodLock(ctx, lock); err != nil {
 		return err
 	}
+	afterJSON, _ := json.Marshal(lock)
 
-	// Audit successful lock (non‑blocking)
-	afterState, _ := json.Marshal(lock)
-	if err := s.audit.LogAction(
+	// 5️⃣ Audit with IP
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
 		ctx,
 		nil,
 		&companyID,
@@ -195,25 +170,18 @@ func (s *payrollLockService) LockPeriod(
 		&lock.LockID,
 		"admin",
 		&actorID,
-		nil,
-		afterState,
+		beforeJSON,
+		afterJSON,
 		map[string]interface{}{
 			"period_start": periodStart,
 			"period_end":   periodEnd,
 			"reason":       reason,
+			"ip":           ip,
 		},
-	); err != nil {
-		s.logger.Error("Failed to audit payroll lock creation",
-			zap.String("lock_id", lock.LockID.String()),
-			zap.Error(err))
-	}
-
-	s.logger.Info("payroll period locked",
-		zap.String("company_id", companyID.String()),
-		zap.Time("start", periodStart),
-		zap.Time("end", periodEnd),
-		zap.String("actor_id", actorID.String()),
 	)
+
+	// 6️⃣ Store idempotency result
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 
 	return nil
 }
@@ -224,6 +192,17 @@ func (s *payrollLockService) UnlockPeriod(
 	periodStart, periodEnd time.Time,
 	actorID uuid.UUID,
 ) error {
+	// 1️⃣ Idempotency
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("payroll_unlock-%s-%s-%s", companyID.String(), periodStart.Format("2006-01-02"), periodEnd.Format("2006-01-02"))
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	// 2️⃣ Validation
 	if companyID == uuid.Nil || actorID == uuid.Nil {
 		return errors.New("invalid company_id or actor_id")
 	}
@@ -231,103 +210,73 @@ func (s *payrollLockService) UnlockPeriod(
 		return errors.New("invalid period range")
 	}
 
-	// Optionally fetch locks before deletion to include in audit
-	// For simplicity, we'll just log the period and actor.
-	// If you need before state, you can extend repository to GetLocksByPeriod.
+	// 3️⃣ Fetch existing lock for audit (optional – we can just log the period)
+	// We'll use a before state – but since we don't have a GetLockByPeriod method, we'll log the period only.
 
+	// 4️⃣ Begin transaction for safety
 	tx, err := s.repo.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	// 🔐 Lock payroll_run row (if exists)
-	run, err := s.repo.GetPayrollRunByPeriodTx(
-		ctx,
-		tx,
-		companyID,
-		periodStart,
-		periodEnd,
-	)
+	// Check payroll run status
+	run, err := s.repo.GetPayrollRunByPeriodTx(ctx, tx, companyID, periodStart, periodEnd)
 	if err != nil {
 		return err
 	}
-
 	if run != nil {
 		if run.Status == models.PayrollStatusCalculated ||
 			run.Status == models.PayrollStatusApproved ||
 			run.Status == models.PayrollStatusPaid {
-			return fmt.Errorf(
-				"cannot unlock period: payroll run in state %s",
-				run.Status,
-			)
+			return fmt.Errorf("cannot unlock period: payroll run in state %s", run.Status)
 		}
 	}
 
-	// 🔐 Delete lock inside same TX
-	if err := s.repo.DeletePayrollPeriodLockTx(
-		ctx,
-		tx,
-		companyID,
-		periodStart,
-		periodEnd,
-	); err != nil {
+	// Delete lock
+	if err := s.repo.DeletePayrollPeriodLockTx(ctx, tx, companyID, periodStart, periodEnd); err != nil {
 		return err
 	}
-
 	if err := tx.Commit(); err != nil {
 		return err
 	}
 
-	// Audit successful unlock (non‑blocking)
-	if err := s.audit.LogAction(
+	// 5️⃣ Audit with IP
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
 		ctx,
 		nil,
 		&companyID,
 		"payroll",
 		"lock_deleted",
 		"payroll_period_lock",
-		nil, // no specific lock ID because multiple could be deleted
+		nil, // no specific lock ID
 		"admin",
 		&actorID,
-		nil, // before state not captured for simplicity
+		nil, // before state not captured
 		nil,
 		map[string]interface{}{
 			"period_start": periodStart,
 			"period_end":   periodEnd,
+			"ip":           ip,
 		},
-	); err != nil {
-		s.logger.Error("Failed to audit payroll lock deletion",
-			zap.String("company_id", companyID.String()),
-			zap.Time("start", periodStart),
-			zap.Time("end", periodEnd),
-			zap.Error(err))
-	}
-
-	s.logger.Warn("payroll period unlocked (tx safe)",
-		zap.String("company_id", companyID.String()),
-		zap.Time("start", periodStart),
-		zap.Time("end", periodEnd),
-		zap.String("actor_id", actorID.String()),
 	)
+
+	// 6️⃣ Store idempotency result
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 
 	return nil
 }
 
-//////////////////////////////////////////////////////////////
-// QUERY
-//////////////////////////////////////////////////////////////
+// --------------------------------------------
+// QUERY (no idempotency)
+// --------------------------------------------
 
-func (s *payrollLockService) ListLocks(
-	ctx context.Context,
-	companyID uuid.UUID,
-	from, to time.Time,
-) ([]PayrollLockInfo, error) {
+func (s *payrollLockService) ListLocks(ctx context.Context, companyID uuid.UUID, from, to time.Time) ([]PayrollLockInfo, error) {
 	locks, err := s.repo.ListPayrollLocks(ctx, companyID, from, to)
 	if err != nil {
 		return nil, err
 	}
-
 	result := make([]PayrollLockInfo, 0, len(locks))
 	for _, l := range locks {
 		var lockedBy uuid.UUID

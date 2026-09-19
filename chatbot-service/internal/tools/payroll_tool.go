@@ -83,9 +83,9 @@ func (p *PayrollTool) Execute(ctx context.Context, input models.ToolCallInput) (
 		}
 	}
 
-	// Build request body for POST/PUT
+	// Build request body for POST/PUT/PATCH
 	var body []byte
-	if handler.method == "POST" || handler.method == "PUT" {
+	if handler.method == "POST" || handler.method == "PUT" || handler.method == "PATCH" {
 		bodyMap := make(map[string]interface{})
 		for k, v := range input.Arguments {
 			// Skip action, path parameters, and query parameters
@@ -103,7 +103,9 @@ func (p *PayrollTool) Execute(ctx context.Context, input models.ToolCallInput) (
 		}
 	}
 
-	fullPath := fmt.Sprintf("/api/v1/companies/%s/payroll%s", companyID, path)
+	// ---- REMOVED hardcoded "/payroll" ----
+	fullPath := fmt.Sprintf("/api/v1/companies/%s%s", companyID, path)
+	// ----------------------------------------
 
 	var bodyReader io.Reader
 	if len(body) > 0 {
@@ -117,6 +119,7 @@ func (p *PayrollTool) Execute(ctx context.Context, input models.ToolCallInput) (
 		input.AuthHeader,
 		input.DeviceID,
 		companyID,
+		input.IdempotencyKey, // <-- NEW
 		bodyReader,
 	)
 	if err != nil {
@@ -128,7 +131,6 @@ func (p *PayrollTool) Execute(ctx context.Context, input models.ToolCallInput) (
 		return nil, err
 	}
 
-	// Determine success based on status and optional "success" field
 	if status >= 200 && status < 300 {
 		if successVal, ok := parsed["success"]; ok {
 			if b, ok := successVal.(bool); ok && !b {
@@ -150,7 +152,6 @@ func (p *PayrollTool) Execute(ctx context.Context, input models.ToolCallInput) (
 		}, nil
 	}
 
-	// Non-2xx status
 	errMsg := extractErrorMessage(parsed)
 	return &models.ToolResult{
 		ToolName:   p.Name(),
@@ -169,8 +170,9 @@ type actionHandler struct {
 	requiredBody []string
 }
 
+// actionHandlers now includes all payroll + new frontend APIs
 var actionHandlers = map[string]actionHandler{
-	// ----- Runs (existing) -----
+	// ----- Payroll Runs (existing) -----
 	"list_runs": {
 		method:       "GET",
 		pathTemplate: "/runs",
@@ -281,7 +283,7 @@ var actionHandlers = map[string]actionHandler{
 		queryParams:  []string{"from", "to"},
 	},
 
-	// ----- Fines (existing + new) -----
+	// ----- Fines (existing) -----
 	"list_fines": {
 		method:       "GET",
 		pathTemplate: "/fines",
@@ -346,7 +348,7 @@ var actionHandlers = map[string]actionHandler{
 		requiredBody: []string{"fine_ids"},
 	},
 
-	// ----- Adjustments (existing + new) -----
+	// ----- Adjustments (existing) -----
 	"list_adjustments": {
 		method:       "GET",
 		pathTemplate: "/adjustments",
@@ -381,10 +383,10 @@ var actionHandlers = map[string]actionHandler{
 	"bulk_create_adjustments": {
 		method:       "POST",
 		pathTemplate: "/adjustments/bulk",
-		requiredBody: []string{"adjustments"}, // expects array in body
+		requiredBody: []string{"adjustments"},
 	},
 
-	// ----- Salary Structures (existing + new) -----
+	// ----- Salary Structures (existing) -----
 	"list_structures": {
 		method:       "GET",
 		pathTemplate: "/structures",
@@ -454,7 +456,7 @@ var actionHandlers = map[string]actionHandler{
 		pathParams:   []string{"structureID"},
 	},
 
-	// ----- Statutory Profiles (existing + new) -----
+	// ----- Statutory Profiles (existing) -----
 	"list_statutory_profiles": {
 		method:       "GET",
 		pathTemplate: "/statutory-profiles",
@@ -504,7 +506,7 @@ var actionHandlers = map[string]actionHandler{
 		pathParams:   []string{"userID", "statutoryCode"},
 	},
 
-	// ----- Attendance Rules (existing + new) -----
+	// ----- Attendance Rules (existing) -----
 	"list_attendance_rules": {
 		method:       "GET",
 		pathTemplate: "/attendance-rules",
@@ -681,7 +683,7 @@ var actionHandlers = map[string]actionHandler{
 		pathParams:   []string{"ruleSetID", "limitID"},
 	},
 
-	// ----- Component Mappings (existing + new) -----
+	// ----- Component Mappings (existing) -----
 	"create_component_mapping": {
 		method:       "POST",
 		pathTemplate: "/statutory-profiles/rule-sets/{ruleSetID}/mappings",
@@ -712,7 +714,7 @@ var actionHandlers = map[string]actionHandler{
 		pathParams:   []string{"ruleSetID", "mappingId"},
 	},
 
-	// ----- Payroll Locks (new) -----
+	// ----- Payroll Locks (existing) -----
 	"list_locks": {
 		method:       "GET",
 		pathTemplate: "/locks",
@@ -728,7 +730,7 @@ var actionHandlers = map[string]actionHandler{
 		queryParams:  []string{"start", "end"},
 	},
 
-	// ----- Payroll Components (new) -----
+	// ----- Payroll Components (existing) -----
 	"list_components": {
 		method:       "GET",
 		pathTemplate: "/components",
@@ -758,7 +760,7 @@ var actionHandlers = map[string]actionHandler{
 		pathTemplate: "/components/clear-cache",
 	},
 
-	// ----- Company Payroll Settings (new) -----
+	// ----- Company Payroll Settings (existing) -----
 	"get_company_settings": {
 		method:       "GET",
 		pathTemplate: "/settings",
@@ -769,7 +771,7 @@ var actionHandlers = map[string]actionHandler{
 		requiredBody: []string{"default_fine_component", "default_arrears_component", "default_loan_component", "default_basic_component"},
 	},
 
-	// ----- Loans (new) -----
+	// ----- Loans (existing) -----
 	"list_loans": {
 		method:       "GET",
 		pathTemplate: "/loans",
@@ -825,7 +827,7 @@ var actionHandlers = map[string]actionHandler{
 		requiredBody: []string{"paid_date"},
 	},
 
-	// ----- Arrears (new) -----
+	// ----- Arrears (existing) -----
 	"create_arrears": {
 		method:       "POST",
 		pathTemplate: "/arrears",
@@ -842,7 +844,7 @@ var actionHandlers = map[string]actionHandler{
 		queryParams:  []string{"period_start", "period_end"},
 	},
 
-	// ----- Employee Payroll Queries (new) -----
+	// ----- Employee Payroll Queries (existing) -----
 	"get_employee_salary": {
 		method:       "GET",
 		pathTemplate: "/employee/{userId}/salary",
@@ -862,12 +864,12 @@ var actionHandlers = map[string]actionHandler{
 		requiredBody: []string{"period_start", "period_end"},
 	},
 
-	// ----- Payslips (new) -----
+	// ----- Payslips (existing) -----
 	"generate_payslips_for_run": {
 		method:       "POST",
 		pathTemplate: "/payslips/runs/{runId}/generate",
 		pathParams:   []string{"runId"},
-		requiredBody: []string{}, // empty body
+		requiredBody: []string{},
 	},
 	"download_payslip": {
 		method:       "GET",
@@ -887,7 +889,7 @@ var actionHandlers = map[string]actionHandler{
 		queryParams:  []string{"from", "to"},
 	},
 
-	// ----- Reports (new) -----
+	// ----- Reports (existing) -----
 	"generate_statutory_challan": {
 		method:       "POST",
 		pathTemplate: "/reports/statutory-challan",
@@ -900,7 +902,7 @@ var actionHandlers = map[string]actionHandler{
 		queryParams:  []string{"group_by"},
 	},
 
-	// ----- Tax Declarations (new) -----
+	// ----- Tax Declarations (existing) -----
 	"create_declaration_type": {
 		method:       "POST",
 		pathTemplate: "/tax-declarations/types",
@@ -953,7 +955,7 @@ var actionHandlers = map[string]actionHandler{
 		queryParams:  []string{"user_id", "financial_year", "only_verified"},
 	},
 
-	// ----- Bank Export (new) -----
+	// ----- Bank Export (existing) -----
 	"export_bank_file": {
 		method:       "GET",
 		pathTemplate: "/runs/{runId}/bank-export",
@@ -961,7 +963,7 @@ var actionHandlers = map[string]actionHandler{
 		queryParams:  []string{"format"},
 	},
 
-	// ----- Component Management (new) -----
+	// ----- Component Management (existing) -----
 	"list_component_management": {
 		method:       "GET",
 		pathTemplate: "/component-management",
@@ -980,6 +982,233 @@ var actionHandlers = map[string]actionHandler{
 		method:       "DELETE",
 		pathTemplate: "/component-management/{componentCode}",
 		pathParams:   []string{"componentCode"},
+	},
+
+	// ==================== NEW FRONTEND APIS ====================
+
+	// ----- Departments -----
+	"get_root_departments": {
+		method:       "GET",
+		pathTemplate: "/departments/root",
+	},
+	"list_departments": {
+		method:       "GET",
+		pathTemplate: "/departments",
+		queryParams:  []string{"parent_id", "include_inactive", "page", "page_size"},
+	},
+	"create_department": {
+		method:       "POST",
+		pathTemplate: "/departments",
+		requiredBody: []string{"name", "code"},
+	},
+	"get_department": {
+		method:       "GET",
+		pathTemplate: "/departments/{departmentId}",
+		pathParams:   []string{"departmentId"},
+	},
+	"update_department": {
+		method:       "PUT",
+		pathTemplate: "/departments/{departmentId}",
+		pathParams:   []string{"departmentId"},
+		requiredBody: []string{"name", "code"},
+	},
+	"delete_department": {
+		method:       "DELETE",
+		pathTemplate: "/departments/{departmentId}",
+		pathParams:   []string{"departmentId"},
+	},
+
+	// ----- Employees (RBAC and search) -----
+	"get_company_employees": {
+		method:       "GET",
+		pathTemplate: "/getemployees",
+		queryParams:  []string{"page", "limit"},
+	},
+	"get_company_hierarchy": {
+		method:       "GET",
+		pathTemplate: "/hierarchy",
+	},
+	"search_employees": {
+		method:       "POST",
+		pathTemplate: "/employees/search",
+		requiredBody: []string{"query", "search_type", "limit", "offset"},
+	},
+	"advanced_search_employees": {
+		method:       "GET",
+		pathTemplate: "/employees/search/advanced",
+		queryParams:  []string{"role_id", "department_id", "reports_to", "is_active", "hire_date_from", "hire_date_to", "limit", "offset", "page"},
+	},
+	"get_employee_suggestions": {
+		method:       "GET",
+		pathTemplate: "/employees/suggestions",
+		queryParams:  []string{"prefix", "limit"},
+	},
+	"find_employee_by_username": {
+		method:       "GET",
+		pathTemplate: "/employees/username/{username}",
+		pathParams:   []string{"username"},
+	},
+	"add_employee": {
+		method:       "POST",
+		pathTemplate: "/rbac/employees",
+		requiredBody: []string{"user_id", "role_id", "position_id"},
+	},
+	"add_manager": {
+		method:       "POST",
+		pathTemplate: "/rbac/managers",
+		requiredBody: []string{"user_id", "role_id", "position_id", "department_id"},
+	},
+	"get_employee_details": {
+		method:       "GET",
+		pathTemplate: "/rbac/employees/{userId}",
+		pathParams:   []string{"userId"},
+	},
+	"update_employee": {
+		method:       "PATCH",
+		pathTemplate: "/rbac/employees/{userId}",
+		pathParams:   []string{"userId"},
+		requiredBody: []string{"employee_id", "role_id", "position_id", "reports_to", "is_active"},
+	},
+
+	// ----- Positions -----
+	"list_positions": {
+		method:       "GET",
+		pathTemplate: "/positions",
+		queryParams:  []string{"page", "limit", "include_inactive"},
+	},
+	"get_position": {
+		method:       "GET",
+		pathTemplate: "/positions/{positionId}",
+		pathParams:   []string{"positionId"},
+	},
+	"create_position": {
+		method:       "POST",
+		pathTemplate: "/positions",
+		requiredBody: []string{"name", "code"},
+	},
+	"update_position": {
+		method:       "PUT",
+		pathTemplate: "/positions/{positionId}",
+		pathParams:   []string{"positionId"},
+		requiredBody: []string{"name", "code"},
+	},
+	"delete_position": {
+		method:       "DELETE",
+		pathTemplate: "/positions/{positionId}",
+		pathParams:   []string{"positionId"},
+	},
+
+	// ----- Roles (RBAC) -----
+	"list_roles": {
+		method:       "GET",
+		pathTemplate: "/rbac/roles",
+		queryParams:  []string{"page", "limit", "name"},
+	},
+	"get_role": {
+		method:       "GET",
+		pathTemplate: "/rbac/roles/{roleId}",
+		pathParams:   []string{"roleId"},
+	},
+	"create_role": {
+		method:       "POST",
+		pathTemplate: "/rbac/roles",
+		requiredBody: []string{"name", "description", "permissions"},
+	},
+	"update_role": {
+		method:       "PUT",
+		pathTemplate: "/rbac/roles/{roleId}",
+		pathParams:   []string{"roleId"},
+		requiredBody: []string{"name", "description"},
+	},
+	"delete_role": {
+		method:       "DELETE",
+		pathTemplate: "/rbac/roles/{roleId}",
+		pathParams:   []string{"roleId"},
+	},
+	"assign_permissions": {
+		method:       "POST",
+		pathTemplate: "/rbac/roles/{roleId}/permissions",
+		pathParams:   []string{"roleId"},
+		requiredBody: []string{"permissions"},
+	},
+	"get_role_permissions": {
+		method:       "GET",
+		pathTemplate: "/rbac/roles/{roleId}/permissions",
+		pathParams:   []string{"roleId"},
+	},
+	"get_role_permissions_detailed": {
+		method:       "GET",
+		pathTemplate: "/rbac/roles/{roleId}/permissions/detailed",
+		pathParams:   []string{"roleId"},
+	},
+	"get_role_departments": {
+		method:       "GET",
+		pathTemplate: "/rbac/roles/{roleId}/departments",
+		pathParams:   []string{"roleId"},
+	},
+	"get_user_permissions": {
+		method:       "GET",
+		pathTemplate: "/rbac/users/{userId}/permissions",
+		pathParams:   []string{"userId"},
+	},
+	"check_user_permission": {
+		method:       "GET",
+		pathTemplate: "/rbac/users/{userId}/permissions/check",
+		pathParams:   []string{"userId"},
+		queryParams:  []string{"permission"},
+	},
+	"bulk_assign_roles": {
+		method:       "POST",
+		pathTemplate: "/rbac/bulk-assign",
+		requiredBody: []string{"user_ids", "role_id"},
+	},
+
+	// ----- Work Centers -----
+	"create_work_center": {
+		method:       "POST",
+		pathTemplate: "/attendance/work-centers",
+		requiredBody: []string{"code", "name", "location"},
+	},
+	"get_work_center_by_code": {
+		method:       "GET",
+		pathTemplate: "/attendance/work-centers/{code}",
+		pathParams:   []string{"code"},
+	},
+	"update_work_center": {
+		method:       "PUT",
+		pathTemplate: "/attendance/work-centers/{code}",
+		pathParams:   []string{"code"},
+		requiredBody: []string{"name", "location"},
+	},
+	"list_work_centers": {
+		method:       "GET",
+		pathTemplate: "/attendance/work-centers",
+		queryParams:  []string{"page", "limit", "is_active"},
+	},
+	"search_work_centers": {
+		method:       "GET",
+		pathTemplate: "/attendance/work-centers/search",
+		queryParams:  []string{"query", "limit"},
+	},
+	"get_active_work_centers": {
+		method:       "GET",
+		pathTemplate: "/attendance/work-centers/active",
+	},
+	"delete_work_center": {
+		method:       "DELETE",
+		pathTemplate: "/attendance/work-centers/{code}",
+		pathParams:   []string{"code"},
+	},
+	"work_center_health": {
+		method:       "GET",
+		pathTemplate: "/attendance/work-centers/health",
+	},
+
+	// ----- Users (phone) -----
+	"get_user_phone": {
+		method:       "GET",
+		pathTemplate: "/users/{userId}/phone",
+		pathParams:   []string{"userId"},
 	},
 }
 

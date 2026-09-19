@@ -54,7 +54,7 @@ type DeviceRequest struct {
 	Manufacturer   *string                `json:"manufacturer,omitempty"`
 	Model          *string                `json:"model,omitempty"`
 	WorkCenterCode *string                `json:"work_center_code,omitempty"`
-	LocationID     *uuid.UUID             `json:"location_id,omitempty"`
+	GeofenceID     *uuid.UUID             `json:"geofence_id,omitempty"`
 	IPAddress      *string                `json:"ip_address,omitempty"`
 	MacAddress     *string                `json:"mac_address,omitempty"`
 	IsActive       *bool                  `json:"is_active,omitempty"`
@@ -71,7 +71,7 @@ type DeviceResponse struct {
 	Manufacturer   *string                `json:"manufacturer,omitempty"`
 	Model          *string                `json:"model,omitempty"`
 	WorkCenterCode *string                `json:"work_center_code,omitempty"`
-	LocationID     *uuid.UUID             `json:"location_id,omitempty"`
+	GeofenceID     *uuid.UUID             `json:"geofence_id,omitempty"`
 	IPAddress      *string                `json:"ip_address,omitempty"`
 	MacAddress     *string                `json:"mac_address,omitempty"`
 	IsActive       bool                   `json:"is_active"`
@@ -180,7 +180,7 @@ func (h *DeviceHandler) CreateDevice(w http.ResponseWriter, r *http.Request) {
 		metadata["device_name"] = *req.DeviceName
 	}
 
-	device := &models.AttendanceDevice{
+	dev := &models.AttendanceDevice{
 		DeviceID:       deviceID,
 		CompanyID:      companyID,
 		SourceType:     req.SourceType,
@@ -189,24 +189,24 @@ func (h *DeviceHandler) CreateDevice(w http.ResponseWriter, r *http.Request) {
 		Manufacturer:   req.Manufacturer,
 		Model:          req.Model,
 		WorkCenterCode: req.WorkCenterCode,
-		LocationID:     req.LocationID,
+		GeofenceID:     req.GeofenceID,
 		IPAddress:      req.IPAddress,
 		MacAddress:     req.MacAddress,
 		Metadata:       req.Metadata,
 		IsTrusted:      false,
 	}
 	if req.IsActive != nil {
-		device.IsActive = *req.IsActive
+		dev.IsActive = *req.IsActive
 	} else {
-		device.IsActive = true
+		dev.IsActive = true
 	}
 	if req.InstalledAt != nil {
-		device.InstalledAt = req.InstalledAt
+		dev.InstalledAt = req.InstalledAt
 	}
 
-	afterState, _ := json.Marshal(device)
+	afterState, _ := json.Marshal(dev)
 
-	if err := h.deviceService.RegisterDevice(ctx, device); err != nil {
+	if err := h.deviceService.RegisterDevice(ctx, dev); err != nil {
 		statusCode := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "already exists") {
 			statusCode = http.StatusConflict
@@ -239,7 +239,7 @@ func (h *DeviceHandler) CreateDevice(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 
-	response := h.buildDeviceResponse(device)
+	response := h.buildDeviceResponse(dev)
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
 		"data":    response,
@@ -268,7 +268,7 @@ func (h *DeviceHandler) GetDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	device, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
+	dev, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
 	if err != nil {
 		if errors.Is(err, repository.ErrDeviceNotFound) {
 			h.respondWithError(w, http.StatusNotFound, "Device not found")
@@ -282,12 +282,12 @@ func (h *DeviceHandler) GetDevice(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve device")
 		return
 	}
-	if device == nil {
+	if dev == nil {
 		h.respondWithError(w, http.StatusNotFound, "Device not found")
 		return
 	}
 
-	response := h.buildDeviceResponse(device)
+	response := h.buildDeviceResponse(dev)
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    response,
@@ -351,7 +351,7 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 
 	if req.SourceType == "" && req.DeviceCode == "" && req.DeviceName == nil &&
 		req.Manufacturer == nil && req.Model == nil && req.WorkCenterCode == nil &&
-		req.LocationID == nil && req.IPAddress == nil && req.MacAddress == nil &&
+		req.GeofenceID == nil && req.IPAddress == nil && req.MacAddress == nil &&
 		req.IsActive == nil && req.InstalledAt == nil && req.Metadata == nil {
 		h.respondWithError(w, http.StatusBadRequest, "No update fields provided")
 		return
@@ -380,7 +380,7 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 		"device_id":      deviceID,
 	}
 
-	device := &models.AttendanceDevice{
+	dev := &models.AttendanceDevice{
 		DeviceID:       deviceID,
 		CompanyID:      companyID,
 		SourceType:     existingDevice.SourceType,
@@ -389,7 +389,7 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 		Manufacturer:   req.Manufacturer,
 		Model:          req.Model,
 		WorkCenterCode: req.WorkCenterCode,
-		LocationID:     req.LocationID,
+		GeofenceID:     req.GeofenceID,
 		IPAddress:      req.IPAddress,
 		MacAddress:     req.MacAddress,
 		Metadata:       req.Metadata,
@@ -397,48 +397,48 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 
 	// Preserve existing values for omitted fields
 	if req.DeviceCode == "" {
-		device.DeviceCode = existingDevice.DeviceCode
+		dev.DeviceCode = existingDevice.DeviceCode
 	}
 	if req.DeviceName == nil {
-		device.DeviceName = existingDevice.DeviceName
+		dev.DeviceName = existingDevice.DeviceName
 	}
 	if req.Manufacturer == nil {
-		device.Manufacturer = existingDevice.Manufacturer
+		dev.Manufacturer = existingDevice.Manufacturer
 	}
 	if req.Model == nil {
-		device.Model = existingDevice.Model
+		dev.Model = existingDevice.Model
 	}
 	if req.WorkCenterCode == nil {
-		device.WorkCenterCode = existingDevice.WorkCenterCode
+		dev.WorkCenterCode = existingDevice.WorkCenterCode
 	}
-	if req.LocationID == nil {
-		device.LocationID = existingDevice.LocationID
+	if req.GeofenceID == nil {
+		dev.GeofenceID = existingDevice.GeofenceID
 	}
 	if req.IPAddress == nil {
-		device.IPAddress = existingDevice.IPAddress
+		dev.IPAddress = existingDevice.IPAddress
 	}
 	if req.MacAddress == nil {
-		device.MacAddress = existingDevice.MacAddress
+		dev.MacAddress = existingDevice.MacAddress
 	}
 	if req.Metadata == nil {
-		device.Metadata = existingDevice.Metadata
+		dev.Metadata = existingDevice.Metadata
 	}
 	if req.IsActive != nil {
-		device.IsActive = *req.IsActive
+		dev.IsActive = *req.IsActive
 	} else {
-		device.IsActive = existingDevice.IsActive
+		dev.IsActive = existingDevice.IsActive
 	}
-	device.IsTrusted = existingDevice.IsTrusted
+	dev.IsTrusted = existingDevice.IsTrusted
 	if req.InstalledAt != nil {
-		device.InstalledAt = req.InstalledAt
+		dev.InstalledAt = req.InstalledAt
 	} else {
-		device.InstalledAt = existingDevice.InstalledAt
+		dev.InstalledAt = existingDevice.InstalledAt
 	}
 
 	beforeState, _ := json.Marshal(existingDevice)
-	afterState, _ := json.Marshal(device)
+	afterState, _ := json.Marshal(dev)
 
-	if err := h.deviceService.UpdateDevice(ctx, device); err != nil {
+	if err := h.deviceService.UpdateDevice(ctx, dev); err != nil {
 		statusCode := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "not found") {
 			statusCode = http.StatusNotFound
@@ -451,21 +451,23 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entityUUID := uuid.Nil
-	_ = h.auditService.LogAction(
-		ctx,
-		nil,
-		&companyID,
-		"device",
-		"update",
-		"device",
-		&entityUUID,
-		actorType,
-		&actorID,
-		beforeState,
-		afterState,
-		metadata,
-	)
+	if h.auditService != nil {
+		entityUUID := uuid.Nil
+		_ = h.auditService.LogAction(
+			ctx,
+			nil,
+			&companyID,
+			"device",
+			"update",
+			"device",
+			&entityUUID,
+			actorType,
+			&actorID,
+			beforeState,
+			afterState,
+			metadata,
+		)
+	}
 
 	updatedDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
 	if err != nil {
@@ -562,21 +564,23 @@ func (h *DeviceHandler) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entityUUID := uuid.Nil
-	_ = h.auditService.LogAction(
-		ctx,
-		nil,
-		&companyID,
-		"device",
-		"delete",
-		"device",
-		&entityUUID,
-		actorType,
-		&actorID,
-		beforeState,
-		nil,
-		metadata,
-	)
+	if h.auditService != nil {
+		entityUUID := uuid.Nil
+		_ = h.auditService.LogAction(
+			ctx,
+			nil,
+			&companyID,
+			"device",
+			"delete",
+			"device",
+			&entityUUID,
+			actorType,
+			&actorID,
+			beforeState,
+			nil,
+			metadata,
+		)
+	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -620,9 +624,9 @@ func (h *DeviceHandler) ListDevices(w http.ResponseWriter, r *http.Request) {
 	if workCenterCode := r.URL.Query().Get("work_center_code"); workCenterCode != "" {
 		filter.WorkCenterCode = &workCenterCode
 	}
-	if locationIDStr := r.URL.Query().Get("location_id"); locationIDStr != "" {
-		if locID, err := uuid.Parse(locationIDStr); err == nil {
-			filter.LocationID = &locID
+	if geofenceIDStr := r.URL.Query().Get("geofence_id"); geofenceIDStr != "" {
+		if gfID, err := uuid.Parse(geofenceIDStr); err == nil {
+			filter.GeofenceID = &gfID
 		}
 	}
 	if isActive := r.URL.Query().Get("is_active"); isActive != "" {
@@ -761,21 +765,13 @@ func (h *DeviceHandler) ActivateDevice(w http.ResponseWriter, r *http.Request) {
 	}
 
 	afterState, _ := json.Marshal(updatedDevice)
-	entityUUID := uuid.Nil
-	_ = h.auditService.LogAction(
-		ctx,
-		nil,
-		&companyID,
-		"device",
-		"activate",
-		"device",
-		&entityUUID,
-		actorType,
-		&actorID,
-		beforeState,
-		afterState,
-		metadata,
-	)
+	if h.auditService != nil {
+		entityUUID := uuid.Nil
+		_ = h.auditService.LogAction(
+			ctx, nil, &companyID, "device", "activate", "device",
+			&entityUUID, actorType, &actorID, beforeState, afterState, metadata,
+		)
+	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -872,21 +868,13 @@ func (h *DeviceHandler) DeactivateDevice(w http.ResponseWriter, r *http.Request)
 	}
 
 	afterState, _ := json.Marshal(updatedDevice)
-	entityUUID := uuid.Nil
-	_ = h.auditService.LogAction(
-		ctx,
-		nil,
-		&companyID,
-		"device",
-		"deactivate",
-		"device",
-		&entityUUID,
-		actorType,
-		&actorID,
-		beforeState,
-		afterState,
-		metadata,
-	)
+	if h.auditService != nil {
+		entityUUID := uuid.Nil
+		_ = h.auditService.LogAction(
+			ctx, nil, &companyID, "device", "deactivate", "device",
+			&entityUUID, actorType, &actorID, beforeState, afterState, metadata,
+		)
+	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -983,21 +971,13 @@ func (h *DeviceHandler) MarkAsTrusted(w http.ResponseWriter, r *http.Request) {
 	}
 
 	afterState, _ := json.Marshal(updatedDevice)
-	entityUUID := uuid.Nil
-	_ = h.auditService.LogAction(
-		ctx,
-		nil,
-		&companyID,
-		"device",
-		"mark_trusted",
-		"device",
-		&entityUUID,
-		actorType,
-		&actorID,
-		beforeState,
-		afterState,
-		metadata,
-	)
+	if h.auditService != nil {
+		entityUUID := uuid.Nil
+		_ = h.auditService.LogAction(
+			ctx, nil, &companyID, "device", "mark_trusted", "device",
+			&entityUUID, actorType, &actorID, beforeState, afterState, metadata,
+		)
+	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -1094,21 +1074,13 @@ func (h *DeviceHandler) RevokeTrust(w http.ResponseWriter, r *http.Request) {
 	}
 
 	afterState, _ := json.Marshal(updatedDevice)
-	entityUUID := uuid.Nil
-	_ = h.auditService.LogAction(
-		ctx,
-		nil,
-		&companyID,
-		"device",
-		"revoke_trust",
-		"device",
-		&entityUUID,
-		actorType,
-		&actorID,
-		beforeState,
-		afterState,
-		metadata,
-	)
+	if h.auditService != nil {
+		entityUUID := uuid.Nil
+		_ = h.auditService.LogAction(
+			ctx, nil, &companyID, "device", "revoke_trust", "device",
+			&entityUUID, actorType, &actorID, beforeState, afterState, metadata,
+		)
+	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -1183,32 +1155,32 @@ func (h *DeviceHandler) getActorInfo(ctx context.Context) (string, uuid.UUID, er
 	return actorType, userID, nil
 }
 
-func (h *DeviceHandler) buildDeviceResponse(device *models.AttendanceDevice) DeviceResponse {
-	if device == nil {
+func (h *DeviceHandler) buildDeviceResponse(dev *models.AttendanceDevice) DeviceResponse {
+	if dev == nil {
 		return DeviceResponse{}
 	}
 	var deviceNamePtr *string
-	if device.DeviceName != nil && *device.DeviceName != "" {
-		deviceNamePtr = device.DeviceName
+	if dev.DeviceName != nil && *dev.DeviceName != "" {
+		deviceNamePtr = dev.DeviceName
 	}
 	return DeviceResponse{
-		DeviceID:       device.DeviceID,
-		CompanyID:      device.CompanyID,
-		SourceType:     device.SourceType,
-		DeviceCode:     device.DeviceCode,
+		DeviceID:       dev.DeviceID,
+		CompanyID:      dev.CompanyID,
+		SourceType:     dev.SourceType,
+		DeviceCode:     dev.DeviceCode,
 		DeviceName:     deviceNamePtr,
-		Manufacturer:   device.Manufacturer,
-		Model:          device.Model,
-		WorkCenterCode: device.WorkCenterCode,
-		LocationID:     device.LocationID,
-		IPAddress:      device.IPAddress,
-		MacAddress:     device.MacAddress,
-		IsActive:       device.IsActive,
-		IsTrusted:      device.IsTrusted,
-		LastSeenAt:     device.LastSeenAt,
-		InstalledAt:    device.InstalledAt,
-		Metadata:       device.Metadata,
-		CreatedAt:      device.CreatedAt,
+		Manufacturer:   dev.Manufacturer,
+		Model:          dev.Model,
+		WorkCenterCode: dev.WorkCenterCode,
+		GeofenceID:     dev.GeofenceID,
+		IPAddress:      dev.IPAddress,
+		MacAddress:     dev.MacAddress,
+		IsActive:       dev.IsActive,
+		IsTrusted:      dev.IsTrusted,
+		LastSeenAt:     dev.LastSeenAt,
+		InstalledAt:    dev.InstalledAt,
+		Metadata:       dev.Metadata,
+		CreatedAt:      dev.CreatedAt,
 	}
 }
 

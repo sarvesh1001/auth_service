@@ -8,7 +8,7 @@ type ToolCall struct {
 type ToolResult struct {
 	ToolName   string      `json:"tool_name"`
 	Success    bool        `json:"success"`
-	HTTPStatus int         `json:"-"` // internal use only, not returned to client
+	HTTPStatus int         `json:"-"`
 	Data       interface{} `json:"data,omitempty"`
 	Error      string      `json:"error,omitempty"`
 }
@@ -21,4 +21,5 @@ type ToolCallInput struct {
 	AuthHeader     string
 	DeviceID       string
 	Arguments      map[string]interface{}
+	IdempotencyKey string // <-- NEW
 }

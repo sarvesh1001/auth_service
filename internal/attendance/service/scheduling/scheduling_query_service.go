@@ -13,21 +13,26 @@ import (
 )
 
 // SchedulingQueryService defines query operations.
+//
+// Location-scoped methods take a `locationID *uuid.UUID`:
+//
+//	nil      = no location filter (ALL scope)
+//	non-nil  = filter to entities at that employment location
 type SchedulingQueryService interface {
 	// Work Calendars
 	GetWorkCalendarByID(ctx context.Context, calendarID uuid.UUID) (*models.WorkCalendar, error)
-	GetWorkCalendarsByCompany(ctx context.Context, companyID uuid.UUID) ([]*models.WorkCalendar, error)
+	GetWorkCalendarsByCompany(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID) ([]*models.WorkCalendar, error)
 	GetWorkCalendarAvailability(ctx context.Context, calendarID uuid.UUID, startDate, endDate time.Time) ([]CalendarAvailability, error)
 
 	// Schedule Templates
 	GetScheduleTemplateByID(ctx context.Context, templateID uuid.UUID) (*models.ScheduleTemplate, error)
-	GetScheduleTemplatesByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.ScheduleTemplate, error)
+	GetScheduleTemplatesByCompany(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, activeOnly bool) ([]*models.ScheduleTemplate, error)
 	GetScheduleTemplatesByCalendar(ctx context.Context, calendarID uuid.UUID) ([]*models.ScheduleTemplate, error)
 
 	// Schedule Instances
 	GetScheduleInstanceByID(ctx context.Context, instanceID uuid.UUID) (*models.ScheduleInstance, error)
 	GetScheduleInstancesByUser(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
-	GetScheduleInstancesByCompany(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
+	GetScheduleInstancesByCompany(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
 	GetScheduleInstancesByTemplate(ctx context.Context, templateID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
 	GetScheduleInstancesByPosition(ctx context.Context, positionID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
 	GetScheduleInstancesByWorkCenter(ctx context.Context, companyID uuid.UUID, workCenterCode string, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
@@ -44,7 +49,7 @@ type SchedulingQueryService interface {
 	GetScheduleOverrideByUserDate(ctx context.Context, userID uuid.UUID, date time.Time) (*models.ScheduleOverride, error)
 
 	// Stats
-	GetScheduleStats(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) (*ScheduleStats, error)
+	GetScheduleStats(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, startDate, endDate time.Time) (*ScheduleStats, error)
 
 	// Health
 	HealthCheck(ctx context.Context) error
@@ -107,8 +112,13 @@ func (qs *schedulingQueryServiceImpl) GetWorkCalendarByID(ctx context.Context, c
 	return qs.schedulingRepo.GetWorkCalendarByID(ctx, calendarID)
 }
 
-func (qs *schedulingQueryServiceImpl) GetWorkCalendarsByCompany(ctx context.Context, companyID uuid.UUID) ([]*models.WorkCalendar, error) {
-	return qs.schedulingRepo.GetWorkCalendarsByCompany(ctx, companyID)
+// GetWorkCalendarsByCompany — locationID == nil means no filter (ALL scope).
+func (qs *schedulingQueryServiceImpl) GetWorkCalendarsByCompany(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+) ([]*models.WorkCalendar, error) {
+	return qs.schedulingRepo.GetWorkCalendarsByCompany(ctx, companyID, locationID)
 }
 
 func (qs *schedulingQueryServiceImpl) GetWorkCalendarAvailability(ctx context.Context, calendarID uuid.UUID, startDate, endDate time.Time) ([]CalendarAvailability, error) {
@@ -116,10 +126,8 @@ func (qs *schedulingQueryServiceImpl) GetWorkCalendarAvailability(ctx context.Co
 	if err != nil {
 		return nil, err
 	}
-	// Build holiday map (holidays are stored as JSONB, but we treat them as map)
 	holidayMap := make(map[string]string)
 	for _, h := range cal.Holidays {
-		// h is interface{} from JSON unmarshaling; we need to assert it to a map
 		if holidayMap, ok := h.(map[string]interface{}); ok {
 			if date, ok := holidayMap["date"].(string); ok {
 				if name, ok := holidayMap["name"].(string); ok {
@@ -155,8 +163,14 @@ func (qs *schedulingQueryServiceImpl) GetScheduleTemplateByID(ctx context.Contex
 	return qs.schedulingRepo.GetScheduleTemplate(ctx, templateID)
 }
 
-func (qs *schedulingQueryServiceImpl) GetScheduleTemplatesByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.ScheduleTemplate, error) {
-	return qs.schedulingRepo.GetScheduleTemplatesByCompany(ctx, companyID, activeOnly)
+// GetScheduleTemplatesByCompany — locationID == nil means no filter (ALL scope).
+func (qs *schedulingQueryServiceImpl) GetScheduleTemplatesByCompany(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+	activeOnly bool,
+) ([]*models.ScheduleTemplate, error) {
+	return qs.schedulingRepo.GetScheduleTemplatesByCompany(ctx, companyID, locationID, activeOnly)
 }
 
 func (qs *schedulingQueryServiceImpl) GetScheduleTemplatesByCalendar(ctx context.Context, calendarID uuid.UUID) ([]*models.ScheduleTemplate, error) {
@@ -173,8 +187,14 @@ func (qs *schedulingQueryServiceImpl) GetScheduleInstancesByUser(ctx context.Con
 	return qs.schedulingRepo.GetScheduleInstancesByUser(ctx, userID, startDate, endDate)
 }
 
-func (qs *schedulingQueryServiceImpl) GetScheduleInstancesByCompany(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error) {
-	return qs.schedulingRepo.GetScheduleInstancesByCompany(ctx, companyID, startDate, endDate)
+// GetScheduleInstancesByCompany — locationID == nil means no filter (ALL scope).
+func (qs *schedulingQueryServiceImpl) GetScheduleInstancesByCompany(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+	startDate, endDate time.Time,
+) ([]*models.ScheduleInstance, error) {
+	return qs.schedulingRepo.GetScheduleInstancesByCompany(ctx, companyID, locationID, startDate, endDate)
 }
 
 func (qs *schedulingQueryServiceImpl) GetScheduleInstancesByTemplate(ctx context.Context, templateID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error) {
@@ -242,13 +262,19 @@ func (qs *schedulingQueryServiceImpl) GetScheduleOverrideByUserDate(ctx context.
 
 // ---- Stats ----
 
-func (qs *schedulingQueryServiceImpl) GetScheduleStats(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) (*ScheduleStats, error) {
+// GetScheduleStats — locationID == nil means no filter (ALL scope).
+func (qs *schedulingQueryServiceImpl) GetScheduleStats(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+	startDate, endDate time.Time,
+) (*ScheduleStats, error) {
 	stats := &ScheduleStats{
 		ByTemplateType: make(map[string]int64),
 		ByDate:         make(map[string]int64),
 		ByWorkCenter:   make(map[string]int64),
 	}
-	instances, err := qs.schedulingRepo.GetScheduleInstancesByCompany(ctx, companyID, startDate, endDate)
+	instances, err := qs.schedulingRepo.GetScheduleInstancesByCompany(ctx, companyID, locationID, startDate, endDate)
 	if err != nil {
 		return nil, err
 	}

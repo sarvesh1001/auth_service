@@ -8,6 +8,7 @@ import (
 	"auth-service/internal/models"
 
 	"github.com/gorilla/websocket"
+	"go.uber.org/zap"
 )
 
 // WebSocketService manages WebSocket connections for pairing status updates.
@@ -45,6 +46,8 @@ func NewWebSocketService() *WebSocketService {
 
 // Run starts the main event loop for the WebSocket service.
 func (s *WebSocketService) Run() {
+	logger := zap.L().With(zap.String("component", "WebSocketService"))
+	logger.Info("WebSocketService main loop started")
 	for {
 		select {
 		case client := <-s.register:
@@ -60,16 +63,24 @@ func (s *WebSocketService) Run() {
 }
 
 func (s *WebSocketService) registerClient(client *WebSocketClient) {
+	logger := zap.L().With(
+		zap.String("session_id", client.SessionID),
+		zap.String("component", "WebSocketService"),
+	)
+	logger.Info("Registering WebSocket client")
+
 	s.clientsMux.Lock()
 	defer s.clientsMux.Unlock()
 
 	// Remove existing client for same session
 	if existing, exists := s.clients[client.SessionID]; exists {
+		logger.Warn("Replacing existing WebSocket client for session")
 		close(existing.Send)
 		delete(s.clients, client.SessionID)
 	}
 
 	s.clients[client.SessionID] = client
+	logger.Info("WebSocket client registered", zap.Int("total_clients", len(s.clients)))
 
 	// Start reader and writer goroutines
 	go s.readPump(client)
@@ -77,32 +88,57 @@ func (s *WebSocketService) registerClient(client *WebSocketClient) {
 }
 
 func (s *WebSocketService) unregisterClient(client *WebSocketClient) {
+	logger := zap.L().With(
+		zap.String("session_id", client.SessionID),
+		zap.String("component", "WebSocketService"),
+	)
+	logger.Info("Unregistering WebSocket client")
+
 	s.clientsMux.Lock()
 	defer s.clientsMux.Unlock()
 
 	if existing, exists := s.clients[client.SessionID]; exists && existing == client {
 		close(client.Send)
 		delete(s.clients, client.SessionID)
+		logger.Info("WebSocket client unregistered", zap.Int("remaining_clients", len(s.clients)))
+	} else {
+		logger.Warn("Client not found or mismatched during unregister")
 	}
 }
 
 func (s *WebSocketService) broadcastToSession(sessionID string, message *WebSocketMessage) {
+	logger := zap.L().With(
+		zap.String("session_id", sessionID),
+		zap.String("message_type", message.Type),
+		zap.String("component", "WebSocketService"),
+	)
+	logger.Debug("Broadcasting message to session")
+
 	s.clientsMux.RLock()
 	defer s.clientsMux.RUnlock()
 
 	if client, exists := s.clients[sessionID]; exists {
 		select {
 		case client.Send <- s.marshalMessage(message):
+			logger.Debug("Message sent to WebSocket client")
 		default:
-			// Client buffer full, close connection
+			logger.Warn("Client send buffer full, closing connection")
 			close(client.Send)
 			delete(s.clients, sessionID)
 		}
+	} else {
+		logger.Debug("No WebSocket client found for session, message dropped")
 	}
 }
 
 // SendStatusUpdate sends a pairing status update to the client.
 func (s *WebSocketService) SendStatusUpdate(sessionID string, status *models.PairingStatusResponse) {
+	logger := zap.L().With(
+		zap.String("session_id", sessionID),
+		zap.String("component", "WebSocketService"),
+		zap.String("status", status.Status),
+	)
+	logger.Info("Sending status update via WebSocket")
 	message := &WebSocketMessage{
 		SessionID: sessionID,
 		Type:      "status_update",
@@ -113,6 +149,11 @@ func (s *WebSocketService) SendStatusUpdate(sessionID string, status *models.Pai
 
 // SendPaired sends the token pair after successful pairing.
 func (s *WebSocketService) SendPaired(sessionID string, tokenPair *models.TokenPairResponse) {
+	logger := zap.L().With(
+		zap.String("session_id", sessionID),
+		zap.String("component", "WebSocketService"),
+	)
+	logger.Info("Sending paired tokens via WebSocket")
 	message := &WebSocketMessage{
 		SessionID: sessionID,
 		Type:      "paired",
@@ -122,7 +163,12 @@ func (s *WebSocketService) SendPaired(sessionID string, tokenPair *models.TokenP
 }
 
 func (s *WebSocketService) readPump(client *WebSocketClient) {
+	logger := zap.L().With(
+		zap.String("session_id", client.SessionID),
+		zap.String("component", "WebSocketService"),
+	)
 	defer func() {
+		logger.Info("Read pump exiting, unregistering client")
 		s.unregister <- client
 		client.Conn.Close()
 	}()
@@ -137,20 +183,30 @@ func (s *WebSocketService) readPump(client *WebSocketClient) {
 	for {
 		_, message, err := client.Conn.ReadMessage()
 		if err != nil {
+			logger.Warn("Read error, closing connection", zap.Error(err))
 			break
 		}
 
 		// Handle ping/pong
-		if string(message) == "ping" {
+		msgStr := string(message)
+		if msgStr == "ping" {
+			logger.Debug("Received ping from client, sending pong")
 			client.Send <- []byte("pong")
+		} else {
+			logger.Debug("Received non‑ping message", zap.String("data", msgStr))
 		}
 	}
 }
 
 func (s *WebSocketService) writePump(client *WebSocketClient) {
+	logger := zap.L().With(
+		zap.String("session_id", client.SessionID),
+		zap.String("component", "WebSocketService"),
+	)
 	ticker := time.NewTicker(30 * time.Second) // Ping interval
 	defer func() {
 		ticker.Stop()
+		logger.Info("Write pump exiting, closing connection")
 		client.Conn.Close()
 	}()
 
@@ -158,19 +214,23 @@ func (s *WebSocketService) writePump(client *WebSocketClient) {
 		select {
 		case message, ok := <-client.Send:
 			if !ok {
-				// Channel closed
+				logger.Warn("Send channel closed, sending close message")
 				client.Conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
 
 			client.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := client.Conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				logger.Warn("Write error", zap.Error(err))
 				return
 			}
+			logger.Debug("Message written to client")
 
 		case <-ticker.C:
+			logger.Debug("Sending ping to client")
 			client.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := client.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				logger.Warn("Ping write error", zap.Error(err))
 				return
 			}
 		}

@@ -2,7 +2,6 @@
 package factory
 
 import (
-	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
 	"auth-service/internal/client"
@@ -762,25 +761,6 @@ func (f *SubscriptionInfraFactory) TrialHandler() *handler.TrialHandler {
 // -----------------------------------------------------------------------------
 // Route registration
 // -----------------------------------------------------------------------------
-
-// RegisterRoutes mounts all subscription routes using the pre‑defined router.
-func (f *SubscriptionInfraFactory) RegisterRoutes(r chi.Router) {
-	handlers := &router.SubscriptionHandlers{
-		AddonHandler:           f.AddonHandler(),
-		AnalyticsHandler:       f.AnalyticsHandler(),
-		BenefitHandler:         f.BenefitHandler(),
-		BillingPolicyHandler:   f.BillingPolicyHandler(),
-		EntitlementHandler:     f.EntitlementHandler(),
-		FeatureHandler:         f.FeatureHandler(),
-		PausePolicyHandler:     f.PausePolicyHandler(),
-		PlanHandler:            f.PlanHandler(),
-		ProrationPolicyHandler: f.ProrationPolicyHandler(),
-		RenewalPolicyHandler:   f.RenewalPolicyHandler(),
-		SubscriptionHandler:    f.SubscriptionHandler(),
-		TrialHandler:           f.TrialHandler(),
-	}
-	router.RegisterSubscriptionRoutes(r, handlers)
-}
 
 // SubscriptionHandlers returns all subscription handlers for route registration.
 func (f *SubscriptionInfraFactory) SubscriptionHandlers() *router.SubscriptionHandlers {

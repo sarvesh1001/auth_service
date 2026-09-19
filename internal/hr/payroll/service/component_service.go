@@ -2,25 +2,22 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
 
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 
 	"auth-service/internal/hr/payroll/models"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
 )
 
 // ComponentRepository defines the data access methods needed by the component service.
 type ComponentRepository interface {
-	// GetComponentsByCompany returns all active payroll components for a company.
 	GetComponentsByCompany(ctx context.Context, companyID uuid.UUID) (map[string]*models.PayrollComponent, error)
-
-	// GetComponent returns a single component by company and code.
 	GetComponent(ctx context.Context, companyID uuid.UUID, code string) (*models.PayrollComponent, error)
-
-	// GetComponentsByCodes returns components for the given codes (bulk lookup).
 	GetComponentsByCodes(ctx context.Context, companyID uuid.UUID, codes []string) ([]*models.PayrollComponent, error)
 }
 
@@ -31,45 +28,36 @@ type CompanySettingsRepository interface {
 
 // ComponentService handles component validation, retrieval, and caching.
 type ComponentService interface {
-	// GetComponents returns a map of component_code -> component for the company.
-	// It may cache the result for the duration of the context.
 	GetComponents(ctx context.Context, companyID uuid.UUID) (map[string]*models.PayrollComponent, error)
-
-	// GetComponent returns a single component. Returns nil, nil if not found.
 	GetComponent(ctx context.Context, companyID uuid.UUID, code string) (*models.PayrollComponent, error)
-
-	// ValidateComponentExists returns an error if the component does not exist or is inactive.
 	ValidateComponentExists(ctx context.Context, companyID uuid.UUID, code string) error
-
-	// GetDefaultComponent returns the default component code for a given purpose (fine, arrears, loan, basic).
-	// Returns empty string and no error if no default is configured.
 	GetDefaultComponent(ctx context.Context, companyID uuid.UUID, purpose string) (string, error)
-
-	// ClearCache removes cached components for a company (useful after updates).
 	ClearCache(companyID uuid.UUID)
 }
 
 type componentService struct {
-	compRepo     ComponentRepository
-	settingsRepo CompanySettingsRepository
-	logger       *zap.Logger
+	compRepo         ComponentRepository
+	settingsRepo     CompanySettingsRepository
+	auditService     *audit.AuditService
+	idempotencyStore idempotency.Store
 
-	// simple in-memory cache keyed by companyID
 	mu    sync.RWMutex
 	cache map[uuid.UUID]map[string]*models.PayrollComponent
 }
 
-// NewComponentService creates a new component service with caching.
+// NewComponentService creates a new component service with caching, audit, and idempotency.
 func NewComponentService(
 	compRepo ComponentRepository,
 	settingsRepo CompanySettingsRepository,
-	logger *zap.Logger,
+	auditService *audit.AuditService,
+	idempotencyStore idempotency.Store,
 ) ComponentService {
 	return &componentService{
-		compRepo:     compRepo,
-		settingsRepo: settingsRepo,
-		logger:       logger.Named("component_service"),
-		cache:        make(map[uuid.UUID]map[string]*models.PayrollComponent),
+		compRepo:         compRepo,
+		settingsRepo:     settingsRepo,
+		auditService:     auditService,
+		idempotencyStore: idempotencyStore,
+		cache:            make(map[uuid.UUID]map[string]*models.PayrollComponent),
 	}
 }
 
@@ -87,7 +75,6 @@ func (s *componentService) GetComponents(ctx context.Context, companyID uuid.UUI
 		return nil, fmt.Errorf("failed to fetch components: %w", err)
 	}
 
-	// Store in cache
 	s.mu.Lock()
 	s.cache[companyID] = components
 	s.mu.Unlock()
@@ -97,7 +84,6 @@ func (s *componentService) GetComponents(ctx context.Context, companyID uuid.UUI
 
 // GetComponent returns a single component, using the cache if possible.
 func (s *componentService) GetComponent(ctx context.Context, companyID uuid.UUID, code string) (*models.PayrollComponent, error) {
-	// First try cache
 	components, err := s.GetComponents(ctx, companyID)
 	if err != nil {
 		return nil, err
@@ -108,7 +94,8 @@ func (s *componentService) GetComponent(ctx context.Context, companyID uuid.UUID
 	return nil, nil
 }
 
-// ValidateComponentExists returns an error if the component does not exist.
+// ValidateComponentExists validates that a component exists and is active.
+// Also logs an audit entry for the validation (with IP).
 func (s *componentService) ValidateComponentExists(ctx context.Context, companyID uuid.UUID, code string) error {
 	comp, err := s.GetComponent(ctx, companyID, code)
 	if err != nil {
@@ -120,18 +107,41 @@ func (s *componentService) ValidateComponentExists(ctx context.Context, companyI
 	if !comp.IsActive {
 		return fmt.Errorf("component %s is inactive", code)
 	}
+
+	// Audit: record component validation (for compliance/security)
+	ip, _ := ctx.Value("ip_address").(string)
+	compJSON, _ := json.Marshal(comp)
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&companyID,
+		"payroll",
+		"component.validate",
+		"payroll_component",
+		nil,
+		"system",
+		nil,
+		nil,
+		compJSON,
+		map[string]interface{}{
+			"ip":         ip,
+			"company_id": companyID.String(),
+			"code":       code,
+		},
+	)
+
 	return nil
 }
 
 // GetDefaultComponent returns the default component code for a given purpose.
-// Purpose should be one of: "fine", "arrears", "loan", "basic".
+// Purpose: "fine", "arrears", "loan", "basic".
 func (s *componentService) GetDefaultComponent(ctx context.Context, companyID uuid.UUID, purpose string) (string, error) {
 	settings, err := s.settingsRepo.GetPayrollSettings(ctx, companyID)
 	if err != nil {
 		return "", fmt.Errorf("failed to get company payroll settings: %w", err)
 	}
 	if settings == nil {
-		return "", nil // no defaults configured
+		return "", nil
 	}
 
 	switch purpose {
@@ -158,6 +168,7 @@ func (s *componentService) GetDefaultComponent(ctx context.Context, companyID uu
 }
 
 // ClearCache removes cached components for a company.
+// No audit needed – this is an internal operation.
 func (s *componentService) ClearCache(companyID uuid.UUID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -16,37 +16,32 @@ type ScheduleRepository interface {
 	GetWorkCentersByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.WorkCenter, error)
 
 	// ── Work Calendars ──
-	// Existing: GetWorkCalendar by company+year
 	GetWorkCalendar(ctx context.Context, companyID uuid.UUID, year int) (*models.WorkCalendar, error)
-	GetWorkCalendarsByCompany(ctx context.Context, companyID uuid.UUID) ([]*models.WorkCalendar, error)
-
-	// NEW: CRUD operations for calendars
+	GetWorkCalendarsByCompany(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID) ([]*models.WorkCalendar, error)
 	CreateWorkCalendar(ctx context.Context, calendar *models.WorkCalendar) error
 	GetWorkCalendarByID(ctx context.Context, calendarID uuid.UUID) (*models.WorkCalendar, error)
 	UpdateWorkCalendar(ctx context.Context, calendar *models.WorkCalendar) error
 	DeleteWorkCalendar(ctx context.Context, calendarID uuid.UUID) error
 
 	// ── Schedule Templates ──
-	// Existing
 	GetScheduleTemplate(ctx context.Context, templateID uuid.UUID) (*models.ScheduleTemplate, error)
-	GetScheduleTemplatesByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.ScheduleTemplate, error)
-
-	// NEW: CRUD for templates
+	GetScheduleTemplatesByCompany(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, activeOnly bool) ([]*models.ScheduleTemplate, error)
 	CreateScheduleTemplate(ctx context.Context, template *models.ScheduleTemplate) error
 	GetScheduleTemplatesByCalendar(ctx context.Context, calendarID uuid.UUID) ([]*models.ScheduleTemplate, error)
 	UpdateScheduleTemplate(ctx context.Context, template *models.ScheduleTemplate) error
 	DeleteScheduleTemplate(ctx context.Context, templateID uuid.UUID) error
 
 	// ── Schedule Instances ──
-	// Existing
 	GetScheduleInstance(ctx context.Context, instanceID uuid.UUID) (*models.ScheduleInstance, error)
 	GetScheduleInstancesByUserDate(ctx context.Context, userID uuid.UUID, date time.Time) ([]*models.ScheduleInstance, error)
 	CreateScheduleInstance(ctx context.Context, tx *sql.Tx, instance *models.ScheduleInstance) error
 	UpdateScheduleInstanceStatus(ctx context.Context, tx *sql.Tx, instanceID uuid.UUID, status string, cancelReason *string) error
-
-	// NEW: extended CRUD for instances
 	GetScheduleInstancesByUser(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
-	GetScheduleInstancesByCompany(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
+
+	// GetScheduleInstancesByCompany returns instances for a company, optionally
+	// scoped to a single location (snapshot from the instance row).
+	GetScheduleInstancesByCompany(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
+
 	GetScheduleInstancesByTemplate(ctx context.Context, templateID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
 	GetScheduleInstancesByWorkCenter(ctx context.Context, companyID uuid.UUID, workCenterCode string, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
 	UpdateScheduleInstance(ctx context.Context, instance *models.ScheduleInstance) error
@@ -55,7 +50,6 @@ type ScheduleRepository interface {
 	HasActiveSchedule(ctx context.Context, companyID, userID uuid.UUID, date time.Time) (bool, error)
 
 	// ── Schedule Overrides ──
-	// NEW: full CRUD
 	CreateScheduleOverride(ctx context.Context, override *models.ScheduleOverride) error
 	GetScheduleOverrideByID(ctx context.Context, overrideID uuid.UUID) (*models.ScheduleOverride, error)
 	GetScheduleOverridesByUser(ctx context.Context, userID uuid.UUID, startDate, endDate *time.Time, overrideType *string) ([]*models.ScheduleOverride, error)
@@ -81,9 +75,8 @@ type ScheduleRepository interface {
 	// ── Off Requests ──
 	GetOffRequests(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time) ([]*models.OffRequest, error)
 
-	// ── Schedule Override (legacy, kept for compatibility) ──
+	// ── Legacy ──
 	GetScheduleOverride(ctx context.Context, userID uuid.UUID, date time.Time) (*models.ScheduleOverride, error)
 
-	// ── Health ──
 	HealthCheck(ctx context.Context) error
 }

@@ -12,6 +12,7 @@ import (
 
 	"auth-service/internal/attendance/repository"
 	"auth-service/internal/attendance/service/query"
+	"auth-service/internal/locationctx"
 )
 
 // AttendanceQueryHandler handles attendance queries.
@@ -73,6 +74,9 @@ func (h *AttendanceQueryHandler) GetEvent(w http.ResponseWriter, r *http.Request
 }
 
 // SearchEvents searches attendance events with filters and pagination.
+//
+// Location scope: reads X-Location-ID from the request context. Delhi-scoped
+// admins see only Delhi events; ALL-scope admins see everything.
 func (h *AttendanceQueryHandler) SearchEvents(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -132,7 +136,10 @@ func (h *AttendanceQueryHandler) SearchEvents(w http.ResponseWriter, r *http.Req
 		filter.DeviceID = &v
 	}
 
-	events, total, err := h.queryService.ListEvents(ctx, filter)
+	// 👇 Location scope from the request context.
+	locFilter := locationctx.Filter(ctx)
+
+	events, total, err := h.queryService.ListEvents(ctx, filter, locFilter)
 	if err != nil {
 		h.logger.Error("Failed to search attendance events",
 			zap.String("company_id", companyID.String()),
@@ -178,7 +185,7 @@ func (h *AttendanceQueryHandler) GetDailySummary(w http.ResponseWriter, r *http.
 
 	subjectType := chi.URLParam(r, "subjectType")
 	if subjectType == "" {
-		subjectType = "employee" // default for backward compatibility
+		subjectType = "employee"
 	}
 
 	date, err := time.Parse("2006-01-02", chi.URLParam(r, "date"))
@@ -255,6 +262,8 @@ func (h *AttendanceQueryHandler) GetSubjectSummaries(w http.ResponseWriter, r *h
 // ---- Stats ----
 
 // GetCompanyStats returns aggregated attendance statistics for a company.
+//
+// Location scope: reads X-Location-ID from the request context.
 func (h *AttendanceQueryHandler) GetCompanyStats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -269,7 +278,10 @@ func (h *AttendanceQueryHandler) GetCompanyStats(w http.ResponseWriter, r *http.
 		return
 	}
 
-	stats, err := h.queryService.GetCompanyStats(ctx, companyID, startDate, endDate)
+	// 👇 Location scope from the request context.
+	locFilter := locationctx.Filter(ctx)
+
+	stats, err := h.queryService.GetCompanyStats(ctx, companyID, locFilter, startDate, endDate)
 	if err != nil {
 		h.logger.Error("Failed to get company stats",
 			zap.String("company_id", companyID.String()),
@@ -374,7 +386,7 @@ func (h *AttendanceQueryHandler) ListSourceTypes(w http.ResponseWriter, r *http.
 	})
 }
 
-// ---- NEW: Session Summary Endpoints ----
+// ---- Session Summary Endpoints ----
 
 // GetSessionSummary returns a session summary for a specific session and subject.
 func (h *AttendanceQueryHandler) GetSessionSummary(w http.ResponseWriter, r *http.Request) {
@@ -428,6 +440,8 @@ func (h *AttendanceQueryHandler) GetSessionSummary(w http.ResponseWriter, r *htt
 }
 
 // ListSessionSummaries returns paginated session summaries with filters.
+//
+// Location scope: reads X-Location-ID from the request context.
 func (h *AttendanceQueryHandler) ListSessionSummaries(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -447,6 +461,9 @@ func (h *AttendanceQueryHandler) ListSessionSummaries(w http.ResponseWriter, r *
 
 	filter := repository.SessionSummaryFilter{}
 	filter.CompanyID = &companyID
+
+	// 👇 Location scope: populate the filter field.
+	filter.LocationID = locationctx.Filter(ctx)
 
 	if v := r.URL.Query().Get("subject_type"); v != "" {
 		filter.SubjectType = &v
@@ -503,7 +520,7 @@ func (h *AttendanceQueryHandler) ListSessionSummaries(w http.ResponseWriter, r *
 	})
 }
 
-// ---- NEW: Exemption Query Endpoints ----
+// ---- Exemption Query Endpoints ----
 
 // GetExemptionsForSubject returns active exemptions for a subject on a specific date.
 func (h *AttendanceQueryHandler) GetExemptionsForSubject(w http.ResponseWriter, r *http.Request) {
@@ -548,6 +565,11 @@ func (h *AttendanceQueryHandler) GetExemptionsForSubject(w http.ResponseWriter, 
 }
 
 // ListExemptions returns paginated exemptions with filters.
+//
+// Note: exemptions derive their location from the subject, so no
+// location filter is applied here — the ExemptionFilter has no
+// LocationID field. Per-subject access is enforced via the subject
+// lookups.
 func (h *AttendanceQueryHandler) ListExemptions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)

@@ -17,8 +17,12 @@ import (
 )
 
 type ReportService interface {
+	// GenerateReport — LocationID on the request is passed through to the
+	// query service. nil = company-wide (ALL scope).
 	GenerateReport(ctx context.Context, req *ReportRequest) ([]byte, string, error)
-	StreamEvents(ctx context.Context, companyID uuid.UUID, filter query.EventFilter, writer io.Writer, format string) error
+
+	// StreamEvents — locationID == nil means no filter (ALL scope).
+	StreamEvents(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, filter query.EventFilter, writer io.Writer, format string) error
 }
 
 type ReportRequest struct {
@@ -29,6 +33,9 @@ type ReportRequest struct {
 	EndDate       time.Time
 	ReportType    string // "csv" or "json"
 	IncludeEvents bool
+
+	// 👇 New. nil = company-wide (ALL scope).
+	LocationID *uuid.UUID
 }
 
 type reportService struct {
@@ -67,7 +74,7 @@ func (s *reportService) GenerateReport(ctx context.Context, req *ReportRequest) 
 			Page:        1,
 			PageSize:    10000,
 		}
-		events, _, err := s.queryService.ListEvents(ctx, filter)
+		events, _, err := s.queryService.ListEvents(ctx, filter, req.LocationID)
 		if err != nil {
 			return nil, "", err
 		}
@@ -75,9 +82,11 @@ func (s *reportService) GenerateReport(ctx context.Context, req *ReportRequest) 
 	} else {
 		var summaries []*models.AttendanceDailySummary
 		if req.SubjectType != nil && req.SubjectID != nil {
+			// Single-subject report — the subject is already scoped, no location filter needed.
 			summaries, err = s.queryService.ListDailySummaries(ctx, req.CompanyID, *req.SubjectID, *req.SubjectType, req.StartDate, req.EndDate)
 		} else {
-			summaries, err = s.queryService.ListCompanySummaries(ctx, req.CompanyID, req.StartDate, req.EndDate)
+			// Company-wide report — apply the location scope if the caller set one.
+			summaries, err = s.queryService.ListCompanySummaries(ctx, req.CompanyID, req.LocationID, req.StartDate, req.EndDate)
 		}
 		if err != nil {
 			return nil, "", err
@@ -101,7 +110,15 @@ func (s *reportService) GenerateReport(ctx context.Context, req *ReportRequest) 
 	return reportData, contentType, nil
 }
 
-func (s *reportService) StreamEvents(ctx context.Context, companyID uuid.UUID, filter query.EventFilter, writer io.Writer, format string) error {
+// StreamEvents — locationID == nil means no filter (ALL scope).
+func (s *reportService) StreamEvents(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+	filter query.EventFilter,
+	writer io.Writer,
+	format string,
+) error {
 	if format != "csv" && format != "jsonl" {
 		return fmt.Errorf("unsupported stream format: %s", format)
 	}
@@ -111,7 +128,7 @@ func (s *reportService) StreamEvents(ctx context.Context, companyID uuid.UUID, f
 
 	firstPage := true
 	for {
-		events, total, err := s.queryService.ListEvents(ctx, filter)
+		events, total, err := s.queryService.ListEvents(ctx, filter, locationID)
 		if err != nil {
 			return err
 		}
@@ -136,7 +153,8 @@ func (s *reportService) StreamEvents(ctx context.Context, companyID uuid.UUID, f
 	return nil
 }
 
-// Helper methods
+// --- helpers (unchanged) ---
+
 func (s *reportService) generateCSV(data interface{}, isEvents bool) ([]byte, error) {
 	var buf bytes.Buffer
 	writer := csv.NewWriter(&buf)

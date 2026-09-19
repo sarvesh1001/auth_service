@@ -11,12 +11,12 @@ import (
 	"sort"
 	"time"
 
+	"github.com/google/uuid"
+
 	"auth-service/internal/hr/payroll/models"
 	"auth-service/internal/hr/payroll/repository"
-	a "auth-service/internal/infrastructure/audit"
-
-	"github.com/google/uuid"
-	"go.uber.org/zap"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
 )
 
 const (
@@ -59,10 +59,7 @@ type StatutoryEngine interface {
 	UpdateComponentMapping(ctx context.Context, input *UpdateComponentMappingInput) error
 	DeactivateComponentMapping(ctx context.Context, mappingID uuid.UUID, actorID uuid.UUID) error
 	ListComponentMappings(ctx context.Context, companyID uuid.UUID, statutoryCode *string) ([]models.StatutoryComponentMapping, error)
-	BulkCreateComponentMappings(
-		ctx context.Context,
-		input *BulkCreateComponentMappingsInput,
-	) error
+	BulkCreateComponentMappings(ctx context.Context, input *BulkCreateComponentMappingsInput) error
 }
 
 type CreateComponentDefinitionInput struct {
@@ -87,70 +84,67 @@ type UpdateComponentDefinitionInput struct {
 }
 
 type statutoryEngine struct {
-	repo   repository.StatutoryRepository
-	audit  *a.AuditService
-	logger *zap.Logger
+	repo             repository.StatutoryRepository
+	audit            *audit.AuditService
+	idempotencyStore idempotency.Store
 }
 
 func NewStatutoryEngine(
 	repo repository.StatutoryRepository,
-	audit *a.AuditService,
-	logger *zap.Logger,
+	audit *audit.AuditService,
+	idempotencyStore idempotency.Store,
 ) StatutoryEngine {
 	return &statutoryEngine{
-		repo:   repo,
-		audit:  audit,
-		logger: logger,
+		repo:             repo,
+		audit:            audit,
+		idempotencyStore: idempotencyStore,
 	}
 }
 
+// --------------------------------------------
+// WRITE OPERATIONS WITH IDEMPOTENCY & IP AUDIT
+// --------------------------------------------
+
 func (s *statutoryEngine) CreateRuleSet(ctx context.Context, input *models.CreateRuleSetInput) error {
+	// Idempotency
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("stat_rule_set_create-%s-%s", input.CompanyID.String(), input.VersionLabel)
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
 	if input == nil {
 		return errors.New("nil input")
 	}
-
 	if input.CompanyID == uuid.Nil ||
 		input.CountryCode == "" ||
 		input.VersionLabel == "" ||
 		input.ActorID == uuid.Nil {
 		return errors.New("invalid rule set input")
 	}
-
 	if input.EffectiveFrom.IsZero() {
 		return errors.New("effective_from is required")
 	}
 
-	// ---------------------------------------------------------
-	// Validate existing rule set to avoid invalid date ranges
-	// ---------------------------------------------------------
 	existing, err := s.repo.ResolveRuleSet(ctx, input.CompanyID, time.Now().UTC())
 	if err != nil {
 		return fmt.Errorf("failed to resolve existing rule set: %w", err)
 	}
-
 	if existing != nil {
-
-		// Prevent creating rule set before current active rule set start
 		if input.EffectiveFrom.Before(existing.EffectiveFrom) {
-			return fmt.Errorf(
-				"effective_from %s cannot be earlier than current rule set start %s",
+			return fmt.Errorf("effective_from %s cannot be earlier than current rule set start %s",
 				input.EffectiveFrom.Format(time.RFC3339),
-				existing.EffectiveFrom.Format(time.RFC3339),
-			)
+				existing.EffectiveFrom.Format(time.RFC3339))
 		}
-
-		// Prevent duplicate effective_from
 		if input.EffectiveFrom.Equal(existing.EffectiveFrom) {
-			return fmt.Errorf(
-				"rule set with effective_from %s already exists",
-				input.EffectiveFrom.Format(time.RFC3339),
-			)
+			return fmt.Errorf("rule set with effective_from %s already exists",
+				input.EffectiveFrom.Format(time.RFC3339))
 		}
 	}
 
-	// ---------------------------------------------------------
-	// Build rule set
-	// ---------------------------------------------------------
 	ruleSet := &models.StatutoryRuleSet{
 		RuleSetID:     uuid.New(),
 		CompanyID:     input.CompanyID,
@@ -162,47 +156,61 @@ func (s *statutoryEngine) CreateRuleSet(ctx context.Context, input *models.Creat
 		CreatedAt:     time.Now().UTC(),
 	}
 
-	// ---------------------------------------------------------
-	// Persist rule set
-	// ---------------------------------------------------------
+	beforeJSON, _ := json.Marshal(ruleSet)
 	if err := s.repo.CreateStatutoryRuleSet(ctx, ruleSet); err != nil {
 		return fmt.Errorf("create rule set failed: %w", err)
 	}
+	afterJSON, _ := json.Marshal(ruleSet)
 
-	// ---------------------------------------------------------
-	// Audit log
-	// ---------------------------------------------------------
-	if s.audit != nil {
-		_ = s.audit.LogAction(
-			ctx,
-			nil, // no transaction
-			&input.CompanyID,
-			"statutory",
-			"rule_set_created",
-			"statutory_rule_set",
-			&ruleSet.RuleSetID,
-			"admin",
-			&input.ActorID,
-			nil,
-			nil,
-			map[string]interface{}{
-				"country_code":   input.CountryCode,
-				"version_label":  input.VersionLabel,
-				"effective_from": input.EffectiveFrom,
-			},
-		)
-	}
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		&input.CompanyID,
+		"statutory",
+		"rule_set_created",
+		"statutory_rule_set",
+		&ruleSet.RuleSetID,
+		"admin",
+		&input.ActorID,
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{
+			"country_code":   input.CountryCode,
+			"version_label":  input.VersionLabel,
+			"effective_from": input.EffectiveFrom,
+			"ip":             ip,
+		},
+	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
 func (s *statutoryEngine) UpdateRuleSet(ctx context.Context, input *models.UpdateRuleSetInput) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("stat_rule_set_update-%s", input.RuleSetID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
 	if input == nil {
 		return errors.New("nil input")
 	}
 	if input.RuleSetID == uuid.Nil || input.CompanyID == uuid.Nil {
 		return errors.New("invalid update input")
 	}
+
+	// Fetch existing for audit
+	existing, err := s.repo.GetRuleSetByID(ctx, input.RuleSetID)
+	if err != nil {
+		return err
+	}
+	beforeJSON, _ := json.Marshal(existing)
+
 	ruleSet := &models.StatutoryRuleSet{
 		RuleSetID:     input.RuleSetID,
 		CompanyID:     input.CompanyID,
@@ -211,14 +219,53 @@ func (s *statutoryEngine) UpdateRuleSet(ctx context.Context, input *models.Updat
 		EffectiveTo:   input.EffectiveTo,
 		IsActive:      input.IsActive,
 	}
-	return s.repo.UpdateStatutoryRuleSet(ctx, ruleSet)
+	if err := s.repo.UpdateStatutoryRuleSet(ctx, ruleSet); err != nil {
+		return err
+	}
+	afterJSON, _ := json.Marshal(ruleSet)
+
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		&input.CompanyID,
+		"statutory",
+		"rule_set_updated",
+		"statutory_rule_set",
+		&input.RuleSetID,
+		"admin",
+		nil, // no actor in input? Use input.ActorID? Actually UpdateRuleSetInput doesn't have ActorID – we might add it. For now, pass nil.
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{"ip": ip},
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+	return nil
 }
 
 func (s *statutoryEngine) ActivateRuleSet(ctx context.Context, ruleSetID uuid.UUID, actorID uuid.UUID) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("stat_rule_set_activate-%s", ruleSetID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
 	if ruleSetID == uuid.Nil || actorID == uuid.Nil {
 		return errors.New("invalid activate input")
 	}
-	return s.repo.WithTx(ctx, func(tx repository.StatutoryRepository) error {
+
+	// Fetch existing for audit
+	rs, err := s.repo.GetRuleSetByID(ctx, ruleSetID)
+	if err != nil {
+		return err
+	}
+	beforeJSON, _ := json.Marshal(rs)
+
+	err = s.repo.WithTx(ctx, func(tx repository.StatutoryRepository) error {
 		rs, err := tx.GetRuleSetByID(ctx, ruleSetID)
 		if err != nil {
 			return err
@@ -235,30 +282,88 @@ func (s *statutoryEngine) ActivateRuleSet(ctx context.Context, ruleSetID uuid.UU
 		}
 		return tx.ActivateRuleSet(ctx, ruleSetID, actorID)
 	})
+	if err != nil {
+		return err
+	}
+
+	// After state (re-fetch)
+	rsAfter, _ := s.repo.GetRuleSetByID(ctx, ruleSetID)
+	afterJSON, _ := json.Marshal(rsAfter)
+
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		&rs.CompanyID,
+		"statutory",
+		"rule_set_activated",
+		"statutory_rule_set",
+		&ruleSetID,
+		"admin",
+		&actorID,
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{"ip": ip},
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+	return nil
 }
 
 func (s *statutoryEngine) DeactivateRuleSet(ctx context.Context, ruleSetID uuid.UUID, actorID uuid.UUID) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("stat_rule_set_deactivate-%s", ruleSetID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
 	if ruleSetID == uuid.Nil || actorID == uuid.Nil {
 		return errors.New("invalid deactivate input")
 	}
-	return s.repo.DeactivateStatutoryRuleSet(ctx, ruleSetID, actorID)
-}
 
-func (s *statutoryEngine) ListRuleSets(ctx context.Context, companyID uuid.UUID) ([]models.StatutoryRuleSet, error) {
-	if companyID == uuid.Nil {
-		return nil, errors.New("invalid company id")
+	rs, err := s.repo.GetRuleSetByID(ctx, ruleSetID)
+	if err != nil {
+		return err
 	}
-	return s.repo.ListRuleSets(ctx, companyID)
+	beforeJSON, _ := json.Marshal(rs)
+
+	if err := s.repo.DeactivateStatutoryRuleSet(ctx, ruleSetID, actorID); err != nil {
+		return err
+	}
+	afterJSON, _ := json.Marshal(rs) // state after (is_active false)
+
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		&rs.CompanyID,
+		"statutory",
+		"rule_set_deactivated",
+		"statutory_rule_set",
+		&ruleSetID,
+		"admin",
+		&actorID,
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{"ip": ip},
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+	return nil
 }
 
-func (s *statutoryEngine) ResolveActiveRuleSet(ctx context.Context, companyID uuid.UUID, asOf time.Time) (*models.StatutoryRuleSet, error) {
-	return s.repo.ResolveRuleSet(ctx, companyID, asOf)
-}
-
-func (s *statutoryEngine) CreateComponentDefinition(
-	ctx context.Context,
-	input *CreateComponentDefinitionInput,
-) error {
+func (s *statutoryEngine) CreateComponentDefinition(ctx context.Context, input *CreateComponentDefinitionInput) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("stat_comp_def_create-%s-%s", input.CompanyID.String(), input.StatutoryCode)
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
 
 	if input.CompanyID == uuid.Nil ||
 		input.StatutoryCode == "" ||
@@ -267,22 +372,13 @@ func (s *statutoryEngine) CreateComponentDefinition(
 		return errors.New("invalid component definition input")
 	}
 
-	// 🔴 CHECK IF EXISTS FIRST
-	existing, err := s.repo.GetStatutoryComponentDefinition(
-		ctx,
-		input.CompanyID,
-		input.StatutoryCode,
-	)
+	existing, err := s.repo.GetStatutoryComponentDefinition(ctx, input.CompanyID, input.StatutoryCode)
 	if err != nil {
 		return err
 	}
-
 	if existing != nil {
-		return fmt.Errorf(
-			"statutory component definition already exists for company %s and code %s",
-			input.CompanyID,
-			input.StatutoryCode,
-		)
+		return fmt.Errorf("statutory component definition already exists for company %s and code %s",
+			input.CompanyID, input.StatutoryCode)
 	}
 
 	def := &models.StatutoryComponentDefinition{
@@ -296,37 +392,56 @@ func (s *statutoryEngine) CreateComponentDefinition(
 		CreatedAt:               time.Now().UTC(),
 	}
 
+	beforeJSON, _ := json.Marshal(def)
 	if err := s.repo.CreateStatutoryComponentDefinition(ctx, def); err != nil {
 		return err
 	}
+	afterJSON, _ := json.Marshal(def)
 
-	if s.audit != nil {
-		_ = s.audit.LogAction(
-			ctx,
-			nil, // no transaction
-			&input.CompanyID,
-			"statutory",
-			"component_definition_created",
-			"statutory_component_definition",
-			nil,
-			"admin",
-			&input.ActorID,
-			nil,
-			nil,
-			map[string]interface{}{
-				"statutory_code": input.StatutoryCode,
-				"country_code":   input.CountryCode,
-			},
-		)
-	}
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		&input.CompanyID,
+		"statutory",
+		"component_definition_created",
+		"statutory_component_definition",
+		nil,
+		"admin",
+		&input.ActorID,
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{
+			"statutory_code": input.StatutoryCode,
+			"country_code":   input.CountryCode,
+			"ip":             ip,
+		},
+	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
 func (s *statutoryEngine) UpdateComponentDefinition(ctx context.Context, input *UpdateComponentDefinitionInput) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("stat_comp_def_update-%s-%s", input.CompanyID.String(), input.StatutoryCode)
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
 	if input.CompanyID == uuid.Nil || input.StatutoryCode == "" || input.ActorID == uuid.Nil {
 		return errors.New("invalid component definition update input")
 	}
+
+	existing, err := s.repo.GetStatutoryComponentDefinition(ctx, input.CompanyID, input.StatutoryCode)
+	if err != nil {
+		return err
+	}
+	beforeJSON, _ := json.Marshal(existing)
+
 	def := &models.StatutoryComponentDefinition{
 		CompanyID:               input.CompanyID,
 		StatutoryCode:           input.StatutoryCode,
@@ -338,25 +453,835 @@ func (s *statutoryEngine) UpdateComponentDefinition(ctx context.Context, input *
 	if err := s.repo.UpdateStatutoryComponentDefinition(ctx, def); err != nil {
 		return err
 	}
-	if s.audit != nil {
-		_ = s.audit.LogAction(
-			ctx,
-			nil, // no transaction
-			&input.CompanyID,
-			"statutory",
-			"component_definition_updated",
-			"statutory_component_definition",
-			nil,
-			"admin",
-			&input.ActorID,
-			nil,
-			nil,
-			map[string]interface{}{
-				"statutory_code": input.StatutoryCode,
-			},
-		)
-	}
+	afterJSON, _ := json.Marshal(def)
+
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		&input.CompanyID,
+		"statutory",
+		"component_definition_updated",
+		"statutory_component_definition",
+		nil,
+		"admin",
+		&input.ActorID,
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{
+			"statutory_code": input.StatutoryCode,
+			"ip":             ip,
+		},
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
+}
+
+func (s *statutoryEngine) DeleteComponentDefinition(ctx context.Context, companyID uuid.UUID, statutoryCode string, actorID uuid.UUID) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("stat_comp_def_delete-%s-%s", companyID.String(), statutoryCode)
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	if companyID == uuid.Nil || statutoryCode == "" || actorID == uuid.Nil {
+		return errors.New("invalid input for component definition deletion")
+	}
+
+	existing, err := s.repo.GetStatutoryComponentDefinition(ctx, companyID, statutoryCode)
+	if err != nil {
+		return err
+	}
+	beforeJSON, _ := json.Marshal(existing)
+
+	rules, err := s.repo.ListContributionRulesByStatutoryCode(ctx, companyID, statutoryCode)
+	if err != nil {
+		return err
+	}
+	if len(rules) > 0 {
+		return fmt.Errorf("cannot delete: %d contribution rule(s) exist for this component", len(rules))
+	}
+	slabs, err := s.repo.ListTaxSlabsByStatutoryCode(ctx, companyID, statutoryCode)
+	if err != nil {
+		return err
+	}
+	if len(slabs) > 0 {
+		return fmt.Errorf("cannot delete: %d tax slab(s) exist for this component", len(slabs))
+	}
+	mappings, err := s.repo.ListComponentMappings(ctx, companyID, &statutoryCode)
+	if err != nil {
+		return err
+	}
+	if len(mappings) > 0 {
+		return fmt.Errorf("cannot delete: %d component mapping(s) exist for this component", len(mappings))
+	}
+
+	if err := s.repo.DeleteStatutoryComponentDefinition(ctx, companyID, statutoryCode); err != nil {
+		return err
+	}
+
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		&companyID,
+		"statutory",
+		"component_definition_deleted",
+		"statutory_component_definition",
+		nil,
+		"admin",
+		&actorID,
+		beforeJSON,
+		[]byte("{}"),
+		map[string]interface{}{
+			"statutory_code": statutoryCode,
+			"ip":             ip,
+		},
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+	return nil
+}
+
+func (s *statutoryEngine) SetContributionRule(ctx context.Context, input *models.CreateStatutoryContributionRuleInput) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("stat_contrib_rule_set-%s-%s", input.RuleSetID.String(), input.StatutoryCode)
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	if input.CompanyID == uuid.Nil || input.RuleSetID == uuid.Nil || input.StatutoryCode == "" {
+		return errors.New("invalid contribution rule input")
+	}
+
+	beforeJSON, _ := json.Marshal(input) // no before state, but we can log the input
+	if err := s.repo.UpsertStatutoryContributionRule(ctx, *input); err != nil {
+		return err
+	}
+	afterJSON, _ := json.Marshal(input)
+
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		&input.CompanyID,
+		"statutory",
+		"contribution_rule_created",
+		"statutory_contribution_rule",
+		nil,
+		"admin",
+		nil, // no actor in input
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{
+			"statutory_code": input.StatutoryCode,
+			"rule_set_id":    input.RuleSetID.String(),
+			"ip":             ip,
+		},
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+	return nil
+}
+
+func (s *statutoryEngine) BulkSetContributionRules(ctx context.Context, inputs []models.CreateStatutoryContributionRuleInput) error {
+	if len(inputs) == 0 {
+		return nil
+	}
+	// Generate a composite key (first rule set ID and count)
+	first := inputs[0]
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("stat_contrib_bulk-%s-%d", first.RuleSetID.String(), len(inputs))
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	beforeJSON, _ := json.Marshal(inputs)
+	err := s.repo.WithTx(ctx, func(tx repository.StatutoryRepository) error {
+		for _, in := range inputs {
+			if err := tx.UpsertStatutoryContributionRule(ctx, in); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	afterJSON, _ := json.Marshal(inputs)
+
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		&first.CompanyID,
+		"statutory",
+		"bulk_contribution_rules_created",
+		"statutory_contribution_rule",
+		nil,
+		"admin",
+		nil,
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{
+			"count":       len(inputs),
+			"rule_set_id": first.RuleSetID.String(),
+			"ip":          ip,
+		},
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+	return nil
+}
+
+func (s *statutoryEngine) DeactivateContributionRule(ctx context.Context, ruleID uuid.UUID, actorID uuid.UUID) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("stat_contrib_deact-%s", ruleID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	if ruleID == uuid.Nil || actorID == uuid.Nil {
+		return errors.New("invalid deactivation input")
+	}
+
+	// We don't have a GetContributionRuleByID, so we just log the ruleID.
+	beforeJSON, _ := json.Marshal(map[string]interface{}{"rule_id": ruleID.String()})
+	if err := s.repo.DeactivateStatutoryContributionRule(ctx, ruleID, actorID); err != nil {
+		return err
+	}
+	afterJSON, _ := json.Marshal(map[string]interface{}{"rule_id": ruleID.String(), "is_active": false})
+
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		nil, // companyID not available
+		"statutory",
+		"contribution_rule_deactivated",
+		"statutory_contribution_rule",
+		&ruleID,
+		"admin",
+		&actorID,
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{"ip": ip},
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+	return nil
+}
+
+func (s *statutoryEngine) CreateTaxSlab(ctx context.Context, input *CreateTaxSlabInput) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("stat_tax_slab_create-%s-%s", input.RuleSetID.String(), input.StatutoryCode)
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	if input == nil ||
+		input.CompanyID == uuid.Nil ||
+		input.StatutoryCode == "" ||
+		input.RuleSetID == uuid.Nil ||
+		input.ActorID == uuid.Nil {
+		return errors.New("invalid tax slab input")
+	}
+
+	// Validate dependencies
+	def, err := s.repo.GetStatutoryComponentDefinition(ctx, input.CompanyID, input.StatutoryCode)
+	if err != nil {
+		return err
+	}
+	if def == nil {
+		return fmt.Errorf("statutory component definition %s not found", input.StatutoryCode)
+	}
+	rs, err := s.repo.GetRuleSetByID(ctx, input.RuleSetID)
+	if err != nil {
+		return err
+	}
+	if rs == nil {
+		return fmt.Errorf("rule set %s not found", input.RuleSetID)
+	}
+
+	// Check duplicate
+	existingSlabs, err := s.repo.ListTaxSlabsByStatutoryCode(ctx, input.CompanyID, input.StatutoryCode)
+	if err != nil {
+		return err
+	}
+	for _, slab := range existingSlabs {
+		if slab.RuleSetID != nil && *slab.RuleSetID == input.RuleSetID && slab.IsActive &&
+			slab.EffectiveFrom.Equal(input.EffectiveFrom) &&
+			slab.MinAmount == input.MinAmount &&
+			((slab.MaxAmount == nil && input.MaxAmount == nil) ||
+				(slab.MaxAmount != nil && input.MaxAmount != nil && *slab.MaxAmount == *input.MaxAmount)) {
+			return fmt.Errorf("tax slab already exists for %s with range %.2f - %v for rule_set %s",
+				input.StatutoryCode, input.MinAmount, input.MaxAmount, input.RuleSetID)
+		}
+	}
+
+	modelInput := models.CreateTaxSlabInput{
+		CompanyID:     input.CompanyID,
+		StatutoryCode: input.StatutoryCode,
+		MinAmount:     input.MinAmount,
+		MaxAmount:     input.MaxAmount,
+		Rate:          input.Rate,
+		IsPercentage:  input.IsPercentage,
+		SlabOrder:     input.SlabOrder,
+		EffectiveFrom: input.EffectiveFrom,
+		RuleSetID:     input.RuleSetID,
+		CreatedBy:     input.ActorID,
+	}
+
+	beforeJSON, _ := json.Marshal(modelInput)
+	if err := s.repo.CreateTaxSlab(ctx, modelInput); err != nil {
+		return err
+	}
+	afterJSON, _ := json.Marshal(modelInput)
+
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		&input.CompanyID,
+		"statutory",
+		"tax_slab_created",
+		"company_tax_slab",
+		nil,
+		"admin",
+		&input.ActorID,
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{
+			"statutory_code": input.StatutoryCode,
+			"rule_set_id":    input.RuleSetID.String(),
+			"min_amount":     input.MinAmount,
+			"max_amount":     input.MaxAmount,
+			"ip":             ip,
+		},
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+	return nil
+}
+
+func (s *statutoryEngine) UpdateTaxSlab(ctx context.Context, input *UpdateTaxSlabInput) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("stat_tax_slab_update-%s", input.SlabID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	if input == nil || input.SlabID == uuid.Nil || input.ActorID == uuid.Nil {
+		return errors.New("invalid tax slab update input")
+	}
+
+	// Fetch existing for audit (if possible; we don't have GetTaxSlabByID, so we just log the update)
+	beforeJSON, _ := json.Marshal(input)
+	modelInput := models.UpdateTaxSlabInput{
+		SlabID:        input.SlabID,
+		MinAmount:     input.MinAmount,
+		MaxAmount:     input.MaxAmount,
+		Rate:          input.Rate,
+		IsPercentage:  input.IsPercentage,
+		SlabOrder:     input.SlabOrder,
+		EffectiveFrom: input.EffectiveFrom,
+		UpdatedBy:     input.ActorID,
+	}
+	if err := s.repo.UpdateTaxSlab(ctx, modelInput); err != nil {
+		return err
+	}
+	afterJSON, _ := json.Marshal(input)
+
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		nil,
+		"statutory",
+		"tax_slab_updated",
+		"company_tax_slab",
+		&input.SlabID,
+		"admin",
+		&input.ActorID,
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{"ip": ip},
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+	return nil
+}
+
+func (s *statutoryEngine) DeactivateTaxSlab(ctx context.Context, slabID uuid.UUID, actorID uuid.UUID) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("stat_tax_slab_deact-%s", slabID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	if slabID == uuid.Nil || actorID == uuid.Nil {
+		return errors.New("invalid deactivate tax slab input")
+	}
+	if err := s.repo.DeactivateTaxSlab(ctx, slabID, actorID); err != nil {
+		return err
+	}
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		nil,
+		"statutory",
+		"tax_slab_deactivated",
+		"company_tax_slab",
+		&slabID,
+		"admin",
+		&actorID,
+		nil,
+		nil,
+		map[string]interface{}{"ip": ip},
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+	return nil
+}
+
+func (s *statutoryEngine) CreateDeductionLimit(ctx context.Context, input *CreateDeductionLimitInput) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("stat_ded_limit_create-%s-%s", input.RuleSetID.String(), input.LimitCode)
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	if input == nil || input.CompanyID == uuid.Nil || input.RuleSetID == uuid.Nil || input.LimitCode == "" || input.ActorID == uuid.Nil {
+		return errors.New("invalid deduction limit input")
+	}
+	rs, err := s.repo.GetRuleSetByID(ctx, input.RuleSetID)
+	if err != nil {
+		return err
+	}
+	if rs == nil {
+		return fmt.Errorf("rule set %s not found", input.RuleSetID)
+	}
+	limits, err := s.repo.ListDeductionLimits(ctx, input.CompanyID, &input.RuleSetID)
+	if err != nil {
+		return err
+	}
+	for _, l := range limits {
+		if l.LimitCode == input.LimitCode {
+			return fmt.Errorf("deduction limit with code %s already exists in this rule set", input.LimitCode)
+		}
+	}
+
+	modelInput := models.CreateDeductionLimitInput{
+		CompanyID:  input.CompanyID,
+		RuleSetID:  input.RuleSetID,
+		LimitCode:  input.LimitCode,
+		LimitValue: input.LimitValue,
+		Metadata:   input.Metadata,
+	}
+	beforeJSON, _ := json.Marshal(modelInput)
+	if err := s.repo.CreateDeductionLimit(ctx, modelInput); err != nil {
+		return err
+	}
+	afterJSON, _ := json.Marshal(modelInput)
+
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		&input.CompanyID,
+		"statutory",
+		"deduction_limit_created",
+		"statutory_deduction_limit",
+		nil,
+		"admin",
+		&input.ActorID,
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{
+			"limit_code":  input.LimitCode,
+			"rule_set_id": input.RuleSetID.String(),
+			"limit_value": input.LimitValue,
+			"ip":          ip,
+		},
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+	return nil
+}
+
+func (s *statutoryEngine) UpdateDeductionLimit(ctx context.Context, input *UpdateDeductionLimitInput) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("stat_ded_limit_update-%s", input.LimitID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	if input == nil || input.LimitID == uuid.Nil || input.ActorID == uuid.Nil {
+		return errors.New("invalid deduction limit update input")
+	}
+	modelInput := models.UpdateDeductionLimitInput{
+		LimitID:    input.LimitID,
+		LimitValue: input.LimitValue,
+		Metadata:   input.Metadata,
+	}
+	beforeJSON, _ := json.Marshal(modelInput)
+	if err := s.repo.UpdateDeductionLimit(ctx, modelInput); err != nil {
+		return err
+	}
+	afterJSON, _ := json.Marshal(modelInput)
+
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		nil,
+		"statutory",
+		"deduction_limit_updated",
+		"statutory_deduction_limit",
+		&input.LimitID,
+		"admin",
+		&input.ActorID,
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{"ip": ip},
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+	return nil
+}
+
+func (s *statutoryEngine) DeleteDeductionLimit(ctx context.Context, limitID uuid.UUID, actorID uuid.UUID) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("stat_ded_limit_delete-%s", limitID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	if limitID == uuid.Nil || actorID == uuid.Nil {
+		return errors.New("invalid delete deduction limit input")
+	}
+	beforeJSON, _ := json.Marshal(map[string]interface{}{"limit_id": limitID.String()})
+	if err := s.repo.DeleteDeductionLimit(ctx, limitID); err != nil {
+		return err
+	}
+	afterJSON, _ := json.Marshal(map[string]interface{}{"limit_id": limitID.String(), "deleted": true})
+
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		nil,
+		"statutory",
+		"deduction_limit_deleted",
+		"statutory_deduction_limit",
+		&limitID,
+		"admin",
+		&actorID,
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{"ip": ip},
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+	return nil
+}
+
+func (s *statutoryEngine) CreateComponentMapping(ctx context.Context, input *CreateComponentMappingInput) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("stat_comp_map_create-%s-%s", input.RuleSetID.String(), input.ComponentCode)
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	if input == nil || input.CompanyID == uuid.Nil || input.StatutoryCode == "" || input.ComponentCode == "" || input.RuleSetID == uuid.Nil || input.ActorID == uuid.Nil {
+		return errors.New("invalid component mapping input")
+	}
+	def, err := s.repo.GetStatutoryComponentDefinition(ctx, input.CompanyID, input.StatutoryCode)
+	if err != nil {
+		return err
+	}
+	if def == nil {
+		return fmt.Errorf("statutory component definition %s not found", input.StatutoryCode)
+	}
+	rs, err := s.repo.GetRuleSetByID(ctx, input.RuleSetID)
+	if err != nil {
+		return err
+	}
+	if rs == nil {
+		return fmt.Errorf("rule set %s not found", input.RuleSetID)
+	}
+	mappings, err := s.repo.ListComponentMappings(ctx, input.CompanyID, &input.StatutoryCode)
+	if err != nil {
+		return err
+	}
+	for _, m := range mappings {
+		if m.ComponentCode == input.ComponentCode && m.IsActive {
+			return fmt.Errorf("active mapping already exists for %s → %s", input.StatutoryCode, input.ComponentCode)
+		}
+	}
+
+	modelInput := models.CreateComponentMappingInput{
+		CompanyID:     input.CompanyID,
+		StatutoryCode: input.StatutoryCode,
+		ComponentCode: input.ComponentCode,
+		EffectiveFrom: input.EffectiveFrom,
+		RuleSetID:     input.RuleSetID,
+		CreatedBy:     input.ActorID,
+	}
+	beforeJSON, _ := json.Marshal(modelInput)
+	if err := s.repo.CreateComponentMapping(ctx, modelInput); err != nil {
+		return err
+	}
+	afterJSON, _ := json.Marshal(modelInput)
+
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		&input.CompanyID,
+		"statutory",
+		"component_mapping_created",
+		"statutory_component_mapping",
+		nil,
+		"admin",
+		&input.ActorID,
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{
+			"statutory_code": input.StatutoryCode,
+			"component_code": input.ComponentCode,
+			"rule_set_id":    input.RuleSetID.String(),
+			"ip":             ip,
+		},
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+	return nil
+}
+
+func (s *statutoryEngine) UpdateComponentMapping(ctx context.Context, input *UpdateComponentMappingInput) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("stat_comp_map_update-%s", input.MappingID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	if input == nil || input.MappingID == uuid.Nil || input.ActorID == uuid.Nil {
+		return errors.New("invalid component mapping update input")
+	}
+	modelInput := models.UpdateComponentMappingInput{
+		MappingID:     input.MappingID,
+		ComponentCode: input.ComponentCode,
+		EffectiveFrom: input.EffectiveFrom,
+		Version:       input.Version,
+		UpdatedBy:     input.ActorID,
+	}
+	beforeJSON, _ := json.Marshal(modelInput)
+	if err := s.repo.UpdateComponentMapping(ctx, modelInput); err != nil {
+		return err
+	}
+	afterJSON, _ := json.Marshal(modelInput)
+
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		nil,
+		"statutory",
+		"component_mapping_updated",
+		"statutory_component_mapping",
+		&input.MappingID,
+		"admin",
+		&input.ActorID,
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{"ip": ip},
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+	return nil
+}
+
+func (s *statutoryEngine) DeactivateComponentMapping(ctx context.Context, mappingID uuid.UUID, actorID uuid.UUID) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("stat_comp_map_deact-%s", mappingID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	if mappingID == uuid.Nil || actorID == uuid.Nil {
+		return errors.New("invalid deactivate component mapping input")
+	}
+	if err := s.repo.DeactivateComponentMapping(ctx, mappingID, actorID); err != nil {
+		return err
+	}
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		nil,
+		"statutory",
+		"component_mapping_deactivated",
+		"statutory_component_mapping",
+		&mappingID,
+		"admin",
+		&actorID,
+		nil,
+		nil,
+		map[string]interface{}{"ip": ip},
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+	return nil
+}
+
+func (s *statutoryEngine) BulkCreateComponentMappings(ctx context.Context, input *BulkCreateComponentMappingsInput) error {
+	if input == nil ||
+		input.CompanyID == uuid.Nil ||
+		input.StatutoryCode == "" ||
+		len(input.ComponentCodes) == 0 ||
+		input.RuleSetID == uuid.Nil ||
+		input.ActorID == uuid.Nil {
+		return errors.New("invalid bulk component mapping input")
+	}
+
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("stat_comp_map_bulk-%s-%s", input.RuleSetID.String(), input.StatutoryCode)
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	beforeJSON, _ := json.Marshal(input)
+	err := s.repo.WithTx(ctx, func(tx repository.StatutoryRepository) error {
+		def, err := tx.GetStatutoryComponentDefinition(ctx, input.CompanyID, input.StatutoryCode)
+		if err != nil {
+			return err
+		}
+		if def == nil {
+			return fmt.Errorf("statutory component definition %s not found", input.StatutoryCode)
+		}
+		rs, err := tx.GetRuleSetByID(ctx, input.RuleSetID)
+		if err != nil {
+			return err
+		}
+		if rs == nil {
+			return fmt.Errorf("rule set %s not found", input.RuleSetID)
+		}
+		existing, err := tx.ListComponentMappings(ctx, input.CompanyID, &input.StatutoryCode)
+		if err != nil {
+			return err
+		}
+		existingMap := make(map[string]bool)
+		for _, m := range existing {
+			if m.IsActive {
+				existingMap[m.ComponentCode] = true
+			}
+		}
+		for _, code := range input.ComponentCodes {
+			if existingMap[code] {
+				continue
+			}
+			modelInput := models.CreateComponentMappingInput{
+				CompanyID:     input.CompanyID,
+				StatutoryCode: input.StatutoryCode,
+				ComponentCode: code,
+				EffectiveFrom: input.EffectiveFrom,
+				RuleSetID:     input.RuleSetID,
+				CreatedBy:     input.ActorID,
+			}
+			if err := tx.CreateComponentMapping(ctx, modelInput); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	afterJSON, _ := json.Marshal(input)
+
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		&input.CompanyID,
+		"statutory",
+		"bulk_component_mappings_created",
+		"statutory_component_mapping",
+		nil,
+		"admin",
+		&input.ActorID,
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{
+			"statutory_code": input.StatutoryCode,
+			"count":          len(input.ComponentCodes),
+			"rule_set_id":    input.RuleSetID.String(),
+			"ip":             ip,
+		},
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+	return nil
+}
+
+// --------------------------------------------
+// READ OPERATIONS (no idempotency)
+// --------------------------------------------
+
+func (s *statutoryEngine) ListRuleSets(ctx context.Context, companyID uuid.UUID) ([]models.StatutoryRuleSet, error) {
+	if companyID == uuid.Nil {
+		return nil, errors.New("invalid company id")
+	}
+	return s.repo.ListRuleSets(ctx, companyID)
+}
+
+func (s *statutoryEngine) ResolveActiveRuleSet(ctx context.Context, companyID uuid.UUID, asOf time.Time) (*models.StatutoryRuleSet, error) {
+	return s.repo.ResolveRuleSet(ctx, companyID, asOf)
 }
 
 func (s *statutoryEngine) ListComponentDefinitions(ctx context.Context, companyID uuid.UUID) ([]models.StatutoryComponentDefinition, error) {
@@ -366,39 +1291,11 @@ func (s *statutoryEngine) ListComponentDefinitions(ctx context.Context, companyI
 	return s.repo.ListStatutoryComponentDefinitions(ctx, companyID)
 }
 
-func (s *statutoryEngine) SetContributionRule(ctx context.Context, input *models.CreateStatutoryContributionRuleInput) error {
-	if input.CompanyID == uuid.Nil || input.RuleSetID == uuid.Nil || input.StatutoryCode == "" {
-		return errors.New("invalid contribution rule input")
-	}
-	return s.repo.UpsertStatutoryContributionRule(ctx, *input)
-}
-
-func (s *statutoryEngine) BulkSetContributionRules(ctx context.Context, inputs []models.CreateStatutoryContributionRuleInput) error {
-	if len(inputs) == 0 {
-		return nil
-	}
-	return s.repo.WithTx(ctx, func(tx repository.StatutoryRepository) error {
-		for _, in := range inputs {
-			if err := tx.UpsertStatutoryContributionRule(ctx, in); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
-
 func (s *statutoryEngine) ListContributionRules(ctx context.Context, companyID uuid.UUID, statutoryCode string) ([]models.StatutoryContributionRule, error) {
 	if companyID == uuid.Nil {
 		return nil, errors.New("company id required")
 	}
 	return s.repo.ListContributionRulesByStatutoryCode(ctx, companyID, statutoryCode)
-}
-
-func (s *statutoryEngine) DeactivateContributionRule(ctx context.Context, ruleID uuid.UUID, actorID uuid.UUID) error {
-	if ruleID == uuid.Nil || actorID == uuid.Nil {
-		return errors.New("invalid deactivation input")
-	}
-	return s.repo.DeactivateStatutoryContributionRule(ctx, ruleID, actorID)
 }
 
 func (s *statutoryEngine) ValidateContributionCompleteness(ctx context.Context, companyID uuid.UUID, ruleSetID uuid.UUID) error {
@@ -434,9 +1331,6 @@ func (s *statutoryEngine) ValidateContributionCompleteness(ctx context.Context, 
 					return fmt.Errorf("rate_value required for %s %s rule", code, r.ContributionSide)
 				}
 			}
-			if r.CalculationType == models.CalculationTypeSlab {
-				// slabs are validated separately
-			}
 		}
 		if !def.HasEmployeeContribution && hasEmp {
 			return fmt.Errorf("%s does not allow employee contribution", code)
@@ -451,16 +1345,38 @@ func (s *statutoryEngine) ValidateContributionCompleteness(ctx context.Context, 
 	return nil
 }
 
-func (s *statutoryEngine) Execute(
-	ctx context.Context,
-	input *StatutoryExecutionInput,
-) (*StatutoryExecutionResult, error) {
+func (s *statutoryEngine) ListTaxSlabs(ctx context.Context, companyID uuid.UUID, statutoryCode string) ([]models.StatutoryTaxSlab, error) {
+	if companyID == uuid.Nil || statutoryCode == "" {
+		return nil, errors.New("company ID and statutory code required")
+	}
+	return s.repo.ListTaxSlabsByStatutoryCode(ctx, companyID, statutoryCode)
+}
+
+func (s *statutoryEngine) ListDeductionLimits(ctx context.Context, companyID uuid.UUID, ruleSetID *uuid.UUID) ([]models.StatutoryDeductionLimit, error) {
+	if companyID == uuid.Nil {
+		return nil, errors.New("company ID required")
+	}
+	return s.repo.ListDeductionLimits(ctx, companyID, ruleSetID)
+}
+
+func (s *statutoryEngine) ListComponentMappings(ctx context.Context, companyID uuid.UUID, statutoryCode *string) ([]models.StatutoryComponentMapping, error) {
+	if companyID == uuid.Nil {
+		return nil, errors.New("company ID required")
+	}
+	return s.repo.ListComponentMappings(ctx, companyID, statutoryCode)
+}
+
+// --------------------------------------------
+// EXECUTION / COMPUTATION (with idempotency for ExecuteTx)
+// --------------------------------------------
+
+func (s *statutoryEngine) Execute(ctx context.Context, input *StatutoryExecutionInput) (*StatutoryExecutionResult, error) {
 	var result *StatutoryExecutionResult
 	err := s.repo.WithTx(ctx, func(txRepo repository.StatutoryRepository) error {
 		engine := &statutoryEngine{
-			repo:   txRepo,
-			audit:  s.audit,
-			logger: s.logger,
+			repo:             txRepo,
+			audit:            s.audit,
+			idempotencyStore: s.idempotencyStore,
 		}
 		r, err := engine.ExecuteTx(ctx, input)
 		if err != nil {
@@ -476,83 +1392,135 @@ func (s *statutoryEngine) Preview(ctx context.Context, input *StatutoryExecution
 	return s.run(ctx, input)
 }
 
+func (s *statutoryEngine) ExecuteTx(ctx context.Context, input *StatutoryExecutionInput) (*StatutoryExecutionResult, error) {
+	if input == nil {
+		return nil, errors.New("statutory execution input is nil")
+	}
+	if input.CompanyID == uuid.Nil ||
+		input.UserID == uuid.Nil ||
+		input.PayrollRunID == uuid.Nil {
+		return nil, errors.New("invalid execution input: missing required identifiers")
+	}
+	if input.ActorID == uuid.Nil {
+		return nil, errors.New("actor_id required for statutory snapshot")
+	}
+
+	// Idempotency based on PayrollRunID + UserID
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("stat_execute-%s-%s", input.PayrollRunID.String(), input.UserID.String())
+	}
+	var cachedResult StatutoryExecutionResult
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cachedResult); err == nil {
+		return &cachedResult, nil
+	}
+
+	result, err := s.run(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+
+	// Save contributions
+	for _, c := range result.ContributionRecords {
+		if err := s.repo.InsertEmployeeStatutoryContribution(ctx, c); err != nil {
+			return nil, fmt.Errorf("failed to insert employee statutory contribution: %w", err)
+		}
+	}
+	breakdown := convertTraceToBreakdown(result.ComputationTrace)
+	snapshot := &models.StatutorySnapshot{
+		SnapshotID:   uuid.New(),
+		PayrollRunID: input.PayrollRunID,
+		CompanyID:    input.CompanyID,
+		UserID:       input.UserID,
+		RuleSetID:    result.RuleSetID,
+		RuleHash:     result.RuleHash,
+		PeriodStart:  input.PeriodStart,
+		PeriodEnd:    input.PeriodEnd,
+		Breakdown:    breakdown,
+		CreatedAt:    time.Now().UTC(),
+		CreatedBy:    &input.ActorID,
+	}
+	if err := s.repo.InsertStatutorySnapshot(ctx, snapshot); err != nil {
+		return nil, fmt.Errorf("failed to insert statutory snapshot: %w", err)
+	}
+
+	// Audit
+	ip, _ := ctx.Value("ip_address").(string)
+	metadata := map[string]interface{}{
+		"user_id":       input.UserID.String(),
+		"period_start":  input.PeriodStart,
+		"period_end":    input.PeriodEnd,
+		"rule_set_id":   result.RuleSetID.String(),
+		"rule_hash":     result.RuleHash,
+		"contributions": len(result.ContributionRecords),
+		"ip":            ip,
+	}
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		&input.CompanyID,
+		"payroll",
+		"statutory_execution_completed",
+		"statutory_contribution",
+		nil,
+		"system",
+		nil,
+		nil,
+		nil,
+		metadata,
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, result)
+	return result, nil
+}
+
+// --------------------------------------------
+// CORE COMPUTATION LOGIC (unchanged, but logger removed)
+// --------------------------------------------
+
 func (s *statutoryEngine) run(ctx context.Context, input *StatutoryExecutionInput) (*StatutoryExecutionResult, error) {
 	if input == nil {
 		return nil, errors.New("nil execution input")
 	}
-	s.logger.Info("statutory_run_started",
-		zap.String("company_id", input.CompanyID.String()),
-		zap.String("user_id", input.UserID.String()),
-		zap.Time("as_of", input.AsOf),
-		zap.Time("period_start", input.PeriodStart),
-		zap.Time("period_end", input.PeriodEnd),
-		zap.Float64("tax_exempt_amount", input.TaxExemptAmount),
-		zap.String("tax_regime", input.TaxRegime),
-		zap.Int("earnings_count", len(input.Earnings)),
-	)
 
 	ruleSet, err := s.repo.ResolveRuleSet(ctx, input.CompanyID, input.AsOf)
 	if err != nil {
-		s.logger.Error("resolve_rule_set_failed", zap.Error(err))
 		return nil, err
 	}
 	if ruleSet == nil {
-		s.logger.Warn("no_active_rule_set_found",
-			zap.String("company_id", input.CompanyID.String()),
-			zap.Time("as_of", input.AsOf),
-		)
 		return nil, errors.New("no active rule set")
 	}
-	s.logger.Info("rule_set_resolved",
-		zap.String("rule_set_id", ruleSet.RuleSetID.String()),
-		zap.String("version_label", ruleSet.VersionLabel),
-	)
 
 	profiles, err := s.repo.GetEmployeeStatutoryProfiles(ctx, input.CompanyID, input.UserID, input.AsOf)
 	if err != nil {
 		return nil, err
 	}
-	s.logger.Info("employee_profiles_loaded", zap.Int("profile_count", len(profiles)))
-
 	validProfiles := filterProfilesByRuleSet(profiles, ruleSet.RuleSetID)
-	s.logger.Info("valid_profiles_after_filter", zap.Int("valid_count", len(validProfiles)))
 
 	mappings, err := s.repo.LoadStatutoryComponentMappingsByRuleSet(ctx, ruleSet.RuleSetID)
 	if err != nil {
 		return nil, err
 	}
-
 	rules, err := s.repo.LoadStatutoryContributionRulesByRuleSet(ctx, ruleSet.RuleSetID, input.CompanyID)
 	if err != nil {
 		return nil, err
 	}
-
 	slabs, err := s.repo.LoadTaxSlabsByRuleSet(ctx, ruleSet.RuleSetID)
 	if err != nil {
 		return nil, err
 	}
-
 	limits, err := s.repo.LoadDeductionLimitsByRuleSet(ctx, ruleSet.RuleSetID)
 	if err != nil {
 		return nil, err
 	}
-
-	s.logger.Info("rule_set_data_loaded",
-		zap.Int("mappings_count", len(mappings)),
-		zap.Int("rules_count", len(rules)),
-		zap.Int("slabs_count", len(slabs)),
-		zap.Int("limits_count", len(limits)),
-	)
 
 	hash, err := s.GenerateRuleHash(ctx, input.CompanyID, ruleSet.RuleSetID)
 	if err != nil {
 		return nil, err
 	}
 
-	// Load component definitions to know calculation_basis
 	defs, err := s.repo.ListStatutoryComponentDefinitions(ctx, input.CompanyID)
 	if err != nil {
-		s.logger.Error("failed to load component definitions", zap.Error(err))
 		return nil, fmt.Errorf("loading component definitions: %w", err)
 	}
 	defMap := make(map[string]models.StatutoryComponentDefinition)
@@ -560,25 +1528,20 @@ func (s *statutoryEngine) run(ctx context.Context, input *StatutoryExecutionInpu
 		defMap[d.StatutoryCode] = d
 	}
 
-	// Compute total gross earnings
 	totalGross := 0.0
 	for _, e := range input.Earnings {
 		totalGross += e.Amount
 	}
-
 	earningMap := make(map[string]float64)
 	for _, e := range input.Earnings {
 		earningMap[e.ComponentCode] += e.Amount
 	}
-
 	mappingGroup := groupMappings(mappings)
 	ruleGroup := groupContributionRules(rules)
 
-	// Separate codes into pre‑tax and tax based on calculation_basis
 	var preTaxCodes, taxCodes []string
 	for code := range mappingGroup {
 		if _, ok := defMap[code]; !ok {
-			s.logger.Warn("statutory code missing definition", zap.String("code", code))
 			continue
 		}
 		if defMap[code].CalculationBasis == "taxable_income" {
@@ -594,28 +1557,20 @@ func (s *statutoryEngine) run(ctx context.Context, input *StatutoryExecutionInpu
 		RuleHash:  hash,
 	}
 
-	// Process pre‑tax codes
+	// Pre-tax codes
 	for _, code := range preTaxCodes {
 		comps := mappingGroup[code]
-		s.logger.Info("processing pre‑tax statutory code", zap.String("code", code), zap.Int("component_count", len(comps)))
-
 		if !isOptedIn(code, validProfiles) {
-			s.logger.Warn("statutory skipped not opted in", zap.String("code", code))
 			continue
 		}
-
 		base := aggregateBase(comps, earningMap)
 		if base <= 0 {
-			s.logger.Warn("statutory skipped zero base", zap.String("code", code), zap.Float64("base", base))
 			continue
 		}
-
 		codeRules := ruleGroup[code]
 		if len(codeRules) == 0 {
-			s.logger.Warn("statutory skipped no rules", zap.String("code", code))
 			continue
 		}
-
 		var employeeAmt, employerAmt float64
 		for _, r := range codeRules {
 			if !r.IsActive {
@@ -628,7 +1583,6 @@ func (s *statutoryEngine) run(ctx context.Context, input *StatutoryExecutionInpu
 			if r.MinThreshold != nil && calcBase < *r.MinThreshold {
 				continue
 			}
-
 			var amount float64
 			switch r.CalculationType {
 			case models.CalculationTypePercentage:
@@ -644,7 +1598,6 @@ func (s *statutoryEngine) run(ctx context.Context, input *StatutoryExecutionInpu
 				amount = slabCumulative(calcBase, input.YTDContext, code, slabsForCode)
 			}
 			amount = round2(amount)
-
 			switch r.ContributionSide {
 			case models.ContributionSideEmployee:
 				employeeAmt += amount
@@ -652,16 +1605,8 @@ func (s *statutoryEngine) run(ctx context.Context, input *StatutoryExecutionInpu
 				employerAmt += amount
 			}
 		}
-
 		employeeAmt = enforceLimits(code, employeeAmt, input.YTDContext, limits)
 		preTaxDeductions += employeeAmt
-
-		s.logger.Info("statutory computed",
-			zap.String("code", code),
-			zap.Float64("base", base),
-			zap.Float64("employee_amount", employeeAmt),
-			zap.Float64("employer_amount", employerAmt),
-		)
 
 		if employeeAmt > 0 {
 			result.EmployeeDeductions = append(result.EmployeeDeductions,
@@ -699,28 +1644,19 @@ func (s *statutoryEngine) run(ctx context.Context, input *StatutoryExecutionInpu
 			})
 	}
 
-	// Process tax codes
+	// Tax codes
 	for _, code := range taxCodes {
-		comps := mappingGroup[code]
-		s.logger.Info("processing tax statutory code", zap.String("code", code), zap.Int("component_count", len(comps)))
-
 		if !isOptedIn(code, validProfiles) {
-			s.logger.Warn("statutory skipped not opted in", zap.String("code", code))
 			continue
 		}
-
-		// For tax codes, base = totalGross - preTaxDeductions - TaxExemptAmount
 		taxBase := totalGross - preTaxDeductions - input.TaxExemptAmount
 		if taxBase < 0 {
 			taxBase = 0
 		}
-
 		codeRules := ruleGroup[code]
 		if len(codeRules) == 0 {
-			s.logger.Warn("statutory skipped no rules", zap.String("code", code))
 			continue
 		}
-
 		var employeeAmt, employerAmt float64
 		for _, r := range codeRules {
 			if !r.IsActive {
@@ -733,7 +1669,6 @@ func (s *statutoryEngine) run(ctx context.Context, input *StatutoryExecutionInpu
 			if r.MinThreshold != nil && calcBase < *r.MinThreshold {
 				continue
 			}
-
 			var amount float64
 			switch r.CalculationType {
 			case models.CalculationTypePercentage:
@@ -749,7 +1684,6 @@ func (s *statutoryEngine) run(ctx context.Context, input *StatutoryExecutionInpu
 				amount = slabCumulative(calcBase, input.YTDContext, code, slabsForCode)
 			}
 			amount = round2(amount)
-
 			switch r.ContributionSide {
 			case models.ContributionSideEmployee:
 				employeeAmt += amount
@@ -757,15 +1691,7 @@ func (s *statutoryEngine) run(ctx context.Context, input *StatutoryExecutionInpu
 				employerAmt += amount
 			}
 		}
-
 		employeeAmt = enforceLimits(code, employeeAmt, input.YTDContext, limits)
-
-		s.logger.Info("statutory computed (tax)",
-			zap.String("code", code),
-			zap.Float64("base", taxBase),
-			zap.Float64("employee_amount", employeeAmt),
-			zap.Float64("employer_amount", employerAmt),
-		)
 
 		if employeeAmt > 0 {
 			result.EmployeeDeductions = append(result.EmployeeDeductions,
@@ -805,6 +1731,10 @@ func (s *statutoryEngine) run(ctx context.Context, input *StatutoryExecutionInpu
 
 	return result, nil
 }
+
+// --------------------------------------------
+// HELPER FUNCTIONS (unchanged)
+// --------------------------------------------
 
 func (s *statutoryEngine) GenerateRuleHash(ctx context.Context, companyID uuid.UUID, ruleSetID uuid.UUID) (string, error) {
 	rules, err := s.repo.LoadStatutoryContributionRulesByRuleSet(ctx, ruleSetID, companyID)
@@ -991,6 +1921,10 @@ func convertTraceToBreakdown(trace []StatutoryTraceStep) []models.StatutoryBreak
 	return out
 }
 
+// --------------------------------------------
+// DTOs (already defined)
+// --------------------------------------------
+
 type StatutoryExecutionInput struct {
 	PayrollRunID    uuid.UUID
 	CompanyID       uuid.UUID
@@ -1019,485 +1953,6 @@ type StatutoryTraceStep struct {
 	BaseAmount    float64
 	EmployeeAmt   float64
 	EmployerAmt   float64
-}
-
-func (s *statutoryEngine) DeleteComponentDefinition(ctx context.Context, companyID uuid.UUID, statutoryCode string, actorID uuid.UUID) error {
-	if companyID == uuid.Nil || statutoryCode == "" || actorID == uuid.Nil {
-		return errors.New("invalid input for component definition deletion")
-	}
-	rules, err := s.repo.ListContributionRulesByStatutoryCode(ctx, companyID, statutoryCode)
-	if err != nil {
-		return err
-	}
-	if len(rules) > 0 {
-		return fmt.Errorf("cannot delete: %d contribution rule(s) exist for this component", len(rules))
-	}
-	slabs, err := s.repo.ListTaxSlabsByStatutoryCode(ctx, companyID, statutoryCode)
-	if err != nil {
-		return err
-	}
-	if len(slabs) > 0 {
-		return fmt.Errorf("cannot delete: %d tax slab(s) exist for this component", len(slabs))
-	}
-	mappings, err := s.repo.ListComponentMappings(ctx, companyID, &statutoryCode)
-	if err != nil {
-		return err
-	}
-	if len(mappings) > 0 {
-		return fmt.Errorf("cannot delete: %d component mapping(s) exist for this component", len(mappings))
-	}
-	if err := s.repo.DeleteStatutoryComponentDefinition(ctx, companyID, statutoryCode); err != nil {
-		return err
-	}
-	if s.audit != nil {
-		_ = s.audit.LogAction(
-			ctx,
-			nil, // no transaction
-			&companyID,
-			"statutory",
-			"component_definition_deleted",
-			"statutory_component_definition",
-			nil,
-			"admin",
-			&actorID,
-			nil,
-			nil,
-			map[string]interface{}{
-				"statutory_code": statutoryCode,
-			},
-		)
-	}
-	return nil
-}
-
-func (s *statutoryEngine) CreateTaxSlab(ctx context.Context, input *CreateTaxSlabInput) error {
-
-	if input == nil ||
-		input.CompanyID == uuid.Nil ||
-		input.StatutoryCode == "" ||
-		input.RuleSetID == uuid.Nil ||
-		input.ActorID == uuid.Nil {
-		return errors.New("invalid tax slab input")
-	}
-
-	// Validate component definition exists
-	def, err := s.repo.GetStatutoryComponentDefinition(ctx, input.CompanyID, input.StatutoryCode)
-	if err != nil {
-		return err
-	}
-	if def == nil {
-		return fmt.Errorf("statutory component definition %s not found", input.StatutoryCode)
-	}
-
-	// Validate rule set exists
-	rs, err := s.repo.GetRuleSetByID(ctx, input.RuleSetID)
-	if err != nil {
-		return err
-	}
-	if rs == nil {
-		return fmt.Errorf("rule set %s not found", input.RuleSetID)
-	}
-
-	// -------------------------------------------------------
-	// CHECK DUPLICATE TAX SLAB BEFORE INSERT
-	// -------------------------------------------------------
-
-	existingSlabs, err := s.repo.ListTaxSlabsByStatutoryCode(ctx, input.CompanyID, input.StatutoryCode)
-	if err != nil {
-		return err
-	}
-
-	for _, slab := range existingSlabs {
-
-		if slab.RuleSetID != nil &&
-			*slab.RuleSetID == input.RuleSetID &&
-			slab.IsActive &&
-			slab.EffectiveFrom.Equal(input.EffectiveFrom) &&
-			slab.MinAmount == input.MinAmount {
-
-			maxEqual := false
-
-			if slab.MaxAmount == nil && input.MaxAmount == nil {
-				maxEqual = true
-			}
-
-			if slab.MaxAmount != nil && input.MaxAmount != nil {
-				maxEqual = (*slab.MaxAmount == *input.MaxAmount)
-			}
-
-			if maxEqual {
-				return fmt.Errorf(
-					"tax slab already exists for %s with range %.2f - %v for rule_set %s",
-					input.StatutoryCode,
-					input.MinAmount,
-					input.MaxAmount,
-					input.RuleSetID,
-				)
-			}
-		}
-	}
-
-	// -------------------------------------------------------
-	// CREATE TAX SLAB
-	// -------------------------------------------------------
-
-	modelInput := models.CreateTaxSlabInput{
-		CompanyID:     input.CompanyID,
-		StatutoryCode: input.StatutoryCode,
-		MinAmount:     input.MinAmount,
-		MaxAmount:     input.MaxAmount,
-		Rate:          input.Rate,
-		IsPercentage:  input.IsPercentage,
-		SlabOrder:     input.SlabOrder,
-		EffectiveFrom: input.EffectiveFrom,
-		RuleSetID:     input.RuleSetID,
-		CreatedBy:     input.ActorID,
-	}
-
-	if err := s.repo.CreateTaxSlab(ctx, modelInput); err != nil {
-		return err
-	}
-
-	// -------------------------------------------------------
-	// AUDIT
-	// -------------------------------------------------------
-
-	if s.audit != nil {
-		_ = s.audit.LogAction(
-			ctx,
-			nil, // no transaction
-			&input.CompanyID,
-			"statutory",
-			"tax_slab_created",
-			"company_tax_slab",
-			nil,
-			"admin",
-			&input.ActorID,
-			nil,
-			nil,
-			map[string]interface{}{
-				"statutory_code": input.StatutoryCode,
-				"rule_set_id":    input.RuleSetID.String(),
-				"min_amount":     input.MinAmount,
-				"max_amount":     input.MaxAmount,
-			},
-		)
-	}
-
-	return nil
-}
-
-func (s *statutoryEngine) UpdateTaxSlab(ctx context.Context, input *UpdateTaxSlabInput) error {
-	if input == nil || input.SlabID == uuid.Nil || input.ActorID == uuid.Nil {
-		return errors.New("invalid tax slab update input")
-	}
-	modelInput := models.UpdateTaxSlabInput{
-		SlabID:        input.SlabID,
-		MinAmount:     input.MinAmount,
-		MaxAmount:     input.MaxAmount,
-		Rate:          input.Rate,
-		IsPercentage:  input.IsPercentage,
-		SlabOrder:     input.SlabOrder,
-		EffectiveFrom: input.EffectiveFrom,
-		UpdatedBy:     input.ActorID,
-	}
-	if err := s.repo.UpdateTaxSlab(ctx, modelInput); err != nil {
-		return err
-	}
-	if s.audit != nil {
-		_ = s.audit.LogAction(
-			ctx,
-			nil, // no transaction
-			nil,
-			"statutory",
-			"tax_slab_updated",
-			"company_tax_slab",
-			&input.SlabID,
-			"admin",
-			&input.ActorID,
-			nil,
-			nil,
-			nil,
-		)
-	}
-	return nil
-}
-
-func (s *statutoryEngine) DeactivateTaxSlab(ctx context.Context, slabID uuid.UUID, actorID uuid.UUID) error {
-	if slabID == uuid.Nil || actorID == uuid.Nil {
-		return errors.New("invalid deactivate tax slab input")
-	}
-	if err := s.repo.DeactivateTaxSlab(ctx, slabID, actorID); err != nil {
-		return err
-	}
-	if s.audit != nil {
-		_ = s.audit.LogAction(
-			ctx,
-			nil, // no transaction
-			nil,
-			"statutory",
-			"tax_slab_deactivated",
-			"company_tax_slab",
-			&slabID,
-			"admin",
-			&actorID,
-			nil,
-			nil,
-			nil,
-		)
-	}
-	return nil
-}
-
-func (s *statutoryEngine) ListTaxSlabs(ctx context.Context, companyID uuid.UUID, statutoryCode string) ([]models.StatutoryTaxSlab, error) {
-	if companyID == uuid.Nil || statutoryCode == "" {
-		return nil, errors.New("company ID and statutory code required")
-	}
-	return s.repo.ListTaxSlabsByStatutoryCode(ctx, companyID, statutoryCode)
-}
-
-func (s *statutoryEngine) CreateDeductionLimit(ctx context.Context, input *CreateDeductionLimitInput) error {
-	if input == nil || input.CompanyID == uuid.Nil || input.RuleSetID == uuid.Nil || input.LimitCode == "" || input.ActorID == uuid.Nil {
-		return errors.New("invalid deduction limit input")
-	}
-	rs, err := s.repo.GetRuleSetByID(ctx, input.RuleSetID)
-	if err != nil {
-		return err
-	}
-	if rs == nil {
-		return fmt.Errorf("rule set %s not found", input.RuleSetID)
-	}
-	limits, err := s.repo.ListDeductionLimits(ctx, input.CompanyID, &input.RuleSetID)
-	if err != nil {
-		return err
-	}
-	for _, l := range limits {
-		if l.LimitCode == input.LimitCode {
-			return fmt.Errorf("deduction limit with code %s already exists in this rule set", input.LimitCode)
-		}
-	}
-	modelInput := models.CreateDeductionLimitInput{
-		CompanyID:  input.CompanyID,
-		RuleSetID:  input.RuleSetID,
-		LimitCode:  input.LimitCode,
-		LimitValue: input.LimitValue,
-		Metadata:   input.Metadata,
-	}
-	if err := s.repo.CreateDeductionLimit(ctx, modelInput); err != nil {
-		return err
-	}
-	if s.audit != nil {
-		_ = s.audit.LogAction(
-			ctx,
-			nil, // no transaction
-			&input.CompanyID,
-			"statutory",
-			"deduction_limit_created",
-			"statutory_deduction_limit",
-			nil,
-			"admin",
-			&input.ActorID,
-			nil,
-			nil,
-			map[string]interface{}{
-				"limit_code":  input.LimitCode,
-				"rule_set_id": input.RuleSetID.String(),
-				"limit_value": input.LimitValue,
-			},
-		)
-	}
-	return nil
-}
-
-func (s *statutoryEngine) UpdateDeductionLimit(ctx context.Context, input *UpdateDeductionLimitInput) error {
-	if input == nil || input.LimitID == uuid.Nil || input.ActorID == uuid.Nil {
-		return errors.New("invalid deduction limit update input")
-	}
-	modelInput := models.UpdateDeductionLimitInput{
-		LimitID:    input.LimitID,
-		LimitValue: input.LimitValue,
-		Metadata:   input.Metadata,
-	}
-	if err := s.repo.UpdateDeductionLimit(ctx, modelInput); err != nil {
-		return err
-	}
-	if s.audit != nil {
-		_ = s.audit.LogAction(
-			ctx,
-			nil, // no transaction
-			nil,
-			"statutory",
-			"deduction_limit_updated",
-			"statutory_deduction_limit",
-			&input.LimitID,
-			"admin",
-			&input.ActorID,
-			nil,
-			nil,
-			nil,
-		)
-	}
-	return nil
-}
-
-func (s *statutoryEngine) DeleteDeductionLimit(ctx context.Context, limitID uuid.UUID, actorID uuid.UUID) error {
-	if limitID == uuid.Nil || actorID == uuid.Nil {
-		return errors.New("invalid delete deduction limit input")
-	}
-	if err := s.repo.DeleteDeductionLimit(ctx, limitID); err != nil {
-		return err
-	}
-	if s.audit != nil {
-		_ = s.audit.LogAction(
-			ctx,
-			nil, // no transaction
-			nil,
-			"statutory",
-			"deduction_limit_deleted",
-			"statutory_deduction_limit",
-			&limitID,
-			"admin",
-			&actorID,
-			nil,
-			nil,
-			nil,
-		)
-	}
-	return nil
-}
-
-func (s *statutoryEngine) ListDeductionLimits(ctx context.Context, companyID uuid.UUID, ruleSetID *uuid.UUID) ([]models.StatutoryDeductionLimit, error) {
-	if companyID == uuid.Nil {
-		return nil, errors.New("company ID required")
-	}
-	return s.repo.ListDeductionLimits(ctx, companyID, ruleSetID)
-}
-
-func (s *statutoryEngine) CreateComponentMapping(ctx context.Context, input *CreateComponentMappingInput) error {
-	if input == nil || input.CompanyID == uuid.Nil || input.StatutoryCode == "" || input.ComponentCode == "" || input.RuleSetID == uuid.Nil || input.ActorID == uuid.Nil {
-		return errors.New("invalid component mapping input")
-	}
-	def, err := s.repo.GetStatutoryComponentDefinition(ctx, input.CompanyID, input.StatutoryCode)
-	if err != nil {
-		return err
-	}
-	if def == nil {
-		return fmt.Errorf("statutory component definition %s not found", input.StatutoryCode)
-	}
-	rs, err := s.repo.GetRuleSetByID(ctx, input.RuleSetID)
-	if err != nil {
-		return err
-	}
-	if rs == nil {
-		return fmt.Errorf("rule set %s not found", input.RuleSetID)
-	}
-	mappings, err := s.repo.ListComponentMappings(ctx, input.CompanyID, &input.StatutoryCode)
-	if err != nil {
-		return err
-	}
-	for _, m := range mappings {
-		if m.ComponentCode == input.ComponentCode && m.IsActive {
-			return fmt.Errorf("active mapping already exists for %s → %s", input.StatutoryCode, input.ComponentCode)
-		}
-	}
-	modelInput := models.CreateComponentMappingInput{
-		CompanyID:     input.CompanyID,
-		StatutoryCode: input.StatutoryCode,
-		ComponentCode: input.ComponentCode,
-		EffectiveFrom: input.EffectiveFrom,
-		RuleSetID:     input.RuleSetID,
-		CreatedBy:     input.ActorID,
-	}
-	if err := s.repo.CreateComponentMapping(ctx, modelInput); err != nil {
-		return err
-	}
-	if s.audit != nil {
-		_ = s.audit.LogAction(
-			ctx,
-			nil, // no transaction
-			&input.CompanyID,
-			"statutory",
-			"component_mapping_created",
-			"statutory_component_mapping",
-			nil,
-			"admin",
-			&input.ActorID,
-			nil,
-			nil,
-			map[string]interface{}{
-				"statutory_code": input.StatutoryCode,
-				"component_code": input.ComponentCode,
-				"rule_set_id":    input.RuleSetID.String(),
-			},
-		)
-	}
-	return nil
-}
-
-func (s *statutoryEngine) UpdateComponentMapping(ctx context.Context, input *UpdateComponentMappingInput) error {
-	if input == nil || input.MappingID == uuid.Nil || input.ActorID == uuid.Nil {
-		return errors.New("invalid component mapping update input")
-	}
-	modelInput := models.UpdateComponentMappingInput{
-		MappingID:     input.MappingID,
-		ComponentCode: input.ComponentCode,
-		EffectiveFrom: input.EffectiveFrom,
-		Version:       input.Version,
-		UpdatedBy:     input.ActorID,
-	}
-	if err := s.repo.UpdateComponentMapping(ctx, modelInput); err != nil {
-		return err
-	}
-	if s.audit != nil {
-		_ = s.audit.LogAction(
-			ctx,
-			nil, // no transaction
-			nil,
-			"statutory",
-			"component_mapping_updated",
-			"statutory_component_mapping",
-			&input.MappingID,
-			"admin",
-			&input.ActorID,
-			nil,
-			nil,
-			nil,
-		)
-	}
-	return nil
-}
-
-func (s *statutoryEngine) DeactivateComponentMapping(ctx context.Context, mappingID uuid.UUID, actorID uuid.UUID) error {
-	if mappingID == uuid.Nil || actorID == uuid.Nil {
-		return errors.New("invalid deactivate component mapping input")
-	}
-	if err := s.repo.DeactivateComponentMapping(ctx, mappingID, actorID); err != nil {
-		return err
-	}
-	if s.audit != nil {
-		_ = s.audit.LogAction(
-			ctx,
-			nil, // no transaction
-			nil,
-			"statutory",
-			"component_mapping_deactivated",
-			"statutory_component_mapping",
-			&mappingID,
-			"admin",
-			&actorID,
-			nil,
-			nil,
-			nil,
-		)
-	}
-	return nil
-}
-
-func (s *statutoryEngine) ListComponentMappings(ctx context.Context, companyID uuid.UUID, statutoryCode *string) ([]models.StatutoryComponentMapping, error) {
-	if companyID == uuid.Nil {
-		return nil, errors.New("company ID required")
-	}
-	return s.repo.ListComponentMappings(ctx, companyID, statutoryCode)
 }
 
 type CreateTaxSlabInput struct {
@@ -1557,74 +2012,6 @@ type UpdateComponentMappingInput struct {
 	ActorID       uuid.UUID
 }
 
-func (s *statutoryEngine) ExecuteTx(
-	ctx context.Context,
-	input *StatutoryExecutionInput,
-) (*StatutoryExecutionResult, error) {
-	if input == nil {
-		return nil, errors.New("statutory execution input is nil")
-	}
-	if input.CompanyID == uuid.Nil ||
-		input.UserID == uuid.Nil ||
-		input.PayrollRunID == uuid.Nil {
-		return nil, errors.New("invalid execution input: missing required identifiers")
-	}
-	if input.ActorID == uuid.Nil {
-		return nil, errors.New("actor_id required for statutory snapshot")
-	}
-	result, err := s.run(ctx, input)
-	if err != nil {
-		return nil, err
-	}
-	for _, c := range result.ContributionRecords {
-		if err := s.repo.InsertEmployeeStatutoryContribution(ctx, c); err != nil {
-			return nil, fmt.Errorf("failed to insert employee statutory contribution: %w", err)
-		}
-	}
-	breakdown := convertTraceToBreakdown(result.ComputationTrace)
-	snapshot := &models.StatutorySnapshot{
-		SnapshotID:   uuid.New(),
-		PayrollRunID: input.PayrollRunID,
-		CompanyID:    input.CompanyID,
-		UserID:       input.UserID,
-		RuleSetID:    result.RuleSetID,
-		RuleHash:     result.RuleHash,
-		PeriodStart:  input.PeriodStart,
-		PeriodEnd:    input.PeriodEnd,
-		Breakdown:    breakdown,
-		CreatedAt:    time.Now().UTC(),
-		CreatedBy:    &input.ActorID,
-	}
-	if err := s.repo.InsertStatutorySnapshot(ctx, snapshot); err != nil {
-		return nil, fmt.Errorf("failed to insert statutory snapshot: %w", err)
-	}
-	if s.audit != nil {
-		metadata := map[string]interface{}{
-			"user_id":       input.UserID.String(),
-			"period_start":  input.PeriodStart,
-			"period_end":    input.PeriodEnd,
-			"rule_set_id":   result.RuleSetID.String(),
-			"rule_hash":     result.RuleHash,
-			"contributions": len(result.ContributionRecords),
-		}
-		_ = s.audit.LogAction(
-			ctx,
-			nil, // no transaction (snapshot is already committed)
-			&input.CompanyID,
-			"payroll",
-			"statutory_execution_completed",
-			"statutory_contribution",
-			nil,
-			"system",
-			nil,
-			nil,
-			nil,
-			metadata,
-		)
-	}
-	return result, nil
-}
-
 type BulkCreateComponentMappingsInput struct {
 	CompanyID      uuid.UUID
 	StatutoryCode  string
@@ -1632,75 +2019,4 @@ type BulkCreateComponentMappingsInput struct {
 	EffectiveFrom  time.Time
 	RuleSetID      uuid.UUID
 	ActorID        uuid.UUID
-}
-
-func (s *statutoryEngine) BulkCreateComponentMappings(
-	ctx context.Context,
-	input *BulkCreateComponentMappingsInput,
-) error {
-
-	if input == nil ||
-		input.CompanyID == uuid.Nil ||
-		input.StatutoryCode == "" ||
-		len(input.ComponentCodes) == 0 ||
-		input.RuleSetID == uuid.Nil ||
-		input.ActorID == uuid.Nil {
-		return errors.New("invalid bulk component mapping input")
-	}
-
-	return s.repo.WithTx(ctx, func(tx repository.StatutoryRepository) error {
-
-		// Validate definition
-		def, err := tx.GetStatutoryComponentDefinition(ctx, input.CompanyID, input.StatutoryCode)
-		if err != nil {
-			return err
-		}
-		if def == nil {
-			return fmt.Errorf("statutory component definition %s not found", input.StatutoryCode)
-		}
-
-		// Validate rule set
-		rs, err := tx.GetRuleSetByID(ctx, input.RuleSetID)
-		if err != nil {
-			return err
-		}
-		if rs == nil {
-			return fmt.Errorf("rule set %s not found", input.RuleSetID)
-		}
-
-		// Load existing mappings once (no N+1)
-		existing, err := tx.ListComponentMappings(ctx, input.CompanyID, &input.StatutoryCode)
-		if err != nil {
-			return err
-		}
-
-		existingMap := make(map[string]bool)
-		for _, m := range existing {
-			if m.IsActive {
-				existingMap[m.ComponentCode] = true
-			}
-		}
-
-		for _, code := range input.ComponentCodes {
-
-			if existingMap[code] {
-				continue // skip duplicate safely
-			}
-
-			modelInput := models.CreateComponentMappingInput{
-				CompanyID:     input.CompanyID,
-				StatutoryCode: input.StatutoryCode,
-				ComponentCode: code,
-				EffectiveFrom: input.EffectiveFrom,
-				RuleSetID:     input.RuleSetID,
-				CreatedBy:     input.ActorID,
-			}
-
-			if err := tx.CreateComponentMapping(ctx, modelInput); err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
 }

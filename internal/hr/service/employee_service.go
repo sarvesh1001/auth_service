@@ -1,52 +1,70 @@
+// internal/hr/service/employee_service.go
 package service
 
 import (
-	"auth-service/internal/hr/models/employee"
-	"auth-service/internal/hr/repository"
-	a "auth-service/internal/infrastructure/audit"
-	"auth-service/internal/util"
 	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"mime/multipart"
 	"time"
 
 	"github.com/google/uuid"
-	"go.uber.org/zap"
+
+	"auth-service/internal/devicefp"
+	"auth-service/internal/encryption"
+	"auth-service/internal/hr/models/employee"
+	"auth-service/internal/hr/repository"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+	"auth-service/internal/locationctx"
 )
 
 // ============================================================================
-// EMPLOYEE SERVICE (WRITE OPERATIONS)
+// ERROR VARIABLES
 // ============================================================================
 
-// EmployeeService handles employee write operations with audit logging
+var ErrEmployeeOutsideScope = errors.New("employee belongs to a different location than your current scope")
+var ErrEmployeeHasNoLocation = errors.New("target employee has no employment location assigned")
+
+// ============================================================================
+// EMPLOYEE SERVICE
+// ============================================================================
+
 type EmployeeService struct {
 	employeeRepo      repository.EmployeeRepository
-	auditService      *a.AuditService
+	auditService      *audit.AuditService
+	idempotencyStore  idempotency.Store
 	documentStorage   DocumentStorage
-	logger            *zap.Logger
+	encryptionMgr     *encryption.EncryptionManager
 	maxDocumentSizeMB int
 }
 
-// EmployeeServiceConfig contains service configuration
 type EmployeeServiceConfig struct {
 	MaxDocumentSizeMB int
 	DocumentStorage   DocumentStorage
+	EncryptionMgr     *encryption.EncryptionManager
 }
 
 func NewEmployeeService(
 	employeeRepo repository.EmployeeRepository,
-	auditService *a.AuditService,
+	auditService *audit.AuditService,
+	idempotencyStore idempotency.Store,
 	config EmployeeServiceConfig,
-	logger *zap.Logger,
 ) *EmployeeService {
-
 	if auditService == nil {
 		panic("auditService is required for EmployeeService")
+	}
+	if idempotencyStore == nil {
+		panic("idempotencyStore is required for EmployeeService")
 	}
 	if config.DocumentStorage == nil {
 		panic("documentStorage is required for EmployeeService")
 	}
-
+	if config.EncryptionMgr == nil {
+		panic("encryptionMgr is required for EmployeeService")
+	}
 	if config.MaxDocumentSizeMB <= 0 {
 		config.MaxDocumentSizeMB = 50
 	}
@@ -54,13 +72,193 @@ func NewEmployeeService(
 	return &EmployeeService{
 		employeeRepo:      employeeRepo,
 		auditService:      auditService,
+		idempotencyStore:  idempotencyStore,
 		documentStorage:   config.DocumentStorage,
-		logger:            logger,
+		encryptionMgr:     config.EncryptionMgr,
 		maxDocumentSizeMB: config.MaxDocumentSizeMB,
 	}
 }
 
-// CreateEmployeeProfile creates a new employee profile
+// ============================================================================
+// ROW-LEVEL AUTHORIZATION HELPER
+// ============================================================================
+
+func (s *EmployeeService) ensureEmployeeInScope(
+	ctx context.Context,
+	companyID, userID uuid.UUID,
+) error {
+	locCtx, err := locationctx.FromContext(ctx)
+	if err != nil {
+		return fmt.Errorf("location context missing: %w", err)
+	}
+	if locCtx.Mode == locationctx.ScopeAll {
+		return nil
+	}
+	empLoc, err := s.employeeRepo.GetEmploymentLocationID(ctx, companyID, userID)
+	if err != nil {
+		return err
+	}
+	if empLoc == nil {
+		return ErrEmployeeHasNoLocation
+	}
+	if *empLoc != *locCtx.LocationID {
+		return ErrEmployeeOutsideScope
+	}
+	return nil
+}
+
+// ============================================================================
+// PII ENCRYPTION HELPERS
+// ============================================================================
+
+// encryptStringField encrypts a single plaintext string into the given
+// encrypted siblings. No-op when the input is nil/empty.
+func (s *EmployeeService) encryptStringField(
+	ctx context.Context,
+	plaintext *string,
+	purpose string,
+	outCT *[]byte,
+	outDEK **string,
+	outKey **uuid.UUID,
+) error {
+	if plaintext == nil || *plaintext == "" {
+		return nil
+	}
+	enc, err := s.encryptionMgr.EncryptField(ctx, *plaintext, purpose)
+	if err != nil {
+		return fmt.Errorf("encrypt %s: %w", purpose, err)
+	}
+	keyID, err := uuid.Parse(enc.KeyID)
+	if err != nil {
+		return fmt.Errorf("parse %s key id: %w", purpose, err)
+	}
+	*outCT = []byte(enc.EncryptedValue)
+	dek := enc.EncryptedDEK
+	*outDEK = &dek
+	*outKey = &keyID
+	return nil
+}
+
+// encryptTimeField encrypts a *time.Time as RFC3339.
+func (s *EmployeeService) encryptTimeField(
+	ctx context.Context,
+	t *time.Time,
+	purpose string,
+	outCT *[]byte,
+	outDEK **string,
+	outKey **uuid.UUID,
+) error {
+	if t == nil {
+		return nil
+	}
+	str := t.UTC().Format(time.RFC3339)
+	return s.encryptStringField(ctx, &str, purpose, outCT, outDEK, outKey)
+}
+
+// encryptPIIFields populates the encrypted siblings for every PII field on
+// the profile. Called on create and update paths.
+//
+// Plaintext PII columns have been dropped from the schema; only the
+// *Encrypted / *EncryptedDEK / *KeyID siblings are persisted.
+func (s *EmployeeService) encryptPIIFields(ctx context.Context, p *employee.EmployeeProfile) error {
+	if err := s.encryptStringField(ctx, p.Email, "employee.email",
+		&p.EmailEncrypted, &p.EmailEncryptedDEK, &p.EmailKeyID); err != nil {
+		return err
+	}
+	if p.Email != nil && *p.Email != "" {
+		h := devicefp.Hash(*p.Email)
+		p.EmailHash = &h
+	}
+
+	if err := s.encryptStringField(ctx, p.TaxID, "employee.tax_id",
+		&p.TaxIDEncrypted, &p.TaxIDEncryptedDEK, &p.TaxIDKeyID); err != nil {
+		return err
+	}
+	if err := s.encryptStringField(ctx, p.SocialSecurityID, "employee.ssn",
+		&p.SocialSecurityIDEncrypted, &p.SocialSecurityIDEncryptedDEK, &p.SocialSecurityIDKeyID); err != nil {
+		return err
+	}
+	if err := s.encryptTimeField(ctx, p.DateOfBirth, "employee.dob",
+		&p.DateOfBirthEncrypted, &p.DateOfBirthEncryptedDEK, &p.DateOfBirthKeyID); err != nil {
+		return err
+	}
+	if err := s.encryptStringField(ctx, p.Nationality, "employee.nationality",
+		&p.NationalityEncrypted, &p.NationalityEncryptedDEK, &p.NationalityKeyID); err != nil {
+		return err
+	}
+	if err := s.encryptStringField(ctx, p.MaritalStatus, "employee.marital_status",
+		&p.MaritalStatusEncrypted, &p.MaritalStatusEncryptedDEK, &p.MaritalStatusKeyID); err != nil {
+		return err
+	}
+	return nil
+}
+
+// decryptPIIFields overwrites the in-memory plaintext PII fields from the
+// encrypted siblings when they are present. Failures are swallowed so a
+// decryption failure never takes down a read path.
+func (s *EmployeeService) decryptPIIFields(ctx context.Context, p *employee.EmployeeProfile) {
+	if len(p.EmailEncrypted) > 0 && p.EmailEncryptedDEK != nil && p.EmailKeyID != nil {
+		if plain, err := s.encryptionMgr.DecryptField(ctx, &encryption.EncryptedData{
+			EncryptedValue: string(p.EmailEncrypted),
+			EncryptedDEK:   *p.EmailEncryptedDEK,
+			KeyID:          p.EmailKeyID.String(),
+		}); err == nil {
+			p.Email = &plain
+		}
+	}
+	if len(p.TaxIDEncrypted) > 0 && p.TaxIDEncryptedDEK != nil && p.TaxIDKeyID != nil {
+		if plain, err := s.encryptionMgr.DecryptField(ctx, &encryption.EncryptedData{
+			EncryptedValue: string(p.TaxIDEncrypted),
+			EncryptedDEK:   *p.TaxIDEncryptedDEK,
+			KeyID:          p.TaxIDKeyID.String(),
+		}); err == nil {
+			p.TaxID = &plain
+		}
+	}
+	if len(p.SocialSecurityIDEncrypted) > 0 && p.SocialSecurityIDEncryptedDEK != nil && p.SocialSecurityIDKeyID != nil {
+		if plain, err := s.encryptionMgr.DecryptField(ctx, &encryption.EncryptedData{
+			EncryptedValue: string(p.SocialSecurityIDEncrypted),
+			EncryptedDEK:   *p.SocialSecurityIDEncryptedDEK,
+			KeyID:          p.SocialSecurityIDKeyID.String(),
+		}); err == nil {
+			p.SocialSecurityID = &plain
+		}
+	}
+	if len(p.DateOfBirthEncrypted) > 0 && p.DateOfBirthEncryptedDEK != nil && p.DateOfBirthKeyID != nil {
+		if plain, err := s.encryptionMgr.DecryptField(ctx, &encryption.EncryptedData{
+			EncryptedValue: string(p.DateOfBirthEncrypted),
+			EncryptedDEK:   *p.DateOfBirthEncryptedDEK,
+			KeyID:          p.DateOfBirthKeyID.String(),
+		}); err == nil {
+			if t, perr := time.Parse(time.RFC3339, plain); perr == nil {
+				p.DateOfBirth = &t
+			}
+		}
+	}
+	if len(p.NationalityEncrypted) > 0 && p.NationalityEncryptedDEK != nil && p.NationalityKeyID != nil {
+		if plain, err := s.encryptionMgr.DecryptField(ctx, &encryption.EncryptedData{
+			EncryptedValue: string(p.NationalityEncrypted),
+			EncryptedDEK:   *p.NationalityEncryptedDEK,
+			KeyID:          p.NationalityKeyID.String(),
+		}); err == nil {
+			p.Nationality = &plain
+		}
+	}
+	if len(p.MaritalStatusEncrypted) > 0 && p.MaritalStatusEncryptedDEK != nil && p.MaritalStatusKeyID != nil {
+		if plain, err := s.encryptionMgr.DecryptField(ctx, &encryption.EncryptedData{
+			EncryptedValue: string(p.MaritalStatusEncrypted),
+			EncryptedDEK:   *p.MaritalStatusEncryptedDEK,
+			KeyID:          p.MaritalStatusKeyID.String(),
+		}); err == nil {
+			p.MaritalStatus = &plain
+		}
+	}
+}
+
+// ============================================================================
+// EMPLOYEE PROFILE WRITES
+// ============================================================================
+
 func (s *EmployeeService) CreateEmployeeProfile(
 	ctx context.Context,
 	profile *employee.EmployeeProfile,
@@ -68,14 +266,18 @@ func (s *EmployeeService) CreateEmployeeProfile(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) (*employee.EmployeeProfile, error) {
-	startTime := time.Now()
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("create_emp_profile-%s", uuid.New().String())
+	}
+	var cached *employee.EmployeeProfile
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
 
-	// Generate profile ID if not provided
 	if profile.EmployeeProfileID == uuid.Nil {
 		profile.EmployeeProfileID = uuid.New()
 	}
-
-	// Set timestamps
 	now := time.Now().UTC()
 	if profile.CreatedAt.IsZero() {
 		profile.CreatedAt = now
@@ -84,7 +286,6 @@ func (s *EmployeeService) CreateEmployeeProfile(
 		profile.UpdatedAt = now
 	}
 
-	// Validate required fields
 	if profile.UserID == uuid.Nil {
 		return nil, fmt.Errorf("user_id is required")
 	}
@@ -92,55 +293,93 @@ func (s *EmployeeService) CreateEmployeeProfile(
 		return nil, fmt.Errorf("company_id is required")
 	}
 
-	// Create profile in repository
-	beforeState := []byte("{}") // Empty before state for creation
+	// 🔐 Encrypt PII before persisting.
+	if err := s.encryptPIIFields(ctx, profile); err != nil {
+		return nil, err
+	}
 
-	err := s.employeeRepo.CreateEmployeeProfile(ctx, profile)
-	if err != nil {
-		s.logger.Error("Failed to create employee profile",
-			util.String("user_id", profile.UserID.String()),
-			util.String("company_id", profile.CompanyID.String()),
-			util.ErrorField(err))
+	beforeJSON, _ := json.Marshal(profile)
+
+	if err := s.employeeRepo.CreateEmployeeProfile(ctx, profile); err != nil {
 		return nil, fmt.Errorf("failed to create employee profile: %w", err)
 	}
 
-	// Prepare after state for audit
-	afterState, _ := util.ToJSON(profile)
+	afterJSON, _ := json.Marshal(profile)
 
-	// Log audit entry
-	auditErr := s.auditService.LogAction(
-		ctx,
-		nil,
-		&profile.CompanyID,
-		"hr",
-		"employee.profile.create",
-		"employee_profile",
-		&profile.EmployeeProfileID,
-		actorType,
-		&actorID,
-		beforeState,
-		afterState,
-		metadata,
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMetadata(metadata, map[string]interface{}{
+		"ip":         ip,
+		"profile_id": profile.EmployeeProfileID.String(),
+		"user_id":    profile.UserID.String(),
+		"company_id": profile.CompanyID.String(),
+	})
+	_ = s.auditService.LogAction(
+		ctx, nil, &profile.CompanyID, "hr",
+		"employee.profile.create", "employee_profile", &profile.EmployeeProfileID,
+		actorType, &actorID, beforeJSON, afterJSON, auditMeta,
 	)
 
-	if auditErr != nil {
-		s.logger.Warn("Failed to log audit entry for profile creation",
-			util.String("profile_id", profile.EmployeeProfileID.String()),
-			util.ErrorField(auditErr))
-	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, profile)
 
-	s.logger.Info("Employee profile created",
-		util.String("profile_id", profile.EmployeeProfileID.String()),
-		util.String("user_id", profile.UserID.String()),
-		util.String("company_id", profile.CompanyID.String()),
-		util.String("actor_type", actorType),
-		util.String("actor_id", actorID.String()),
-		util.Duration("duration", time.Since(startTime)))
-
+	// Return decrypted view to caller.
+	s.decryptPIIFields(ctx, profile)
 	return profile, nil
 }
 
-// UpdateEmployeeProfile updates an existing employee profile
+// CreateEmployeeProfileInTx inserts an employee profile inside the caller's
+// transaction, applying the same PII encryption as CreateEmployeeProfile.
+//
+// Used by CompanyService.AddMember so the whole hire (user + roster row +
+// profile + location grants) commits atomically and PII is never persisted
+// in plaintext.
+//
+// Idempotency and audit are the caller's responsibility — this method only
+// encrypts, generates IDs/timestamps when missing, and writes via the
+// repository's tx variant.
+func (s *EmployeeService) CreateEmployeeProfileInTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	profile *employee.EmployeeProfile,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) (*employee.EmployeeProfile, error) {
+	if profile == nil {
+		return nil, fmt.Errorf("profile is required")
+	}
+	if profile.EmployeeProfileID == uuid.Nil {
+		profile.EmployeeProfileID = uuid.New()
+	}
+	now := time.Now().UTC()
+	if profile.CreatedAt.IsZero() {
+		profile.CreatedAt = now
+	}
+	if profile.UpdatedAt.IsZero() {
+		profile.UpdatedAt = now
+	}
+	if profile.UserID == uuid.Nil {
+		return nil, fmt.Errorf("user_id is required")
+	}
+	if profile.CompanyID == uuid.Nil {
+		return nil, fmt.Errorf("company_id is required")
+	}
+
+	// 🔐 Encrypt PII before persisting. Only the *_encrypted siblings are
+	// written; the plaintext PII columns have been dropped from the schema.
+	if err := s.encryptPIIFields(ctx, profile); err != nil {
+		return nil, err
+	}
+
+	if err := s.employeeRepo.CreateEmployeeProfileTx(ctx, tx, profile); err != nil {
+		return nil, fmt.Errorf("failed to create employee profile (tx): %w", err)
+	}
+
+	// Hand the caller a decrypted copy for its own audit/logging.
+	out := *profile
+	s.decryptPIIFields(ctx, &out)
+	return &out, nil
+}
+
 func (s *EmployeeService) UpdateEmployeeProfile(
 	ctx context.Context,
 	profileID uuid.UUID,
@@ -149,21 +388,32 @@ func (s *EmployeeService) UpdateEmployeeProfile(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) (*employee.EmployeeProfile, error) {
-	startTime := time.Now()
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("update_emp_profile-%s", profileID.String())
+	}
+	var cached *employee.EmployeeProfile
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
 
-	// Get existing profile for audit
 	existingProfile, err := s.employeeRepo.GetEmployeeProfileByID(ctx, profileID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get existing profile: %w", err)
 	}
 
-	beforeState, _ := util.ToJSON(existingProfile)
+	if err := s.ensureEmployeeInScope(ctx, existingProfile.CompanyID, existingProfile.UserID); err != nil {
+		return nil, err
+	}
 
-	// Apply updates
+	// Decrypt existing PII so the response payload (and audit) show plaintext.
+	s.decryptPIIFields(ctx, existingProfile)
+
+	beforeJSON, _ := json.Marshal(existingProfile)
+
 	updatedProfile := *existingProfile
 	updatedProfile.UpdatedAt = time.Now().UTC()
 
-	// Update fields (in real code you would validate each field)
 	for key, value := range updates {
 		switch key {
 		case "date_of_birth":
@@ -202,6 +452,10 @@ func (s *EmployeeService) UpdateEmployeeProfile(
 			if cc, ok := value.(string); ok {
 				updatedProfile.CostCenter = &cc
 			}
+		case "cost_center_id":
+			if ccID, ok := value.(uuid.UUID); ok {
+				updatedProfile.CostCenterID = &ccID
+			}
 		case "tax_id":
 			if taxID, ok := value.(string); ok {
 				updatedProfile.TaxID = &taxID
@@ -217,47 +471,37 @@ func (s *EmployeeService) UpdateEmployeeProfile(
 		}
 	}
 
-	// Save updated profile
-	err = s.employeeRepo.UpdateEmployeeProfile(ctx, &updatedProfile)
-	if err != nil {
+	// 🔐 Re-encrypt any changed PII fields.
+	if err := s.encryptPIIFields(ctx, &updatedProfile); err != nil {
+		return nil, err
+	}
+
+	if err := s.employeeRepo.UpdateEmployeeProfile(ctx, &updatedProfile); err != nil {
 		return nil, fmt.Errorf("failed to update employee profile: %w", err)
 	}
 
-	// Log audit
-	afterState, _ := util.ToJSON(&updatedProfile)
+	afterJSON, _ := json.Marshal(&updatedProfile)
 
-	auditErr := s.auditService.LogAction(
-		ctx,
-		nil,
-		&updatedProfile.CompanyID,
-		"hr",
-		"employee.profile.update",
-		"employee_profile",
-		&profileID,
-		actorType,
-		&actorID,
-		beforeState,
-		afterState,
-		metadata,
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMetadata(metadata, map[string]interface{}{
+		"ip":         ip,
+		"profile_id": profileID.String(),
+		"updates":    updates,
+	})
+	_ = s.auditService.LogAction(
+		ctx, nil, &updatedProfile.CompanyID, "hr",
+		"employee.profile.update", "employee_profile", &profileID,
+		actorType, &actorID, beforeJSON, afterJSON, auditMeta,
 	)
 
-	if auditErr != nil {
-		s.logger.Warn("Failed to log audit entry for profile update",
-			util.String("profile_id", profileID.String()),
-			util.ErrorField(auditErr))
-	}
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, &updatedProfile)
 
-	s.logger.Info("Employee profile updated",
-		util.String("profile_id", profileID.String()),
-		util.String("user_id", updatedProfile.UserID.String()),
-		util.String("actor_type", actorType),
-		util.String("actor_id", actorID.String()),
-		util.Duration("duration", time.Since(startTime)))
-
-	return &updatedProfile, nil
+	// Hand the caller a decrypted copy.
+	out := updatedProfile
+	s.decryptPIIFields(ctx, &out)
+	return &out, nil
 }
 
-// DeleteEmployeeProfile deletes an employee profile
 func (s *EmployeeService) DeleteEmployeeProfile(
 	ctx context.Context,
 	profileID uuid.UUID,
@@ -265,54 +509,50 @@ func (s *EmployeeService) DeleteEmployeeProfile(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) error {
-	startTime := time.Now()
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("delete_emp_profile-%s", profileID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
 
-	// Get profile for audit
 	profile, err := s.employeeRepo.GetEmployeeProfileByID(ctx, profileID)
 	if err != nil {
 		return fmt.Errorf("failed to get profile for deletion: %w", err)
 	}
 
-	beforeState, _ := util.ToJSON(profile)
+	if err := s.ensureEmployeeInScope(ctx, profile.CompanyID, profile.UserID); err != nil {
+		return err
+	}
 
-	// Delete the profile
-	err = s.employeeRepo.DeleteEmployeeProfile(ctx, profileID)
-	if err != nil {
+	s.decryptPIIFields(ctx, profile)
+	beforeJSON, _ := json.Marshal(profile)
+
+	if err := s.employeeRepo.DeleteEmployeeProfile(ctx, profileID); err != nil {
 		return fmt.Errorf("failed to delete employee profile: %w", err)
 	}
 
-	// Log audit
-	auditErr := s.auditService.LogAction(
-		ctx,
-		nil,
-		&profile.CompanyID,
-		"hr",
-		"employee.profile.delete",
-		"employee_profile",
-		&profileID,
-		actorType,
-		&actorID,
-		beforeState,
-		[]byte("{}"), // Empty after state for deletion
-		metadata,
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMetadata(metadata, map[string]interface{}{
+		"ip":         ip,
+		"profile_id": profileID.String(),
+		"user_id":    profile.UserID.String(),
+	})
+	_ = s.auditService.LogAction(
+		ctx, nil, &profile.CompanyID, "hr",
+		"employee.profile.delete", "employee_profile", &profileID,
+		actorType, &actorID, beforeJSON, []byte("{}"), auditMeta,
 	)
 
-	if auditErr != nil {
-		s.logger.Warn("Failed to log audit entry for profile deletion",
-			util.String("profile_id", profileID.String()),
-			util.ErrorField(auditErr))
-	}
-
-	s.logger.Info("Employee profile deleted",
-		util.String("profile_id", profileID.String()),
-		util.String("user_id", profile.UserID.String()),
-		util.String("company_id", profile.CompanyID.String()),
-		util.String("actor_type", actorType),
-		util.String("actor_id", actorID.String()),
-		util.Duration("duration", time.Since(startTime)))
-
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
+
+// ============================================================================
+// EMPLOYEE DOCUMENT WRITES  (unchanged — no PII on the document model)
+// ============================================================================
 
 func (s *EmployeeService) UploadEmployeeDocument(
 	ctx context.Context,
@@ -325,18 +565,23 @@ func (s *EmployeeService) UploadEmployeeDocument(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) (*employee.EmployeeDocument, error) {
-	startTime := time.Now()
-
-	// 🔒 1. ENFORCE MAX FILE SIZE (cheap check first)
-	if header.Size > int64(s.maxDocumentSizeMB)*1024*1024 {
-		return nil, fmt.Errorf(
-			"file size %d exceeds max allowed size %d MB",
-			header.Size,
-			s.maxDocumentSizeMB,
-		)
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("upload_doc-%s", uuid.New().String())
+	}
+	var cached *employee.EmployeeDocument
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
 	}
 
-	// 🔒 2. VALIDATE USER EXISTS
+	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
+		return nil, err
+	}
+
+	if header.Size > int64(s.maxDocumentSizeMB)*1024*1024 {
+		return nil, fmt.Errorf("file size %d exceeds max allowed size %d MB", header.Size, s.maxDocumentSizeMB)
+	}
+
 	userExists, err := s.employeeRepo.UserExists(ctx, userID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to validate user existence: %w", err)
@@ -345,7 +590,6 @@ func (s *EmployeeService) UploadEmployeeDocument(
 		return nil, fmt.Errorf("user does not exist")
 	}
 
-	// 🔒 3. VALIDATE USER IS EMPLOYEE OF COMPANY
 	isEmployee, err := s.employeeRepo.IsUserEmployeeOfCompany(ctx, userID, companyID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to validate employee ownership: %w", err)
@@ -354,13 +598,11 @@ func (s *EmployeeService) UploadEmployeeDocument(
 		return nil, fmt.Errorf("user is not an employee of this company")
 	}
 
-	// 📤 4. UPLOAD TO DOCUMENT STORAGE (only after validations)
 	uploadResult, err := s.documentStorage.UploadDocument(ctx, file, header, companyID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to upload document: %w", err)
 	}
 
-	// 🧾 5. CREATE DOCUMENT RECORD
 	document := &employee.EmployeeDocument{
 		DocumentID:        uuid.New(),
 		UserID:            userID,
@@ -374,51 +616,30 @@ func (s *EmployeeService) UploadEmployeeDocument(
 		UploadedAt:        &uploadResult.UploadedAt,
 	}
 
-	// 💾 6. SAVE TO DATABASE
-	err = s.employeeRepo.CreateEmployeeDocument(ctx, document)
-	if err != nil {
-		// 🧹 CLEANUP UPLOADED FILE IF DB WRITE FAILS
+	if err := s.employeeRepo.CreateEmployeeDocument(ctx, document); err != nil {
 		_ = s.documentStorage.DeleteDocument(ctx, uploadResult.ObjectKey)
 		return nil, fmt.Errorf("failed to save document record: %w", err)
 	}
 
-	// 🧠 7. AUDIT LOG (non-blocking)
-	afterState, _ := util.ToJSON(document)
+	afterJSON, _ := json.Marshal(document)
 
-	auditErr := s.auditService.LogAction(
-		ctx,
-		nil,
-		&companyID,
-		"hr",
-		"employee.document.upload",
-		"employee_document",
-		&document.DocumentID,
-		actorType,
-		&actorID,
-		[]byte("{}"),
-		afterState,
-		metadata,
-	)
-	if auditErr != nil {
-		s.logger.Warn(
-			"Failed to log audit entry for document upload",
-			util.String("document_id", document.DocumentID.String()),
-			util.ErrorField(auditErr),
-		)
-	}
-
-	// 📊 8. LOG SUCCESS
-	s.logger.Info(
-		"Employee document uploaded",
-		util.String("document_id", document.DocumentID.String()),
-		util.String("user_id", userID.String()),
-		util.String("company_id", companyID.String()),
-		util.String("document_type", documentType),
-		util.Bool("confidential", isConfidential),
-		util.Int64("file_size", uploadResult.FileSize),
-		util.Duration("duration", time.Since(startTime)),
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMetadata(metadata, map[string]interface{}{
+		"ip":           ip,
+		"document_id":  document.DocumentID.String(),
+		"user_id":      userID.String(),
+		"company_id":   companyID.String(),
+		"file_size":    uploadResult.FileSize,
+		"mime_type":    uploadResult.MimeType,
+		"confidential": isConfidential,
+	})
+	_ = s.auditService.LogAction(
+		ctx, nil, &companyID, "hr",
+		"employee.document.upload", "employee_document", &document.DocumentID,
+		actorType, &actorID, []byte("{}"), afterJSON, auditMeta,
 	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, document)
 	return document, nil
 }
 
@@ -429,61 +650,53 @@ func (s *EmployeeService) DeleteEmployeeDocument(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) error {
-	startTime := time.Now()
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("delete_doc-%s", documentID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
 
-	// Get document for audit
 	document, err := s.employeeRepo.GetEmployeeDocumentByID(ctx, documentID)
 	if err != nil {
 		return fmt.Errorf("failed to get document for deletion: %w", err)
 	}
 
-	beforeState, _ := util.ToJSON(document)
+	if err := s.ensureEmployeeInScope(ctx, document.CompanyID, document.UserID); err != nil {
+		return err
+	}
 
-	// ✅ DELETE DB RECORD FIRST (SOURCE OF TRUTH)
-	err = s.employeeRepo.DeleteEmployeeDocument(ctx, documentID)
-	if err != nil {
+	beforeJSON, _ := json.Marshal(document)
+
+	if err := s.employeeRepo.DeleteEmployeeDocument(ctx, documentID); err != nil {
 		return fmt.Errorf("failed to delete document record: %w", err)
 	}
 
-	// ✅ DELETE STORAGE FILE (BEST-EFFORT)
-	if err := s.documentStorage.DeleteDocument(ctx, document.DocumentObjectKey); err != nil {
-		s.logger.Warn("Failed to delete document file after DB deletion",
-			util.String("document_id", documentID.String()),
-			util.ErrorField(err))
-	}
+	_ = s.documentStorage.DeleteDocument(ctx, document.DocumentObjectKey)
 
-	// Audit log
-	auditErr := s.auditService.LogAction(
-		ctx,
-		nil,
-		&document.CompanyID,
-		"hr",
-		"employee.document.delete",
-		"employee_document",
-		&documentID,
-		actorType,
-		&actorID,
-		beforeState,
-		[]byte("{}"),
-		metadata,
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMetadata(metadata, map[string]interface{}{
+		"ip":          ip,
+		"document_id": documentID.String(),
+		"user_id":     document.UserID.String(),
+		"company_id":  document.CompanyID.String(),
+	})
+	_ = s.auditService.LogAction(
+		ctx, nil, &document.CompanyID, "hr",
+		"employee.document.delete", "employee_document", &documentID,
+		actorType, &actorID, beforeJSON, []byte("{}"), auditMeta,
 	)
 
-	if auditErr != nil {
-		s.logger.Warn("Failed to log audit entry for document deletion",
-			util.String("document_id", documentID.String()),
-			util.ErrorField(auditErr))
-	}
-
-	s.logger.Info("Employee document deleted",
-		util.String("document_id", documentID.String()),
-		util.String("user_id", document.UserID.String()),
-		util.String("company_id", document.CompanyID.String()),
-		util.Duration("duration", time.Since(startTime)))
-
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
-// CreateDepartmentAssignment assigns an employee to a department
+// ============================================================================
+// DEPARTMENT ASSIGNMENT
+// ============================================================================
+
 func (s *EmployeeService) CreateDepartmentAssignment(
 	ctx context.Context,
 	userID, companyID, departmentID uuid.UUID,
@@ -492,31 +705,31 @@ func (s *EmployeeService) CreateDepartmentAssignment(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) (*employee.EmployeeDepartmentHistory, error) {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("dept_assign-%s-%s", userID.String(), departmentID.String())
+	}
+	var cached *employee.EmployeeDepartmentHistory
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
 
-	startTime := time.Now()
+	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
+		return nil, err
+	}
+
 	now := time.Now().UTC()
 
-	// ---------------------------------------------------------------------
-	// 1. Check current active department
-	// ---------------------------------------------------------------------
 	activeAssignment, err := s.employeeRepo.GetActiveDepartmentAssignment(ctx, userID)
 	if err == nil {
-		// Active assignment exists
 		if activeAssignment.DepartmentID == departmentID {
-			// ❌ SAME department → reject
 			return nil, fmt.Errorf("employee is already assigned to this department")
 		}
-
-		// ✅ Different department → end previous assignment
-		err = s.employeeRepo.EndDepartmentAssignment(ctx, userID, now.Add(-time.Second))
-		if err != nil {
+		if err := s.employeeRepo.EndDepartmentAssignment(ctx, userID, now.Add(-time.Second)); err != nil {
 			return nil, fmt.Errorf("failed to end previous department assignment: %w", err)
 		}
 	}
 
-	// ---------------------------------------------------------------------
-	// 2. Create new department assignment
-	// ---------------------------------------------------------------------
 	history := &employee.EmployeeDepartmentHistory{
 		ID:           uuid.New(),
 		UserID:       userID,
@@ -528,49 +741,34 @@ func (s *EmployeeService) CreateDepartmentAssignment(
 		CreatedAt:    now,
 	}
 
-	err = s.employeeRepo.CreateDepartmentHistory(ctx, history)
-	if err != nil {
+	if err := s.employeeRepo.CreateDepartmentHistory(ctx, history); err != nil {
 		return nil, fmt.Errorf("failed to create department assignment: %w", err)
 	}
 
-	// ---------------------------------------------------------------------
-	// 3. Audit log
-	// ---------------------------------------------------------------------
-	afterState, _ := util.ToJSON(history)
-
-	auditErr := s.auditService.LogAction(
-		ctx,
-		nil,
-		&companyID,
-		"hr",
-		"employee.department.assign",
-		"employee_department_history",
-		&history.ID,
-		actorType,
-		&actorID,
-		[]byte("{}"),
-		afterState,
-		metadata,
+	afterJSON, _ := json.Marshal(history)
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMetadata(metadata, map[string]interface{}{
+		"ip":            ip,
+		"history_id":    history.ID.String(),
+		"user_id":       userID.String(),
+		"department_id": departmentID.String(),
+		"company_id":    companyID.String(),
+		"change_reason": changeReason,
+	})
+	_ = s.auditService.LogAction(
+		ctx, nil, &companyID, "hr",
+		"employee.department.assign", "employee_department_history", &history.ID,
+		actorType, &actorID, []byte("{}"), afterJSON, auditMeta,
 	)
 
-	if auditErr != nil {
-		s.logger.Warn("Failed to log audit entry for department assignment",
-			util.String("history_id", history.ID.String()),
-			util.ErrorField(auditErr))
-	}
-
-	s.logger.Info("Department assignment created",
-		util.String("history_id", history.ID.String()),
-		util.String("user_id", userID.String()),
-		util.String("department_id", departmentID.String()),
-		util.String("company_id", companyID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
-
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, history)
 	return history, nil
 }
 
-// CreateEmployeeExit records employee termination/exit
+// ============================================================================
+// EMPLOYEE EXIT
+// ============================================================================
+
 func (s *EmployeeService) CreateEmployeeExit(
 	ctx context.Context,
 	userID, companyID uuid.UUID,
@@ -581,8 +779,19 @@ func (s *EmployeeService) CreateEmployeeExit(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) (*employee.EmployeeExit, error) {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("exit-%s", userID.String())
+	}
+	var cached *employee.EmployeeExit
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
 
-	// Prevent duplicate active exits
+	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
+		return nil, err
+	}
+
 	existing, _ := s.employeeRepo.GetEmployeeExitByUserID(ctx, userID, companyID)
 	if existing != nil && existing.ExitState == "scheduled" {
 		return nil, fmt.Errorf("employee exit already scheduled")
@@ -603,27 +812,30 @@ func (s *EmployeeService) CreateEmployeeExit(
 		return nil, err
 	}
 
-	afterState, _ := util.ToJSON(exit)
-
+	afterJSON, _ := json.Marshal(exit)
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMetadata(metadata, map[string]interface{}{
+		"ip":         ip,
+		"exit_id":    exit.ExitID.String(),
+		"user_id":    userID.String(),
+		"company_id": companyID.String(),
+		"exit_date":  exitDate,
+		"reason":     exitReason,
+	})
 	_ = s.auditService.LogAction(
-		ctx,
-		nil,
-		&companyID,
-		"hr",
-		"employee.exit.schedule",
-		"employee_exit",
-		&exit.ExitID,
-		actorType,
-		&actorID,
-		[]byte("{}"),
-		afterState,
-		metadata,
+		ctx, nil, &companyID, "hr",
+		"employee.exit.schedule", "employee_exit", &exit.ExitID,
+		actorType, &actorID, []byte("{}"), afterJSON, auditMeta,
 	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, exit)
 	return exit, nil
 }
 
-// CreatePosition creates a new position
+// ============================================================================
+// POSITION WRITES
+// ============================================================================
+
 func (s *EmployeeService) CreatePosition(
 	ctx context.Context,
 	position *employee.Position,
@@ -631,12 +843,18 @@ func (s *EmployeeService) CreatePosition(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) (*employee.Position, error) {
-	startTime := time.Now()
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("create_pos-%s", uuid.New().String())
+	}
+	var cached *employee.Position
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
 
 	if position.PositionID == uuid.Nil {
 		position.PositionID = uuid.New()
 	}
-
 	now := time.Now().UTC()
 	if position.CreatedAt.IsZero() {
 		position.CreatedAt = now
@@ -645,109 +863,31 @@ func (s *EmployeeService) CreatePosition(
 		position.UpdatedAt = now
 	}
 
-	err := s.employeeRepo.CreatePosition(ctx, position)
-	if err != nil {
+	if err := s.employeeRepo.CreatePosition(ctx, position); err != nil {
 		return nil, fmt.Errorf("failed to create position: %w", err)
 	}
 
-	// Log audit
-	afterState, _ := util.ToJSON(position)
-
-	auditErr := s.auditService.LogAction(
-		ctx,
-		nil,
-		&position.CompanyID,
-		"hr",
-		"position.create",
-		"position",
-		&position.PositionID,
-		actorType,
-		&actorID,
-		[]byte("{}"),
-		afterState,
-		metadata,
+	afterJSON, _ := json.Marshal(position)
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMetadata(metadata, map[string]interface{}{
+		"ip":          ip,
+		"position_id": position.PositionID.String(),
+		"company_id":  position.CompanyID.String(),
+		"title":       position.Title,
+	})
+	_ = s.auditService.LogAction(
+		ctx, nil, &position.CompanyID, "hr",
+		"position.create", "position", &position.PositionID,
+		actorType, &actorID, []byte("{}"), afterJSON, auditMeta,
 	)
 
-	if auditErr != nil {
-		s.logger.Warn("Failed to log audit entry for position creation",
-			util.String("position_id", position.PositionID.String()),
-			util.ErrorField(auditErr))
-	}
-
-	s.logger.Info("Position created",
-		util.String("position_id", position.PositionID.String()),
-		util.String("company_id", position.CompanyID.String()),
-		util.String("department_id", position.DepartmentID.String()),
-		util.String("title", *position.Title),
-		util.Bool("is_open", position.IsOpen),
-		util.Duration("duration", time.Since(startTime)))
-
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, position)
 	return position, nil
 }
 
-// HealthCheck performs service health check
-func (s *EmployeeService) HealthCheck(ctx context.Context) error {
-	if err := s.employeeRepo.HealthCheck(ctx); err != nil {
-		return fmt.Errorf("employee repository health check failed: %w", err)
-	}
-
-	if s.documentStorage != nil {
-		if err := s.documentStorage.HealthCheck(ctx); err != nil {
-			return fmt.Errorf("document storage health check failed: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// TODO: replace with typed repository errors (errors.Is(err, repository.ErrNotFound))
-
-// Helper function to check if error is "not found"
-func isNotFoundError(err error) bool {
-	return err != nil && (err.Error() == "employee profile not found" ||
-		err.Error() == "no active department assignment found for user")
-}
-
-// GetEmployeeProfileByID returns an employee profile by profile ID
-func (s *EmployeeService) GetEmployeeProfileByID(
-	ctx context.Context,
-	profileID uuid.UUID,
-) (*employee.EmployeeProfile, error) {
-
-	if profileID == uuid.Nil {
-		return nil, fmt.Errorf("employee profile id is required")
-	}
-
-	profile, err := s.employeeRepo.GetEmployeeProfileByID(ctx, profileID)
-	if err != nil {
-		return nil, err
-	}
-
-	return profile, nil
-}
-
-func (s *EmployeeService) EnforceScheduledEmployeeExits(
-	ctx context.Context,
-	effectiveDate time.Time,
-	actorID uuid.UUID,
-) (int, error) {
-
-	count, err := s.employeeRepo.EnforceScheduledEmployeeExits(
-		ctx,
-		effectiveDate,
-		actorID,
-	)
-	if err != nil {
-		return 0, err
-	}
-
-	s.logger.Info("Employee exits enforced",
-		util.Int("count", count),
-		util.Time("effective_date", effectiveDate),
-	)
-
-	return count, nil
-}
+// ============================================================================
+// REHIRE
+// ============================================================================
 
 func (s *EmployeeService) RehireEmployee(
 	ctx context.Context,
@@ -756,25 +896,88 @@ func (s *EmployeeService) RehireEmployee(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("rehire-%s", userID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
+		return err
+	}
 
 	if err := s.employeeRepo.RehireEmployee(ctx, companyID, userID); err != nil {
 		return err
 	}
 
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMetadata(metadata, map[string]interface{}{
+		"ip":         ip,
+		"user_id":    userID.String(),
+		"company_id": companyID.String(),
+	})
 	_ = s.auditService.LogAction(
-		ctx,
-		nil,
-		&companyID,
-		"hr",
-		"employee.rehire",
-		"employee_exit",
-		nil,
-		actorType,
-		&actorID,
-		nil,
-		nil,
-		metadata,
+		ctx, nil, &companyID, "hr",
+		"employee.rehire", "employee_exit", nil,
+		actorType, &actorID, nil, nil, auditMeta,
 	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
+}
+
+// ============================================================================
+// SYSTEM OPERATIONS
+// ============================================================================
+
+func (s *EmployeeService) EnforceScheduledEmployeeExits(
+	ctx context.Context,
+	effectiveDate time.Time,
+	actorID uuid.UUID,
+) (int, error) {
+	return s.employeeRepo.EnforceScheduledEmployeeExits(ctx, effectiveDate, actorID)
+}
+
+func (s *EmployeeService) HealthCheck(ctx context.Context) error {
+	if err := s.employeeRepo.HealthCheck(ctx); err != nil {
+		return fmt.Errorf("employee repository health check failed: %w", err)
+	}
+	if s.documentStorage != nil {
+		if err := s.documentStorage.HealthCheck(ctx); err != nil {
+			return fmt.Errorf("document storage health check failed: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *EmployeeService) GetEmployeeProfileByID(
+	ctx context.Context,
+	profileID uuid.UUID,
+) (*employee.EmployeeProfile, error) {
+	if profileID == uuid.Nil {
+		return nil, fmt.Errorf("employee profile id is required")
+	}
+	profile, err := s.employeeRepo.GetEmployeeProfileByID(ctx, profileID)
+	if err != nil {
+		return nil, err
+	}
+	s.decryptPIIFields(ctx, profile)
+	return profile, nil
+}
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+func mergeMetadata(base, extra map[string]interface{}) map[string]interface{} {
+	if base == nil {
+		base = make(map[string]interface{})
+	}
+	for k, v := range extra {
+		base[k] = v
+	}
+	return base
 }

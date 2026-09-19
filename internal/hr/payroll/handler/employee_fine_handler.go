@@ -10,7 +10,6 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 
 	"auth-service/internal/hr/payroll/models"
 	"auth-service/internal/hr/payroll/service"
@@ -19,14 +18,12 @@ import (
 // EmployeeFineHandler handles HTTP requests for employee fines.
 type EmployeeFineHandler struct {
 	fineService service.EmployeeFineService
-	logger      *zap.Logger
 }
 
 // NewEmployeeFineHandler creates a new employee fine handler.
-func NewEmployeeFineHandler(fineService service.EmployeeFineService, logger *zap.Logger) *EmployeeFineHandler {
+func NewEmployeeFineHandler(fineService service.EmployeeFineService) *EmployeeFineHandler {
 	return &EmployeeFineHandler{
 		fineService: fineService,
-		logger:      logger,
 	}
 }
 
@@ -39,7 +36,7 @@ type createFineRequest struct {
 	FineAmount    float64   `json:"fine_amount"`
 	Reason        string    `json:"reason"`
 	FineDate      time.Time `json:"fine_date"`
-	ComponentCode *string   `json:"component_code,omitempty"` // added
+	ComponentCode *string   `json:"component_code,omitempty"`
 	Category      *string   `json:"category,omitempty"`
 	Reference     *string   `json:"reference,omitempty"`
 }
@@ -48,7 +45,7 @@ type updateFineRequest struct {
 	FineAmount    *float64   `json:"fine_amount,omitempty"`
 	Reason        *string    `json:"reason,omitempty"`
 	FineDate      *time.Time `json:"fine_date,omitempty"`
-	ComponentCode *string    `json:"component_code,omitempty"` // added
+	ComponentCode *string    `json:"component_code,omitempty"`
 }
 
 type bulkCreateFinesRequest struct {
@@ -56,7 +53,7 @@ type bulkCreateFinesRequest struct {
 	FineAmount    float64   `json:"fine_amount"`
 	Reason        string    `json:"reason"`
 	FineDate      time.Time `json:"fine_date"`
-	ComponentCode *string   `json:"component_code,omitempty"` // added
+	ComponentCode *string   `json:"component_code,omitempty"`
 }
 
 type bulkDeleteUnprocessedRequest struct {
@@ -78,7 +75,7 @@ type lockFinesForPayrollRunRequest struct {
 // ---------------------------------------------------------------------
 
 func (h *EmployeeFineHandler) CreateFine(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -110,7 +107,7 @@ func (h *EmployeeFineHandler) CreateFine(w http.ResponseWriter, r *http.Request)
 		FineAmount:    req.FineAmount,
 		Reason:        req.Reason,
 		FineDate:      req.FineDate,
-		ComponentCode: req.ComponentCode, // added
+		ComponentCode: req.ComponentCode,
 		Category:      req.Category,
 		Reference:     req.Reference,
 		CreatedBy:     actorID,
@@ -118,6 +115,9 @@ func (h *EmployeeFineHandler) CreateFine(w http.ResponseWriter, r *http.Request)
 
 	fine, err := h.fineService.CreateFine(ctx, input)
 	if err != nil {
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -133,7 +133,7 @@ func (h *EmployeeFineHandler) CreateFine(w http.ResponseWriter, r *http.Request)
 // ---------------------------------------------------------------------
 
 func (h *EmployeeFineHandler) UpdateFine(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -169,12 +169,15 @@ func (h *EmployeeFineHandler) UpdateFine(w http.ResponseWriter, r *http.Request)
 		FineAmount:    req.FineAmount,
 		Reason:        req.Reason,
 		FineDate:      req.FineDate,
-		ComponentCode: req.ComponentCode, // added
+		ComponentCode: req.ComponentCode,
 		UpdatedBy:     actorID,
 	}
 
 	fine, err := h.fineService.UpdateFine(ctx, input)
 	if err != nil {
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -190,7 +193,7 @@ func (h *EmployeeFineHandler) UpdateFine(w http.ResponseWriter, r *http.Request)
 // ---------------------------------------------------------------------
 
 func (h *EmployeeFineHandler) DeleteFine(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -212,6 +215,9 @@ func (h *EmployeeFineHandler) DeleteFine(w http.ResponseWriter, r *http.Request)
 
 	err = h.fineService.DeleteFine(ctx, companyID, fineID, actorID)
 	if err != nil {
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -227,7 +233,7 @@ func (h *EmployeeFineHandler) DeleteFine(w http.ResponseWriter, r *http.Request)
 // ---------------------------------------------------------------------
 
 func (h *EmployeeFineHandler) BulkCreateFines(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -267,12 +273,15 @@ func (h *EmployeeFineHandler) BulkCreateFines(w http.ResponseWriter, r *http.Req
 		FineAmount:    req.FineAmount,
 		Reason:        req.Reason,
 		FineDate:      req.FineDate,
-		ComponentCode: req.ComponentCode, // added
+		ComponentCode: req.ComponentCode,
 		CreatedBy:     actorID,
 	}
 
 	fines, err := h.fineService.BulkCreateFines(ctx, input)
 	if err != nil {
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -285,11 +294,10 @@ func (h *EmployeeFineHandler) BulkCreateFines(w http.ResponseWriter, r *http.Req
 
 // ---------------------------------------------------------------------
 // Bulk Delete Unprocessed Fines (DELETE /companies/{companyID}/employees/fines/bulk/unprocessed)
-// Body contains fine_ids array.
 // ---------------------------------------------------------------------
 
 func (h *EmployeeFineHandler) BulkDeleteUnprocessed(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -325,6 +333,9 @@ func (h *EmployeeFineHandler) BulkDeleteUnprocessed(w http.ResponseWriter, r *ht
 
 	err = h.fineService.BulkDeleteUnprocessed(ctx, companyID, fineIDs, actorID)
 	if err != nil {
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -340,7 +351,7 @@ func (h *EmployeeFineHandler) BulkDeleteUnprocessed(w http.ResponseWriter, r *ht
 // ---------------------------------------------------------------------
 
 func (h *EmployeeFineHandler) MarkFineAsProcessed(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	fineID, err := uuid.Parse(chi.URLParam(r, "fineID"))
 	if err != nil {
@@ -361,6 +372,9 @@ func (h *EmployeeFineHandler) MarkFineAsProcessed(w http.ResponseWriter, r *http
 
 	err = h.fineService.MarkFineAsProcessed(ctx, fineID, payrollRunID)
 	if err != nil {
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -373,11 +387,10 @@ func (h *EmployeeFineHandler) MarkFineAsProcessed(w http.ResponseWriter, r *http
 
 // ---------------------------------------------------------------------
 // Lock Fines for Payroll Run (POST /companies/{companyID}/payroll-runs/fines/lock)
-// This is typically used by payroll processing internally.
 // ---------------------------------------------------------------------
 
 func (h *EmployeeFineHandler) LockFinesForPayrollRun(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -398,6 +411,9 @@ func (h *EmployeeFineHandler) LockFinesForPayrollRun(w http.ResponseWriter, r *h
 
 	fines, err := h.fineService.LockFinesForPayrollRun(ctx, companyID, req.PeriodStart, req.PeriodEnd, payrollRunID)
 	if err != nil {
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -413,7 +429,7 @@ func (h *EmployeeFineHandler) LockFinesForPayrollRun(w http.ResponseWriter, r *h
 // ---------------------------------------------------------------------
 
 func (h *EmployeeFineHandler) GetFineByID(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -445,11 +461,10 @@ func (h *EmployeeFineHandler) GetFineByID(w http.ResponseWriter, r *http.Request
 
 // ---------------------------------------------------------------------
 // List Fines (GET /companies/{companyID}/employees/fines)
-// Supports filtering by user_id, is_processed, payroll_run_id, date range, pagination.
 // ---------------------------------------------------------------------
 
 func (h *EmployeeFineHandler) ListFines(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -504,9 +519,12 @@ func (h *EmployeeFineHandler) ListFines(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
+	// 👇 Populate location scope from request context.
+	// nil = admin/ALL, non-nil = specific location from X-Location-ID.
+	filter.LocationID = locationFilterFromCtx(ctx)
+
 	fines, total, err := h.fineService.ListFines(ctx, filter)
 	if err != nil {
-		h.logger.Error("failed to list fines", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -522,11 +540,10 @@ func (h *EmployeeFineHandler) ListFines(w http.ResponseWriter, r *http.Request) 
 
 // ---------------------------------------------------------------------
 // Get Employee Unprocessed Fines (GET /companies/{companyID}/employees/{userID}/fines/unprocessed)
-// Query params: from_date, to_date (YYYY-MM-DD)
 // ---------------------------------------------------------------------
 
 func (h *EmployeeFineHandler) GetEmployeeUnprocessedFines(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -559,7 +576,9 @@ func (h *EmployeeFineHandler) GetEmployeeUnprocessedFines(w http.ResponseWriter,
 
 	fines, err := h.fineService.GetEmployeeUnprocessedFines(ctx, companyID, userID, from, to)
 	if err != nil {
-		h.logger.Error("failed to get employee unprocessed fines", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -572,11 +591,10 @@ func (h *EmployeeFineHandler) GetEmployeeUnprocessedFines(w http.ResponseWriter,
 
 // ---------------------------------------------------------------------
 // Get Fine Summary by Employee (GET /companies/{companyID}/employees/{userID}/fines/summary)
-// Query params: from_date, to_date
 // ---------------------------------------------------------------------
 
 func (h *EmployeeFineHandler) GetFineSummaryByEmployee(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -609,7 +627,9 @@ func (h *EmployeeFineHandler) GetFineSummaryByEmployee(w http.ResponseWriter, r 
 
 	summary, err := h.fineService.GetFineSummaryByEmployee(ctx, companyID, userID, from, to)
 	if err != nil {
-		h.logger.Error("failed to get fine summary by employee", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -622,11 +642,10 @@ func (h *EmployeeFineHandler) GetFineSummaryByEmployee(w http.ResponseWriter, r 
 
 // ---------------------------------------------------------------------
 // Get Company Fine Summary (GET /companies/{companyID}/fines/summary)
-// Query params: from_date, to_date
 // ---------------------------------------------------------------------
 
 func (h *EmployeeFineHandler) GetCompanyFineSummary(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -653,7 +672,9 @@ func (h *EmployeeFineHandler) GetCompanyFineSummary(w http.ResponseWriter, r *ht
 
 	summary, err := h.fineService.GetCompanyFineSummary(ctx, companyID, from, to)
 	if err != nil {
-		h.logger.Error("failed to get company fine summary", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

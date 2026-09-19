@@ -164,9 +164,13 @@ func NewSchedulingService(
 	}
 }
 
-// ---- Work Calendar CRUD ----
-
-func (s *schedulingServiceImpl) CreateWorkCalendar(ctx context.Context, calendar *models.WorkCalendar, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.WorkCalendar, error) {
+func (s *schedulingServiceImpl) CreateWorkCalendar(
+	ctx context.Context,
+	calendar *models.WorkCalendar,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) (*models.WorkCalendar, error) {
 	if err := s.validateWorkCalendar(calendar); err != nil {
 		return nil, err
 	}
@@ -175,10 +179,27 @@ func (s *schedulingServiceImpl) CreateWorkCalendar(ctx context.Context, calendar
 	}
 	calendar.CreatedAt = time.Now().UTC()
 
-	existing, _ := s.schedulingRepo.GetWorkCalendarsByCompany(ctx, calendar.CompanyID)
+	// Duplicate check is scope-aware.
+	//
+	// The DB enforces two partial unique indexes:
+	//   - one company-wide calendar per (company, year)         [location_id IS NULL]
+	//   - one calendar per (company, year, location_id)         [location_id IS NOT NULL]
+	//
+	// We fetch all calendars for the company and filter in Go so that we can
+	// return a clean error instead of a raw constraint violation, and so that
+	// the caller is told which scope collided.
+	existing, _ := s.schedulingRepo.GetWorkCalendarsByCompany(ctx, calendar.CompanyID, nil)
 	for _, e := range existing {
-		if e.Year == calendar.Year {
-			return nil, fmt.Errorf("calendar for year %d already exists", calendar.Year)
+		if e.Year != calendar.Year {
+			continue
+		}
+		sameScope := (e.LocationID == nil && calendar.LocationID == nil) ||
+			(e.LocationID != nil && calendar.LocationID != nil && *e.LocationID == *calendar.LocationID)
+		if sameScope {
+			if calendar.LocationID == nil {
+				return nil, fmt.Errorf("company-wide calendar for year %d already exists", calendar.Year)
+			}
+			return nil, fmt.Errorf("calendar for year %d already exists at this location", calendar.Year)
 		}
 	}
 
@@ -190,7 +211,6 @@ func (s *schedulingServiceImpl) CreateWorkCalendar(ctx context.Context, calendar
 	s.logAudit(ctx, calendar.CompanyID, "work_calendar.create", calendar.CalendarID, actorType, actorID, nil, after, metadata)
 	return calendar, nil
 }
-
 func (s *schedulingServiceImpl) UpdateWorkCalendar(ctx context.Context, calendarID uuid.UUID, update WorkCalendarUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.WorkCalendar, error) {
 	calendar, err := s.schedulingRepo.GetWorkCalendarByID(ctx, calendarID)
 	if err != nil {
@@ -266,8 +286,17 @@ func (s *schedulingServiceImpl) AddHolidayToCalendar(ctx context.Context, calend
 	return s.schedulingRepo.UpdateWorkCalendar(ctx, calendar)
 }
 
-func (s *schedulingServiceImpl) ProcessHolidayForDate(ctx context.Context, companyID uuid.UUID, date time.Time, actorType string, actorID uuid.UUID) error {
-	instances, err := s.schedulingRepo.GetScheduleInstancesByCompany(ctx, companyID, date, date)
+func (s *schedulingServiceImpl) ProcessHolidayForDate(
+	ctx context.Context,
+	companyID uuid.UUID,
+	date time.Time,
+	actorType string,
+	actorID uuid.UUID,
+) error {
+	// nil = no location filter. Holiday processing applies to every employee
+	// in the company — a declared holiday cancels schedules company-wide,
+	// not per-location.
+	instances, err := s.schedulingRepo.GetScheduleInstancesByCompany(ctx, companyID, nil, date, date)
 	if err != nil {
 		return err
 	}

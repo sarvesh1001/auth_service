@@ -7,14 +7,12 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/lib/pq"
 
 	"auth-service/internal/client"
+	hrErrors "auth-service/internal/hr/errors"
 	"auth-service/internal/hr/payroll/models"
-	"auth-service/internal/util"
-
-	"github.com/google/uuid"
-	"go.uber.org/zap"
 )
 
 // ---------------------------------------------------------------------
@@ -33,17 +31,14 @@ import (
 
 type compensationRepository struct {
 	client *client.PostgresClient
-	logger *zap.Logger
 }
 
 // NewCompensationRepository creates a new CompensationRepository instance.
 func NewCompensationRepository(
 	postgresClient *client.PostgresClient,
-	logger *zap.Logger,
 ) CompensationRepository {
 	return &compensationRepository{
 		client: postgresClient,
-		logger: logger,
 	}
 }
 
@@ -55,7 +50,6 @@ func (r *compensationRepository) CreateEmployeeSalary(
 	ctx context.Context,
 	salary *models.EmployeeSalary,
 ) error {
-	// Defensive default
 	if salary.PayType == "" {
 		salary.PayType = models.PayTypeMonthly
 	}
@@ -72,7 +66,7 @@ func (r *compensationRepository) CreateEmployeeSalary(
 		return err
 	}
 	if overlap {
-		return fmt.Errorf("overlapping active salary assignment for employee %s", salary.UserID)
+		return hrErrors.ErrSalaryOverlap
 	}
 
 	query := `
@@ -118,11 +112,6 @@ func (r *compensationRepository) CreateEmployeeSalary(
 		salary.UpdatedBy,
 	)
 	if err != nil {
-		r.logger.Error("Failed to create employee salary",
-			util.String("company_id", salary.CompanyID.String()),
-			util.String("user_id", salary.UserID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to create employee salary: %w", err)
 	}
 	return nil
@@ -144,7 +133,7 @@ func (r *compensationRepository) UpdateEmployeeSalary(
 		return err
 	}
 	if overlap {
-		return fmt.Errorf("overlapping active salary assignment for employee %s", salary.UserID)
+		return hrErrors.ErrSalaryOverlap
 	}
 
 	query := `
@@ -177,15 +166,11 @@ func (r *compensationRepository) UpdateEmployeeSalary(
 		salary.Version,
 	)
 	if err != nil {
-		r.logger.Error("Failed to update employee salary",
-			util.String("salary_id", salary.EmployeeSalaryID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to update employee salary: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("employee salary not found or version mismatch")
+		return hrErrors.ErrEmployeeSalaryNotFound
 	}
 	salary.Version++
 	return nil
@@ -196,7 +181,6 @@ func (r *compensationRepository) DeactivateEmployeeSalary(
 	employeeSalaryID uuid.UUID,
 	updatedBy uuid.UUID,
 ) error {
-	// ENTERPRISE FIX: audit trail – set is_active = false, record who and when
 	query := `
 		UPDATE payroll.employee_salary
 		SET
@@ -214,15 +198,11 @@ func (r *compensationRepository) DeactivateEmployeeSalary(
 		updatedBy,
 	)
 	if err != nil {
-		r.logger.Error("Failed to deactivate employee salary",
-			util.String("salary_id", employeeSalaryID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to deactivate employee salary: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("employee salary not found")
+		return hrErrors.ErrEmployeeSalaryNotFound
 	}
 	return nil
 }
@@ -272,12 +252,8 @@ func (r *compensationRepository) GetEmployeeSalaryByID(
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrEmployeeSalaryNotFound
 		}
-		r.logger.Error("Failed to get employee salary by ID",
-			util.String("salary_id", employeeSalaryID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get employee salary: %w", err)
 	}
 	return &salary, nil
@@ -336,20 +312,13 @@ func (r *compensationRepository) GetActiveEmployeeSalary(
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrEmployeeSalaryNotFound
 		}
-		r.logger.Error("Failed to get active employee salary",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.String("as_of", asOf.Format("2006-01-02")),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get active employee salary: %w", err)
 	}
 	return &salary, nil
 }
 
-// ENTERPRISE FIX: pagination added
 func (r *compensationRepository) GetEmployeeSalaryHistory(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -388,11 +357,6 @@ func (r *compensationRepository) GetEmployeeSalaryHistory(
 	`
 	rows, err := r.client.Query(ctx, query, companyID, userID, pageSize, offset)
 	if err != nil {
-		r.logger.Error("Failed to get employee salary history",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get employee salary history: %w", err)
 	}
 	defer rows.Close()
@@ -442,10 +406,6 @@ func (r *compensationRepository) GetEmployeesWithActiveSalaryInPeriod(
 	`
 	rows, err := r.client.Query(ctx, query, companyID, startDate, endDate)
 	if err != nil {
-		r.logger.Error("Failed to get employees with active salary in period",
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get employees with active salary: %w", err)
 	}
 	defer rows.Close()
@@ -464,7 +424,6 @@ func (r *compensationRepository) GetEmployeesWithActiveSalaryInPeriod(
 	return userIDs, nil
 }
 
-// ENTERPRISE FIX: properly close ANY overlapping salary, not only NULL effective_to
 func (r *compensationRepository) CloseActiveSalaryBefore(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -493,11 +452,6 @@ func (r *compensationRepository) CloseActiveSalaryBefore(
 		closedBy,
 	)
 	if err != nil {
-		r.logger.Error("Failed to close active salary",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to close active salary: %w", err)
 	}
 	return nil
@@ -548,11 +502,6 @@ func (r *compensationRepository) CreateSalaryStructure(
 		structure.UpdatedBy,
 	)
 	if err != nil {
-		r.logger.Error("Failed to create salary structure",
-			util.String("company_id", structure.CompanyID.String()),
-			util.String("name", structure.StructureName),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to create salary structure: %w", err)
 	}
 	return nil
@@ -562,7 +511,6 @@ func (r *compensationRepository) UpdateSalaryStructure(
 	ctx context.Context,
 	structure *models.SalaryStructure,
 ) error {
-	// ENTERPRISE FIX: optimistic locking with version
 	query := `
 		UPDATE payroll.salary_structure
 		SET
@@ -586,15 +534,11 @@ func (r *compensationRepository) UpdateSalaryStructure(
 		structure.Version,
 	)
 	if err != nil {
-		r.logger.Error("Failed to update salary structure",
-			util.String("structure_id", structure.SalaryStructureID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to update salary structure: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("salary structure not found or version mismatch")
+		return hrErrors.ErrSalaryStructureNotFound
 	}
 	structure.Version++
 	return nil
@@ -622,20 +566,15 @@ func (r *compensationRepository) DeactivateSalaryStructure(
 		updatedBy,
 	)
 	if err != nil {
-		r.logger.Error("Failed to deactivate salary structure",
-			util.String("structure_id", structureID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to deactivate salary structure: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("salary structure not found")
+		return hrErrors.ErrSalaryStructureNotFound
 	}
 	return nil
 }
 
-// ENTERPRISE FIX: company validation – returns structure only if it belongs to given company
 func (r *compensationRepository) GetSalaryStructure(
 	ctx context.Context,
 	structureID uuid.UUID,
@@ -676,13 +615,8 @@ func (r *compensationRepository) GetSalaryStructure(
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrSalaryStructureNotFound
 		}
-		r.logger.Error("Failed to get salary structure",
-			util.String("structure_id", structureID.String()),
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get salary structure: %w", err)
 	}
 	return &s, nil
@@ -718,10 +652,6 @@ func (r *compensationRepository) GetSalaryStructuresByCompany(
 
 	rows, err := r.client.Query(ctx, query, args...)
 	if err != nil {
-		r.logger.Error("Failed to get salary structures by company",
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get salary structures: %w", err)
 	}
 	defer rows.Close()
@@ -767,10 +697,6 @@ func (r *compensationRepository) IsSalaryStructureInUse(
 	var inUse bool
 	err := r.client.QueryRow(ctx, query, structureID).Scan(&inUse)
 	if err != nil {
-		r.logger.Error("Failed to check if salary structure is in use",
-			util.String("structure_id", structureID.String()),
-			util.ErrorField(err),
-		)
 		return false, fmt.Errorf("failed to check salary structure usage: %w", err)
 	}
 	return inUse, nil
@@ -780,8 +706,6 @@ func (r *compensationRepository) IsSalaryStructureInUse(
 // SALARY STRUCTURE COMPONENTS
 // ---------------------------------------------------------------------
 
-// componentExistsForCompany checks whether a given component code exists and is active,
-// either as a company-specific component or as a global component.
 func (r *compensationRepository) componentExistsForCompany(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -808,25 +732,22 @@ func (r *compensationRepository) AddStructureComponent(
 	ctx context.Context,
 	component *models.SalaryStructureComponent,
 ) error {
-	// ENTERPRISE FIX: verify that the structure exists and belongs to the company
 	exists, err := r.salaryStructureExists(ctx, component.SalaryStructureID, component.CompanyID)
 	if err != nil {
 		return err
 	}
 	if !exists {
-		return fmt.Errorf("salary structure %s not found or not owned by company", component.SalaryStructureID)
+		return hrErrors.ErrSalaryStructureNotFound
 	}
 
-	// ENTERPRISE FIX: verify that the component code exists (company-specific or global)
 	compExists, err := r.componentExistsForCompany(ctx, component.CompanyID, component.ComponentCode)
 	if err != nil {
 		return err
 	}
 	if !compExists {
-		return fmt.Errorf("component %s does not exist or is inactive for company", component.ComponentCode)
+		return hrErrors.ErrPayrollComponentNotFound
 	}
 
-	// ✅ CRITICAL FIX: include company_id column and value
 	query := `
         INSERT INTO payroll.salary_structure_component (
             mapping_id,
@@ -850,7 +771,7 @@ func (r *compensationRepository) AddStructureComponent(
 	_, err = r.client.Exec(ctx, query,
 		component.MappingID,
 		component.SalaryStructureID,
-		component.CompanyID, // ✅ now provided
+		component.CompanyID,
 		component.ComponentCode,
 		component.CalculationType,
 		component.Value,
@@ -859,22 +780,15 @@ func (r *compensationRepository) AddStructureComponent(
 		component.CreatedAt,
 	)
 	if err != nil {
-		r.logger.Error("Failed to add structure component",
-			util.String("structure_id", component.SalaryStructureID.String()),
-			util.String("component", component.ComponentCode),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to add structure component: %w", err)
 	}
 	return nil
 }
+
 func (r *compensationRepository) UpdateStructureComponent(
 	ctx context.Context,
 	component *models.SalaryStructureComponent,
 ) error {
-	// Note: We don't validate component existence on update because the mapping already exists.
-	// If the component code is changed, we should validate the new code, but that's a business decision.
-	// We'll assume component code is immutable or validated in service layer.
 	query := `
 		UPDATE payroll.salary_structure_component
 		SET
@@ -894,15 +808,11 @@ func (r *compensationRepository) UpdateStructureComponent(
 		component.MappingID,
 	)
 	if err != nil {
-		r.logger.Error("Failed to update structure component",
-			util.String("mapping_id", component.MappingID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to update structure component: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("structure component not found")
+		return hrErrors.ErrSalaryStructureComponentNotFound
 	}
 	return nil
 }
@@ -917,15 +827,11 @@ func (r *compensationRepository) RemoveStructureComponent(
 	`
 	result, err := r.client.Exec(ctx, query, mappingID)
 	if err != nil {
-		r.logger.Error("Failed to remove structure component",
-			util.String("mapping_id", mappingID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to remove structure component: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("structure component not found")
+		return hrErrors.ErrSalaryStructureComponentNotFound
 	}
 	return nil
 }
@@ -961,12 +867,8 @@ func (r *compensationRepository) GetStructureComponentByID(
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrSalaryStructureComponentNotFound
 		}
-		r.logger.Error("Failed to get structure component by ID",
-			util.String("mapping_id", mappingID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get structure component: %w", err)
 	}
 	return &c, nil
@@ -988,20 +890,18 @@ func (r *compensationRepository) GetStructureComponentsOrdered(
 	return r.getStructureComponentsOrdered(ctx, structureID, companyID, true)
 }
 
-// internal helper with company validation
 func (r *compensationRepository) getStructureComponentsOrdered(
 	ctx context.Context,
 	structureID uuid.UUID,
 	companyID uuid.UUID,
 	ordered bool,
 ) ([]models.SalaryStructureComponent, error) {
-	// First ensure structure belongs to the company
 	exists, err := r.salaryStructureExists(ctx, structureID, companyID)
 	if err != nil {
 		return nil, err
 	}
 	if !exists {
-		return nil, fmt.Errorf("salary structure %s not found or not owned by company", structureID)
+		return nil, hrErrors.ErrSalaryStructureNotFound
 	}
 
 	query := `
@@ -1023,10 +923,6 @@ func (r *compensationRepository) getStructureComponentsOrdered(
 
 	rows, err := r.client.Query(ctx, query, structureID)
 	if err != nil {
-		r.logger.Error("Failed to get structure components",
-			util.String("structure_id", structureID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get structure components: %w", err)
 	}
 	defer rows.Close()
@@ -1060,23 +956,21 @@ func (r *compensationRepository) ReplaceStructureComponents(
 	companyID uuid.UUID,
 	components []models.SalaryStructureComponent,
 ) error {
-	// ENTERPRISE FIX: verify ownership before replacement
 	exists, err := r.salaryStructureExists(ctx, structureID, companyID)
 	if err != nil {
 		return err
 	}
 	if !exists {
-		return fmt.Errorf("salary structure %s does not exist or not owned by company", structureID)
+		return hrErrors.ErrSalaryStructureNotFound
 	}
 
-	// Validate that all component codes belong to the company (either company-specific or global)
 	for _, comp := range components {
 		compExists, err := r.componentExistsForCompany(ctx, companyID, comp.ComponentCode)
 		if err != nil {
 			return err
 		}
 		if !compExists {
-			return fmt.Errorf("component %s does not exist or is inactive for company", comp.ComponentCode)
+			return hrErrors.ErrPayrollComponentNotFound
 		}
 	}
 
@@ -1168,7 +1062,6 @@ func (r *compensationRepository) salaryStructureExists(
 // VALIDATION & RESOLUTION HELPERS
 // ---------------------------------------------------------------------
 
-// ENTERPRISE FIX: excludeID parameter to prevent self‑conflict during update
 func (r *compensationRepository) HasOverlappingSalaryAssignment(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1205,18 +1098,11 @@ func (r *compensationRepository) HasOverlappingSalaryAssignment(
 	var overlaps bool
 	err := r.client.QueryRow(ctx, query, args...).Scan(&overlaps)
 	if err != nil {
-		r.logger.Error("Failed to check overlapping salary assignment",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.ErrorField(err),
-		)
 		return false, fmt.Errorf("failed to check overlapping salary: %w", err)
 	}
 	return overlaps, nil
 }
 
-// ENTERPRISE FIX: company‑aware validation – ensure components are active and unique,
-// considering both company-specific and global components.
 func (r *compensationRepository) IsSalaryStructureValid(
 	ctx context.Context,
 	structureID uuid.UUID,
@@ -1225,7 +1111,6 @@ func (r *compensationRepository) IsSalaryStructureValid(
 		WITH comps AS (
 			SELECT
 				ssc.component_code,
-				-- resolve component type from either company-specific or global version
 				COALESCE(
 					(SELECT component_type FROM payroll.payroll_component pc
 					 WHERE pc.component_code = ssc.component_code
@@ -1261,10 +1146,6 @@ func (r *compensationRepository) IsSalaryStructureValid(
 		&uniqueSeqOrder,
 	)
 	if err != nil {
-		r.logger.Error("Failed to validate salary structure",
-			util.String("structure_id", structureID.String()),
-			util.ErrorField(err),
-		)
 		return false, fmt.Errorf("failed to validate salary structure: %w", err)
 	}
 	return hasEarning && allActive && noDupCodes && uniqueSeqOrder, nil
@@ -1290,10 +1171,6 @@ func (r *compensationRepository) GetTotalMonthlyCTCByCompany(
 	var total float64
 	err := r.client.QueryRow(ctx, query, companyID, asOf).Scan(&total)
 	if err != nil {
-		r.logger.Error("Failed to get total monthly CTC by company",
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err),
-		)
 		return 0, fmt.Errorf("failed to get total monthly CTC: %w", err)
 	}
 	return total, nil
@@ -1318,7 +1195,6 @@ func (r *compensationRepository) HealthCheck(ctx context.Context) error {
 	row := r.client.QueryRow(ctx, query)
 	err := row.Scan(&result)
 	if err != nil {
-		r.logger.Error("Compensation repository health check failed", util.ErrorField(err))
 		return fmt.Errorf("compensation repository health check failed: %w", err)
 	}
 	return nil
@@ -1328,9 +1204,6 @@ func (r *compensationRepository) HealthCheck(ctx context.Context) error {
 // Component Metadata (from payroll.payroll_component)
 // ---------------------------------------------------------------------
 
-// GetComponent retrieves a payroll component by code for a given company.
-// Returns the company-specific version if it exists, otherwise the global version.
-// Returns nil, nil if neither exists.
 func (r *compensationRepository) GetComponent(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1349,7 +1222,7 @@ func (r *compensationRepository) GetComponent(
         WHERE component_code = $2
           AND is_active = true
           AND (company_id = $1 OR company_id IS NULL)
-        ORDER BY (company_id IS NULL) ASC   -- company-specific first, global fallback
+        ORDER BY (company_id IS NULL) ASC
         LIMIT 1
     `
 	row := r.client.QueryRow(ctx, query, companyID, code)
@@ -1366,13 +1239,8 @@ func (r *compensationRepository) GetComponent(
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrPayrollComponentNotFound
 		}
-		r.logger.Error("Failed to get payroll component",
-			util.String("code", code),
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get component: %w", err)
 	}
 	if cid != nil {
@@ -1381,9 +1249,6 @@ func (r *compensationRepository) GetComponent(
 	return &comp, nil
 }
 
-// GetComponentsByCodes retrieves multiple payroll components for a given company.
-// For each code, returns the company-specific version if available, otherwise the global version.
-// Returns empty slice (not nil) if none found.
 func (r *compensationRepository) GetComponentsByCodes(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1394,8 +1259,16 @@ func (r *compensationRepository) GetComponentsByCodes(
 		return []*models.PayrollComponent{}, nil
 	}
 
-	// Optional: deduplicate codes to avoid unnecessary rows
-	codes = util.UniqueStrings(codes)
+	// Deduplicate codes
+	codeSet := make(map[string]struct{})
+	unique := make([]string, 0, len(codes))
+	for _, c := range codes {
+		if _, ok := codeSet[c]; !ok {
+			codeSet[c] = struct{}{}
+			unique = append(unique, c)
+		}
+	}
+	codes = unique
 
 	query := `
         SELECT
@@ -1414,18 +1287,11 @@ func (r *compensationRepository) GetComponentsByCodes(
 
 	rows, err := r.client.Query(ctx, query, companyID, pq.Array(codes))
 	if err != nil {
-		r.logger.Error("Failed to get payroll components by codes",
-			util.Int("codes_count", len(codes)),
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get components by codes: %w", err)
 	}
 	defer rows.Close()
 
-	// Use a map to keep the best match: company-specific overrides global
 	metaMap := make(map[string]*models.PayrollComponent)
-
 	for rows.Next() {
 		var comp models.PayrollComponent
 		var cid *uuid.UUID
@@ -1440,18 +1306,16 @@ func (r *compensationRepository) GetComponentsByCodes(
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan component: %w", err)
 		}
-
 		if cid != nil {
 			comp.CompanyID = *cid
 		}
-
 		// Company-specific version always wins over global
-		_, ok := metaMap[comp.ComponentCode]
-		if !ok || comp.CompanyID == companyID {
+		if existing, ok := metaMap[comp.ComponentCode]; !ok || comp.CompanyID == companyID {
+			metaMap[comp.ComponentCode] = &comp
+		} else if existing.CompanyID == uuid.Nil && comp.CompanyID == companyID {
 			metaMap[comp.ComponentCode] = &comp
 		}
 	}
-
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("rows iteration error: %w", err)
 	}
@@ -1471,7 +1335,6 @@ func (r *compensationRepository) GetSalaryStructureWithComponents(
 	asOf time.Time, // kept for interface consistency
 ) (*models.SalaryStructure, []models.SalaryStructureComponent, error) {
 
-	// 1️⃣ Fetch structure (no effective date filtering)
 	structureQuery := `
         SELECT
             salary_structure_id,
@@ -1509,12 +1372,11 @@ func (r *compensationRepository) GetSalaryStructureWithComponents(
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil, nil
+			return nil, nil, hrErrors.ErrSalaryStructureNotFound
 		}
 		return nil, nil, fmt.Errorf("failed to get salary structure: %w", err)
 	}
 
-	// 2️⃣ Fetch components (no effective date filtering)
 	componentsQuery := `
         SELECT
             mapping_id,
@@ -1554,16 +1416,13 @@ func (r *compensationRepository) GetSalaryStructureWithComponents(
 		comp.CompanyID = companyID
 		components = append(components, comp)
 	}
-
 	if err := rows.Err(); err != nil {
 		return nil, nil, fmt.Errorf("rows iteration error: %w", err)
 	}
-
 	return &structure, components, nil
 }
 
 // GetEmployeeSalaryHistoryInRange returns ALL salary assignments overlapping the given date range.
-// Ordered by effective_from ASC (oldest first) – critical for segment splitting.
 func (r *compensationRepository) GetEmployeeSalaryHistoryInRange(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1597,11 +1456,6 @@ func (r *compensationRepository) GetEmployeeSalaryHistoryInRange(
 	`
 	rows, err := r.client.Query(ctx, query, companyID, userID, startDate, endDate)
 	if err != nil {
-		r.logger.Error("Failed to get employee salary history in range",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get salary history in range: %w", err)
 	}
 	defer rows.Close()
@@ -1691,13 +1545,8 @@ func (r *compensationRepository) GetActiveEmployeeSalaryForUpdate(
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrEmployeeSalaryNotFound
 		}
-		r.logger.Error("Failed to get active employee salary for update",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get active employee salary for update: %w", err)
 	}
 	return &salary, nil
@@ -1738,11 +1587,6 @@ func (r *compensationRepository) GetEmployeeSalaryHistoryInRangeForUpdate(
 	`
 	rows, err := r.client.Query(ctx, query, companyID, userID, startDate, endDate)
 	if err != nil {
-		r.logger.Error("Failed to get employee salary history for update",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get salary history for update: %w", err)
 	}
 	defer rows.Close()

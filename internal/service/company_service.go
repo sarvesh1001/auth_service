@@ -1,15 +1,23 @@
-// Package service defines the company service layer with audit, idempotency, and application-specific errors.
 package service
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
+	hrEmployee "auth-service/internal/hr/models/employee"
+	hrRepo "auth-service/internal/hr/repository"
 
+	hrService "auth-service/internal/hr/service" // 👈 ADD THIS
+
+	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
+
+	"auth-service/internal/client"
 	"auth-service/internal/config"
 	appErrors "auth-service/internal/errors"
 	"auth-service/internal/infrastructure/audit"
@@ -19,35 +27,64 @@ import (
 	"auth-service/internal/repository/postgres"
 )
 
-// CompanyService handles company, employee, role, department, and position management.
 type CompanyService struct {
+	pgClient         *client.PostgresClient
 	companyRepo      postgres.CompanyRepository
+	locationRepo     postgres.LocationRepository
+	employeeRepo     hrRepo.EmployeeRepository  // 👈 ADD
+	employeeService  *hrService.EmployeeService // 👈 was *EmployeeService
 	userService      *UserService
+	planService      *SubscriptionPlanService
+	paymentService   *PaymentService
+	invoiceService   *SubscriptionInvoiceService
+	reminderService  *ReminderService
+	lifecycleService *SubscriptionLifecycleService
 	auditService     *audit.AuditService
 	idempotencyStore idempotency.Store
 	config           config.Config
+	redisClient      *redis.Client
 }
 
-// NewCompanyService creates a new CompanyService.
 func NewCompanyService(
+	pgClient *client.PostgresClient,
 	companyRepo postgres.CompanyRepository,
+	locationRepo postgres.LocationRepository,
+	employeeRepo hrRepo.EmployeeRepository,
+	employeeService *hrService.EmployeeService, // 👈 was *EmployeeService
 	userService *UserService,
+	planService *SubscriptionPlanService,
+	paymentService *PaymentService,
+	invoiceService *SubscriptionInvoiceService,
+	reminderService *ReminderService,
+	lifecycleService *SubscriptionLifecycleService,
 	auditService *audit.AuditService,
 	idempotencyStore idempotency.Store,
-	config config.Config,
+	cfg config.Config,
+	redisClient *redis.Client,
 ) *CompanyService {
 	return &CompanyService{
+		pgClient:         pgClient,
 		companyRepo:      companyRepo,
+		locationRepo:     locationRepo,
+		employeeRepo:     employeeRepo,
+		employeeService:  employeeService,
 		userService:      userService,
+		planService:      planService,
+		paymentService:   paymentService,
+		invoiceService:   invoiceService,
+		reminderService:  reminderService,
+		lifecycleService: lifecycleService,
 		auditService:     auditService,
 		idempotencyStore: idempotencyStore,
-		config:           config,
+		config:           cfg,
+		redisClient:      redisClient,
 	}
 }
 
-// ---- Permission helpers ----
+// ============================================================
+// Context-based permission helpers (unchanged)
+// ============================================================
 
-// CheckMultiplePermissionsFromContext checks multiple permissions from context using bitmask.
 func (s *CompanyService) CheckMultiplePermissionsFromContext(ctx context.Context, permissions []string, checkAll bool) (bool, error) {
 	sessionType, ok := ctx.Value("session_type").(string)
 	if !ok {
@@ -66,7 +103,6 @@ func (s *CompanyService) CheckMultiplePermissionsFromContext(ctx context.Context
 	return rbac.HasAnyPermission(permissionMask, permissions...), nil
 }
 
-// GetPermissionsFromContext returns the list of permission names from context.
 func (s *CompanyService) GetPermissionsFromContext(ctx context.Context) ([]string, error) {
 	permissionMask, ok := ctx.Value("permission_mask").([]uint64)
 	if !ok || permissionMask == nil {
@@ -75,7 +111,6 @@ func (s *CompanyService) GetPermissionsFromContext(ctx context.Context) ([]strin
 	return rbac.GetPermissionsFromMask(permissionMask), nil
 }
 
-// CheckPermissionFromContext checks a single permission from context.
 func (s *CompanyService) CheckPermissionFromContext(ctx context.Context, permissionName string) (bool, error) {
 	sessionType, ok := ctx.Value("session_type").(string)
 	if !ok {
@@ -91,38 +126,153 @@ func (s *CompanyService) CheckPermissionFromContext(ctx context.Context, permiss
 	return rbac.HasPermission(permissionMask, permissionName), nil
 }
 
-// ---- Company creation ----
-
-// CreateCompanyRequest defines the request for creating a new company.
-type CreateCompanyRequest struct {
-	CompanyName             string
-	OwnerPhone              string
-	OwnerUsername           string
-	OwnerFullName           string
-	OwnerPositionTitle      string
-	SubscriptionTier        string
-	MaxEmployees            int
-	MaxDepartments          int
-	DataRegion              string
-	SubscriptionMonths      int
-	SubscriptionDays        int
-	Departments             []string
-	FinancialYearStartMonth int
-	WorkCenterCode          string
-	WorkCenterName          string
-	WorkCenterDesc          *string
-	WorkCenterTZ            string
-	WorkCenterActive        bool
-	PositionWorkCenterCode  *string
+type CompanyStatusSnapshot struct {
+	CompanyID           uuid.UUID  `json:"company_id"`
+	SubscriptionStatus  string     `json:"subscription_status"`
+	SubscriptionEndDate *time.Time `json:"subscription_end_date,omitempty"`
+	TrialEndDate        *time.Time `json:"trial_end_date,omitempty"`
+	GracePeriodDays     int        `json:"grace_period_days"`
+	IsActive            bool       `json:"is_active"`
+	CachedAt            time.Time  `json:"cached_at"`
 }
 
-// CreateCompany creates a new company with owner, departments, work center, and position.
+func (s *CompanyService) IsCompanyAllowed(
+	ctx context.Context,
+	companyID uuid.UUID,
+) (bool, string, error) {
+	if companyID == uuid.Nil {
+		return false, "", fmt.Errorf("%w: company_id is required", appErrors.ErrInvalidInput)
+	}
+	snap, err := s.getCachedCompanyStatus(ctx, companyID)
+	if err != nil {
+		return false, "", err
+	}
+	switch snap.SubscriptionStatus {
+	case models.SubscriptionStatusTrial,
+		models.SubscriptionStatusActive:
+		return true, snap.SubscriptionStatus, nil
+	case models.SubscriptionStatusPastDue:
+		return true, snap.SubscriptionStatus, nil
+	case models.SubscriptionStatusPending:
+		return false, snap.SubscriptionStatus, nil
+	case models.SubscriptionStatusExpired,
+		models.SubscriptionStatusCancelled:
+		return false, snap.SubscriptionStatus, nil
+	default:
+		return false, snap.SubscriptionStatus, nil
+	}
+}
+
+func (s *CompanyService) getCachedCompanyStatus(
+	ctx context.Context,
+	companyID uuid.UUID,
+) (*CompanyStatusSnapshot, error) {
+	cacheKey := fmt.Sprintf("company:sub:%s", companyID.String())
+	if s.redisClient != nil {
+		if data, err := s.redisClient.Get(ctx, cacheKey).Bytes(); err == nil {
+			var snap CompanyStatusSnapshot
+			if err := json.Unmarshal(data, &snap); err == nil {
+				return &snap, nil
+			}
+			_ = s.redisClient.Del(ctx, cacheKey).Err()
+		}
+	}
+	company, err := s.companyRepo.GetCompany(ctx, companyID)
+	if err != nil {
+		if errors.Is(err, appErrors.ErrNotFound) {
+			return nil, fmt.Errorf("%w: company not found", appErrors.ErrNotFound)
+		}
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	snap := &CompanyStatusSnapshot{
+		CompanyID:           company.CompanyID,
+		SubscriptionStatus:  company.SubscriptionStatus,
+		SubscriptionEndDate: company.SubscriptionEndDate,
+		TrialEndDate:        company.TrialEndDate,
+		GracePeriodDays:     company.GracePeriodDays,
+		IsActive:            company.IsActive,
+		CachedAt:            time.Now().UTC(),
+	}
+	if s.redisClient != nil {
+		if data, err := json.Marshal(snap); err == nil {
+			_ = s.redisClient.Set(ctx, cacheKey, data, 10*time.Minute).Err()
+		}
+	}
+	return snap, nil
+}
+
+func (s *CompanyService) InvalidateCompanyStatusCache(
+	ctx context.Context,
+	companyID uuid.UUID,
+) {
+	if s.redisClient == nil {
+		return
+	}
+	cacheKey := fmt.Sprintf("company:sub:%s", companyID.String())
+	_ = s.redisClient.Del(ctx, cacheKey).Err()
+}
+
+func (s *CompanyService) WarmCompanyStatusCache(ctx context.Context, companyID uuid.UUID) {
+	_, _ = s.getCachedCompanyStatus(ctx, companyID)
+}
+
+type CreateCompanyRequest struct {
+	CompanyName             string   `json:"company_name"`
+	OwnerPhone              string   `json:"owner_phone"`
+	OwnerUsername           string   `json:"owner_username"`
+	OwnerFullName           string   `json:"owner_full_name"`
+	OwnerPositionTitle      string   `json:"owner_position_title"`
+	SubscriptionTier        string   `json:"subscription_tier"`
+	SubscriptionPlanCode    string   `json:"subscription_plan_code"`
+	MaxEmployees            int      `json:"max_employees"`
+	MaxLocations            int      `json:"max_locations"`
+	DataRegion              string   `json:"data_region"`
+	SubscriptionMonths      int      `json:"subscription_months"`
+	SubscriptionDays        int      `json:"subscription_days"`
+	Departments             []string `json:"departments"`
+	FinancialYearStartMonth int      `json:"financial_year_start_month"`
+	TrialDays               int      `json:"trial_days"`
+	LocationCode            string   `json:"location_code"`
+	LocationName            string   `json:"location_name"`
+	AddressLine1            *string  `json:"address_line1,omitempty"`
+	AddressLine2            *string  `json:"address_line2,omitempty"`
+	City                    *string  `json:"city,omitempty"`
+	State                   *string  `json:"state,omitempty"`
+	Country                 *string  `json:"country,omitempty"`
+	Pincode                 *string  `json:"pincode,omitempty"`
+	WorkCenterCode          string   `json:"work_center_code"`
+	WorkCenterName          string   `json:"work_center_name"`
+	WorkCenterDesc          *string  `json:"work_center_desc,omitempty"`
+	WorkCenterTZ            string   `json:"work_center_timezone"`
+	WorkCenterActive        bool     `json:"work_center_active"`
+	PositionWorkCenterCode  *string  `json:"position_work_center_code,omitempty"`
+
+	// ============================================================
+	// 👇 Owner employee profile — mirrors AddMemberRequest.
+	//    Every field is optional / nullable. Anything not provided
+	//    is left NULL, including CostCenter*.
+	// ============================================================
+	OwnerDateOfBirth      *time.Time `json:"owner_date_of_birth,omitempty"`
+	OwnerGender           *string    `json:"owner_gender,omitempty"`
+	OwnerMaritalStatus    *string    `json:"owner_marital_status,omitempty"`
+	OwnerNationality      *string    `json:"owner_nationality,omitempty"`
+	OwnerEmploymentType   *string    `json:"owner_employment_type,omitempty"`
+	OwnerEmploymentStatus *string    `json:"owner_employment_status,omitempty"`
+	OwnerProbationEndDate *time.Time `json:"owner_probation_end_date,omitempty"`
+	OwnerConfirmationDate *time.Time `json:"owner_confirmation_date,omitempty"`
+	OwnerGrade            *string    `json:"owner_grade,omitempty"`
+	OwnerCostCenterID     *uuid.UUID `json:"owner_cost_center_id,omitempty"` // nullable
+	OwnerCostCenter       *string    `json:"owner_cost_center,omitempty"`    // nullable (legacy text)
+	OwnerTaxID            *string    `json:"owner_tax_id,omitempty"`
+	OwnerSocialSecurityID *string    `json:"owner_social_security_id,omitempty"`
+	OwnerEmail            *string    `json:"owner_email,omitempty"`
+}
+
 func (s *CompanyService) CreateCompany(
 	ctx context.Context,
 	req *CreateCompanyRequest,
 	createdBy uuid.UUID,
 ) (*models.Company, error) {
-	// Idempotency
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
 		idempKey = fmt.Sprintf("create_company:%s:%s", req.CompanyName, req.OwnerPhone)
@@ -134,19 +284,35 @@ func (s *CompanyService) CreateCompany(
 		return &cachedCompany, nil
 	}
 
-	// Validation
-	if req.MaxDepartments < 1 || req.MaxDepartments > 100 {
-		return nil, fmt.Errorf("%w: max_departments must be between 1 and 100", appErrors.ErrInvalidInput)
+	if req.MaxLocations < 1 || req.MaxLocations > 500 {
+		return nil, fmt.Errorf("%w: max_locations must be between 1 and 500", appErrors.ErrInvalidInput)
 	}
 	if req.FinancialYearStartMonth < 1 || req.FinancialYearStartMonth > 12 {
 		return nil, fmt.Errorf("%w: financial_year_start_month must be between 1 and 12", appErrors.ErrInvalidInput)
 	}
-	totalDepartments := len(req.Departments) + 1
-	if totalDepartments > req.MaxDepartments {
-		return nil, fmt.Errorf("%w: requested %d departments exceeds max_departments limit %d", appErrors.ErrInvalidInput, totalDepartments, req.MaxDepartments)
+	if req.SubscriptionMonths < 0 || req.SubscriptionMonths > 36 {
+		return nil, fmt.Errorf("%w: subscription_months must be between 0 and 36", appErrors.ErrInvalidInput)
+	}
+	if req.SubscriptionDays < 0 || req.SubscriptionDays > 30 {
+		return nil, fmt.Errorf("%w: subscription_days must be between 0 and 30", appErrors.ErrInvalidInput)
+	}
+	if req.TrialDays < 0 {
+		return nil, fmt.Errorf("%w: trial_days cannot be negative", appErrors.ErrInvalidInput)
+	}
+	if req.LocationCode == "" || req.LocationName == "" {
+		return nil, fmt.Errorf("%w: location_code and location_name are required", appErrors.ErrInvalidInput)
 	}
 
-	// Owner user
+	var plan *models.SubscriptionPlan
+	if req.SubscriptionPlanCode != "" {
+		var err error
+		plan, err = s.planService.GetPlanByCode(ctx, req.SubscriptionPlanCode)
+		if err != nil {
+			return nil, fmt.Errorf("%w: plan '%s' not found: %v",
+				appErrors.ErrNotFound, req.SubscriptionPlanCode, err)
+		}
+	}
+
 	var ownerUser *models.User
 	existingUser, err := s.userService.GetUserByPhone(ctx, req.OwnerPhone)
 	if err != nil {
@@ -162,17 +328,75 @@ func (s *CompanyService) CreateCompany(
 		ownerUser = existingUser
 	}
 
-	// Check existing company
 	exists, err := s.companyRepo.CheckCompanyExists(ctx, req.CompanyName, ownerUser.UserID)
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to validate company", appErrors.ErrInternal)
 	}
 	if exists {
-		return nil, fmt.Errorf("%w: company with name '%s' already exists for this owner", appErrors.ErrDuplicate, req.CompanyName)
+		return nil, fmt.Errorf("%w: company with name '%s' already exists for this owner",
+			appErrors.ErrDuplicate, req.CompanyName)
 	}
 
 	now := time.Now().UTC()
-	subscriptionEnd := now.AddDate(0, req.SubscriptionMonths, req.SubscriptionDays)
+	var (
+		subscriptionStart  *time.Time
+		subscriptionEnd    *time.Time
+		trialStart         *time.Time
+		trialEnd           *time.Time
+		subscriptionStatus = models.SubscriptionStatusPending
+		subscriptionAmount = 0.0
+		subscriptionPlanID *uuid.UUID
+	)
+	switch {
+	case req.TrialDays > 0:
+		subscriptionStatus = models.SubscriptionStatusTrial
+		trialStart = &now
+		trialEnd = pointerTime(now.AddDate(0, 0, req.TrialDays))
+	case req.SubscriptionMonths > 0 || req.SubscriptionDays > 0:
+		subscriptionStatus = models.SubscriptionStatusActive
+		subscriptionStart = &now
+		subscriptionEnd = pointerTime(
+			now.AddDate(0, req.SubscriptionMonths, req.SubscriptionDays),
+		)
+		if plan != nil {
+			subscriptionAmount = plan.Price
+			pid := plan.PlanID
+			subscriptionPlanID = &pid
+		}
+	default:
+		subscriptionStatus = models.SubscriptionStatusPending
+		subscriptionStart = nil
+		subscriptionEnd = nil
+		subscriptionAmount = 0
+		subscriptionPlanID = nil
+	}
+
+	maxEmployees := req.MaxEmployees
+	if maxEmployees == 0 {
+		maxEmployees = 10
+	}
+
+	company := &models.Company{
+		CompanyID:               uuid.New(),
+		CompanyName:             req.CompanyName,
+		OwnerUserID:             ownerUser.UserID,
+		SubscriptionTier:        req.SubscriptionTier,
+		SubscriptionStatus:      subscriptionStatus,
+		MaxEmployees:            maxEmployees,
+		MaxLocations:            req.MaxLocations,
+		SubscriptionAmount:      subscriptionAmount,
+		DataRegion:              req.DataRegion,
+		IsActive:                true,
+		CreatedAt:               now,
+		UpdatedAt:               now,
+		SubscriptionStartDate:   subscriptionStart,
+		SubscriptionEndDate:     subscriptionEnd,
+		FinancialYearStartMonth: req.FinancialYearStartMonth,
+		GracePeriodDays:         3,
+		SubscriptionPlanID:      subscriptionPlanID,
+		TrialStartDate:          trialStart,
+		TrialEndDate:            trialEnd,
+	}
 
 	positionWorkCenter := req.PositionWorkCenterCode
 	if positionWorkCenter == nil {
@@ -181,7 +405,7 @@ func (s *CompanyService) CreateCompany(
 
 	workCenter := &models.WorkCenter{
 		WorkCenterCode: req.WorkCenterCode,
-		CompanyID:      uuid.Nil, // Will be set after company creation
+		CompanyID:      uuid.Nil,
 		Name:           req.WorkCenterName,
 		Description:    req.WorkCenterDesc,
 		Timezone:       req.WorkCenterTZ,
@@ -189,6 +413,7 @@ func (s *CompanyService) CreateCompany(
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}
+
 	position := &models.Position{
 		PositionID:         uuid.New(),
 		CompanyID:          uuid.Nil,
@@ -203,49 +428,181 @@ func (s *CompanyService) CreateCompany(
 		CreatedAt:          now,
 		UpdatedAt:          now,
 	}
-	company := &models.Company{
-		CompanyID:               uuid.New(),
-		CompanyName:             req.CompanyName,
-		OwnerUserID:             ownerUser.UserID,
-		SubscriptionTier:        req.SubscriptionTier,
-		SubscriptionStatus:      models.SubscriptionStatusActive,
-		MaxEmployees:            req.MaxEmployees,
-		MaxDepartments:          req.MaxDepartments,
-		DataRegion:              req.DataRegion,
-		IsActive:                true,
-		CreatedAt:               now,
-		UpdatedAt:               now,
-		SubscriptionStartDate:   &now,
-		SubscriptionEndDate:     &subscriptionEnd,
-		FinancialYearStartMonth: req.FinancialYearStartMonth,
+
+	if err := s.companyRepo.CreateCompany(
+		ctx, company, req.Departments, req.OwnerPositionTitle, position, workCenter,
+	); err != nil {
+		return nil, fmt.Errorf("%w: failed to create company: %v", appErrors.ErrInternal, err)
 	}
 
-	if err := s.companyRepo.CreateCompany(ctx, company, req.Departments, req.OwnerPositionTitle, position, workCenter); err != nil {
-		return nil, fmt.Errorf("%w: failed to create company", appErrors.ErrInternal)
+	location := &models.Location{
+		LocationID:   uuid.New(),
+		CompanyID:    company.CompanyID,
+		LocationCode: req.LocationCode,
+		LocationName: req.LocationName,
+		AddressLine1: req.AddressLine1,
+		AddressLine2: req.AddressLine2,
+		City:         req.City,
+		State:        req.State,
+		Country:      req.Country,
+		Pincode:      req.Pincode,
+		IsActive:     true,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	if err := s.locationRepo.CreateLocation(ctx, s.pgClient.Pool(), location); err != nil {
+		return nil, fmt.Errorf("%w: failed to create default location: %v", appErrors.ErrInternal, err)
 	}
 
-	// Store idempotency
+	if err := s.companyRepo.SetWorkCenterLocation(
+		ctx,
+		s.pgClient.Pool(),
+		company.CompanyID,
+		req.WorkCenterCode,
+		location.LocationID,
+	); err != nil {
+		if s.auditService != nil {
+			_ = s.auditService.LogAction(
+				ctx, nil, nil,
+				"company", "work_center_location_link_failed", "company",
+				&company.CompanyID, "system", nil, nil, nil,
+				map[string]interface{}{
+					"error":            err.Error(),
+					"company_id":       company.CompanyID.String(),
+					"work_center_code": req.WorkCenterCode,
+					"location_id":      location.LocationID.String(),
+				},
+			)
+		}
+	}
+
+	if err := s.companyRepo.UpdateEmployeeLocationSettings(
+		ctx, s.pgClient.Pool(), company.CompanyID, ownerUser.UserID, &location.LocationID, models.LocationScopeAll,
+	); err != nil {
+		if s.auditService != nil {
+			_ = s.auditService.LogAction(ctx, nil, nil, "company", "location_assignment_failed", "employee",
+				&ownerUser.UserID, "system", nil, nil, nil, map[string]interface{}{
+					"error":      err.Error(),
+					"company_id": company.CompanyID.String(),
+				})
+		}
+	} else {
+		history := &models.EmployeeLocationHistory{
+			ID:           uuid.New(),
+			UserID:       ownerUser.UserID,
+			CompanyID:    company.CompanyID,
+			LocationID:   location.LocationID,
+			StartDate:    now,
+			EndDate:      nil,
+			ChangeReason: "initial assignment on company creation",
+			CreatedAt:    now,
+		}
+		if err := s.locationRepo.AddLocationHistory(ctx, s.pgClient.Pool(), history); err != nil {
+			if s.auditService != nil {
+				_ = s.auditService.LogAction(ctx, nil, nil, "company", "location_history_write_failed", "employee",
+					&ownerUser.UserID, "system", nil, nil, nil, map[string]interface{}{
+						"error":       err.Error(),
+						"company_id":  company.CompanyID.String(),
+						"location_id": location.LocationID.String(),
+					})
+			}
+		}
+	}
+
+	// ============================================================
+	// 👇 Create the owner's employee_profiles row.
+	//
+	//    Routed through EmployeeService so that:
+	//      • PII columns (email, tax_id, ssn, dob, nationality,
+	//        marital_status) are envelope-encrypted and their
+	//        *_encrypted / *_encrypted_dek / *_key_id siblings
+	//        and email_hash are populated.
+	//      • An HR audit entry is emitted.
+	//
+	//    A derived context carries its own idempotency_key so it
+	//    does not collide with CreateCompany's idempotency slot.
+	//
+	//    CostCenter / CostCenterID remain nil when the caller did
+	//    not provide them — the columns are nullable.
+	// ============================================================
+	ownerStatus := "active"
+	if req.OwnerEmploymentStatus != nil && *req.OwnerEmploymentStatus != "" {
+		ownerStatus = *req.OwnerEmploymentStatus
+	}
+
+	profileCtx := context.WithValue(
+		ctx,
+		"idempotency_key",
+		fmt.Sprintf("owner_profile:%s", company.CompanyID.String()),
+	)
+
+	ownerProfile := &hrEmployee.EmployeeProfile{
+		EmployeeProfileID: uuid.New(),
+		UserID:            ownerUser.UserID,
+		CompanyID:         company.CompanyID,
+
+		// Plaintext PII — EmployeeService encrypts and fills siblings.
+		DateOfBirth:      req.OwnerDateOfBirth,
+		Gender:           req.OwnerGender,
+		MaritalStatus:    req.OwnerMaritalStatus,
+		Nationality:      req.OwnerNationality,
+		TaxID:            req.OwnerTaxID,
+		SocialSecurityID: req.OwnerSocialSecurityID,
+		Email:            req.OwnerEmail,
+
+		// Non-PII
+		EmploymentType:   req.OwnerEmploymentType,
+		EmploymentStatus: &ownerStatus,
+		ProbationEndDate: req.OwnerProbationEndDate,
+		ConfirmationDate: req.OwnerConfirmationDate,
+		JobTitle:         &req.OwnerPositionTitle,
+		Grade:            req.OwnerGrade,
+		CostCenter:       req.OwnerCostCenter,   // 👈 nil when not provided
+		CostCenterID:     req.OwnerCostCenterID, // 👈 nil when not provided
+
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	if _, err := s.employeeService.CreateEmployeeProfile(
+		profileCtx,
+		ownerProfile,
+		"admin",
+		createdBy,
+		map[string]interface{}{
+			"source":     "create_company",
+			"company_id": company.CompanyID.String(),
+		},
+	); err != nil {
+		return nil, fmt.Errorf("%w: failed to create owner employee profile: %v", appErrors.ErrInternal, err)
+	}
+
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, company)
+	s.InvalidateCompanyStatusCache(ctx, company.CompanyID)
 
-	// Audit
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "company", "create_company", "admin",
 			&createdBy, "admin", &createdBy, nil, nil, map[string]interface{}{
-				"company_id":        company.CompanyID.String(),
-				"company_name":      req.CompanyName,
-				"owner_user_id":     ownerUser.UserID.String(),
-				"subscription_tier": req.SubscriptionTier,
-				"max_departments":   req.MaxDepartments,
-				"ip_address":        ip,
+				"company_id":          company.CompanyID.String(),
+				"company_name":        req.CompanyName,
+				"owner_user_id":       ownerUser.UserID.String(),
+				"subscription_tier":   req.SubscriptionTier,
+				"subscription_plan":   req.SubscriptionPlanCode,
+				"subscription_status": subscriptionStatus,
+				"subscription_months": req.SubscriptionMonths,
+				"subscription_days":   req.SubscriptionDays,
+				"trial_days":          req.TrialDays,
+				"max_locations":       req.MaxLocations,
+				"max_employees":       maxEmployees,
+				"ip_address":          ip,
 			})
 	}
-
 	return company, nil
 }
 
-// createOrFindUserForCompanyOwner creates a user for the owner, handling username conflicts.
 func (s *CompanyService) createOrFindUserForCompanyOwner(ctx context.Context, req *CreateCompanyRequest) (*models.User, error) {
-	user, err := s.userService.CreateUser(ctx, &UserCreateRequest{
+	// No surrounding tx here — auto-commit path, so pass the pool.
+	user, err := s.userService.CreateUser(ctx, s.pgClient.Pool(), &UserCreateRequest{
 		Username:          req.OwnerUsername,
 		FullName:          req.OwnerFullName,
 		PhoneNumber:       req.OwnerPhone,
@@ -262,7 +619,7 @@ func (s *CompanyService) createOrFindUserForCompanyOwner(ctx context.Context, re
 	}
 	if strings.Contains(err.Error(), "username already exists") {
 		uniqueUsername := fmt.Sprintf("%s_%s", req.OwnerUsername, generateRandomString(6))
-		user, err = s.userService.CreateUser(ctx, &UserCreateRequest{
+		user, err = s.userService.CreateUser(ctx, s.pgClient.Pool(), &UserCreateRequest{
 			Username:          uniqueUsername,
 			FullName:          req.OwnerFullName,
 			PhoneNumber:       req.OwnerPhone,
@@ -282,9 +639,6 @@ func (s *CompanyService) createOrFindUserForCompanyOwner(ctx context.Context, re
 	return nil, err
 }
 
-// ---- Company read methods ----
-
-// GetCompany retrieves a company by ID.
 func (s *CompanyService) GetCompany(ctx context.Context, companyID uuid.UUID) (*models.Company, error) {
 	company, err := s.companyRepo.GetCompany(ctx, companyID)
 	if err != nil {
@@ -296,12 +650,32 @@ func (s *CompanyService) GetCompany(ctx context.Context, companyID uuid.UUID) (*
 	return company, nil
 }
 
-// GetCompanyByID is an alias for GetCompany.
+func (s *CompanyService) GetCompanyDetail(
+	ctx context.Context,
+	companyID uuid.UUID,
+) (*models.CompanyDetailView, error) {
+	company, err := s.companyRepo.GetCompany(ctx, companyID)
+	if err != nil {
+		if errors.Is(err, appErrors.ErrNotFound) {
+			return nil, fmt.Errorf("%w: company not found", appErrors.ErrNotFound)
+		}
+		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	view := models.NewCompanyDetailView(company)
+	if company.SubscriptionPlanID != nil && s.planService != nil {
+		plan, perr := s.planService.GetPlanByID(ctx, *company.SubscriptionPlanID)
+		if perr == nil && plan != nil {
+			view.SubscriptionPlanCode = &plan.PlanCode
+			view.SubscriptionPlanName = &plan.PlanName
+		}
+	}
+	return view, nil
+}
+
 func (s *CompanyService) GetCompanyByID(ctx context.Context, companyID uuid.UUID) (*models.Company, error) {
 	return s.GetCompany(ctx, companyID)
 }
 
-// GetCompaniesByOwner returns companies owned by a user.
 func (s *CompanyService) GetCompaniesByOwner(ctx context.Context, ownerUserID uuid.UUID) ([]*models.Company, error) {
 	companies, err := s.companyRepo.GetCompaniesByOwner(ctx, ownerUserID)
 	if err != nil {
@@ -310,46 +684,42 @@ func (s *CompanyService) GetCompaniesByOwner(ctx context.Context, ownerUserID uu
 	return companies, nil
 }
 
-// UpdateCompany updates company details.
 func (s *CompanyService) UpdateCompany(ctx context.Context, company *models.Company) error {
 	if err := s.companyRepo.UpdateCompany(ctx, company); err != nil {
 		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
+	s.InvalidateCompanyStatusCache(ctx, company.CompanyID)
 	return nil
 }
 
-// UpdateCompanyStatus updates company active status.
 func (s *CompanyService) UpdateCompanyStatus(ctx context.Context, companyID uuid.UUID, isActive bool, updatedBy uuid.UUID) error {
 	if err := s.companyRepo.UpdateCompanyStatus(ctx, companyID, isActive); err != nil {
 		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
+	s.InvalidateCompanyStatusCache(ctx, companyID)
 	return nil
 }
 
-// UpdateSubscription updates subscription details.
 func (s *CompanyService) UpdateSubscription(ctx context.Context, companyID uuid.UUID, tier, status string, maxEmployees int, updatedBy uuid.UUID) error {
 	if err := s.companyRepo.UpdateSubscription(ctx, companyID, tier, status, maxEmployees); err != nil {
 		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
+	s.InvalidateCompanyStatusCache(ctx, companyID)
 	return nil
 }
 
-// ListCompanies lists companies with pagination.
 func (s *CompanyService) ListCompanies(ctx context.Context, limit, offset int) ([]*models.Company, int, error) {
 	return s.companyRepo.ListCompanies(ctx, limit, offset)
 }
 
-// ListCompaniesByTier lists companies by subscription tier.
 func (s *CompanyService) ListCompaniesByTier(ctx context.Context, tier string, limit, offset int) ([]*models.Company, int, error) {
 	return s.companyRepo.GetCompaniesByTier(ctx, tier, limit, offset)
 }
 
-// GetCompaniesWithExpiringSubscription returns companies whose subscription ends within days.
 func (s *CompanyService) GetCompaniesWithExpiringSubscription(ctx context.Context, days int, limit int) ([]*models.Company, error) {
 	return s.companyRepo.GetCompaniesWithExpiringSubscription(ctx, days, limit)
 }
 
-// DeactivateCompany deactivates a company.
 func (s *CompanyService) DeactivateCompany(ctx context.Context, companyID uuid.UUID, reason string, updatedBy uuid.UUID) error {
 	company, err := s.companyRepo.GetCompany(ctx, companyID)
 	if err != nil {
@@ -361,10 +731,10 @@ func (s *CompanyService) DeactivateCompany(ctx context.Context, companyID uuid.U
 	if err := s.companyRepo.DeactivateCompany(ctx, companyID, reason); err != nil {
 		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
+	s.InvalidateCompanyStatusCache(ctx, companyID)
 	return nil
 }
 
-// ReactivateCompany reactivates a company.
 func (s *CompanyService) ReactivateCompany(ctx context.Context, companyID uuid.UUID, reactivatedBy uuid.UUID) error {
 	company, err := s.companyRepo.GetCompany(ctx, companyID)
 	if err != nil {
@@ -376,10 +746,10 @@ func (s *CompanyService) ReactivateCompany(ctx context.Context, companyID uuid.U
 	if err := s.companyRepo.UpdateCompanyStatus(ctx, companyID, true); err != nil {
 		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
+	s.InvalidateCompanyStatusCache(ctx, companyID)
 	return nil
 }
 
-// DeleteCompany deletes a company (must be inactive).
 func (s *CompanyService) DeleteCompany(ctx context.Context, companyID uuid.UUID, deletedBy uuid.UUID) error {
 	company, err := s.companyRepo.GetCompany(ctx, companyID)
 	if err != nil {
@@ -391,11 +761,22 @@ func (s *CompanyService) DeleteCompany(ctx context.Context, companyID uuid.UUID,
 	if err := s.companyRepo.DeleteCompany(ctx, companyID); err != nil {
 		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
+	s.InvalidateCompanyStatusCache(ctx, companyID)
 	return nil
 }
 
-// ExtendSubscription extends company subscription.
-func (s *CompanyService) ExtendSubscription(ctx context.Context, companyID uuid.UUID, additionalMonths, additionalDays int, extendedBy uuid.UUID) error {
+func (s *CompanyService) ExtendSubscription(
+	ctx context.Context,
+	companyID uuid.UUID,
+	additionalMonths, additionalDays int,
+	extendedBy uuid.UUID,
+) error {
+	if additionalMonths < 0 || additionalDays < 0 {
+		return fmt.Errorf("%w: additional months/days cannot be negative", appErrors.ErrInvalidInput)
+	}
+	if additionalMonths == 0 && additionalDays == 0 {
+		return fmt.Errorf("%w: at least one of additional_months or additional_days must be > 0", appErrors.ErrInvalidInput)
+	}
 	company, err := s.companyRepo.GetCompany(ctx, companyID)
 	if err != nil {
 		return fmt.Errorf("%w: %v", appErrors.ErrNotFound, err)
@@ -403,23 +784,65 @@ func (s *CompanyService) ExtendSubscription(ctx context.Context, companyID uuid.
 	if !company.IsActive {
 		return fmt.Errorf("%w: cannot extend subscription for inactive company", appErrors.ErrInvalidState)
 	}
-	var newEndDate time.Time
-	if company.SubscriptionEndDate != nil {
-		newEndDate = company.SubscriptionEndDate.AddDate(0, additionalMonths, additionalDays)
-	} else {
-		newEndDate = time.Now().UTC().AddDate(0, additionalMonths, additionalDays)
+	now := time.Now().UTC()
+	beforeStatus := company.SubscriptionStatus
+	switch company.SubscriptionStatus {
+	case models.SubscriptionStatusActive, models.SubscriptionStatusPastDue:
+		base := now
+		if company.SubscriptionEndDate != nil {
+			base = *company.SubscriptionEndDate
+		}
+		newEnd := base.AddDate(0, additionalMonths, additionalDays)
+		company.SubscriptionEndDate = &newEnd
+		if company.SubscriptionStartDate == nil {
+			company.SubscriptionStartDate = &now
+		}
+		company.SubscriptionStatus = models.SubscriptionStatusActive
+	case models.SubscriptionStatusTrial:
+		base := now
+		if company.TrialEndDate != nil && company.TrialEndDate.After(now) {
+			base = *company.TrialEndDate
+		}
+		newEnd := base.AddDate(0, additionalMonths, additionalDays)
+		company.SubscriptionStartDate = &base
+		company.SubscriptionEndDate = &newEnd
+		company.SubscriptionStatus = models.SubscriptionStatusActive
+	case models.SubscriptionStatusPending,
+		models.SubscriptionStatusExpired,
+		models.SubscriptionStatusCancelled:
+		newEnd := now.AddDate(0, additionalMonths, additionalDays)
+		company.SubscriptionStartDate = &now
+		company.SubscriptionEndDate = &newEnd
+		company.SubscriptionStatus = models.SubscriptionStatusActive
+	default:
+		newEnd := now.AddDate(0, additionalMonths, additionalDays)
+		company.SubscriptionStartDate = &now
+		company.SubscriptionEndDate = &newEnd
+		company.SubscriptionStatus = models.SubscriptionStatusActive
 	}
-	company.SubscriptionEndDate = &newEndDate
-	company.UpdatedAt = time.Now().UTC()
+	company.UpdatedAt = now
 	if err := s.companyRepo.UpdateCompany(ctx, company); err != nil {
 		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+	}
+	s.InvalidateCompanyStatusCache(ctx, companyID)
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "subscription", "extend", "admin",
+			&extendedBy, "admin", &extendedBy, nil, nil, map[string]interface{}{
+				"company_id":        companyID.String(),
+				"previous_status":   beforeStatus,
+				"new_status":        company.SubscriptionStatus,
+				"additional_months": additionalMonths,
+				"additional_days":   additionalDays,
+				"new_start_date":    company.SubscriptionStartDate,
+				"new_end_date":      company.SubscriptionEndDate,
+			})
 	}
 	return nil
 }
 
-// ---- Employee management ----
-
-// AddEmployeeRequest defines the request to add an employee.
+// ============================================================
+// AddEmployee (legacy — pool-only, no tx needed)
+// ============================================================
 type AddEmployeeRequest struct {
 	CompanyID   uuid.UUID  `json:"company_id" validate:"required"`
 	PhoneNumber string     `json:"phone" validate:"required"`
@@ -431,9 +854,7 @@ type AddEmployeeRequest struct {
 	PositionID  *uuid.UUID `json:"position_id,omitempty"`
 }
 
-// AddEmployee adds a new employee to a company.
 func (s *CompanyService) AddEmployee(ctx context.Context, req *AddEmployeeRequest) error {
-	// Idempotency
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
 		idempKey = fmt.Sprintf("add_employee:%s:%s", req.CompanyID.String(), req.PhoneNumber)
@@ -445,7 +866,6 @@ func (s *CompanyService) AddEmployee(ctx context.Context, req *AddEmployeeReques
 		return nil
 	}
 
-	// Validate company
 	company, err := s.companyRepo.GetCompany(ctx, req.CompanyID)
 	if err != nil {
 		return fmt.Errorf("%w: company not found", appErrors.ErrNotFound)
@@ -454,7 +874,6 @@ func (s *CompanyService) AddEmployee(ctx context.Context, req *AddEmployeeReques
 		return fmt.Errorf("%w: company is not active", appErrors.ErrInvalidState)
 	}
 
-	// Check employee limit
 	activeCount, err := s.companyRepo.GetActiveEmployeeCount(ctx, req.CompanyID)
 	if err != nil {
 		return fmt.Errorf("%w: failed to get active employee count", appErrors.ErrInternal)
@@ -463,7 +882,6 @@ func (s *CompanyService) AddEmployee(ctx context.Context, req *AddEmployeeReques
 		return fmt.Errorf("%w: max employee limit reached (%d/%d)", appErrors.ErrConflict, activeCount, company.MaxEmployees)
 	}
 
-	// Validate role
 	role, err := s.companyRepo.GetRole(ctx, req.RoleID)
 	if err != nil {
 		return fmt.Errorf("%w: role not found", appErrors.ErrNotFound)
@@ -471,6 +889,7 @@ func (s *CompanyService) AddEmployee(ctx context.Context, req *AddEmployeeReques
 	if role.CompanyID != req.CompanyID {
 		return fmt.Errorf("%w: role does not belong to company", appErrors.ErrInvalidInput)
 	}
+
 	roleDepartments, err := s.companyRepo.GetRoleDepartments(ctx, req.RoleID)
 	if err != nil {
 		return fmt.Errorf("%w: failed to get role departments", appErrors.ErrInternal)
@@ -479,9 +898,8 @@ func (s *CompanyService) AddEmployee(ctx context.Context, req *AddEmployeeReques
 		return fmt.Errorf("%w: role is not assigned to any department", appErrors.ErrInvalidState)
 	}
 
-	// Validate position if provided
 	if req.PositionID != nil {
-		position, err := s.companyRepo.GetPosition(ctx, *req.PositionID)
+		position, err := s.companyRepo.GetPosition(ctx, s.pgClient.Pool(), *req.PositionID)
 		if err != nil {
 			return fmt.Errorf("%w: position not found", appErrors.ErrNotFound)
 		}
@@ -491,7 +909,6 @@ func (s *CompanyService) AddEmployee(ctx context.Context, req *AddEmployeeReques
 		if !position.IsOpen {
 			return fmt.Errorf("%w: position is not open", appErrors.ErrInvalidState)
 		}
-		// Check if position department matches role departments
 		found := false
 		for _, rd := range roleDepartments {
 			if rd.DepartmentID == position.DepartmentID {
@@ -504,16 +921,14 @@ func (s *CompanyService) AddEmployee(ctx context.Context, req *AddEmployeeReques
 		}
 	}
 
-	// Validate reports_to
 	if err := s.validateReportsTo(ctx, req.CompanyID, req.ReportsTo); err != nil {
 		return fmt.Errorf("%w: %v", appErrors.ErrInvalidInput, err)
 	}
 
-	// Get or create user
 	user, err := s.userService.GetUserByPhone(ctx, req.PhoneNumber)
 	if err != nil {
 		if errors.Is(err, appErrors.ErrNotFound) {
-			user, err = s.userService.CreateUser(ctx, &UserCreateRequest{
+			user, err = s.userService.CreateUser(ctx, s.pgClient.Pool(), &UserCreateRequest{
 				Username:          req.Username,
 				FullName:          req.FullName,
 				PhoneNumber:       req.PhoneNumber,
@@ -533,8 +948,7 @@ func (s *CompanyService) AddEmployee(ctx context.Context, req *AddEmployeeReques
 		}
 	}
 
-	// Check existing active employee
-	existingEmp, _ := s.companyRepo.GetEmployee(ctx, req.CompanyID, user.UserID)
+	existingEmp, _ := s.companyRepo.GetEmployee(ctx, s.pgClient.Pool(), req.CompanyID, user.UserID)
 	if existingEmp != nil && existingEmp.IsActive {
 		return fmt.Errorf("%w: user is already an active employee", appErrors.ErrDuplicate)
 	}
@@ -543,7 +957,6 @@ func (s *CompanyService) AddEmployee(ctx context.Context, req *AddEmployeeReques
 	if reportsTo == nil {
 		reportsTo = &company.OwnerUserID
 	}
-
 	emp := &models.CompanyEmployee{
 		CompanyID:  req.CompanyID,
 		UserID:     user.UserID,
@@ -556,14 +969,11 @@ func (s *CompanyService) AddEmployee(ctx context.Context, req *AddEmployeeReques
 		CreatedAt:  time.Now().UTC(),
 		UpdatedAt:  time.Now().UTC(),
 	}
-	if err := s.companyRepo.CreateEmployee(ctx, emp); err != nil {
+	if err := s.companyRepo.CreateEmployee(ctx, s.pgClient.Pool(), emp); err != nil {
 		return fmt.Errorf("%w: failed to add employee", appErrors.ErrInternal)
 	}
 
-	// Store idempotency
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
-
-	// Audit
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "employee", "add_employee", "admin",
 			nil, "admin", nil, nil, nil, map[string]interface{}{
@@ -573,11 +983,13 @@ func (s *CompanyService) AddEmployee(ctx context.Context, req *AddEmployeeReques
 				"ip_address": ip,
 			})
 	}
-
 	return nil
 }
 
-// AddManagerRequest defines adding a manager.
+// ============================================================
+// AddManager (legacy — pool-only, no tx needed)
+// ============================================================
+
 type AddManagerRequest struct {
 	CompanyID   uuid.UUID  `json:"company_id" validate:"required"`
 	PhoneNumber string     `json:"phone" validate:"required"`
@@ -589,7 +1001,6 @@ type AddManagerRequest struct {
 	PositionID  *uuid.UUID `json:"position_id,omitempty"`
 }
 
-// AddManager adds a manager (role level >= 500).
 func (s *CompanyService) AddManager(ctx context.Context, req *AddManagerRequest) error {
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
@@ -617,6 +1028,7 @@ func (s *CompanyService) AddManager(ctx context.Context, req *AddManagerRequest)
 	if role.RoleLevel < 500 {
 		return fmt.Errorf("%w: role level must be 500 or higher for managers", appErrors.ErrInvalidInput)
 	}
+
 	roleDepartments, err := s.companyRepo.GetRoleDepartments(ctx, req.RoleID)
 	if err != nil {
 		return fmt.Errorf("%w: failed to get role departments", appErrors.ErrInternal)
@@ -624,6 +1036,7 @@ func (s *CompanyService) AddManager(ctx context.Context, req *AddManagerRequest)
 	if len(roleDepartments) == 0 {
 		return fmt.Errorf("%w: role is not assigned to any department", appErrors.ErrInvalidState)
 	}
+
 	if err := s.validateReportsTo(ctx, req.CompanyID, req.ReportsTo); err != nil {
 		return fmt.Errorf("%w: %v", appErrors.ErrInvalidInput, err)
 	}
@@ -631,7 +1044,7 @@ func (s *CompanyService) AddManager(ctx context.Context, req *AddManagerRequest)
 	user, err := s.userService.GetUserByPhone(ctx, req.PhoneNumber)
 	if err != nil {
 		if errors.Is(err, appErrors.ErrNotFound) {
-			user, err = s.userService.CreateUser(ctx, &UserCreateRequest{
+			user, err = s.userService.CreateUser(ctx, s.pgClient.Pool(), &UserCreateRequest{
 				Username:          req.Username,
 				FullName:          req.FullName,
 				PhoneNumber:       req.PhoneNumber,
@@ -651,7 +1064,7 @@ func (s *CompanyService) AddManager(ctx context.Context, req *AddManagerRequest)
 		}
 	}
 
-	existingEmp, _ := s.companyRepo.GetEmployee(ctx, req.CompanyID, user.UserID)
+	existingEmp, _ := s.companyRepo.GetEmployee(ctx, s.pgClient.Pool(), req.CompanyID, user.UserID)
 	if existingEmp != nil && existingEmp.IsActive {
 		return fmt.Errorf("%w: user is already an active employee", appErrors.ErrDuplicate)
 	}
@@ -676,12 +1089,11 @@ func (s *CompanyService) AddManager(ctx context.Context, req *AddManagerRequest)
 		CreatedAt:  time.Now().UTC(),
 		UpdatedAt:  time.Now().UTC(),
 	}
-	if err := s.companyRepo.CreateEmployee(ctx, emp); err != nil {
+	if err := s.companyRepo.CreateEmployee(ctx, s.pgClient.Pool(), emp); err != nil {
 		return fmt.Errorf("%w: failed to add manager", appErrors.ErrInternal)
 	}
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
-
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "employee", "add_manager", "admin",
 			nil, "admin", nil, nil, nil, map[string]interface{}{
@@ -691,13 +1103,10 @@ func (s *CompanyService) AddManager(ctx context.Context, req *AddManagerRequest)
 				"ip_address": ip,
 			})
 	}
-
 	return nil
 }
-
-// GetEmployee retrieves an employee by company and user.
 func (s *CompanyService) GetEmployee(ctx context.Context, companyID, userID uuid.UUID) (*models.CompanyEmployee, error) {
-	emp, err := s.companyRepo.GetEmployee(ctx, companyID, userID)
+	emp, err := s.companyRepo.GetEmployee(ctx, s.pgClient.Pool(), companyID, userID)
 	if err != nil {
 		if errors.Is(err, appErrors.ErrNotFound) {
 			return nil, fmt.Errorf("%w: employee not found", appErrors.ErrNotFound)
@@ -707,21 +1116,14 @@ func (s *CompanyService) GetEmployee(ctx context.Context, companyID, userID uuid
 	return emp, nil
 }
 
-// ListEmployees lists employees of a company.
-// ListEmployees returns a paginated list of employee summaries (minimal fields)
-// and the total count of employees in the company.
-// ListEmployees returns a paginated list of employee summaries (minimal fields)
-// and the total count of employees in the company.
 func (s *CompanyService) ListEmployees(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]models.EmployeeSummary, int, error) {
-	return s.companyRepo.GetEmployeeSummariesByCompany(ctx, companyID, limit, offset)
+	return s.companyRepo.GetEmployeeSummariesByCompany(ctx, s.pgClient.Pool(), companyID, limit, offset)
 }
 
-// ListActiveEmployees lists active employees only.
 func (s *CompanyService) ListActiveEmployees(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]*models.CompanyEmployee, int, error) {
 	return s.companyRepo.ListActiveEmployees(ctx, companyID, limit, offset)
 }
 
-// UpdateEmployeeRole updates employee's role.
 func (s *CompanyService) UpdateEmployeeRole(ctx context.Context, companyID, userID, newRoleID, updatedBy uuid.UUID) error {
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
@@ -734,10 +1136,11 @@ func (s *CompanyService) UpdateEmployeeRole(ctx context.Context, companyID, user
 		return nil
 	}
 
-	emp, err := s.companyRepo.GetEmployee(ctx, companyID, userID)
+	emp, err := s.companyRepo.GetEmployee(ctx, s.pgClient.Pool(), companyID, userID)
 	if err != nil {
 		return fmt.Errorf("%w: employee not found", appErrors.ErrNotFound)
 	}
+
 	newRole, err := s.companyRepo.GetRole(ctx, newRoleID)
 	if err != nil {
 		return fmt.Errorf("%w: new role not found", appErrors.ErrNotFound)
@@ -745,13 +1148,13 @@ func (s *CompanyService) UpdateEmployeeRole(ctx context.Context, companyID, user
 	if newRole.CompanyID != companyID {
 		return fmt.Errorf("%w: new role does not belong to company", appErrors.ErrInvalidInput)
 	}
-	// Validate reports_to if set
+
 	if emp.ReportsTo != nil {
 		if err := s.validateReportsTo(ctx, companyID, emp.ReportsTo); err != nil {
-			// If invalid, set to nil
 			emp.ReportsTo = nil
 		}
 	}
+
 	emp.RoleID = newRoleID
 	emp.UpdatedAt = time.Now().UTC()
 	if err := s.companyRepo.UpdateEmployee(ctx, emp); err != nil {
@@ -759,7 +1162,6 @@ func (s *CompanyService) UpdateEmployeeRole(ctx context.Context, companyID, user
 	}
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
-
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "employee", "update_role", "admin",
 			&updatedBy, "admin", &updatedBy, nil, nil, map[string]interface{}{
@@ -769,11 +1171,9 @@ func (s *CompanyService) UpdateEmployeeRole(ctx context.Context, companyID, user
 				"ip_address":  ip,
 			})
 	}
-
 	return nil
 }
 
-// RemoveEmployee deactivates an employee.
 func (s *CompanyService) RemoveEmployee(ctx context.Context, companyID, userID uuid.UUID, removedBy uuid.UUID) error {
 	if userID == removedBy {
 		return fmt.Errorf("%w: cannot remove yourself", appErrors.ErrInvalidInput)
@@ -791,7 +1191,6 @@ func (s *CompanyService) RemoveEmployee(ctx context.Context, companyID, userID u
 	return nil
 }
 
-// ReactivateEmployee reactivates an employee.
 func (s *CompanyService) ReactivateEmployee(ctx context.Context, companyID, userID, reactivatedBy uuid.UUID) error {
 	if err := s.companyRepo.ReactivateEmployee(ctx, companyID, userID); err != nil {
 		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
@@ -806,22 +1205,18 @@ func (s *CompanyService) ReactivateEmployee(ctx context.Context, companyID, user
 	return nil
 }
 
-// GetEmployeeCount returns active employee count.
 func (s *CompanyService) GetEmployeeCount(ctx context.Context, companyID uuid.UUID) (int, error) {
 	return s.companyRepo.GetEmployeeCount(ctx, companyID)
 }
 
-// IsUserActiveEmployee checks if user is active employee.
 func (s *CompanyService) IsUserActiveEmployee(ctx context.Context, companyID, userID uuid.UUID) (bool, error) {
 	return s.companyRepo.IsUserActiveEmployee(ctx, companyID, userID)
 }
 
-// GetEmployeesByUser returns all employee records for a user.
 func (s *CompanyService) GetEmployeesByUser(ctx context.Context, userID uuid.UUID) ([]*models.CompanyEmployee, error) {
 	return s.companyRepo.GetEmployeesByUser(ctx, userID)
 }
 
-// GetCompaniesByEmployeePhone returns active companies for an employee by phone.
 func (s *CompanyService) GetCompaniesByEmployeePhone(ctx context.Context, employeePhone string) ([]*models.Company, error) {
 	user, err := s.userService.GetUserByPhone(ctx, employeePhone)
 	if err != nil {
@@ -852,7 +1247,6 @@ func (s *CompanyService) GetCompaniesByEmployeePhone(ctx context.Context, employ
 	return companies, nil
 }
 
-// UpdateEmployeePosition updates employee's position.
 func (s *CompanyService) UpdateEmployeePosition(ctx context.Context, companyID, userID uuid.UUID, positionID *uuid.UUID) error {
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
@@ -865,15 +1259,16 @@ func (s *CompanyService) UpdateEmployeePosition(ctx context.Context, companyID, 
 		return nil
 	}
 
-	employee, err := s.companyRepo.GetEmployee(ctx, companyID, userID)
+	employee, err := s.companyRepo.GetEmployee(ctx, s.pgClient.Pool(), companyID, userID)
 	if err != nil {
 		return fmt.Errorf("%w: employee not found", appErrors.ErrNotFound)
 	}
 	if !employee.IsActive {
 		return fmt.Errorf("%w: employee is not active", appErrors.ErrInvalidState)
 	}
+
 	if positionID != nil {
-		position, err := s.companyRepo.GetPosition(ctx, *positionID)
+		position, err := s.companyRepo.GetPosition(ctx, s.pgClient.Pool(), *positionID)
 		if err != nil {
 			return fmt.Errorf("%w: position not found", appErrors.ErrNotFound)
 		}
@@ -898,12 +1293,12 @@ func (s *CompanyService) UpdateEmployeePosition(ctx context.Context, companyID, 
 			return fmt.Errorf("%w: position's department not assigned to role", appErrors.ErrInvalidInput)
 		}
 	}
-	if err := s.companyRepo.UpdateEmployeePosition(ctx, companyID, userID, positionID); err != nil {
+
+	if err := s.companyRepo.UpdateEmployeePosition(ctx, s.pgClient.Pool(), companyID, userID, positionID); err != nil {
 		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
-
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "employee", "update_position", "admin",
 			nil, "admin", nil, nil, nil, map[string]interface{}{
@@ -916,13 +1311,10 @@ func (s *CompanyService) UpdateEmployeePosition(ctx context.Context, companyID, 
 	return nil
 }
 
-// GetEmployeeWithPosition retrieves employee with position details.
-// GetEmployeeWithPosition retrieves a company employee with enriched details:
-// role, position, work center, department, username, and full name.
 func (s *CompanyService) GetEmployeeWithPosition(ctx context.Context, companyID, userID uuid.UUID) (*models.EmployeeWithPositionDetails, error) {
-	employee, err := s.companyRepo.GetEmployeeWithPosition(ctx, companyID, userID)
+	employee, err := s.companyRepo.GetEmployeeWithPosition(ctx, s.pgClient.Pool(), companyID, userID)
 	if err != nil {
-		if errors.Is(err, appErrors.ErrNotFound) { // appErrors, not apperrors
+		if errors.Is(err, appErrors.ErrNotFound) {
 			return nil, fmt.Errorf("%w: employee not found", appErrors.ErrNotFound)
 		}
 		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
@@ -930,9 +1322,233 @@ func (s *CompanyService) GetEmployeeWithPosition(ctx context.Context, companyID,
 	return employee, nil
 }
 
-// ---- Role management ----
+type UpdateEmployeeRequest struct {
+	CompanyID  uuid.UUID
+	UserID     uuid.UUID
+	EmployeeID *string
+	RoleID     *uuid.UUID
+	PositionID *uuid.UUID
+	ReportsTo  *uuid.UUID
+	IsActive   *bool
+	HireDate   *time.Time
+}
 
-// CreateRoleRequest defines role creation.
+func (s *CompanyService) UpdateEmployee(ctx context.Context, req *UpdateEmployeeRequest) error {
+	skipIdempotency := false
+	if val, ok := ctx.Value("disable_idempotency").(bool); ok {
+		skipIdempotency = val
+	}
+	var idempKey string
+	if !skipIdempotency {
+		idempKey, _ = ctx.Value("idempotency_key").(string)
+		if idempKey == "" {
+			idempKey = fmt.Sprintf("update_employee:%s:%s", req.CompanyID.String(), req.UserID.String())
+		}
+		var processed bool
+		if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+			return nil
+		}
+	}
+	ip, _ := ctx.Value("ip_address").(string)
+
+	existing, err := s.companyRepo.GetEmployee(ctx, s.pgClient.Pool(), req.CompanyID, req.UserID)
+	if err != nil {
+		if errors.Is(err, appErrors.ErrNotFound) {
+			return fmt.Errorf("%w: employee not found", appErrors.ErrNotFound)
+		}
+		return fmt.Errorf("%w: failed to get employee", appErrors.ErrInternal)
+	}
+
+	updated := *existing
+	if req.EmployeeID != nil {
+		updated.EmployeeID = *req.EmployeeID
+	}
+	if req.RoleID != nil {
+		updated.RoleID = *req.RoleID
+	}
+	if req.PositionID != nil {
+		updated.PositionID = req.PositionID
+	}
+	if req.ReportsTo != nil {
+		updated.ReportsTo = req.ReportsTo
+	}
+	if req.IsActive != nil {
+		updated.IsActive = *req.IsActive
+	}
+	if req.HireDate != nil {
+		updated.HireDate = *req.HireDate
+	}
+	updated.UpdatedAt = time.Now().UTC()
+
+	if req.RoleID != nil {
+		role, err := s.companyRepo.GetRole(ctx, *req.RoleID)
+		if err != nil {
+			return fmt.Errorf("%w: role not found", appErrors.ErrNotFound)
+		}
+		if role.CompanyID != req.CompanyID {
+			return fmt.Errorf("%w: role does not belong to company", appErrors.ErrInvalidInput)
+		}
+		roleDepts, err := s.companyRepo.GetRoleDepartments(ctx, *req.RoleID)
+		if err != nil || len(roleDepts) == 0 {
+			return fmt.Errorf("%w: role is not assigned to any department", appErrors.ErrInvalidState)
+		}
+	}
+
+	if req.PositionID != nil {
+		position, err := s.companyRepo.GetPosition(ctx, s.pgClient.Pool(), *req.PositionID)
+		if err != nil {
+			return fmt.Errorf("%w: position not found", appErrors.ErrNotFound)
+		}
+		if position.CompanyID != req.CompanyID {
+			return fmt.Errorf("%w: position does not belong to company", appErrors.ErrInvalidInput)
+		}
+		if !position.IsOpen {
+			return fmt.Errorf("%w: position is not open for assignment", appErrors.ErrInvalidState)
+		}
+		var roleID uuid.UUID
+		if req.RoleID != nil {
+			roleID = *req.RoleID
+		} else {
+			roleID = existing.RoleID
+		}
+		roleDepts, err := s.companyRepo.GetRoleDepartments(ctx, roleID)
+		if err != nil {
+			return err
+		}
+		found := false
+		for _, rd := range roleDepts {
+			if rd.DepartmentID == position.DepartmentID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("%w: position's department not assigned to the role", appErrors.ErrInvalidInput)
+		}
+	}
+
+	if req.ReportsTo != nil {
+		if *req.ReportsTo == req.UserID {
+			return fmt.Errorf("%w: employee cannot report to themselves", appErrors.ErrInvalidInput)
+		}
+		isActive, err := s.companyRepo.IsUserActiveEmployee(ctx, req.CompanyID, *req.ReportsTo)
+		if err != nil || !isActive {
+			return fmt.Errorf("%w: reports-to employee not found or not active", appErrors.ErrInvalidInput)
+		}
+	}
+
+	if err := s.companyRepo.UpdateEmployee(ctx, &updated); err != nil {
+		return fmt.Errorf("%w: failed to update employee", appErrors.ErrInternal)
+	}
+
+	if !skipIdempotency {
+		_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+	}
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "employee", "update_employee", "admin",
+			nil, "admin", nil, nil, nil, map[string]interface{}{
+				"company_id": req.CompanyID.String(),
+				"user_id":    req.UserID.String(),
+				"updates": map[string]interface{}{
+					"employee_id": req.EmployeeID,
+					"role_id":     req.RoleID,
+					"position_id": req.PositionID,
+					"reports_to":  req.ReportsTo,
+					"is_active":   req.IsActive,
+					"hire_date":   req.HireDate,
+				},
+				"ip_address": ip,
+			})
+	}
+	return nil
+}
+
+func (s *CompanyService) GetUserDepartments(ctx context.Context, companyID, userID uuid.UUID) ([]*models.Department, error) {
+	return s.companyRepo.GetDepartmentsByUserID(ctx, s.pgClient.Pool(), companyID, userID)
+}
+
+type EmployeeProfileResponse struct {
+	CompanyID      uuid.UUID  `json:"company_id"`
+	UserID         uuid.UUID  `json:"user_id"`
+	Username       string     `json:"username"`
+	FullName       string     `json:"full_name"`
+	Phone          string     `json:"phone"`
+	Email          *string    `json:"email,omitempty"`
+	EmployeeID     string     `json:"employee_id"`
+	RoleID         uuid.UUID  `json:"role_id"`
+	RoleName       string     `json:"role_name"`
+	PositionID     *uuid.UUID `json:"position_id,omitempty"`
+	PositionTitle  *string    `json:"position_title,omitempty"`
+	DepartmentID   *uuid.UUID `json:"department_id,omitempty"`
+	DepartmentName *string    `json:"department_name,omitempty"`
+	ReportsTo      *uuid.UUID `json:"reports_to,omitempty"`
+	ReportsToName  *string    `json:"reports_to_name,omitempty"`
+	HireDate       time.Time  `json:"hire_date"`
+	IsActive       bool       `json:"is_active"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+}
+
+func (s *CompanyService) GetEmployeeProfile(ctx context.Context, companyID, userID uuid.UUID) (*EmployeeProfileResponse, error) {
+	employee, err := s.companyRepo.GetEmployee(ctx, s.pgClient.Pool(), companyID, userID)
+	if err != nil {
+		return nil, err
+	}
+	user, err := s.userService.GetUserByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	phone, err := s.userService.DecryptPhoneNumber(ctx, user)
+	if err != nil {
+		phone = ""
+	}
+	role, err := s.companyRepo.GetRole(ctx, employee.RoleID)
+	if err != nil {
+		return nil, err
+	}
+	var positionTitle *string
+	var deptID *uuid.UUID
+	var deptName *string
+	if employee.PositionID != nil {
+		position, err := s.companyRepo.GetPosition(ctx, s.pgClient.Pool(), *employee.PositionID)
+		if err == nil {
+			positionTitle = &position.Title
+			dept, err := s.companyRepo.GetDepartment(ctx, s.pgClient.Pool(), position.DepartmentID)
+			if err == nil {
+				deptID = &dept.DepartmentID
+				deptName = &dept.DepartmentName
+			}
+		}
+	}
+	var reportsToName *string
+	if employee.ReportsTo != nil {
+		reportsToUser, err := s.userService.GetUserByID(ctx, *employee.ReportsTo)
+		if err == nil && reportsToUser != nil {
+			reportsToName = &reportsToUser.FullName
+		}
+	}
+	return &EmployeeProfileResponse{
+		CompanyID:      companyID,
+		UserID:         user.UserID,
+		Username:       user.Username,
+		FullName:       user.FullName,
+		Phone:          phone,
+		EmployeeID:     employee.EmployeeID,
+		RoleID:         employee.RoleID,
+		RoleName:       role.RoleName,
+		PositionID:     employee.PositionID,
+		PositionTitle:  positionTitle,
+		DepartmentID:   deptID,
+		DepartmentName: deptName,
+		ReportsTo:      employee.ReportsTo,
+		ReportsToName:  reportsToName,
+		HireDate:       employee.HireDate,
+		IsActive:       employee.IsActive,
+		CreatedAt:      employee.CreatedAt,
+		UpdatedAt:      employee.UpdatedAt,
+	}, nil
+}
+
 type CreateRoleRequest struct {
 	CompanyID     uuid.UUID   `json:"company_id" validate:"required"`
 	RoleName      string      `json:"role_name" validate:"required"`
@@ -943,9 +1559,7 @@ type CreateRoleRequest struct {
 	CreatedBy     uuid.UUID   `json:"created_by" validate:"required"`
 }
 
-// CreateRole creates a new role with departments and permissions.
 func (s *CompanyService) CreateRole(ctx context.Context, req *CreateRoleRequest) (*models.Role, error) {
-	// Idempotency
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
 		idempKey = fmt.Sprintf("create_role:%s:%s", req.CompanyID.String(), req.RoleName)
@@ -957,9 +1571,8 @@ func (s *CompanyService) CreateRole(ctx context.Context, req *CreateRoleRequest)
 		return &cachedRole, nil
 	}
 
-	// Validate departments
 	for _, deptID := range req.DepartmentIDs {
-		dept, err := s.companyRepo.GetDepartment(ctx, deptID)
+		dept, err := s.companyRepo.GetDepartment(ctx, s.pgClient.Pool(), deptID)
 		if err != nil {
 			return nil, fmt.Errorf("%w: department not found: %s", appErrors.ErrNotFound, deptID)
 		}
@@ -968,7 +1581,6 @@ func (s *CompanyService) CreateRole(ctx context.Context, req *CreateRoleRequest)
 		}
 	}
 
-	// Validate permissions
 	allPerms, err := s.companyRepo.GetAllPermissions(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to get permissions", appErrors.ErrInternal)
@@ -977,16 +1589,18 @@ func (s *CompanyService) CreateRole(ctx context.Context, req *CreateRoleRequest)
 	for _, perm := range allPerms {
 		permMap[perm.PermissionID] = perm
 	}
+
 	departmentModules := make(map[string]bool)
 	for _, deptID := range req.DepartmentIDs {
-		dept, _ := s.companyRepo.GetDepartment(ctx, deptID)
+		dept, _ := s.companyRepo.GetDepartment(ctx, s.pgClient.Pool(), deptID)
 		if dept.SystemDepartmentID != nil {
-			systemDept, err := s.companyRepo.GetSystemDepartment(ctx, *dept.SystemDepartmentID)
+			systemDept, err := s.companyRepo.GetSystemDepartment(ctx, s.pgClient.Pool(), *dept.SystemDepartmentID)
 			if err == nil {
 				departmentModules[systemDept.ModuleCode] = true
 			}
 		}
 	}
+
 	for _, permID := range req.PermissionIDs {
 		perm, exists := permMap[permID]
 		if !exists {
@@ -997,7 +1611,6 @@ func (s *CompanyService) CreateRole(ctx context.Context, req *CreateRoleRequest)
 		}
 	}
 
-	// Check duplicate role name
 	existingRoles, _, err := s.companyRepo.GetRolesByCompany(ctx, req.CompanyID, 1000, 0)
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to check existing roles", appErrors.ErrInternal)
@@ -1021,14 +1634,12 @@ func (s *CompanyService) CreateRole(ctx context.Context, req *CreateRoleRequest)
 	if err := s.companyRepo.CreateRole(ctx, role, req.DepartmentIDs); err != nil {
 		return nil, fmt.Errorf("%w: failed to create role", appErrors.ErrInternal)
 	}
+
 	if len(req.PermissionIDs) > 0 {
-		if err := s.companyRepo.GrantMultipleRolePermissions(ctx, role.RoleID, req.PermissionIDs, req.CreatedBy); err != nil {
-			// non-critical
-		}
+		_ = s.companyRepo.GrantMultipleRolePermissions(ctx, role.RoleID, req.PermissionIDs, req.CreatedBy)
 	}
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, role)
-
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "role", "create_role", "admin",
 			&req.CreatedBy, "admin", &req.CreatedBy, nil, nil, map[string]interface{}{
@@ -1039,16 +1650,13 @@ func (s *CompanyService) CreateRole(ctx context.Context, req *CreateRoleRequest)
 				"ip_address": ip,
 			})
 	}
-
 	return role, nil
 }
 
-// CreateRoleAdmin is an admin version of CreateRole.
 func (s *CompanyService) CreateRoleAdmin(ctx context.Context, req *CreateRoleRequest) (*models.Role, error) {
 	return s.CreateRole(ctx, req)
 }
 
-// GetRole retrieves a role by ID.
 func (s *CompanyService) GetRole(ctx context.Context, roleID uuid.UUID) (*models.Role, error) {
 	role, err := s.companyRepo.GetRole(ctx, roleID)
 	if err != nil {
@@ -1060,12 +1668,10 @@ func (s *CompanyService) GetRole(ctx context.Context, roleID uuid.UUID) (*models
 	return role, nil
 }
 
-// GetRolesByCompany lists roles.
 func (s *CompanyService) GetRolesByCompany(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]*models.Role, int, error) {
 	return s.companyRepo.GetRolesByCompany(ctx, companyID, limit, offset)
 }
 
-// ListRoles lists roles with optional permission inclusion.
 func (s *CompanyService) ListRoles(ctx context.Context, companyID uuid.UUID, limit, offset int, includePermissions bool) ([]*models.Role, int, error) {
 	roles, total, err := s.companyRepo.GetRolesByCompany(ctx, companyID, limit, offset)
 	if err != nil {
@@ -1082,7 +1688,6 @@ func (s *CompanyService) ListRoles(ctx context.Context, companyID uuid.UUID, lim
 	return roles, total, nil
 }
 
-// DeleteRole deletes a custom role.
 func (s *CompanyService) DeleteRole(ctx context.Context, roleID uuid.UUID, deletedBy uuid.UUID) error {
 	role, err := s.companyRepo.GetRole(ctx, roleID)
 	if err != nil {
@@ -1091,7 +1696,7 @@ func (s *CompanyService) DeleteRole(ctx context.Context, roleID uuid.UUID, delet
 	if role.IsSystemRole {
 		return fmt.Errorf("%w: cannot delete system roles", appErrors.ErrSystemRole)
 	}
-	employees, _, err := s.companyRepo.GetEmployeesByRole(ctx, roleID, 1, 0)
+	employees, _, err := s.companyRepo.GetEmployeesByRole(ctx, s.pgClient.Pool(), roleID, 1, 0)
 	if err != nil {
 		return fmt.Errorf("%w: failed to check assignments", appErrors.ErrInternal)
 	}
@@ -1111,7 +1716,6 @@ func (s *CompanyService) DeleteRole(ctx context.Context, roleID uuid.UUID, delet
 	return nil
 }
 
-// UpdateRoleRequest defines role update.
 type UpdateRoleRequest struct {
 	CompanyID          uuid.UUID
 	RoleID             uuid.UUID
@@ -1125,7 +1729,6 @@ type UpdateRoleRequest struct {
 	UpdatedBy          uuid.UUID
 }
 
-// UpdateRole updates a role's name, description, departments, and permissions.
 func (s *CompanyService) UpdateRole(ctx context.Context, req UpdateRoleRequest) error {
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
@@ -1156,14 +1759,12 @@ func (s *CompanyService) UpdateRole(ctx context.Context, req UpdateRoleRequest) 
 		return fmt.Errorf("%w: failed to update role", appErrors.ErrInternal)
 	}
 
-	// Update departments
 	if len(req.AddDepartments) > 0 || len(req.RemoveDepartments) > 0 {
 		if err := s.updateRoleDepartments(ctx, req, role); err != nil {
 			return err
 		}
 	}
 
-	// Update permissions
 	if len(req.ReplacePermissions) > 0 {
 		if err := s.replaceRolePermissions(ctx, req, role); err != nil {
 			return err
@@ -1175,7 +1776,6 @@ func (s *CompanyService) UpdateRole(ctx context.Context, req UpdateRoleRequest) 
 	}
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
-
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "role", "update_role", "admin",
 			&req.UpdatedBy, "admin", &req.UpdatedBy, nil, nil, map[string]interface{}{
@@ -1184,11 +1784,9 @@ func (s *CompanyService) UpdateRole(ctx context.Context, req UpdateRoleRequest) 
 				"ip_address": ip,
 			})
 	}
-
 	return nil
 }
 
-// Helper functions for UpdateRole
 func (s *CompanyService) updateRoleDepartments(ctx context.Context, req UpdateRoleRequest, role *models.Role) error {
 	currentDepts, err := s.companyRepo.GetRoleDepartments(ctx, req.RoleID)
 	if err != nil {
@@ -1198,11 +1796,12 @@ func (s *CompanyService) updateRoleDepartments(ctx context.Context, req UpdateRo
 	for _, dept := range currentDepts {
 		currentDeptMap[dept.DepartmentName] = dept.DepartmentID
 	}
+
 	for _, deptName := range req.AddDepartments {
 		if _, exists := currentDeptMap[deptName]; exists {
 			continue
 		}
-		dept, err := s.companyRepo.GetDepartmentByName(ctx, role.CompanyID, deptName)
+		dept, err := s.companyRepo.GetDepartmentByName(ctx, s.pgClient.Pool(), role.CompanyID, deptName)
 		if err != nil {
 			return fmt.Errorf("%w: department not found: %s", appErrors.ErrNotFound, deptName)
 		}
@@ -1213,6 +1812,7 @@ func (s *CompanyService) updateRoleDepartments(ctx context.Context, req UpdateRo
 			return fmt.Errorf("%w: failed to add department", appErrors.ErrInternal)
 		}
 	}
+
 	for _, deptName := range req.RemoveDepartments {
 		deptID, exists := currentDeptMap[deptName]
 		if !exists {
@@ -1242,7 +1842,6 @@ func (s *CompanyService) replaceRolePermissions(ctx context.Context, req UpdateR
 		}
 		permIDs = append(permIDs, id)
 	}
-	// Validate compatibility with current departments
 	currentDepts, err := s.companyRepo.GetRoleDepartments(ctx, req.RoleID)
 	if err != nil {
 		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
@@ -1305,7 +1904,6 @@ func (s *CompanyService) updateRolePermissions(ctx context.Context, req UpdateRo
 		}
 		toRemove = append(toRemove, id)
 	}
-	// Validate compatibility
 	currentDepts, err := s.companyRepo.GetRoleDepartments(ctx, req.RoleID)
 	if err != nil {
 		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
@@ -1336,16 +1934,12 @@ func (s *CompanyService) updateRolePermissions(ctx context.Context, req UpdateRo
 	return nil
 }
 
-// ---- Role-Department mapping ----
-
-// MapRoleToDepartmentRequest defines mapping.
 type MapRoleToDepartmentRequest struct {
 	RoleID       uuid.UUID `json:"role_id" validate:"required"`
 	DepartmentID uuid.UUID `json:"department_id" validate:"required"`
 	MappedBy     uuid.UUID `json:"mapped_by" validate:"required"`
 }
 
-// MapRoleToDepartment maps a role to a department.
 func (s *CompanyService) MapRoleToDepartment(ctx context.Context, req *MapRoleToDepartmentRequest) error {
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
@@ -1362,19 +1956,19 @@ func (s *CompanyService) MapRoleToDepartment(ctx context.Context, req *MapRoleTo
 	if err != nil {
 		return fmt.Errorf("%w: role not found", appErrors.ErrNotFound)
 	}
-	department, err := s.companyRepo.GetDepartment(ctx, req.DepartmentID)
+	department, err := s.companyRepo.GetDepartment(ctx, s.pgClient.Pool(), req.DepartmentID)
 	if err != nil {
 		return fmt.Errorf("%w: department not found", appErrors.ErrNotFound)
 	}
 	if role.CompanyID != department.CompanyID {
 		return fmt.Errorf("%w: role and department must belong to same company", appErrors.ErrInvalidInput)
 	}
+
 	if err := s.companyRepo.CreateRoleDepartment(ctx, req.RoleID, req.DepartmentID); err != nil {
 		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
-
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "role", "map_role_department", "admin",
 			&req.MappedBy, "admin", &req.MappedBy, nil, nil, map[string]interface{}{
@@ -1386,7 +1980,6 @@ func (s *CompanyService) MapRoleToDepartment(ctx context.Context, req *MapRoleTo
 	return nil
 }
 
-// RemoveRoleFromDepartment removes a role from a department.
 func (s *CompanyService) RemoveRoleFromDepartment(ctx context.Context, roleID, departmentID, removedBy uuid.UUID) error {
 	if _, err := s.companyRepo.GetRole(ctx, roleID); err != nil {
 		return fmt.Errorf("%w: role not found", appErrors.ErrNotFound)
@@ -1404,13 +1997,12 @@ func (s *CompanyService) RemoveRoleFromDepartment(ctx context.Context, roleID, d
 	return nil
 }
 
-// GetRoleDepartments returns departments for a role.
 func (s *CompanyService) GetRoleDepartments(ctx context.Context, roleID uuid.UUID) ([]*models.Department, error) {
 	return s.companyRepo.GetRoleDepartments(ctx, roleID)
 }
 
 func (s *CompanyService) GetDepartmentRoles(ctx context.Context, departmentID uuid.UUID) ([]*models.Role, error) {
-	department, err := s.companyRepo.GetDepartment(ctx, departmentID)
+	department, err := s.companyRepo.GetDepartment(ctx, s.pgClient.Pool(), departmentID)
 	if err != nil {
 		return nil, err
 	}
@@ -1434,14 +2026,10 @@ func (s *CompanyService) GetDepartmentRoles(ctx context.Context, departmentID uu
 	return departmentRoles, nil
 }
 
-// ---- Permission management ----
-
-// GrantRolePermission grants a permission to a role.
 func (s *CompanyService) GrantRolePermission(ctx context.Context, roleID, permissionID, grantedBy uuid.UUID) error {
 	if _, err := s.companyRepo.GetRole(ctx, roleID); err != nil {
 		return fmt.Errorf("%w: role not found", appErrors.ErrNotFound)
 	}
-	// Check if user has the permission to grant (optional)
 	if err := s.companyRepo.GrantRolePermission(ctx, roleID, permissionID, grantedBy); err != nil {
 		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
@@ -1455,12 +2043,10 @@ func (s *CompanyService) GrantRolePermission(ctx context.Context, roleID, permis
 	return nil
 }
 
-// GrantRolePermissionAdmin is admin version.
 func (s *CompanyService) GrantRolePermissionAdmin(ctx context.Context, roleID, permissionID, grantedBy uuid.UUID) error {
 	return s.GrantRolePermission(ctx, roleID, permissionID, grantedBy)
 }
 
-// RevokeRolePermission revokes a permission from a role.
 func (s *CompanyService) RevokeRolePermission(ctx context.Context, roleID, permissionID, revokedBy uuid.UUID) error {
 	if _, err := s.companyRepo.GetRole(ctx, roleID); err != nil {
 		return fmt.Errorf("%w: role not found", appErrors.ErrNotFound)
@@ -1478,18 +2064,15 @@ func (s *CompanyService) RevokeRolePermission(ctx context.Context, roleID, permi
 	return nil
 }
 
-// RevokeRolePermissionAdmin is admin version.
 func (s *CompanyService) RevokeRolePermissionAdmin(ctx context.Context, roleID, permissionID, revokedBy uuid.UUID) error {
 	return s.RevokeRolePermission(ctx, roleID, permissionID, revokedBy)
 }
 
-// GrantRolePermissions grants multiple permissions.
 type GrantRolePermissionsRequest struct {
 	RoleID        uuid.UUID   `json:"role_id" validate:"required"`
 	PermissionIDs []uuid.UUID `json:"permission_ids" validate:"required"`
 }
 
-// GrantRolePermissions grants multiple permissions.
 func (s *CompanyService) GrantRolePermissions(ctx context.Context, req *GrantRolePermissionsRequest) error {
 	if _, err := s.companyRepo.GetRole(ctx, req.RoleID); err != nil {
 		return fmt.Errorf("%w: role not found", appErrors.ErrNotFound)
@@ -1515,7 +2098,6 @@ func (s *CompanyService) GrantRolePermissions(ctx context.Context, req *GrantRol
 	return nil
 }
 
-// RevokeRolePermissions revokes multiple permissions.
 func (s *CompanyService) RevokeRolePermissions(ctx context.Context, roleID uuid.UUID, permissionIDs []uuid.UUID) error {
 	if _, err := s.companyRepo.GetRole(ctx, roleID); err != nil {
 		return fmt.Errorf("%w: role not found", appErrors.ErrNotFound)
@@ -1526,12 +2108,10 @@ func (s *CompanyService) RevokeRolePermissions(ctx context.Context, roleID uuid.
 	return nil
 }
 
-// GetRolePermissions returns permissions for a role.
 func (s *CompanyService) GetRolePermissions(ctx context.Context, roleID uuid.UUID) ([]*models.Permission, error) {
 	return s.companyRepo.GetRolePermissions(ctx, roleID)
 }
 
-// GetPermissionByName returns a permission by name.
 func (s *CompanyService) GetPermissionByName(ctx context.Context, name string) (*models.Permission, error) {
 	perm, err := s.companyRepo.GetPermissionByName(ctx, name)
 	if err != nil {
@@ -1543,12 +2123,10 @@ func (s *CompanyService) GetPermissionByName(ctx context.Context, name string) (
 	return perm, nil
 }
 
-// GetPermissionsByModule returns permissions for a module.
 func (s *CompanyService) GetPermissionsByModule(ctx context.Context, module string) ([]*models.Permission, error) {
 	return s.companyRepo.GetPermissionsByModule(ctx, module)
 }
 
-// GetAllPermissions returns all permissions with filters.
 func (s *CompanyService) GetAllPermissions(ctx context.Context, module, category, tier string) ([]*models.Permission, error) {
 	all, err := s.companyRepo.GetAllPermissions(ctx)
 	if err != nil {
@@ -1570,7 +2148,6 @@ func (s *CompanyService) GetAllPermissions(ctx context.Context, module, category
 	return filtered, nil
 }
 
-// CreatePermission creates a new permission.
 func (s *CompanyService) CreatePermission(ctx context.Context, permissionName, description, category, module, requiresTier string) (*models.Permission, error) {
 	perm := &models.Permission{
 		PermissionID:   uuid.New(),
@@ -1587,7 +2164,6 @@ func (s *CompanyService) CreatePermission(ctx context.Context, permissionName, d
 	return perm, nil
 }
 
-// GetUserPermissions returns permissions for a user across companies.
 func (s *CompanyService) GetUserPermissions(ctx context.Context, userID uuid.UUID) ([]*models.Permission, error) {
 	employees, err := s.companyRepo.GetEmployeesByUser(ctx, userID)
 	if err != nil {
@@ -1611,24 +2187,18 @@ func (s *CompanyService) GetUserPermissions(ctx context.Context, userID uuid.UUI
 	return result, nil
 }
 
-// GetUserPermissionBitmask returns permission bitmask for a user in a company.
 func (s *CompanyService) GetUserPermissionBitmask(ctx context.Context, companyID, userID uuid.UUID) ([]uint64, error) {
 	return s.companyRepo.GetUserPermissionBitmask(ctx, companyID, userID)
 }
 
-// GetRolePermissionBitmask returns permission bitmask for a role.
 func (s *CompanyService) GetRolePermissionBitmask(ctx context.Context, roleID uuid.UUID) ([]uint64, error) {
 	return s.companyRepo.GetRolePermissionBitmask(ctx, roleID)
 }
 
-// GetPermissionsWithBitIndex returns permissions with bit index.
 func (s *CompanyService) GetPermissionsWithBitIndex(ctx context.Context) ([]*models.PermissionWithBitIndex, error) {
 	return s.companyRepo.GetPermissionsWithBitIndex(ctx)
 }
 
-// ---- Department management ----
-
-// CreateDepartmentRequest defines department creation.
 type CreateDepartmentRequest struct {
 	CompanyID          uuid.UUID  `json:"company_id" validate:"required"`
 	DepartmentName     string     `json:"department_name" validate:"required"`
@@ -1636,7 +2206,6 @@ type CreateDepartmentRequest struct {
 	ParentDepartmentID *uuid.UUID `json:"parent_department_id,omitempty"`
 }
 
-// CreateDepartment creates a new department.
 func (s *CompanyService) CreateDepartment(ctx context.Context, req *CreateDepartmentRequest) (*models.Department, error) {
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
@@ -1656,12 +2225,13 @@ func (s *CompanyService) CreateDepartment(ctx context.Context, req *CreateDepart
 	if !company.IsActive {
 		return nil, fmt.Errorf("%w: company is not active", appErrors.ErrInvalidState)
 	}
-	systemDept, err := s.companyRepo.GetSystemDepartment(ctx, req.SystemDepartmentID)
+
+	systemDept, err := s.companyRepo.GetSystemDepartment(ctx, s.pgClient.Pool(), req.SystemDepartmentID)
 	if err != nil {
 		return nil, fmt.Errorf("%w: system department not found", appErrors.ErrNotFound)
 	}
-	// Check duplicate name
-	existing, _, err := s.companyRepo.GetDepartmentsByCompany(ctx, req.CompanyID, 1000, 0)
+
+	existing, _, err := s.companyRepo.GetDepartmentsByCompany(ctx, s.pgClient.Pool(), req.CompanyID, 1000, 0)
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to check existing", appErrors.ErrInternal)
 	}
@@ -1673,8 +2243,9 @@ func (s *CompanyService) CreateDepartment(ctx context.Context, req *CreateDepart
 			return nil, fmt.Errorf("%w: system department already assigned", appErrors.ErrDuplicate)
 		}
 	}
+
 	if req.ParentDepartmentID != nil {
-		parent, err := s.companyRepo.GetDepartment(ctx, *req.ParentDepartmentID)
+		parent, err := s.companyRepo.GetDepartment(ctx, s.pgClient.Pool(), *req.ParentDepartmentID)
 		if err != nil {
 			return nil, fmt.Errorf("%w: parent department not found", appErrors.ErrNotFound)
 		}
@@ -1697,14 +2268,12 @@ func (s *CompanyService) CreateDepartment(ctx context.Context, req *CreateDepart
 		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 
-	// Auto-assign to owner role
 	ownerRole, err := s.companyRepo.GetSystemRoleByLevel(ctx, req.CompanyID, 1000)
 	if err == nil && ownerRole != nil {
 		_ = s.companyRepo.CreateRoleDepartment(ctx, ownerRole.RoleID, dept.DepartmentID)
 	}
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, dept)
-
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "department", "create", "admin",
 			nil, "admin", nil, nil, nil, map[string]interface{}{
@@ -1718,9 +2287,8 @@ func (s *CompanyService) CreateDepartment(ctx context.Context, req *CreateDepart
 	return dept, nil
 }
 
-// GetDepartment retrieves a department by ID.
 func (s *CompanyService) GetDepartment(ctx context.Context, departmentID uuid.UUID) (*models.Department, error) {
-	dept, err := s.companyRepo.GetDepartment(ctx, departmentID)
+	dept, err := s.companyRepo.GetDepartment(ctx, s.pgClient.Pool(), departmentID)
 	if err != nil {
 		if errors.Is(err, appErrors.ErrNotFound) {
 			return nil, fmt.Errorf("%w: department not found", appErrors.ErrNotFound)
@@ -1730,23 +2298,20 @@ func (s *CompanyService) GetDepartment(ctx context.Context, departmentID uuid.UU
 	return dept, nil
 }
 
-// ListDepartments lists departments with pagination.
 func (s *CompanyService) ListDepartments(ctx context.Context, companyID uuid.UUID, limit, offset int, includeEmployees bool) ([]*models.Department, int, error) {
-	depts, total, err := s.companyRepo.GetDepartmentsByCompany(ctx, companyID, limit, offset)
+	depts, total, err := s.companyRepo.GetDepartmentsByCompany(ctx, s.pgClient.Pool(), companyID, limit, offset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 	return depts, total, nil
 }
 
-// GetDepartmentsByCompany lists departments.
 func (s *CompanyService) GetDepartmentsByCompany(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]*models.Department, int, error) {
-	return s.companyRepo.GetDepartmentsByCompany(ctx, companyID, limit, offset)
+	return s.companyRepo.GetDepartmentsByCompany(ctx, s.pgClient.Pool(), companyID, limit, offset)
 }
 
-// UpdateDepartment updates department name.
 func (s *CompanyService) UpdateDepartment(ctx context.Context, departmentID uuid.UUID, name string, updatedBy uuid.UUID) error {
-	dept, err := s.companyRepo.GetDepartment(ctx, departmentID)
+	dept, err := s.companyRepo.GetDepartment(ctx, s.pgClient.Pool(), departmentID)
 	if err != nil {
 		return fmt.Errorf("%w: department not found", appErrors.ErrNotFound)
 	}
@@ -1765,21 +2330,19 @@ func (s *CompanyService) UpdateDepartment(ctx context.Context, departmentID uuid
 	return nil
 }
 
-// RenameDepartment is an alias.
 func (s *CompanyService) RenameDepartment(ctx context.Context, companyID, departmentID uuid.UUID, newName string) error {
 	return s.UpdateDepartment(ctx, departmentID, newName, uuid.Nil)
 }
 
-// DeactivateDepartment deactivates a department.
 func (s *CompanyService) DeactivateDepartment(ctx context.Context, departmentID, adminID uuid.UUID) error {
-	dept, err := s.companyRepo.GetDepartment(ctx, departmentID)
+	dept, err := s.companyRepo.GetDepartment(ctx, s.pgClient.Pool(), departmentID)
 	if err != nil {
 		return fmt.Errorf("%w: department not found", appErrors.ErrNotFound)
 	}
 	if !dept.IsActive {
 		return fmt.Errorf("%w: department already deactivated", appErrors.ErrInvalidState)
 	}
-	// Check if any employees in roles that belong to this department
+
 	roles, _, err := s.companyRepo.GetRolesByCompany(ctx, dept.CompanyID, 1000, 0)
 	if err != nil {
 		return fmt.Errorf("%w: failed to get roles", appErrors.ErrInternal)
@@ -1791,7 +2354,7 @@ func (s *CompanyService) DeactivateDepartment(ctx context.Context, departmentID,
 		}
 		for _, rd := range roleDepts {
 			if rd.DepartmentID == departmentID {
-				employees, _, err := s.companyRepo.GetEmployeesByRole(ctx, role.RoleID, 1, 0)
+				employees, _, err := s.companyRepo.GetEmployeesByRole(ctx, s.pgClient.Pool(), role.RoleID, 1, 0)
 				if err == nil && len(employees) > 0 {
 					return fmt.Errorf("%w: department has active employees", appErrors.ErrConflict)
 				}
@@ -1799,6 +2362,7 @@ func (s *CompanyService) DeactivateDepartment(ctx context.Context, departmentID,
 			}
 		}
 	}
+
 	dept.IsActive = false
 	dept.UpdatedAt = time.Now().UTC()
 	if err := s.companyRepo.UpdateDepartment(ctx, dept); err != nil {
@@ -1813,9 +2377,8 @@ func (s *CompanyService) DeactivateDepartment(ctx context.Context, departmentID,
 	return nil
 }
 
-// ActivateDepartment activates a department.
 func (s *CompanyService) ActivateDepartment(ctx context.Context, companyID uuid.UUID, departmentID uuid.UUID) error {
-	dept, err := s.companyRepo.GetDepartment(ctx, departmentID)
+	dept, err := s.companyRepo.GetDepartment(ctx, s.pgClient.Pool(), departmentID)
 	if err != nil {
 		return fmt.Errorf("%w: department not found", appErrors.ErrNotFound)
 	}
@@ -1830,13 +2393,11 @@ func (s *CompanyService) ActivateDepartment(ctx context.Context, companyID uuid.
 	return nil
 }
 
-// DeleteDepartment deletes a department (must be inactive and no employees).
 func (s *CompanyService) DeleteDepartment(ctx context.Context, departmentID, adminID uuid.UUID) error {
-	dept, err := s.companyRepo.GetDepartment(ctx, departmentID)
+	dept, err := s.companyRepo.GetDepartment(ctx, s.pgClient.Pool(), departmentID)
 	if err != nil {
 		return fmt.Errorf("%w: department not found", appErrors.ErrNotFound)
 	}
-	// Check employees
 	roles, _, err := s.companyRepo.GetRolesByCompany(ctx, dept.CompanyID, 1000, 0)
 	if err != nil {
 		return fmt.Errorf("%w: failed to get roles", appErrors.ErrInternal)
@@ -1848,7 +2409,7 @@ func (s *CompanyService) DeleteDepartment(ctx context.Context, departmentID, adm
 		}
 		for _, rd := range roleDepts {
 			if rd.DepartmentID == departmentID {
-				employees, _, err := s.companyRepo.GetEmployeesByRole(ctx, role.RoleID, 1, 0)
+				employees, _, err := s.companyRepo.GetEmployeesByRole(ctx, s.pgClient.Pool(), role.RoleID, 1, 0)
 				if err == nil && len(employees) > 0 {
 					return fmt.Errorf("%w: department has employees", appErrors.ErrConflict)
 				}
@@ -1856,11 +2417,9 @@ func (s *CompanyService) DeleteDepartment(ctx context.Context, departmentID, adm
 			}
 		}
 	}
-	// Remove role-department mappings
-	if err := s.companyRepo.RemoveAllRoleDepartments(ctx, departmentID); err != nil {
-		// non-critical
-	}
-	if err := s.companyRepo.DeleteDepartment(ctx, departmentID); err != nil {
+
+	_ = s.companyRepo.RemoveAllRoleDepartments(ctx, s.pgClient.Pool(), departmentID)
+	if err := s.companyRepo.DeleteDepartment(ctx, s.pgClient.Pool(), departmentID); err != nil {
 		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 	if s.auditService != nil {
@@ -1873,50 +2432,42 @@ func (s *CompanyService) DeleteDepartment(ctx context.Context, departmentID, adm
 	return nil
 }
 
-// SoftDeleteDepartment soft-deletes a department.
 func (s *CompanyService) SoftDeleteDepartment(ctx context.Context, companyID uuid.UUID, departmentID uuid.UUID) error {
 	return s.companyRepo.SoftDeleteDepartment(ctx, companyID, departmentID)
 }
 
-// GetDepartmentHierarchy returns hierarchy.
 func (s *CompanyService) GetDepartmentHierarchy(ctx context.Context, companyID uuid.UUID) ([]*models.Department, error) {
-	return s.companyRepo.GetDepartmentHierarchy(ctx, companyID)
+	return s.companyRepo.GetDepartmentHierarchy(ctx, s.pgClient.Pool(), companyID)
 }
 
-// UpdateDepartmentParent updates parent.
 type UpdateDepartmentParentRequest struct {
 	DepartmentID       uuid.UUID  `json:"department_id" validate:"required"`
 	ParentDepartmentID *uuid.UUID `json:"parent_department_id"`
 }
 
-// UpdateDepartmentParent updates the parent of a department.
 func (s *CompanyService) UpdateDepartmentParent(ctx context.Context, req *UpdateDepartmentParentRequest, updatedBy uuid.UUID) error {
-	_, err := s.companyRepo.GetDepartment(ctx, req.DepartmentID)
+	_, err := s.companyRepo.GetDepartment(ctx, s.pgClient.Pool(), req.DepartmentID)
 	if err != nil {
 		return fmt.Errorf("%w: department not found", appErrors.ErrNotFound)
 	}
-	if err := s.companyRepo.UpdateDepartmentParent(ctx, req.DepartmentID, req.ParentDepartmentID); err != nil {
+	if err := s.companyRepo.UpdateDepartmentParent(ctx, s.pgClient.Pool(), req.DepartmentID, req.ParentDepartmentID); err != nil {
 		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 	return nil
 }
 
-// GetDepartmentChildren returns children.
 func (s *CompanyService) GetDepartmentChildren(ctx context.Context, departmentID uuid.UUID) ([]*models.Department, error) {
-	return s.companyRepo.GetDepartmentChildren(ctx, departmentID)
+	return s.companyRepo.GetDepartmentChildren(ctx, s.pgClient.Pool(), departmentID)
 }
 
-// GetDepartmentTree returns tree.
 func (s *CompanyService) GetDepartmentTree(ctx context.Context, departmentID uuid.UUID) ([]*models.DepartmentTree, error) {
-	return s.companyRepo.GetDepartmentTree(ctx, departmentID)
+	return s.companyRepo.GetDepartmentTree(ctx, s.pgClient.Pool(), departmentID)
 }
 
-// GetDepartmentParents returns parents.
 func (s *CompanyService) GetDepartmentParents(ctx context.Context, departmentID uuid.UUID) ([]*models.Department, error) {
-	return s.companyRepo.GetDepartmentParents(ctx, departmentID)
+	return s.companyRepo.GetDepartmentParents(ctx, s.pgClient.Pool(), departmentID)
 }
 
-// MoveDepartmentWithEmployees moves a department.
 func (s *CompanyService) MoveDepartmentWithEmployees(ctx context.Context, departmentID uuid.UUID, newParentDepartmentID *uuid.UUID, movedBy uuid.UUID) error {
 	if err := s.companyRepo.MoveDepartmentWithEmployees(ctx, departmentID, newParentDepartmentID); err != nil {
 		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
@@ -1924,61 +2475,35 @@ func (s *CompanyService) MoveDepartmentWithEmployees(ctx context.Context, depart
 	return nil
 }
 
-// GetRootDepartments returns root departments.
 func (s *CompanyService) GetRootDepartments(ctx context.Context, companyID uuid.UUID) ([]*models.Department, error) {
-	return s.companyRepo.GetRootDepartments(ctx, companyID)
+	return s.companyRepo.GetRootDepartments(ctx, s.pgClient.Pool(), companyID)
 }
 
-// ValidateDepartmentHierarchy validates hierarchy.
 func (s *CompanyService) ValidateDepartmentHierarchy(ctx context.Context, departmentID uuid.UUID, newParentDepartmentID *uuid.UUID) (bool, error) {
 	if newParentDepartmentID == nil {
 		return true, nil
 	}
-	parent, err := s.companyRepo.GetDepartment(ctx, *newParentDepartmentID)
+	parent, err := s.companyRepo.GetDepartment(ctx, s.pgClient.Pool(), *newParentDepartmentID)
 	if err != nil {
 		return false, err
 	}
-	current, err := s.companyRepo.GetDepartment(ctx, departmentID)
+	current, err := s.companyRepo.GetDepartment(ctx, s.pgClient.Pool(), departmentID)
 	if err != nil {
 		return false, err
 	}
 	return parent.CompanyID == current.CompanyID, nil
 }
 
-// GetActiveDepartmentCount returns count.
 func (s *CompanyService) GetActiveDepartmentCount(ctx context.Context, companyID uuid.UUID) (int, error) {
-	return s.companyRepo.GetActiveDepartmentCount(ctx, companyID)
+	return s.companyRepo.GetActiveDepartmentCount(ctx, s.pgClient.Pool(), companyID)
 }
 
-// GetCompanyDepartmentInfo returns info.
-func (s *CompanyService) GetCompanyDepartmentInfo(ctx context.Context, companyID uuid.UUID) (*postgres.CompanyDepartmentInfo, error) {
-	return s.companyRepo.GetCompanyDepartmentInfo(ctx, companyID)
-}
-
-// CheckDepartmentLimit checks limit.
-func (s *CompanyService) CheckDepartmentLimit(ctx context.Context, companyID uuid.UUID) error {
-	return s.companyRepo.CheckDepartmentLimit(ctx, companyID)
-}
-
-// GetDeactivatedDepartments retrieves all deactivated departments for a company.
 func (s *CompanyService) GetDeactivatedDepartments(ctx context.Context, companyID uuid.UUID) ([]*models.Department, error) {
-	return s.companyRepo.GetDeactivatedDepartments(ctx, companyID)
+	return s.companyRepo.GetDeactivatedDepartments(ctx, s.pgClient.Pool(), companyID)
 }
 
-// UpdateMaxDepartments updates max departments.
-func (s *CompanyService) UpdateMaxDepartments(ctx context.Context, companyID uuid.UUID, newMaxDepartments int) error {
-	if newMaxDepartments < 1 || newMaxDepartments > 100 {
-		return fmt.Errorf("%w: max_departments must be between 1 and 100", appErrors.ErrInvalidInput)
-	}
-	if err := s.companyRepo.UpdateMaxDepartments(ctx, companyID, newMaxDepartments); err != nil {
-		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
-	}
-	return nil
-}
-
-// CreateSubDepartment creates a sub-department.
 func (s *CompanyService) CreateSubDepartment(ctx context.Context, companyID uuid.UUID, parentDepartmentID uuid.UUID, departmentName string) (*models.Department, error) {
-	parent, err := s.companyRepo.GetDepartmentByID(ctx, parentDepartmentID)
+	parent, err := s.companyRepo.GetDepartmentByID(ctx, s.pgClient.Pool(), parentDepartmentID)
 	if err != nil {
 		return nil, fmt.Errorf("%w: parent not found", appErrors.ErrNotFound)
 	}
@@ -1991,7 +2516,6 @@ func (s *CompanyService) CreateSubDepartment(ctx context.Context, companyID uuid
 	return s.companyRepo.CreateSubDepartment(ctx, companyID, parentDepartmentID, departmentName, *parent.SystemDepartmentID)
 }
 
-// AdminAddDepartment is admin version.
 func (s *CompanyService) AdminAddDepartment(ctx context.Context, companyID uuid.UUID, departmentName string, systemDepartmentID uuid.UUID) (*models.Department, error) {
 	return s.CreateDepartment(ctx, &CreateDepartmentRequest{
 		CompanyID:          companyID,
@@ -2000,21 +2524,14 @@ func (s *CompanyService) AdminAddDepartment(ctx context.Context, companyID uuid.
 	})
 }
 
-// ---- System departments ----
-
-// GetSystemDepartments returns all system departments.
 func (s *CompanyService) GetSystemDepartments(ctx context.Context) ([]*models.SystemDepartment, error) {
-	return s.companyRepo.GetSystemDepartments(ctx)
+	return s.companyRepo.GetSystemDepartments(ctx, s.pgClient.Pool())
 }
 
-// GetSystemDepartmentByModule returns system department by module.
 func (s *CompanyService) GetSystemDepartmentByModule(ctx context.Context, module string) (*models.SystemDepartment, error) {
-	return s.companyRepo.GetSystemDepartmentByModule(ctx, module)
+	return s.companyRepo.GetSystemDepartmentByModule(ctx, s.pgClient.Pool(), module)
 }
 
-// ---- Positions ----
-
-// CreatePositionRequest defines position creation.
 type CreatePositionRequest struct {
 	CompanyID          uuid.UUID `json:"company_id"`
 	DepartmentID       uuid.UUID `json:"department_id"`
@@ -2026,21 +2543,20 @@ type CreatePositionRequest struct {
 	WorkCenterCode     *string   `json:"work_center_code"`
 }
 
-// CreatePosition creates a position.
 func (s *CompanyService) CreatePosition(ctx context.Context, req *CreatePositionRequest, createdBy uuid.UUID) (*models.Position, error) {
 	if req.IsOpen == nil || req.IsSchedulable == nil || req.AttendanceRequired == nil || req.OvertimeAllowed == nil {
 		return nil, fmt.Errorf("%w: boolean defaults not initialized", appErrors.ErrInvalidInput)
 	}
-	department, err := s.companyRepo.GetDepartment(ctx, req.DepartmentID)
+	department, err := s.companyRepo.GetDepartment(ctx, s.pgClient.Pool(), req.DepartmentID)
 	if err != nil {
 		return nil, fmt.Errorf("%w: department not found", appErrors.ErrNotFound)
 	}
 	if department.CompanyID != req.CompanyID {
 		return nil, fmt.Errorf("%w: department does not belong to company", appErrors.ErrInvalidInput)
 	}
-	// Validate work center if provided
+
 	if req.WorkCenterCode != nil && *req.WorkCenterCode != "" {
-		exists, err := s.companyRepo.WorkCenterExists(ctx, req.CompanyID, *req.WorkCenterCode)
+		exists, err := s.companyRepo.WorkCenterExists(ctx, s.pgClient.Pool(), req.CompanyID, *req.WorkCenterCode)
 		if err != nil {
 			return nil, fmt.Errorf("%w: failed to validate work center", appErrors.ErrInternal)
 		}
@@ -2048,13 +2564,15 @@ func (s *CompanyService) CreatePosition(ctx context.Context, req *CreatePosition
 			return nil, fmt.Errorf("%w: work center does not exist", appErrors.ErrNotFound)
 		}
 	}
-	exists, err := s.companyRepo.PositionExists(ctx, req.CompanyID, req.DepartmentID, req.Title)
+
+	exists, err := s.companyRepo.PositionExists(ctx, s.pgClient.Pool(), req.CompanyID, req.DepartmentID, req.Title)
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to check uniqueness", appErrors.ErrInternal)
 	}
 	if exists {
 		return nil, fmt.Errorf("%w: position with this title already exists", appErrors.ErrDuplicate)
 	}
+
 	now := time.Now().UTC()
 	position := &models.Position{
 		PositionID:         uuid.New(),
@@ -2069,9 +2587,10 @@ func (s *CompanyService) CreatePosition(ctx context.Context, req *CreatePosition
 		CreatedAt:          now,
 		UpdatedAt:          now,
 	}
-	if err := s.companyRepo.CreatePosition(ctx, position); err != nil {
+	if err := s.companyRepo.CreatePosition(ctx, s.pgClient.Pool(), position); err != nil {
 		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
+
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "position", "create", "admin",
 			&createdBy, "admin", &createdBy, nil, nil, map[string]interface{}{
@@ -2084,7 +2603,6 @@ func (s *CompanyService) CreatePosition(ctx context.Context, req *CreatePosition
 	return position, nil
 }
 
-// UpdatePositionRequest defines position update.
 type UpdatePositionRequest struct {
 	PositionID         uuid.UUID `json:"position_id" validate:"required"`
 	Title              string    `json:"title" validate:"required,min=1,max=255"`
@@ -2096,7 +2614,6 @@ type UpdatePositionRequest struct {
 	WorkCenterCode     *string   `json:"work_center_code,omitempty" validate:"omitempty,max=100"`
 }
 
-// UpdatePosition updates a position.
 func (s *CompanyService) UpdatePosition(ctx context.Context, req *UpdatePositionRequest, updatedBy uuid.UUID) error {
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
@@ -2109,12 +2626,13 @@ func (s *CompanyService) UpdatePosition(ctx context.Context, req *UpdatePosition
 		return nil
 	}
 
-	existing, err := s.companyRepo.GetPosition(ctx, req.PositionID)
+	existing, err := s.companyRepo.GetPosition(ctx, s.pgClient.Pool(), req.PositionID)
 	if err != nil {
 		return fmt.Errorf("%w: position not found", appErrors.ErrNotFound)
 	}
+
 	if req.DepartmentID != existing.DepartmentID {
-		newDept, err := s.companyRepo.GetDepartment(ctx, req.DepartmentID)
+		newDept, err := s.companyRepo.GetDepartment(ctx, s.pgClient.Pool(), req.DepartmentID)
 		if err != nil {
 			return fmt.Errorf("%w: new department not found", appErrors.ErrNotFound)
 		}
@@ -2122,8 +2640,9 @@ func (s *CompanyService) UpdatePosition(ctx context.Context, req *UpdatePosition
 			return fmt.Errorf("%w: new department does not belong to same company", appErrors.ErrInvalidInput)
 		}
 	}
+
 	if req.WorkCenterCode != nil && *req.WorkCenterCode != "" {
-		exists, err := s.companyRepo.WorkCenterExists(ctx, existing.CompanyID, *req.WorkCenterCode)
+		exists, err := s.companyRepo.WorkCenterExists(ctx, s.pgClient.Pool(), existing.CompanyID, *req.WorkCenterCode)
 		if err != nil {
 			return fmt.Errorf("%w: failed to validate work center", appErrors.ErrInternal)
 		}
@@ -2132,6 +2651,7 @@ func (s *CompanyService) UpdatePosition(ctx context.Context, req *UpdatePosition
 		}
 		existing.WorkCenterCode = req.WorkCenterCode
 	}
+
 	existing.Title = req.Title
 	existing.DepartmentID = req.DepartmentID
 	existing.IsOpen = req.IsOpen
@@ -2145,12 +2665,12 @@ func (s *CompanyService) UpdatePosition(ctx context.Context, req *UpdatePosition
 		existing.OvertimeAllowed = *req.OvertimeAllowed
 	}
 	existing.UpdatedAt = time.Now().UTC()
-	if err := s.companyRepo.UpdatePosition(ctx, existing); err != nil {
+
+	if err := s.companyRepo.UpdatePosition(ctx, s.pgClient.Pool(), existing); err != nil {
 		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
-
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "position", "update", "admin",
 			&updatedBy, "admin", &updatedBy, nil, nil, map[string]interface{}{
@@ -2162,23 +2682,21 @@ func (s *CompanyService) UpdatePosition(ctx context.Context, req *UpdatePosition
 	return nil
 }
 
-// UpdatePositionStatus updates open status.
 func (s *CompanyService) UpdatePositionStatus(ctx context.Context, positionID uuid.UUID, isOpen bool, updatedBy uuid.UUID) error {
-	pos, err := s.companyRepo.GetPosition(ctx, positionID)
+	pos, err := s.companyRepo.GetPosition(ctx, s.pgClient.Pool(), positionID)
 	if err != nil {
 		return fmt.Errorf("%w: position not found", appErrors.ErrNotFound)
 	}
 	pos.IsOpen = isOpen
 	pos.UpdatedAt = time.Now().UTC()
-	if err := s.companyRepo.UpdatePosition(ctx, pos); err != nil {
+	if err := s.companyRepo.UpdatePosition(ctx, s.pgClient.Pool(), pos); err != nil {
 		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 	return nil
 }
 
-// GetPosition retrieves a position.
 func (s *CompanyService) GetPosition(ctx context.Context, positionID uuid.UUID) (*models.Position, error) {
-	pos, err := s.companyRepo.GetPosition(ctx, positionID)
+	pos, err := s.companyRepo.GetPosition(ctx, s.pgClient.Pool(), positionID)
 	if err != nil {
 		if errors.Is(err, appErrors.ErrNotFound) {
 			return nil, fmt.Errorf("%w: position not found", appErrors.ErrNotFound)
@@ -2188,15 +2706,14 @@ func (s *CompanyService) GetPosition(ctx context.Context, positionID uuid.UUID) 
 	return pos, nil
 }
 
-// ListPositions lists positions.
 func (s *CompanyService) ListPositions(ctx context.Context, companyID uuid.UUID, departmentID *uuid.UUID, onlyOpen bool, limit, offset int) ([]*models.Position, int, error) {
 	var positions []*models.Position
 	var total int
 	var err error
 	if departmentID != nil {
-		positions, total, err = s.companyRepo.GetPositionsByDepartment(ctx, *departmentID, limit, offset, onlyOpen)
+		positions, total, err = s.companyRepo.GetPositionsByDepartment(ctx, s.pgClient.Pool(), *departmentID, limit, offset, onlyOpen)
 	} else {
-		positions, total, err = s.companyRepo.GetPositionsByCompany(ctx, companyID, limit, offset, onlyOpen)
+		positions, total, err = s.companyRepo.GetPositionsByCompany(ctx, s.pgClient.Pool(), companyID, limit, offset, onlyOpen)
 	}
 	if err != nil {
 		return nil, 0, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
@@ -2204,14 +2721,12 @@ func (s *CompanyService) ListPositions(ctx context.Context, companyID uuid.UUID,
 	return positions, total, nil
 }
 
-// DeletePosition deletes a position.
 func (s *CompanyService) DeletePosition(ctx context.Context, positionID, deletedBy uuid.UUID) error {
-	pos, err := s.companyRepo.GetPosition(ctx, positionID)
+	pos, err := s.companyRepo.GetPosition(ctx, s.pgClient.Pool(), positionID)
 	if err != nil {
 		return fmt.Errorf("%w: position not found", appErrors.ErrNotFound)
 	}
-	// Check if any employee assigned
-	employees, _, err := s.companyRepo.GetEmployeesByCompany(ctx, pos.CompanyID, 1, 0)
+	employees, _, err := s.companyRepo.GetEmployeesByCompany(ctx, s.pgClient.Pool(), pos.CompanyID, 1, 0)
 	if err == nil {
 		for _, emp := range employees {
 			if emp.PositionID != nil && *emp.PositionID == positionID {
@@ -2219,7 +2734,7 @@ func (s *CompanyService) DeletePosition(ctx context.Context, positionID, deleted
 			}
 		}
 	}
-	if err := s.companyRepo.DeletePosition(ctx, positionID); err != nil {
+	if err := s.companyRepo.DeletePosition(ctx, s.pgClient.Pool(), positionID); err != nil {
 		return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
 	if s.auditService != nil {
@@ -2232,23 +2747,18 @@ func (s *CompanyService) DeletePosition(ctx context.Context, positionID, deleted
 	return nil
 }
 
-// GetOpenPositions returns open positions.
 func (s *CompanyService) GetOpenPositions(ctx context.Context, companyID uuid.UUID, isOpen *bool, limit, offset int) ([]*models.Position, int, error) {
-	return s.companyRepo.GetOpenPositions(ctx, companyID, isOpen, limit, offset)
+	return s.companyRepo.GetOpenPositions(ctx, s.pgClient.Pool(), companyID, isOpen, limit, offset)
 }
 
-// GetPositionsByDepartment returns positions by department.
 func (s *CompanyService) GetPositionsByDepartment(ctx context.Context, companyID, departmentID uuid.UUID, isOpen *bool, limit, offset int) ([]*models.Position, int, error) {
 	onlyOpen := false
 	if isOpen != nil {
 		onlyOpen = *isOpen
 	}
-	return s.companyRepo.GetPositionsByDepartment(ctx, departmentID, limit, offset, onlyOpen)
+	return s.companyRepo.GetPositionsByDepartment(ctx, s.pgClient.Pool(), departmentID, limit, offset, onlyOpen)
 }
 
-// ---- Permission checks ----
-
-// PermissionCheckRequest defines permission check.
 type PermissionCheckRequest struct {
 	CompanyID      uuid.UUID `json:"company_id" validate:"required"`
 	UserID         uuid.UUID `json:"user_id" validate:"required"`
@@ -2256,7 +2766,6 @@ type PermissionCheckRequest struct {
 	Module         string    `json:"module,omitempty"`
 }
 
-// PermissionCheckResult contains result.
 type PermissionCheckResult struct {
 	HasPermission bool              `json:"has_permission"`
 	IsOwner       bool              `json:"is_owner"`
@@ -2265,7 +2774,6 @@ type PermissionCheckResult struct {
 	Message       string            `json:"message,omitempty"`
 }
 
-// PermissionDetail provides details.
 type PermissionDetail struct {
 	CompanyID      string `json:"company_id"`
 	UserID         string `json:"user_id"`
@@ -2277,16 +2785,17 @@ type PermissionDetail struct {
 	RequiredModule string `json:"required_module"`
 }
 
-// CheckPermission checks if a user has a permission in a company.
 func (s *CompanyService) CheckPermission(ctx context.Context, req *PermissionCheckRequest) (*PermissionCheckResult, error) {
 	result := &PermissionCheckResult{
 		HasPermission: false,
 		Checks:        make(map[string]bool),
 	}
+
 	company, err := s.companyRepo.GetCompany(ctx, req.CompanyID)
 	if err != nil {
 		return nil, fmt.Errorf("%w: company not found", appErrors.ErrNotFound)
 	}
+
 	if company.OwnerUserID == req.UserID {
 		result.HasPermission = true
 		result.IsOwner = true
@@ -2297,7 +2806,8 @@ func (s *CompanyService) CheckPermission(ctx context.Context, req *PermissionChe
 		result.Checks["module_access"] = true
 		return result, nil
 	}
-	employee, err := s.companyRepo.GetEmployee(ctx, req.CompanyID, req.UserID)
+
+	employee, err := s.companyRepo.GetEmployee(ctx, s.pgClient.Pool(), req.CompanyID, req.UserID)
 	if err != nil {
 		result.Checks["has_employee_record"] = false
 		result.Message = "User is not an active employee"
@@ -2325,12 +2835,14 @@ func (s *CompanyService) CheckPermission(ctx context.Context, req *PermissionChe
 	if err != nil {
 		return nil, fmt.Errorf("%w: role not found", appErrors.ErrInternal)
 	}
+
 	permission, err := s.companyRepo.GetPermissionByName(ctx, req.PermissionName)
 	if err != nil {
 		result.Checks["role_has_permission"] = false
 		result.Message = "Permission not found"
 		return result, nil
 	}
+
 	hasPerm, err := s.companyRepo.CheckRolePermission(ctx, employee.RoleID, permission.PermissionID)
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to check permission", appErrors.ErrInternal)
@@ -2340,14 +2852,14 @@ func (s *CompanyService) CheckPermission(ctx context.Context, req *PermissionChe
 		result.Message = "Role does not have permission"
 		return result, nil
 	}
-	// Module match
+
 	moduleMatch := false
 	var matchingDept *models.Department
 	for _, dept := range roleDepartments {
 		if dept.SystemDepartmentID == nil {
 			continue
 		}
-		systemDept, err := s.companyRepo.GetSystemDepartment(ctx, *dept.SystemDepartmentID)
+		systemDept, err := s.companyRepo.GetSystemDepartment(ctx, s.pgClient.Pool(), *dept.SystemDepartmentID)
 		if err != nil {
 			continue
 		}
@@ -2362,6 +2874,7 @@ func (s *CompanyService) CheckPermission(ctx context.Context, req *PermissionChe
 		result.Message = fmt.Sprintf("Permission module '%s' not in department modules", permission.Module)
 		return result, nil
 	}
+
 	result.HasPermission = true
 	result.Details = &PermissionDetail{
 		CompanyID:      req.CompanyID.String(),
@@ -2376,7 +2889,6 @@ func (s *CompanyService) CheckPermission(ctx context.Context, req *PermissionChe
 	return result, nil
 }
 
-// CheckUserPermission is a simpler version.
 func (s *CompanyService) CheckUserPermission(ctx context.Context, companyID, userID uuid.UUID, permissionName string) (bool, error) {
 	req := &PermissionCheckRequest{
 		CompanyID:      companyID,
@@ -2390,7 +2902,6 @@ func (s *CompanyService) CheckUserPermission(ctx context.Context, companyID, use
 	return result.HasPermission, nil
 }
 
-// BulkPermissionCheck checks multiple permissions.
 func (s *CompanyService) BulkPermissionCheck(ctx context.Context, companyID, userID uuid.UUID, permissionNames []string) (map[string]bool, error) {
 	results := make(map[string]bool)
 	for _, name := range permissionNames {
@@ -2404,9 +2915,6 @@ func (s *CompanyService) BulkPermissionCheck(ctx context.Context, companyID, use
 	return results, nil
 }
 
-// ---- Company context ----
-
-// CompanyContext holds context data for a user in a company.
 type CompanyContext struct {
 	CompanyID        string   `json:"company_id"`
 	EmployeeID       string   `json:"employee_id"`
@@ -2422,7 +2930,6 @@ type CompanyContext struct {
 	IsManager        bool     `json:"is_manager"`
 }
 
-// GetCompanyContext returns context for a user's first active company.
 func (s *CompanyService) GetCompanyContext(ctx context.Context, userID uuid.UUID) (*CompanyContext, error) {
 	employees, err := s.companyRepo.GetEmployeesByUser(ctx, userID)
 	if err != nil {
@@ -2453,7 +2960,7 @@ func (s *CompanyService) GetCompanyContext(ctx context.Context, userID uuid.UUID
 		deptID = dept.DepartmentID.String()
 		deptName = dept.DepartmentName
 		if dept.SystemDepartmentID != nil {
-			sys, _ := s.companyRepo.GetSystemDepartment(ctx, *dept.SystemDepartmentID)
+			sys, _ := s.companyRepo.GetSystemDepartment(ctx, s.pgClient.Pool(), *dept.SystemDepartmentID)
 			if sys != nil {
 				sysModule = sys.ModuleCode
 			}
@@ -2483,9 +2990,8 @@ func (s *CompanyService) GetCompanyContext(ctx context.Context, userID uuid.UUID
 	}, nil
 }
 
-// GetCompanyContextForCompany returns context for a specific company.
 func (s *CompanyService) GetCompanyContextForCompany(ctx context.Context, userID, companyID uuid.UUID) (*CompanyContext, error) {
-	employee, err := s.companyRepo.GetEmployee(ctx, companyID, userID)
+	employee, err := s.companyRepo.GetEmployee(ctx, s.pgClient.Pool(), companyID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("%w: employee not found", appErrors.ErrNotFound)
 	}
@@ -2516,7 +3022,7 @@ func (s *CompanyService) GetCompanyContextForCompany(ctx context.Context, userID
 		deptID = dept.DepartmentID.String()
 		deptName = dept.DepartmentName
 		if dept.SystemDepartmentID != nil {
-			sys, _ := s.companyRepo.GetSystemDepartment(ctx, *dept.SystemDepartmentID)
+			sys, _ := s.companyRepo.GetSystemDepartment(ctx, s.pgClient.Pool(), *dept.SystemDepartmentID)
 			if sys != nil {
 				sysModule = sys.ModuleCode
 			}
@@ -2546,9 +3052,6 @@ func (s *CompanyService) GetCompanyContextForCompany(ctx context.Context, userID
 	}, nil
 }
 
-// ---- Authorization ----
-
-// AuthorizeUserLogin checks if a user is active in any company.
 func (s *CompanyService) AuthorizeUserLogin(ctx context.Context, phoneNumber string) (*models.User, error) {
 	user, err := s.userService.GetUserByPhone(ctx, phoneNumber)
 	if err != nil {
@@ -2566,20 +3069,16 @@ func (s *CompanyService) AuthorizeUserLogin(ctx context.Context, phoneNumber str
 	return nil, fmt.Errorf("%w: user is not an active employee", appErrors.ErrPermissionDenied)
 }
 
-// ---- Bulk operations ----
-
-// BulkAssignment defines bulk role assignment.
 type BulkAssignment struct {
 	UserID    uuid.UUID `json:"user_id"`
 	RoleID    uuid.UUID `json:"role_id"`
 	ReportsTo uuid.UUID `json:"reports_to,omitempty"`
 }
 
-// BulkAssignRoles assigns roles to multiple employees.
 func (s *CompanyService) BulkAssignRoles(ctx context.Context, companyID uuid.UUID, assignments []BulkAssignment, assignedBy uuid.UUID) (map[uuid.UUID]string, error) {
 	results := make(map[uuid.UUID]string)
 	for _, assignment := range assignments {
-		emp, err := s.companyRepo.GetEmployee(ctx, companyID, assignment.UserID)
+		emp, err := s.companyRepo.GetEmployee(ctx, s.pgClient.Pool(), companyID, assignment.UserID)
 		if err != nil {
 			results[assignment.UserID] = fmt.Sprintf("Error: %v", err)
 			continue
@@ -2602,11 +3101,8 @@ func (s *CompanyService) BulkAssignRoles(ctx context.Context, companyID uuid.UUI
 	return results, nil
 }
 
-// ---- Manager permissions ----
-
-// AssignManagerPermissions assigns permissions to a manager's role.
 func (s *CompanyService) AssignManagerPermissions(ctx context.Context, companyID, managerID uuid.UUID, permissionNames []string, assignedBy uuid.UUID) error {
-	managerEmp, err := s.companyRepo.GetEmployee(ctx, companyID, managerID)
+	managerEmp, err := s.companyRepo.GetEmployee(ctx, s.pgClient.Pool(), companyID, managerID)
 	if err != nil {
 		return fmt.Errorf("%w: manager not found", appErrors.ErrNotFound)
 	}
@@ -2624,9 +3120,8 @@ func (s *CompanyService) AssignManagerPermissions(ctx context.Context, companyID
 	return nil
 }
 
-// RevokeManagerPermissions revokes permissions from a manager's role.
 func (s *CompanyService) RevokeManagerPermissions(ctx context.Context, companyID, managerID uuid.UUID, permissionNames []string, revokedBy uuid.UUID) error {
-	managerEmp, err := s.companyRepo.GetEmployee(ctx, companyID, managerID)
+	managerEmp, err := s.companyRepo.GetEmployee(ctx, s.pgClient.Pool(), companyID, managerID)
 	if err != nil {
 		return fmt.Errorf("%w: manager not found", appErrors.ErrNotFound)
 	}
@@ -2644,12 +3139,10 @@ func (s *CompanyService) RevokeManagerPermissions(ctx context.Context, companyID
 	return nil
 }
 
-// GetManagerPermissions returns permission names for a manager.
 func (s *CompanyService) GetManagerPermissions(ctx context.Context, managerID uuid.UUID) ([]string, error) {
 	return s.companyRepo.GetUserPermissionNames(ctx, managerID)
 }
 
-// ValidatePermissionSubset checks if requested permissions are subset of manager's.
 func (s *CompanyService) ValidatePermissionSubset(ctx context.Context, managerPermissions, requestedPermissions []string) bool {
 	managerSet := make(map[string]bool)
 	for _, p := range managerPermissions {
@@ -2663,9 +3156,6 @@ func (s *CompanyService) ValidatePermissionSubset(ctx context.Context, managerPe
 	return true
 }
 
-// ---- Permission department compatibility ----
-
-// ValidatePermissionDepartmentCompatibility checks if permissions match department modules.
 func (s *CompanyService) ValidatePermissionDepartmentCompatibility(ctx context.Context, departmentIDs []uuid.UUID, permissionIDs []uuid.UUID) (bool, string, error) {
 	if len(departmentIDs) == 0 || len(permissionIDs) == 0 {
 		return true, "", nil
@@ -2678,19 +3168,21 @@ func (s *CompanyService) ValidatePermissionDepartmentCompatibility(ctx context.C
 	for _, p := range allPerms {
 		permMap[p.PermissionID] = p
 	}
+
 	departmentModules := make(map[string]bool)
 	for _, deptID := range departmentIDs {
-		dept, err := s.companyRepo.GetDepartment(ctx, deptID)
+		dept, err := s.companyRepo.GetDepartment(ctx, s.pgClient.Pool(), deptID)
 		if err != nil {
 			return false, "", fmt.Errorf("%w: department not found: %s", appErrors.ErrNotFound, deptID)
 		}
 		if dept.SystemDepartmentID != nil {
-			sys, err := s.companyRepo.GetSystemDepartment(ctx, *dept.SystemDepartmentID)
+			sys, err := s.companyRepo.GetSystemDepartment(ctx, s.pgClient.Pool(), *dept.SystemDepartmentID)
 			if err == nil {
 				departmentModules[sys.ModuleCode] = true
 			}
 		}
 	}
+
 	for _, permID := range permissionIDs {
 		perm, exists := permMap[permID]
 		if !exists {
@@ -2738,14 +3230,13 @@ func (s *CompanyService) validatePermissionDepartmentCompatibilityForUpdate(ctx 
 	return nil
 }
 
-// GetPermissionsByDepartmentModules returns permissions for departments.
 func (s *CompanyService) GetPermissionsByDepartmentModules(ctx context.Context, departmentIDs []uuid.UUID) ([]*models.Permission, error) {
 	if len(departmentIDs) == 0 {
 		return []*models.Permission{}, nil
 	}
 	var sysDeptIDs []uuid.UUID
 	for _, deptID := range departmentIDs {
-		dept, err := s.companyRepo.GetDepartment(ctx, deptID)
+		dept, err := s.companyRepo.GetDepartment(ctx, s.pgClient.Pool(), deptID)
 		if err != nil {
 			continue
 		}
@@ -2759,9 +3250,8 @@ func (s *CompanyService) GetPermissionsByDepartmentModules(ctx context.Context, 
 	return s.companyRepo.GetPermissionsBySystemDepartments(ctx, sysDeptIDs, "", "", "")
 }
 
-// GetPermissionsByCompanyDepartments returns permissions for company departments.
 func (s *CompanyService) GetPermissionsByCompanyDepartments(ctx context.Context, companyID uuid.UUID, module, category, tier string) ([]*models.Permission, error) {
-	depts, _, err := s.companyRepo.GetDepartmentsByCompany(ctx, companyID, 1000, 0)
+	depts, _, err := s.companyRepo.GetDepartmentsByCompany(ctx, s.pgClient.Pool(), companyID, 1000, 0)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
@@ -2771,7 +3261,7 @@ func (s *CompanyService) GetPermissionsByCompanyDepartments(ctx context.Context,
 			sysDeptIDs = append(sysDeptIDs, *d.SystemDepartmentID)
 		}
 	}
-	adminSys, err := s.companyRepo.GetSystemDepartmentByModule(ctx, "administration")
+	adminSys, err := s.companyRepo.GetSystemDepartmentByModule(ctx, s.pgClient.Pool(), "administration")
 	if err == nil {
 		sysDeptIDs = append(sysDeptIDs, adminSys.SystemDepartmentID)
 	}
@@ -2781,43 +3271,29 @@ func (s *CompanyService) GetPermissionsByCompanyDepartments(ctx context.Context,
 	return s.companyRepo.GetPermissionsBySystemDepartments(ctx, sysDeptIDs, module, category, tier)
 }
 
-// ---- Validation helpers ----
-
 func (s *CompanyService) validateReportsTo(ctx context.Context, companyID uuid.UUID, userID *uuid.UUID) error {
 	if userID == nil {
 		return nil
 	}
-	_, err := s.companyRepo.GetEmployee(ctx, companyID, *userID)
+	_, err := s.companyRepo.GetEmployee(ctx, s.pgClient.Pool(), companyID, *userID)
 	if err != nil {
 		return fmt.Errorf("%w: reports_to user not employee", appErrors.ErrInvalidInput)
 	}
 	return nil
 }
 
-// ---- Statistics and health ----
-
-// GetCompanyStats returns company statistics.
 func (s *CompanyService) GetCompanyStats(ctx context.Context, companyID uuid.UUID) (map[string]interface{}, error) {
 	return s.companyRepo.GetCompanyStats(ctx, companyID)
 }
 
-// HealthCheck performs health check.
 func (s *CompanyService) HealthCheck(ctx context.Context) error {
 	return s.companyRepo.HealthCheck(ctx)
 }
 
-// ---- Search ----
-
-// SearchCompaniesRequest is alias.
 type SearchCompaniesRequest = models.CompanySearchRequest
-
-// SearchCompaniesResponse is alias.
 type SearchCompaniesResponse = models.CompanySearchResponse
-
-// CompanySearchResult is alias.
 type CompanySearchResult = models.CompanySearchResult
 
-// SearchCompanies searches companies.
 func (s *CompanyService) SearchCompanies(ctx context.Context, req *models.CompanySearchRequest) (*models.CompanySearchResponse, error) {
 	searchType := req.SearchType
 	if searchType == "all" {
@@ -2858,7 +3334,6 @@ func (s *CompanyService) SearchCompanies(ctx context.Context, req *models.Compan
 	}, nil
 }
 
-// SearchCompaniesByOwner searches companies owned by a user.
 func (s *CompanyService) SearchCompaniesByOwner(ctx context.Context, ownerID uuid.UUID, query string, isActive *bool, limit int, offset int) (*models.CompanySearchResponse, error) {
 	companies, total, err := s.companyRepo.SearchCompaniesByOwnerAndName(ctx, ownerID, query, isActive, limit, offset)
 	if err != nil {
@@ -2899,7 +3374,6 @@ func (s *CompanyService) SearchCompaniesByOwner(ctx context.Context, ownerID uui
 	}, nil
 }
 
-// GetCompanySuggestions returns company name suggestions.
 func (s *CompanyService) GetCompanySuggestions(ctx context.Context, prefix string, limit int) ([]string, error) {
 	if len(prefix) < 2 {
 		return []string{}, nil
@@ -2907,7 +3381,6 @@ func (s *CompanyService) GetCompanySuggestions(ctx context.Context, prefix strin
 	return s.companyRepo.GetCompanySuggestions(ctx, prefix, limit)
 }
 
-// GetCompanySearchAnalytics returns search stats.
 func (s *CompanyService) GetCompanySearchAnalytics(ctx context.Context) (map[string]interface{}, error) {
 	stats, err := s.companyRepo.GetCompanySearchStats(ctx)
 	if err != nil {
@@ -2920,7 +3393,6 @@ func (s *CompanyService) GetCompanySearchAnalytics(ctx context.Context) (map[str
 	return stats, nil
 }
 
-// BenchmarkCompanySearch benchmarks search.
 func (s *CompanyService) BenchmarkCompanySearch(ctx context.Context, testQueries []string, iterations int) (map[string]interface{}, error) {
 	if iterations <= 0 || iterations > 100 {
 		iterations = 10
@@ -2968,9 +3440,6 @@ func (s *CompanyService) BenchmarkCompanySearch(ctx context.Context, testQueries
 	return results, nil
 }
 
-// ---- Department search ----
-
-// SearchDepartmentsRequest defines department search.
 type SearchDepartmentsRequest struct {
 	Query           string `json:"q"`
 	Limit           int    `json:"limit,omitempty"`
@@ -2978,7 +3447,6 @@ type SearchDepartmentsRequest struct {
 	IncludeInactive bool   `json:"include_inactive,omitempty"`
 }
 
-// DepartmentSearchResponse is response.
 type DepartmentSearchResponse struct {
 	Departments []*models.DepartmentSearchResult `json:"departments"`
 	Total       int                              `json:"total"`
@@ -2987,7 +3455,6 @@ type DepartmentSearchResponse struct {
 	HasMore     bool                             `json:"has_more"`
 }
 
-// SearchDepartments searches departments in a company.
 func (s *CompanyService) SearchDepartments(ctx context.Context, companyID uuid.UUID, req *SearchDepartmentsRequest) (*DepartmentSearchResponse, error) {
 	if req.Limit <= 0 || req.Limit > 100 {
 		req.Limit = 20
@@ -2995,7 +3462,7 @@ func (s *CompanyService) SearchDepartments(ctx context.Context, companyID uuid.U
 	if req.Offset < 0 {
 		req.Offset = 0
 	}
-	depts, total, err := s.companyRepo.SearchDepartments(ctx, companyID, req.Query, req.Limit, req.Offset, req.IncludeInactive)
+	depts, total, err := s.companyRepo.SearchDepartments(ctx, s.pgClient.Pool(), companyID, req.Query, req.Limit, req.Offset, req.IncludeInactive)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
@@ -3013,17 +3480,13 @@ func (s *CompanyService) SearchDepartments(ctx context.Context, companyID uuid.U
 	}, nil
 }
 
-// GetDepartmentSuggestions returns department suggestions.
 func (s *CompanyService) GetDepartmentSuggestions(ctx context.Context, companyID uuid.UUID, prefix string, limit int) ([]*models.Department, error) {
 	if limit <= 0 || limit > 50 {
 		limit = 10
 	}
-	return s.companyRepo.GetDepartmentSuggestions(ctx, companyID, prefix, limit)
+	return s.companyRepo.GetDepartmentSuggestions(ctx, s.pgClient.Pool(), companyID, prefix, limit)
 }
 
-// ---- Employee hierarchy ----
-
-// GetUserHierarchy returns hierarchy for a user.
 func (s *CompanyService) GetUserHierarchy(ctx context.Context, userID uuid.UUID) ([]*models.EmployeeHierarchy, error) {
 	employees, err := s.companyRepo.GetEmployeesByUser(ctx, userID)
 	if err != nil {
@@ -3056,9 +3519,8 @@ func (s *CompanyService) GetUserHierarchy(ctx context.Context, userID uuid.UUID)
 	return hierarchy, nil
 }
 
-// GetEmployeeHierarchy returns hierarchy for a company.
 func (s *CompanyService) GetEmployeeHierarchy(ctx context.Context, companyID uuid.UUID) ([]*models.EmployeeHierarchy, error) {
-	employees, _, err := s.companyRepo.GetEmployeesByCompany(ctx, companyID, 1000, 0)
+	employees, _, err := s.companyRepo.GetEmployeesByCompany(ctx, s.pgClient.Pool(), companyID, 1000, 0)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
 	}
@@ -3089,52 +3551,31 @@ func (s *CompanyService) GetEmployeeHierarchy(ctx context.Context, companyID uui
 	return hierarchy, nil
 }
 
-// GetCompanyHierarchy returns company hierarchy.
 func (s *CompanyService) GetCompanyHierarchy(ctx context.Context, companyID uuid.UUID) ([]*models.EmployeeHierarchy, error) {
 	return s.companyRepo.GetEmployeeHierarchy(ctx, companyID)
 }
 
-// ---- Role-level queries ----
-
-// GetUsersWithPermission returns users with a permission.
 func (s *CompanyService) GetUsersWithPermission(ctx context.Context, companyID uuid.UUID, permissionName string, limit int) ([]*models.CompanyEmployee, error) {
-	return s.companyRepo.GetUsersWithPermission(ctx, companyID, permissionName, limit)
+	return s.companyRepo.GetUsersWithPermission(ctx, s.pgClient.Pool(), companyID, permissionName, limit)
 }
 
-// GetUsersByRoleLevel returns users by role level.
 func (s *CompanyService) GetUsersByRoleLevel(ctx context.Context, companyID uuid.UUID, minLevel, maxLevel int) ([]*models.CompanyEmployee, error) {
-	return s.companyRepo.GetUsersByRoleLevel(ctx, companyID, minLevel, maxLevel)
+	return s.companyRepo.GetUsersByRoleLevel(ctx, s.pgClient.Pool(), companyID, minLevel, maxLevel)
 }
 
-// ---- Utility ----
-
-func generateRandomString(n int) string {
-	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = letters[time.Now().UnixNano()%int64(len(letters))]
-	}
-	return string(b)
-}
-
-// ListPermissionsByModule retrieves all permissions for a given module.
 func (s *CompanyService) ListPermissionsByModule(ctx context.Context, module string) ([]*models.Permission, error) {
 	return s.companyRepo.GetPermissionsByModule(ctx, module)
 }
 
-// GetDepartmentLoad returns the number of employees per department.
 func (s *CompanyService) GetDepartmentLoad(ctx context.Context, companyID uuid.UUID) (map[string]int, error) {
 	return s.companyRepo.GetDepartmentLoad(ctx, companyID)
 }
 
-// GetRoleDistribution returns the count of employees per role.
 func (s *CompanyService) GetRoleDistribution(ctx context.Context, companyID uuid.UUID) (map[string]int, error) {
 	return s.companyRepo.GetRoleDistribution(ctx, companyID)
 }
 
-// AddDepartment creates a new department in a company and auto‑assigns it to the owner role.
 func (s *CompanyService) AddDepartment(ctx context.Context, companyID uuid.UUID, departmentName string, systemDepartmentID uuid.UUID) (*models.Department, error) {
-	// Idempotency
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
 		idempKey = fmt.Sprintf("add_dept:%s:%s", companyID.String(), departmentName)
@@ -3146,14 +3587,12 @@ func (s *CompanyService) AddDepartment(ctx context.Context, companyID uuid.UUID,
 		return &cachedDept, nil
 	}
 
-	// Validate system department
-	systemDept, err := s.companyRepo.GetSystemDepartment(ctx, systemDepartmentID)
+	systemDept, err := s.companyRepo.GetSystemDepartment(ctx, s.pgClient.Pool(), systemDepartmentID)
 	if err != nil {
 		return nil, fmt.Errorf("%w: system department not found", appErrors.ErrNotFound)
 	}
 
-	// Check duplicate name (optional, repository may enforce unique)
-	existing, _, err := s.companyRepo.GetDepartmentsByCompany(ctx, companyID, 1, 0)
+	existing, _, err := s.companyRepo.GetDepartmentsByCompany(ctx, s.pgClient.Pool(), companyID, 1, 0)
 	if err == nil {
 		for _, d := range existing {
 			if strings.EqualFold(d.DepartmentName, departmentName) {
@@ -3171,21 +3610,16 @@ func (s *CompanyService) AddDepartment(ctx context.Context, companyID uuid.UUID,
 		CreatedAt:          time.Now().UTC(),
 		UpdatedAt:          time.Now().UTC(),
 	}
-
 	if err := s.companyRepo.CreateDepartment(ctx, department); err != nil {
 		return nil, fmt.Errorf("%w: failed to create department", appErrors.ErrInternal)
 	}
 
-	// Auto-assign to owner role (non-critical)
 	ownerRole, err := s.companyRepo.GetSystemRoleByLevel(ctx, companyID, 1000)
 	if err == nil {
 		_ = s.companyRepo.CreateRoleDepartment(ctx, ownerRole.RoleID, department.DepartmentID)
 	}
 
-	// Store idempotency
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, department)
-
-	// Audit
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "department", "add_department", "admin",
 			nil, "admin", nil, nil, nil, map[string]interface{}{
@@ -3196,68 +3630,288 @@ func (s *CompanyService) AddDepartment(ctx context.Context, companyID uuid.UUID,
 				"ip_address":        ip,
 			})
 	}
-
 	return department, nil
 }
 
-// GetRoleDepartments returns departments for a role.
 func (s *CompanyService) GetRoleDepartmentsForPermissions(ctx context.Context, roleID uuid.UUID) ([]*models.Department, error) {
-	return s.companyRepo.GetRoleDepartmentsForPermission(ctx, roleID)
+	return s.companyRepo.GetRoleDepartmentsForPermission(ctx, s.pgClient.Pool(), roleID)
 }
 
-// UpdateEmployee updates an existing employee's details.
-// It validates role, position, reports_to, and active status against company rules.
-func (s *CompanyService) UpdateEmployee(ctx context.Context, req *UpdateEmployeeRequest) error {
-	// 1. Fetch existing employee to verify existence and get current values
-	existing, err := s.companyRepo.GetEmployee(ctx, req.CompanyID, req.UserID)
-	if err != nil {
-		if errors.Is(err, appErrors.ErrNotFound) {
-			return fmt.Errorf("%w: employee not found", appErrors.ErrNotFound)
-		}
-		return fmt.Errorf("%w: failed to get employee", appErrors.ErrInternal)
-	}
+type UpdateCompanyRequest struct {
+	CompanyName             *string `json:"company_name,omitempty"`
+	DataRegion              *string `json:"data_region,omitempty"`
+	FinancialYearStartMonth *int    `json:"financial_year_start_month,omitempty"`
+	MaxEmployees            *int    `json:"max_employees,omitempty"`
+	MaxLocations            *int    `json:"max_locations,omitempty"`
+	IsActive                *bool   `json:"is_active,omitempty"`
+	SubscriptionPlanCode    *string `json:"subscription_plan_code,omitempty"`
+	SubscriptionStatus      *string `json:"subscription_status,omitempty"`
+	GracePeriodDays         *int    `json:"grace_period_days,omitempty"`
+	ExtendByMonths          *int    `json:"extend_by_months,omitempty"`
+	ExtendByDays            *int    `json:"extend_by_days,omitempty"`
+	SubscriptionStartDate   *string `json:"subscription_start_date,omitempty"`
+	SubscriptionEndDate     *string `json:"subscription_end_date,omitempty"`
+	TrialStartDate          *string `json:"trial_start_date,omitempty"`
+	TrialEndDate            *string `json:"trial_end_date,omitempty"`
+}
 
-	// 2. Prepare update map
-	updates := make(map[string]interface{})
-	if req.EmployeeID != nil {
-		updates["employee_id"] = *req.EmployeeID
+func (s *CompanyService) UpdateCompanyWithOptions(
+	ctx context.Context,
+	companyID uuid.UUID,
+	req *UpdateCompanyRequest,
+	updatedBy uuid.UUID,
+) error {
+	company, err := s.companyRepo.GetCompany(ctx, companyID)
+	if err != nil {
+		return err
 	}
-	if req.RoleID != nil {
-		updates["role_id"] = *req.RoleID
+	before := &models.Company{}
+	*before = *company
+
+	if req.CompanyName != nil {
+		company.CompanyName = *req.CompanyName
 	}
-	if req.PositionID != nil {
-		updates["position_id"] = *req.PositionID
+	if req.DataRegion != nil {
+		company.DataRegion = *req.DataRegion
 	}
-	if req.ReportsTo != nil {
-		updates["reports_to"] = *req.ReportsTo
+	if req.FinancialYearStartMonth != nil {
+		if *req.FinancialYearStartMonth < 1 || *req.FinancialYearStartMonth > 12 {
+			return fmt.Errorf("%w: financial_year_start_month must be between 1 and 12", appErrors.ErrInvalidInput)
+		}
+		company.FinancialYearStartMonth = *req.FinancialYearStartMonth
+	}
+	if req.MaxEmployees != nil {
+		if *req.MaxEmployees < 1 {
+			return fmt.Errorf("%w: max_employees must be at least 1", appErrors.ErrInvalidInput)
+		}
+		company.MaxEmployees = *req.MaxEmployees
+	}
+	if req.MaxLocations != nil {
+		if *req.MaxLocations < 1 || *req.MaxLocations > 500 {
+			return fmt.Errorf("%w: max_locations must be between 1 and 500", appErrors.ErrInvalidInput)
+		}
+		company.MaxLocations = *req.MaxLocations
 	}
 	if req.IsActive != nil {
-		updates["is_active"] = *req.IsActive
-	}
-	// No fields to update
-	if len(updates) == 0 {
-		return fmt.Errorf("%w: no fields to update", appErrors.ErrInvalidInput)
+		company.IsActive = *req.IsActive
 	}
 
-	// 3. Validate role if provided
-	if req.RoleID != nil {
-		role, err := s.companyRepo.GetRole(ctx, *req.RoleID)
+	if req.SubscriptionPlanCode != nil && *req.SubscriptionPlanCode != "" {
+		plan, err := s.planService.GetPlanByCode(ctx, *req.SubscriptionPlanCode)
 		if err != nil {
-			return fmt.Errorf("%w: role not found", appErrors.ErrNotFound)
+			return fmt.Errorf("%w: plan with code '%s' not found", appErrors.ErrNotFound, *req.SubscriptionPlanCode)
 		}
-		if role.CompanyID != req.CompanyID {
-			return fmt.Errorf("%w: role does not belong to company", appErrors.ErrInvalidInput)
+		company.SubscriptionPlanID = &plan.PlanID
+		company.SubscriptionAmount = plan.Price
+	}
+	if req.SubscriptionStatus != nil {
+		validStatuses := map[string]bool{
+			models.SubscriptionStatusPending:   true,
+			models.SubscriptionStatusTrial:     true,
+			models.SubscriptionStatusActive:    true,
+			models.SubscriptionStatusPastDue:   true,
+			models.SubscriptionStatusExpired:   true,
+			models.SubscriptionStatusCancelled: true,
 		}
-		// Check if role has departments (optional but recommended)
-		roleDepts, err := s.companyRepo.GetRoleDepartments(ctx, *req.RoleID)
-		if err != nil || len(roleDepts) == 0 {
-			return fmt.Errorf("%w: role is not assigned to any department", appErrors.ErrInvalidState)
+		if !validStatuses[*req.SubscriptionStatus] {
+			return fmt.Errorf("%w: invalid subscription status '%s'", appErrors.ErrInvalidInput, *req.SubscriptionStatus)
 		}
+		company.SubscriptionStatus = *req.SubscriptionStatus
+	}
+	if req.GracePeriodDays != nil {
+		if *req.GracePeriodDays < 0 {
+			return fmt.Errorf("%w: grace_period_days cannot be negative", appErrors.ErrInvalidInput)
+		}
+		company.GracePeriodDays = *req.GracePeriodDays
+	}
+	if req.ExtendByMonths != nil || req.ExtendByDays != nil {
+		months := 0
+		days := 0
+		if req.ExtendByMonths != nil {
+			months = *req.ExtendByMonths
+		}
+		if req.ExtendByDays != nil {
+			days = *req.ExtendByDays
+		}
+		if company.SubscriptionEndDate == nil {
+			now := time.Now().UTC()
+			company.SubscriptionEndDate = &now
+		}
+		newEnd := company.SubscriptionEndDate.AddDate(0, months, days)
+		company.SubscriptionEndDate = &newEnd
+	}
+	if req.SubscriptionStartDate != nil {
+		t, err := time.Parse(time.RFC3339, *req.SubscriptionStartDate)
+		if err != nil {
+			return fmt.Errorf("%w: invalid subscription_start_date format, use RFC3339", appErrors.ErrInvalidInput)
+		}
+		company.SubscriptionStartDate = &t
+	}
+	if req.SubscriptionEndDate != nil {
+		t, err := time.Parse(time.RFC3339, *req.SubscriptionEndDate)
+		if err != nil {
+			return fmt.Errorf("%w: invalid subscription_end_date format, use RFC3339", appErrors.ErrInvalidInput)
+		}
+		company.SubscriptionEndDate = &t
+	}
+	if req.TrialStartDate != nil {
+		t, err := time.Parse(time.RFC3339, *req.TrialStartDate)
+		if err != nil {
+			return fmt.Errorf("%w: invalid trial_start_date format, use RFC3339", appErrors.ErrInvalidInput)
+		}
+		company.TrialStartDate = &t
+	}
+	if req.TrialEndDate != nil {
+		t, err := time.Parse(time.RFC3339, *req.TrialEndDate)
+		if err != nil {
+			return fmt.Errorf("%w: invalid trial_end_date format, use RFC3339", appErrors.ErrInvalidInput)
+		}
+		company.TrialEndDate = &t
 	}
 
-	// 4. Validate position if provided
+	company.UpdatedAt = time.Now().UTC()
+	if err := s.companyRepo.UpdateCompany(ctx, company); err != nil {
+		return fmt.Errorf("%w: failed to update company", appErrors.ErrInternal)
+	}
+	s.InvalidateCompanyStatusCache(ctx, companyID)
+
+	if s.auditService != nil {
+		ip, _ := ctx.Value("ip_address").(string)
+		beforeJSON, _ := json.Marshal(before)
+		afterJSON, _ := json.Marshal(company)
+		_ = s.auditService.LogAction(ctx, nil, nil, "company", "update_details", "company",
+			&companyID, "admin", &updatedBy, beforeJSON, afterJSON, map[string]interface{}{
+				"updated_by": updatedBy.String(),
+				"ip_address": ip,
+			})
+	}
+	return nil
+}
+
+func pointerTime(t time.Time) *time.Time {
+	return &t
+}
+
+func generateRandomString(n int) string {
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = letters[time.Now().UnixNano()%int64(len(letters))]
+	}
+	return string(b)
+}
+
+// ============================================================
+// AddMember — unified member creation with optional location
+// assignment. Writes are wrapped in a single transaction so the
+// deferred SELECTED-scope trigger sees a consistent state at COMMIT.
+// ============================================================
+
+// ============================================================
+// AddMemberRequest — unified member creation payload
+// ============================================================
+type AddMemberRequest struct {
+	CompanyID           uuid.UUID                             `json:"-"`
+	MemberType          string                                `json:"member_type,omitempty" validate:"omitempty,oneof=employee manager"`
+	PhoneNumber         string                                `json:"phone" validate:"required"`
+	Username            string                                `json:"username" validate:"required,min=3,max=100,alphanum"`
+	FullName            string                                `json:"full_name" validate:"required,max=255"`
+	EmployeeID          string                                `json:"employee_id,omitempty"`
+	RoleID              uuid.UUID                             `json:"role_id" validate:"required"`
+	ReportsTo           *uuid.UUID                            `json:"reports_to,omitempty"`
+	PositionID          *uuid.UUID                            `json:"position_id,omitempty"`
+	PrimaryLocationID   *uuid.UUID                            `json:"primary_location_id,omitempty"`
+	LocationAccessScope string                                `json:"location_access_scope,omitempty" validate:"omitempty,oneof=PRIMARY SELECTED ALL"`
+	SelectedLocations   []models.EmployeeLocationGrantRequest `json:"selected_locations,omitempty"`
+	SelectedLocationIDs []uuid.UUID                           `json:"selected_location_ids,omitempty"`
+
+	// ============================================================
+	// HR profile — all optional at hire; HR can fill later.
+	// ============================================================
+	DateOfBirth      *time.Time `json:"date_of_birth,omitempty"`
+	Gender           *string    `json:"gender,omitempty"`
+	MaritalStatus    *string    `json:"marital_status,omitempty"`
+	Nationality      *string    `json:"nationality,omitempty"`
+	EmploymentType   *string    `json:"employment_type,omitempty"`
+	EmploymentStatus *string    `json:"employment_status,omitempty"`
+	ProbationEndDate *time.Time `json:"probation_end_date,omitempty"`
+	ConfirmationDate *time.Time `json:"confirmation_date,omitempty"`
+	Grade            *string    `json:"grade,omitempty"`
+	CostCenterID     *uuid.UUID `json:"cost_center_id,omitempty"` // 👈 FK to accounting.cost_centers
+	CostCenter       *string    `json:"cost_center,omitempty"`    // legacy text — optional
+	TaxID            *string    `json:"tax_id,omitempty"`
+	SocialSecurityID *string    `json:"social_security_id,omitempty"`
+	Email            *string    `json:"email,omitempty"`
+}
+
+// ============================================================
+// AddMember — unified member creation.
+//
+// Writes in ONE transaction:
+//   - users               (create or reuse by phone)
+//   - company_employees   (roster row)
+//   - employee_profiles   (HR dossier — stub or full)
+//   - employee_location_* (grants + scope + history)
+//
+// Any failure rolls back the whole hire — no orphan users, no
+// roster rows without profiles, no partial location grants.
+// ============================================================
+func (s *CompanyService) AddMember(ctx context.Context, req *AddMemberRequest) error {
+	if req.MemberType == "" {
+		req.MemberType = "employee"
+	}
+	if req.MemberType != "employee" && req.MemberType != "manager" {
+		return fmt.Errorf("%w: invalid member_type '%s'", appErrors.ErrInvalidInput, req.MemberType)
+	}
+
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("add_member:%s:%s:%s", req.CompanyID.String(), req.MemberType, req.PhoneNumber)
+	}
+	ip, _ := ctx.Value("ip_address").(string)
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	company, err := s.companyRepo.GetCompany(ctx, req.CompanyID)
+	if err != nil {
+		return fmt.Errorf("%w: company not found", appErrors.ErrNotFound)
+	}
+	if !company.IsActive {
+		return fmt.Errorf("%w: company is not active", appErrors.ErrInvalidState)
+	}
+
+	activeCount, err := s.companyRepo.GetActiveEmployeeCount(ctx, req.CompanyID)
+	if err != nil {
+		return fmt.Errorf("%w: failed to get active employee count", appErrors.ErrInternal)
+	}
+	if activeCount >= company.MaxEmployees {
+		return fmt.Errorf("%w: max employee limit reached (%d/%d)", appErrors.ErrConflict, activeCount, company.MaxEmployees)
+	}
+
+	role, err := s.companyRepo.GetRole(ctx, req.RoleID)
+	if err != nil {
+		return fmt.Errorf("%w: role not found", appErrors.ErrNotFound)
+	}
+	if role.CompanyID != req.CompanyID {
+		return fmt.Errorf("%w: role does not belong to company", appErrors.ErrInvalidInput)
+	}
+	if req.MemberType == "manager" && role.RoleLevel < 500 {
+		return fmt.Errorf("%w: role level must be 500 or higher for managers", appErrors.ErrInvalidInput)
+	}
+
+	roleDepartments, err := s.companyRepo.GetRoleDepartments(ctx, req.RoleID)
+	if err != nil {
+		return fmt.Errorf("%w: failed to get role departments", appErrors.ErrInternal)
+	}
+	if len(roleDepartments) == 0 {
+		return fmt.Errorf("%w: role is not assigned to any department", appErrors.ErrInvalidState)
+	}
+
 	if req.PositionID != nil {
-		position, err := s.companyRepo.GetPosition(ctx, *req.PositionID)
+		position, err := s.companyRepo.GetPosition(ctx, s.pgClient.Pool(), *req.PositionID)
 		if err != nil {
 			return fmt.Errorf("%w: position not found", appErrors.ErrNotFound)
 		}
@@ -3265,76 +3919,297 @@ func (s *CompanyService) UpdateEmployee(ctx context.Context, req *UpdateEmployee
 			return fmt.Errorf("%w: position does not belong to company", appErrors.ErrInvalidInput)
 		}
 		if !position.IsOpen {
-			return fmt.Errorf("%w: position is not open for assignment", appErrors.ErrInvalidState)
-		}
-
-		// Determine which role to check for department compatibility
-		var roleID uuid.UUID
-		if req.RoleID != nil {
-			roleID = *req.RoleID
-		} else {
-			roleID = existing.RoleID // use current role
-		}
-
-		roleDepts, err := s.companyRepo.GetRoleDepartments(ctx, roleID)
-		if err != nil {
-			return err
+			return fmt.Errorf("%w: position is not open", appErrors.ErrInvalidState)
 		}
 		found := false
-		for _, rd := range roleDepts {
+		for _, rd := range roleDepartments {
 			if rd.DepartmentID == position.DepartmentID {
 				found = true
 				break
 			}
 		}
 		if !found {
-			return fmt.Errorf("%w: position's department not assigned to the role", appErrors.ErrInvalidInput)
+			return fmt.Errorf("%w: position's department not assigned to role", appErrors.ErrInvalidInput)
 		}
 	}
 
-	// 5. Validate reports_to if provided
-	if req.ReportsTo != nil {
-		if *req.ReportsTo == req.UserID {
-			return fmt.Errorf("%w: employee cannot report to themselves", appErrors.ErrInvalidInput)
-		}
-		// Check if the reports-to user is an active employee of the same company
-		isActive, err := s.companyRepo.IsUserActiveEmployee(ctx, req.CompanyID, *req.ReportsTo)
-		if err != nil || !isActive {
-			return fmt.Errorf("%w: reports-to employee not found or not active", appErrors.ErrInvalidInput)
-		}
+	if err := s.validateReportsTo(ctx, req.CompanyID, req.ReportsTo); err != nil {
+		return fmt.Errorf("%w: %v", appErrors.ErrInvalidInput, err)
 	}
 
-	// 6. If deactivating, prevent deactivation if they are a manager of active employees? (optional)
-	// This is a business rule you may or may not want to enforce.
-	// For now, we allow deactivation.
-
-	// 7. Perform update
-	if err := s.companyRepo.UpdateEmployeeOfCompany(ctx, req.CompanyID, req.UserID, updates); err != nil {
-		return fmt.Errorf("%w: failed to update employee", appErrors.ErrInternal)
+	employeeID := req.EmployeeID
+	if employeeID == "" {
+		prefix := "EMP"
+		if req.MemberType == "manager" {
+			prefix = "MGR"
+		}
+		employeeID = fmt.Sprintf("%s-%s", prefix, uuid.New().String()[:8])
 	}
+	reportsTo := req.ReportsTo
+	if reportsTo == nil {
+		reportsTo = &company.OwnerUserID
+	}
+	now := time.Now().UTC()
 
-	// 8. Audit logging
-	if s.auditService != nil {
-		ip, _ := ctx.Value("ip_address").(string)
-		_ = s.auditService.LogAction(ctx, nil, nil, "employee", "update_employee", "admin",
-			nil, "admin", nil, nil, nil, map[string]interface{}{
-				"company_id": req.CompanyID.String(),
-				"user_id":    req.UserID.String(),
-				"updates":    updates,
-				"ip_address": ip,
+	hasLocationInput := req.PrimaryLocationID != nil ||
+		req.LocationAccessScope != "" ||
+		len(req.SelectedLocations) > 0 ||
+		len(req.SelectedLocationIDs) > 0
+
+	var resolvedUser *models.User
+
+	txErr := s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
+		// 7a. Resolve or create the user INSIDE the tx.
+		user, uerr := s.userService.GetUserByPhoneTx(ctx, tx, req.PhoneNumber)
+		if uerr != nil && !errors.Is(uerr, appErrors.ErrNotFound) {
+			return fmt.Errorf("%w: failed to look up user by phone: %v", appErrors.ErrInternal, uerr)
+		}
+		if uerr == nil {
+			resolvedUser = user
+		} else {
+			created, cerr := s.userService.CreateUser(ctx, tx, &UserCreateRequest{
+				Username:          req.Username,
+				FullName:          req.FullName,
+				PhoneNumber:       req.PhoneNumber,
+				DeviceID:          "company-assigned",
+				DeviceFingerprint: "company-assigned",
+				DataRegion:        company.DataRegion,
+				ConsentAgreed:     true,
+				ConsentVersion:    "v1.0",
+				KYCStatus:         models.KYCStatusPending,
+				KYCLevel:          models.KYCLevelBasic,
 			})
+			if cerr != nil {
+				return fmt.Errorf("%w: failed to create user: %v", appErrors.ErrInternal, cerr)
+			}
+			resolvedUser = created
+		}
+
+		// 7b. Duplicate employee check inside the tx.
+		existingEmp, err := s.companyRepo.GetEmployee(ctx, tx, req.CompanyID, resolvedUser.UserID)
+		if err == nil && existingEmp != nil && existingEmp.IsActive {
+			return fmt.Errorf("%w: user is already an active employee", appErrors.ErrDuplicate)
+		}
+		if err != nil && !errors.Is(err, appErrors.ErrNotFound) {
+			return fmt.Errorf("%w: failed to check existing employee: %v", appErrors.ErrInternal, err)
+		}
+
+		// 7c. Insert company_employees row.
+		emp := &models.CompanyEmployee{
+			CompanyID:  req.CompanyID,
+			UserID:     resolvedUser.UserID,
+			EmployeeID: employeeID,
+			RoleID:     req.RoleID,
+			PositionID: req.PositionID,
+			HireDate:   now,
+			IsActive:   true,
+			ReportsTo:  reportsTo,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		}
+		if err := s.companyRepo.CreateEmployee(ctx, tx, emp); err != nil {
+			return fmt.Errorf("%w: failed to add member: %v", appErrors.ErrInternal, err)
+		}
+
+		// 7c-bis. Insert employee_profiles in the SAME tx.
+		status := "active"
+		if req.EmploymentStatus != nil && *req.EmploymentStatus != "" {
+			status = *req.EmploymentStatus
+		}
+		profile := &hrEmployee.EmployeeProfile{
+			EmployeeProfileID: uuid.New(),
+			UserID:            resolvedUser.UserID,
+			CompanyID:         req.CompanyID,
+			DateOfBirth:       req.DateOfBirth,
+			Gender:            req.Gender,
+			MaritalStatus:     req.MaritalStatus,
+			Nationality:       req.Nationality,
+			EmploymentType:    req.EmploymentType,
+			EmploymentStatus:  &status,
+			ProbationEndDate:  req.ProbationEndDate,
+			ConfirmationDate:  req.ConfirmationDate,
+			Grade:             req.Grade,
+			CostCenterID:      req.CostCenterID, // 👈 FK
+			CostCenter:        req.CostCenter,   // legacy text
+			TaxID:             req.TaxID,
+			SocialSecurityID:  req.SocialSecurityID,
+			Email:             req.Email,
+			CreatedAt:         now,
+			UpdatedAt:         now,
+		}
+		if err := s.employeeRepo.CreateEmployeeProfileTx(ctx, tx, profile); err != nil {
+			return fmt.Errorf("%w: failed to create employee profile: %v", appErrors.ErrInternal, err)
+		}
+
+		// 7d. Location assignment.
+		if hasLocationInput {
+			if err := s.assignMemberLocationsTx(ctx, tx, req.CompanyID, resolvedUser.UserID, req); err != nil {
+				return fmt.Errorf("%w: %v", appErrors.ErrInvalidInput, err)
+			}
+		}
+		return nil
+	})
+	if txErr != nil {
+		return txErr
+	}
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+
+	if s.auditService != nil && resolvedUser != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "employee", "add_member", "admin",
+			nil, "admin", nil, nil, nil, map[string]interface{}{
+				"company_id":   req.CompanyID.String(),
+				"user_id":      resolvedUser.UserID.String(),
+				"role_id":      req.RoleID.String(),
+				"member_type":  req.MemberType,
+				"has_location": hasLocationInput,
+				"has_profile":  true,
+				"ip_address":   ip,
+			})
+	}
+	return nil
+}
+
+// assignMemberLocationsTx runs the location assignment for a newly created
+// member. Grants are inserted BEFORE the scope flip so the deferred trigger
+// sees a valid intermediate state (though the deferred check only fires at
+// COMMIT anyway).
+func (s *CompanyService) assignMemberLocationsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	companyID, userID uuid.UUID,
+	req *AddMemberRequest,
+) error {
+	// 1. Resolve effective scope
+	scope := req.LocationAccessScope
+	if scope == "" {
+		if req.PrimaryLocationID != nil {
+			scope = models.LocationScopePrimary
+		} else {
+			scope = models.LocationScopeAll
+		}
+	}
+	if scope != models.LocationScopePrimary &&
+		scope != models.LocationScopeSelected &&
+		scope != models.LocationScopeAll {
+		return fmt.Errorf("%w: invalid location_access_scope '%s'", appErrors.ErrInvalidInput, scope)
+	}
+
+	// 2. Validate primary location (optional)
+	var primaryLocID uuid.UUID
+	if req.PrimaryLocationID != nil && *req.PrimaryLocationID != uuid.Nil {
+		loc, err := s.locationRepo.GetLocation(ctx, tx, *req.PrimaryLocationID)
+		if err != nil {
+			if errors.Is(err, appErrors.ErrNotFound) {
+				return fmt.Errorf("%w: primary location not found", appErrors.ErrNotFound)
+			}
+			return fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+		}
+		if loc.CompanyID != companyID {
+			return fmt.Errorf("%w: primary location does not belong to company", appErrors.ErrInvalidInput)
+		}
+		if !loc.IsActive {
+			return fmt.Errorf("%w: primary location is not active", appErrors.ErrInvalidInput)
+		}
+		primaryLocID = *req.PrimaryLocationID
+	}
+	if scope == models.LocationScopePrimary && primaryLocID == uuid.Nil {
+		return fmt.Errorf("%w: primary_location_id required for PRIMARY scope", appErrors.ErrInvalidInput)
+	}
+
+	// 3. Grants FIRST — insert into employee_location_access before the
+	//    scope flip on company_employees.
+	if scope == models.LocationScopeSelected {
+		grants, err := s.resolveMemberGrantsTx(ctx, tx, companyID, req)
+		if err != nil {
+			return err
+		}
+		if len(grants) == 0 {
+			return fmt.Errorf("%w: at least one selected location required for SELECTED scope", appErrors.ErrInvalidInput)
+		}
+		for locID, level := range grants {
+			access := &models.EmployeeLocationAccess{
+				CompanyID:   companyID,
+				UserID:      userID,
+				LocationID:  locID,
+				AccessLevel: level,
+				GrantedAt:   time.Now().UTC(),
+			}
+			if err := s.locationRepo.AddLocationAccess(ctx, tx, access); err != nil {
+				return fmt.Errorf("%w: failed to grant access to %s: %v", appErrors.ErrInternal, locID, err)
+			}
+		}
+	}
+
+	// 4. THEN flip scope + primary on company_employees.
+	if err := s.companyRepo.UpdateEmployeeLocationSettings(ctx, tx, companyID, userID, &primaryLocID, scope); err != nil {
+		return fmt.Errorf("%w: failed to set location settings: %v", appErrors.ErrInternal, err)
+	}
+
+	// 5. History row.
+	if primaryLocID != uuid.Nil {
+		history := &models.EmployeeLocationHistory{
+			ID:           uuid.New(),
+			UserID:       userID,
+			CompanyID:    companyID,
+			LocationID:   primaryLocID,
+			StartDate:    time.Now().UTC(),
+			EndDate:      nil,
+			ChangeReason: "initial assignment on member creation",
+			CreatedAt:    time.Now().UTC(),
+		}
+		if err := s.locationRepo.AddLocationHistory(ctx, tx, history); err != nil {
+			return fmt.Errorf("%w: failed to write location history: %v", appErrors.ErrInternal, err)
+		}
 	}
 
 	return nil
 }
 
-// UpdateEmployeeRequest defines the fields that can be updated.
-type UpdateEmployeeRequest struct {
-	CompanyID  uuid.UUID
-	UserID     uuid.UUID
-	EmployeeID *string
-	RoleID     *uuid.UUID
-	PositionID *uuid.UUID
-	ReportsTo  *uuid.UUID
-	IsActive   *bool
+// resolveMemberGrantsTx validates each selected location belongs to the
+// company and is active, and returns a merged map[locationID]accessLevel.
+func (s *CompanyService) resolveMemberGrantsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	companyID uuid.UUID,
+	req *AddMemberRequest,
+) (map[uuid.UUID]string, error) {
+	out := make(map[uuid.UUID]string, len(req.SelectedLocations)+len(req.SelectedLocationIDs))
+
+	for _, id := range req.SelectedLocationIDs {
+		if id != uuid.Nil {
+			out[id] = models.AccessLevelView
+		}
+	}
+	for _, g := range req.SelectedLocations {
+		if g.LocationID == uuid.Nil {
+			continue
+		}
+		level := g.AccessLevel
+		if level == "" {
+			level = models.AccessLevelView
+		}
+		if level != models.AccessLevelView && level != models.AccessLevelManage {
+			return nil, fmt.Errorf("%w: invalid access_level '%s'", appErrors.ErrInvalidInput, level)
+		}
+		out[g.LocationID] = level
+	}
+
+	for locID := range out {
+		loc, err := s.locationRepo.GetLocation(ctx, tx, locID)
+		if err != nil {
+			if errors.Is(err, appErrors.ErrNotFound) {
+				return nil, fmt.Errorf("%w: selected location %s not found", appErrors.ErrInvalidInput, locID)
+			}
+			return nil, fmt.Errorf("%w: %v", appErrors.ErrInternal, err)
+		}
+		if loc.CompanyID != companyID {
+			return nil, fmt.Errorf("%w: selected location %s does not belong to company", appErrors.ErrInvalidInput, locID)
+		}
+		if !loc.IsActive {
+			return nil, fmt.Errorf("%w: selected location %s is not active", appErrors.ErrInvalidInput, locID)
+		}
+	}
+
+	return out, nil
 }

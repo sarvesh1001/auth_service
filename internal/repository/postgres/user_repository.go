@@ -44,7 +44,7 @@ func (r *UserRepositoryImpl) Close() error {
 // -----------------------------------------------------------------------------
 
 // SearchUsers performs a full‑text search on users.
-func (r *UserRepositoryImpl) SearchUsers(ctx context.Context, req *models.UserSearchRequest) ([]*models.UserSearchResult, int, error) {
+func (r *UserRepositoryImpl) SearchUsers(ctx context.Context, db client.DBTX, req *models.UserSearchRequest) ([]*models.UserSearchResult, int, error) {
 	if req.Limit <= 0 || req.Limit > 100 {
 		req.Limit = 50
 	}
@@ -88,7 +88,7 @@ func (r *UserRepositoryImpl) SearchUsers(ctx context.Context, req *models.UserSe
 		req.Offset,
 	}
 
-	rows, err := r.client.Query(ctx, query, args...)
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to search users: %w", err)
 	}
@@ -125,14 +125,14 @@ func (r *UserRepositoryImpl) SearchUsers(ctx context.Context, req *models.UserSe
 		return nil, 0, fmt.Errorf("error iterating search results: %w", err)
 	}
 
-	totalCount, err := r.countSearchResults(ctx, req.Query, req.Filters)
+	totalCount, err := r.countSearchResults(ctx, db, req.Query, req.Filters)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to count search results: %w", err)
 	}
 	return results, totalCount, nil
 }
 
-func (r *UserRepositoryImpl) countSearchResults(ctx context.Context, query string, filters *models.UserSearchFilters) (int, error) {
+func (r *UserRepositoryImpl) countSearchResults(ctx context.Context, db client.DBTX, query string, filters *models.UserSearchFilters) (int, error) {
 	conditions := []string{}
 	args := []interface{}{}
 	argCounter := 1
@@ -178,7 +178,7 @@ func (r *UserRepositoryImpl) countSearchResults(ctx context.Context, query strin
 	}
 	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM users %s", whereClause)
 	var totalCount int
-	err := r.client.QueryRow(ctx, countQuery, args...).Scan(&totalCount)
+	err := db.QueryRowContext(ctx, countQuery, args...).Scan(&totalCount)
 	if err != nil {
 		return 0, fmt.Errorf("failed to count search results: %w", err)
 	}
@@ -186,7 +186,7 @@ func (r *UserRepositoryImpl) countSearchResults(ctx context.Context, query strin
 }
 
 // SearchUsersByUsername searches users by username (partial match).
-func (r *UserRepositoryImpl) SearchUsersByUsername(ctx context.Context, username string, limit int) ([]*models.User, error) {
+func (r *UserRepositoryImpl) SearchUsersByUsername(ctx context.Context, db client.DBTX, username string, limit int) ([]*models.User, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
@@ -200,7 +200,7 @@ func (r *UserRepositoryImpl) SearchUsersByUsername(ctx context.Context, username
 		WHERE username ILIKE $1
 		ORDER BY similarity(username, $1) DESC, username ASC
 		LIMIT $2`
-	rows, err := r.client.Query(ctx, query, "%"+username+"%", limit)
+	rows, err := db.QueryContext(ctx, query, "%"+username+"%", limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to search users by username: %w", err)
 	}
@@ -209,7 +209,7 @@ func (r *UserRepositoryImpl) SearchUsersByUsername(ctx context.Context, username
 }
 
 // SearchUsersByFullName searches users by full name (partial match).
-func (r *UserRepositoryImpl) SearchUsersByFullName(ctx context.Context, fullName string, limit int) ([]*models.User, error) {
+func (r *UserRepositoryImpl) SearchUsersByFullName(ctx context.Context, db client.DBTX, fullName string, limit int) ([]*models.User, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
@@ -223,7 +223,7 @@ func (r *UserRepositoryImpl) SearchUsersByFullName(ctx context.Context, fullName
 		WHERE full_name ILIKE $1
 		ORDER BY similarity(full_name, $1) DESC, full_name ASC
 		LIMIT $2`
-	rows, err := r.client.Query(ctx, query, "%"+fullName+"%", limit)
+	rows, err := db.QueryContext(ctx, query, "%"+fullName+"%", limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to search users by full name: %w", err)
 	}
@@ -232,12 +232,12 @@ func (r *UserRepositoryImpl) SearchUsersByFullName(ctx context.Context, fullName
 }
 
 // GetUserSuggestions returns username suggestions.
-func (r *UserRepositoryImpl) GetUserSuggestions(ctx context.Context, prefix string, limit int) ([]*models.UserSuggestion, error) {
+func (r *UserRepositoryImpl) GetUserSuggestions(ctx context.Context, db client.DBTX, prefix string, limit int) ([]*models.UserSuggestion, error) {
 	if limit <= 0 || limit > 20 {
 		limit = 10
 	}
 	query := `SELECT username, full_name, user_id FROM get_user_suggestions($1, $2)`
-	rows, err := r.client.Query(ctx, query, prefix, limit)
+	rows, err := db.QueryContext(ctx, query, prefix, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user suggestions: %w", err)
 	}
@@ -254,7 +254,7 @@ func (r *UserRepositoryImpl) GetUserSuggestions(ctx context.Context, prefix stri
 }
 
 // GetUserByUsername returns a user by exact username. Returns apperrors.ErrNotFound if not found.
-func (r *UserRepositoryImpl) GetUserByUsername(ctx context.Context, username string) (*models.User, error) {
+func (r *UserRepositoryImpl) GetUserByUsername(ctx context.Context, db client.DBTX, username string) (*models.User, error) {
 	query := `
 		SELECT
 			user_id, username, full_name, phone_hash, phone_encrypted,
@@ -262,7 +262,7 @@ func (r *UserRepositoryImpl) GetUserByUsername(ctx context.Context, username str
 			kyc_status, kyc_level, kyc_verified_at, is_verified, is_active,
 			data_region, created_at, updated_at, last_login
 		FROM users WHERE username = $1`
-	rows, err := r.client.Query(ctx, query, username)
+	rows, err := db.QueryContext(ctx, query, username)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user by username: %w", err)
 	}
@@ -274,9 +274,9 @@ func (r *UserRepositoryImpl) GetUserByUsername(ctx context.Context, username str
 }
 
 // GetUserByUsernameExact is an alias for GetUserByUsername.
-func (r *UserRepositoryImpl) GetUserByUsernameExact(ctx context.Context, username string) (*models.UserByUsername, error) {
+func (r *UserRepositoryImpl) GetUserByUsernameExact(ctx context.Context, db client.DBTX, username string) (*models.UserByUsername, error) {
 	query := `SELECT * FROM find_user_by_username($1)`
-	rows, err := r.client.Query(ctx, query, username)
+	rows, err := db.QueryContext(ctx, query, username)
 	if err != nil {
 		return nil, fmt.Errorf("failed to find user by username: %w", err)
 	}
@@ -299,12 +299,12 @@ func (r *UserRepositoryImpl) GetUserByUsernameExact(ctx context.Context, usernam
 }
 
 // FindUserByUsername is an alias.
-func (r *UserRepositoryImpl) FindUserByUsername(ctx context.Context, username string) (*models.UserByUsername, error) {
-	return r.GetUserByUsernameExact(ctx, username)
+func (r *UserRepositoryImpl) FindUserByUsername(ctx context.Context, db client.DBTX, username string) (*models.UserByUsername, error) {
+	return r.GetUserByUsernameExact(ctx, db, username)
 }
 
 // SearchUsersAdvanced performs advanced search with arbitrary filters.
-func (r *UserRepositoryImpl) SearchUsersAdvanced(ctx context.Context, filters map[string]interface{}, limit, offset int) ([]*models.User, int, error) {
+func (r *UserRepositoryImpl) SearchUsersAdvanced(ctx context.Context, db client.DBTX, filters map[string]interface{}, limit, offset int) ([]*models.User, int, error) {
 	if limit <= 0 || limit > DefaultPageSize {
 		limit = DefaultPageSize
 	}
@@ -372,7 +372,7 @@ func (r *UserRepositoryImpl) SearchUsersAdvanced(ctx context.Context, filters ma
 
 	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM users %s", baseWhere)
 	var totalCount int
-	err := r.client.QueryRow(ctx, countQuery, params...).Scan(&totalCount)
+	err := db.QueryRowContext(ctx, countQuery, params...).Scan(&totalCount)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to count filtered users: %w", err)
 	}
@@ -388,7 +388,7 @@ func (r *UserRepositoryImpl) SearchUsersAdvanced(ctx context.Context, filters ma
 		LIMIT $%d OFFSET $%d`, baseWhere, paramCount, paramCount+1)
 	params = append(params, limit, offset)
 
-	rows, err := r.client.Query(ctx, searchQuery, params...)
+	rows, err := db.QueryContext(ctx, searchQuery, params...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to search users: %w", err)
 	}
@@ -402,29 +402,29 @@ func (r *UserRepositoryImpl) SearchUsersAdvanced(ctx context.Context, filters ma
 }
 
 // GetUserSearchStats returns statistics about user search.
-func (r *UserRepositoryImpl) GetUserSearchStats(ctx context.Context) (map[string]interface{}, error) {
+func (r *UserRepositoryImpl) GetUserSearchStats(ctx context.Context, db client.DBTX) (map[string]interface{}, error) {
 	stats := make(map[string]interface{})
 	var totalUsers, activeUsers, verifiedUsers int
-	err := r.client.QueryRow(ctx, "SELECT COUNT(*) FROM users").Scan(&totalUsers)
+	err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM users").Scan(&totalUsers)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user count: %w", err)
 	}
 	stats["total_users"] = totalUsers
 
-	err = r.client.QueryRow(ctx, "SELECT COUNT(*) FROM users WHERE is_active = true").Scan(&activeUsers)
+	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM users WHERE is_active = true").Scan(&activeUsers)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get active user count: %w", err)
 	}
 	stats["active_users"] = activeUsers
 
-	err = r.client.QueryRow(ctx, "SELECT COUNT(*) FROM users WHERE is_verified = true").Scan(&verifiedUsers)
+	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM users WHERE is_verified = true").Scan(&verifiedUsers)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get verified user count: %w", err)
 	}
 	stats["verified_users"] = verifiedUsers
 
 	var avgUsernameLength, avgFullNameLength float64
-	err = r.client.QueryRow(ctx, `
+	err = db.QueryRowContext(ctx, `
 		SELECT
 			AVG(LENGTH(username)) as avg_username_length,
 			AVG(LENGTH(full_name)) as avg_fullname_length
@@ -445,7 +445,7 @@ func (r *UserRepositoryImpl) GetUserSearchStats(ctx context.Context) (map[string
 		FROM pg_stat_user_indexes
 		WHERE tablename = 'users'
 		ORDER BY idx_scan DESC`
-	rows, err := r.client.Query(ctx, indexQuery)
+	rows, err := db.QueryContext(ctx, indexQuery)
 	if err == nil {
 		defer rows.Close()
 		var indexStats []map[string]interface{}
@@ -471,10 +471,12 @@ func (r *UserRepositoryImpl) GetUserSearchStats(ctx context.Context) (map[string
 // -----------------------------------------------------------------------------
 
 // CreateUser inserts a new user. Returns apperrors.ErrDuplicate if username exists.
-func (r *UserRepositoryImpl) CreateUser(ctx context.Context, user *models.User) error {
+// Callers that want this to be atomic with other writes (e.g. an employee row)
+// must pass a *sql.Tx as db.
+func (r *UserRepositoryImpl) CreateUser(ctx context.Context, db client.DBTX, user *models.User) error {
 	// Check if username already exists
 	var exists bool
-	err := r.client.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM users WHERE username = $1)", user.Username).Scan(&exists)
+	err := db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM users WHERE username = $1)", user.Username).Scan(&exists)
 	if err != nil {
 		return fmt.Errorf("failed to check username existence: %w", err)
 	}
@@ -488,27 +490,30 @@ func (r *UserRepositoryImpl) CreateUser(ctx context.Context, user *models.User) 
 			phone_encrypted_dek, device_id, device_fingerprint, kyc_status, kyc_level,
 			kyc_verified_at, is_verified, is_active, data_region, created_at, updated_at, last_login
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`
-	_, err = r.client.Exec(ctx, query,
+	_, err = db.ExecContext(ctx, query,
 		user.UserID, user.Username, user.FullName, user.PhoneHash, user.PhoneEncrypted, user.PhoneKeyID,
 		user.PhoneEncryptedDEK, user.DeviceID, user.DeviceFingerprint, user.KYCStatus, user.KYCLevel,
 		user.KYCVerifiedAt, user.IsVerified, user.IsActive, user.DataRegion,
 		user.CreatedAt, user.UpdatedAt, user.LastLogin,
 	)
 	if err != nil {
+		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23505" {
+			return apperrors.ErrDuplicate
+		}
 		return fmt.Errorf("failed to create user: %w", err)
 	}
 	return nil
 }
 
 // GetUserByID returns a user by ID. Returns apperrors.ErrNotFound if not found.
-func (r *UserRepositoryImpl) GetUserByID(ctx context.Context, userID uuid.UUID) (*models.User, error) {
+func (r *UserRepositoryImpl) GetUserByID(ctx context.Context, db client.DBTX, userID uuid.UUID) (*models.User, error) {
 	query := `
 		SELECT
 			user_id, username, full_name, phone_hash, phone_encrypted, phone_key_id,
 			phone_encrypted_dek, device_id, device_fingerprint, kyc_status, kyc_level,
 			kyc_verified_at, is_verified, is_active, data_region, created_at, updated_at, last_login
 		FROM users WHERE user_id = $1`
-	rows, err := r.client.Query(ctx, query, userID)
+	rows, err := db.QueryContext(ctx, query, userID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user: %w", err)
 	}
@@ -520,14 +525,14 @@ func (r *UserRepositoryImpl) GetUserByID(ctx context.Context, userID uuid.UUID) 
 }
 
 // GetUserByPhoneHash returns a user by phone hash. Returns apperrors.ErrNotFound if not found.
-func (r *UserRepositoryImpl) GetUserByPhoneHash(ctx context.Context, phoneHash string) (*models.User, error) {
+func (r *UserRepositoryImpl) GetUserByPhoneHash(ctx context.Context, db client.DBTX, phoneHash string) (*models.User, error) {
 	query := `
 		SELECT
 			user_id, username, full_name, phone_hash, phone_encrypted, phone_key_id,
 			phone_encrypted_dek, device_id, device_fingerprint, kyc_status, kyc_level,
 			kyc_verified_at, is_verified, is_active, data_region, created_at, updated_at, last_login
 		FROM users WHERE phone_hash = $1`
-	rows, err := r.client.Query(ctx, query, phoneHash)
+	rows, err := db.QueryContext(ctx, query, phoneHash)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user by phone hash: %w", err)
 	}
@@ -539,14 +544,14 @@ func (r *UserRepositoryImpl) GetUserByPhoneHash(ctx context.Context, phoneHash s
 }
 
 // UpdateUser updates a user. Returns apperrors.ErrNotFound if not found.
-func (r *UserRepositoryImpl) UpdateUser(ctx context.Context, user *models.User) error {
+func (r *UserRepositoryImpl) UpdateUser(ctx context.Context, db client.DBTX, user *models.User) error {
 	user.UpdatedAt = time.Now().UTC()
 	query := `
 		UPDATE users SET
 			username = $1, full_name = $2, device_id = $3, device_fingerprint = $4,
 			data_region = $5, updated_at = $6, last_login = $7
 		WHERE user_id = $8`
-	result, err := r.client.Exec(ctx, query,
+	result, err := db.ExecContext(ctx, query,
 		user.Username, user.FullName, user.DeviceID, user.DeviceFingerprint,
 		user.DataRegion, user.UpdatedAt, user.LastLogin, user.UserID,
 	)
@@ -561,10 +566,10 @@ func (r *UserRepositoryImpl) UpdateUser(ctx context.Context, user *models.User) 
 }
 
 // UpdateUserStatus updates is_verified and is_active.
-func (r *UserRepositoryImpl) UpdateUserStatus(ctx context.Context, userID uuid.UUID, isVerified, isActive bool) error {
+func (r *UserRepositoryImpl) UpdateUserStatus(ctx context.Context, db client.DBTX, userID uuid.UUID, isVerified, isActive bool) error {
 	now := time.Now().UTC()
 	query := `UPDATE users SET is_verified = $1, is_active = $2, updated_at = $3 WHERE user_id = $4`
-	result, err := r.client.Exec(ctx, query, isVerified, isActive, now, userID)
+	result, err := db.ExecContext(ctx, query, isVerified, isActive, now, userID)
 	if err != nil {
 		return fmt.Errorf("failed to update user status: %w", err)
 	}
@@ -576,10 +581,10 @@ func (r *UserRepositoryImpl) UpdateUserStatus(ctx context.Context, userID uuid.U
 }
 
 // UpdateLastLogin updates last_login timestamp.
-func (r *UserRepositoryImpl) UpdateLastLogin(ctx context.Context, userID uuid.UUID, timestamp time.Time) error {
+func (r *UserRepositoryImpl) UpdateLastLogin(ctx context.Context, db client.DBTX, userID uuid.UUID, timestamp time.Time) error {
 	now := time.Now().UTC()
 	query := `UPDATE users SET last_login = $1, updated_at = $2 WHERE user_id = $3`
-	result, err := r.client.Exec(ctx, query, timestamp, now, userID)
+	result, err := db.ExecContext(ctx, query, timestamp, now, userID)
 	if err != nil {
 		return fmt.Errorf("failed to update last login: %w", err)
 	}
@@ -591,9 +596,9 @@ func (r *UserRepositoryImpl) UpdateLastLogin(ctx context.Context, userID uuid.UU
 }
 
 // DeleteUser permanently deletes a user. Returns apperrors.ErrNotFound if not found.
-func (r *UserRepositoryImpl) DeleteUser(ctx context.Context, userID uuid.UUID) error {
+func (r *UserRepositoryImpl) DeleteUser(ctx context.Context, db client.DBTX, userID uuid.UUID) error {
 	query := `DELETE FROM users WHERE user_id = $1`
-	result, err := r.client.Exec(ctx, query, userID)
+	result, err := db.ExecContext(ctx, query, userID)
 	if err != nil {
 		return fmt.Errorf("failed to delete user: %w", err)
 	}
@@ -605,22 +610,22 @@ func (r *UserRepositoryImpl) DeleteUser(ctx context.Context, userID uuid.UUID) e
 }
 
 // SoftDeleteUser deactivates a user (sets is_active=false).
-func (r *UserRepositoryImpl) SoftDeleteUser(ctx context.Context, userID uuid.UUID) error {
-	return r.UpdateUserStatus(ctx, userID, false, false)
+func (r *UserRepositoryImpl) SoftDeleteUser(ctx context.Context, db client.DBTX, userID uuid.UUID) error {
+	return r.UpdateUserStatus(ctx, db, userID, false, false)
 }
 
 // ReactivateUser reactivates a user (is_active=true, is_verified=true).
-func (r *UserRepositoryImpl) ReactivateUser(ctx context.Context, userID uuid.UUID) error {
-	return r.UpdateUserStatus(ctx, userID, true, true)
+func (r *UserRepositoryImpl) ReactivateUser(ctx context.Context, db client.DBTX, userID uuid.UUID) error {
+	return r.UpdateUserStatus(ctx, db, userID, true, true)
 }
 
 // ArchiveInactiveUsers archives users inactive since before.
-func (r *UserRepositoryImpl) ArchiveInactiveUsers(ctx context.Context, before time.Time) (int, error) {
+func (r *UserRepositoryImpl) ArchiveInactiveUsers(ctx context.Context, db client.DBTX, before time.Time) (int, error) {
 	query := `
 		UPDATE users
 		SET is_active = false, updated_at = $1
 		WHERE last_login < $2 AND is_active = true`
-	result, err := r.client.Exec(ctx, query, time.Now().UTC(), before)
+	result, err := db.ExecContext(ctx, query, time.Now().UTC(), before)
 	if err != nil {
 		return 0, fmt.Errorf("failed to archive inactive users: %w", err)
 	}
@@ -629,7 +634,7 @@ func (r *UserRepositoryImpl) ArchiveInactiveUsers(ctx context.Context, before ti
 }
 
 // UpdateUserFields updates specific fields of a user.
-func (r *UserRepositoryImpl) UpdateUserFields(ctx context.Context, userID uuid.UUID, fields map[string]interface{}) error {
+func (r *UserRepositoryImpl) UpdateUserFields(ctx context.Context, db client.DBTX, userID uuid.UUID, fields map[string]interface{}) error {
 	if len(fields) == 0 {
 		return apperrors.ErrInvalidInput
 	}
@@ -645,7 +650,7 @@ func (r *UserRepositoryImpl) UpdateUserFields(ctx context.Context, userID uuid.U
 	params = append(params, userID)
 	query := fmt.Sprintf("UPDATE users SET %s WHERE user_id = $%d",
 		strings.Join(setClauses, ", "), paramCount)
-	result, err := r.client.Exec(ctx, query, params...)
+	result, err := db.ExecContext(ctx, query, params...)
 	if err != nil {
 		return fmt.Errorf("failed to update user fields: %w", err)
 	}
@@ -660,16 +665,13 @@ func (r *UserRepositoryImpl) UpdateUserFields(ctx context.Context, userID uuid.U
 // Batch operations
 // -----------------------------------------------------------------------------
 
-// CreateUsersBatch inserts multiple users in a single transaction.
-func (r *UserRepositoryImpl) CreateUsersBatch(ctx context.Context, users []*models.User) error {
+// CreateUsersBatch inserts multiple users using the provided DBTX.
+// Callers must pass a *sql.Tx to get all-or-nothing semantics; passing the pool
+// means each insert auto-commits independently.
+func (r *UserRepositoryImpl) CreateUsersBatch(ctx context.Context, db client.DBTX, users []*models.User) error {
 	if len(users) == 0 {
 		return nil
 	}
-	tx, err := r.client.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
 
 	query := `
 		INSERT INTO users (
@@ -677,14 +679,9 @@ func (r *UserRepositoryImpl) CreateUsersBatch(ctx context.Context, users []*mode
 			phone_encrypted_dek, device_id, device_fingerprint, kyc_status, kyc_level,
 			kyc_verified_at, is_verified, is_active, data_region, created_at, updated_at, last_login
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`
-	stmt, err := tx.PrepareContext(ctx, query)
-	if err != nil {
-		return fmt.Errorf("failed to prepare batch statement: %w", err)
-	}
-	defer stmt.Close()
 
 	for _, user := range users {
-		_, err := stmt.ExecContext(ctx,
+		_, err := db.ExecContext(ctx, query,
 			user.UserID, user.Username, user.FullName, user.PhoneHash, user.PhoneEncrypted, user.PhoneKeyID,
 			user.PhoneEncryptedDEK, user.DeviceID, user.DeviceFingerprint, user.KYCStatus, user.KYCLevel,
 			user.KYCVerifiedAt, user.IsVerified, user.IsActive, user.DataRegion,
@@ -694,14 +691,11 @@ func (r *UserRepositoryImpl) CreateUsersBatch(ctx context.Context, users []*mode
 			return fmt.Errorf("failed to insert user %s: %w", user.UserID, err)
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit batch transaction: %w", err)
-	}
 	return nil
 }
 
 // GetUsersByIDBatch retrieves multiple users by their IDs.
-func (r *UserRepositoryImpl) GetUsersByIDBatch(ctx context.Context, userIDs []uuid.UUID) ([]*models.User, error) {
+func (r *UserRepositoryImpl) GetUsersByIDBatch(ctx context.Context, db client.DBTX, userIDs []uuid.UUID) ([]*models.User, error) {
 	if len(userIDs) == 0 {
 		return []*models.User{}, nil
 	}
@@ -716,7 +710,7 @@ func (r *UserRepositoryImpl) GetUsersByIDBatch(ctx context.Context, userIDs []uu
 			kyc_status, kyc_level, kyc_verified_at, is_verified, is_active,
 			data_region, created_at, updated_at, last_login
 		FROM users WHERE user_id = ANY($1)`
-	rows, err := r.client.Query(ctx, query, pq.Array(idStrings))
+	rows, err := db.QueryContext(ctx, query, pq.Array(idStrings))
 	if err != nil {
 		return nil, fmt.Errorf("failed to query users batch: %w", err)
 	}
@@ -732,32 +726,19 @@ type UserStatusUpdate struct {
 	UpdatedAt  time.Time
 }
 
-// UpdateUserStatusBatch updates statuses for multiple users.
-func (r *UserRepositoryImpl) UpdateUserStatusBatch(ctx context.Context, updates []UserStatusUpdate) error {
+// UpdateUserStatusBatch updates statuses for multiple users using the provided DBTX.
+// Callers must pass a *sql.Tx to get all-or-nothing semantics.
+func (r *UserRepositoryImpl) UpdateUserStatusBatch(ctx context.Context, db client.DBTX, updates []UserStatusUpdate) error {
 	if len(updates) == 0 {
 		return nil
 	}
-	tx, err := r.client.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
 
 	query := `UPDATE users SET is_verified = $1, is_active = $2, updated_at = $3 WHERE user_id = $4`
-	stmt, err := tx.PrepareContext(ctx, query)
-	if err != nil {
-		return fmt.Errorf("failed to prepare batch update statement: %w", err)
-	}
-	defer stmt.Close()
-
 	for _, update := range updates {
-		_, err := stmt.ExecContext(ctx, update.IsVerified, update.IsActive, update.UpdatedAt, update.UserID)
+		_, err := db.ExecContext(ctx, query, update.IsVerified, update.IsActive, update.UpdatedAt, update.UserID)
 		if err != nil {
 			return fmt.Errorf("failed to update user %s: %w", update.UserID, err)
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit batch update transaction: %w", err)
 	}
 	return nil
 }
@@ -767,7 +748,7 @@ func (r *UserRepositoryImpl) UpdateUserStatusBatch(ctx context.Context, updates 
 // -----------------------------------------------------------------------------
 
 // GetRecentlyActiveUsers returns users active since a given time.
-func (r *UserRepositoryImpl) GetRecentlyActiveUsers(ctx context.Context, since time.Time, limit int) ([]*models.User, error) {
+func (r *UserRepositoryImpl) GetRecentlyActiveUsers(ctx context.Context, db client.DBTX, since time.Time, limit int) ([]*models.User, error) {
 	if limit <= 0 || limit > DefaultPageSize {
 		limit = DefaultPageSize
 	}
@@ -780,7 +761,7 @@ func (r *UserRepositoryImpl) GetRecentlyActiveUsers(ctx context.Context, since t
 		WHERE last_login >= $1 AND is_active = true
 		ORDER BY last_login DESC
 		LIMIT $2`
-	rows, err := r.client.Query(ctx, query, since, limit)
+	rows, err := db.QueryContext(ctx, query, since, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query recently active users: %w", err)
 	}
@@ -789,7 +770,7 @@ func (r *UserRepositoryImpl) GetRecentlyActiveUsers(ctx context.Context, since t
 }
 
 // GetInactiveUsersSince returns users inactive since a given time.
-func (r *UserRepositoryImpl) GetInactiveUsersSince(ctx context.Context, since time.Time, limit int) ([]*models.User, error) {
+func (r *UserRepositoryImpl) GetInactiveUsersSince(ctx context.Context, db client.DBTX, since time.Time, limit int) ([]*models.User, error) {
 	if limit <= 0 || limit > DefaultPageSize {
 		limit = DefaultPageSize
 	}
@@ -802,7 +783,7 @@ func (r *UserRepositoryImpl) GetInactiveUsersSince(ctx context.Context, since ti
 		WHERE (last_login < $1 OR last_login IS NULL) AND is_active = true
 		ORDER BY created_at ASC
 		LIMIT $2`
-	rows, err := r.client.Query(ctx, query, since, limit)
+	rows, err := db.QueryContext(ctx, query, since, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query inactive users: %w", err)
 	}
@@ -811,7 +792,7 @@ func (r *UserRepositoryImpl) GetInactiveUsersSince(ctx context.Context, since ti
 }
 
 // SearchUsersByPhoneOrDevice searches users by phone hash or device ID.
-func (r *UserRepositoryImpl) SearchUsersByPhoneOrDevice(ctx context.Context, query string, limit, offset int) ([]*models.User, int, error) {
+func (r *UserRepositoryImpl) SearchUsersByPhoneOrDevice(ctx context.Context, db client.DBTX, query string, limit, offset int) ([]*models.User, int, error) {
 	if limit <= 0 || limit > DefaultPageSize {
 		limit = DefaultPageSize
 	}
@@ -825,7 +806,7 @@ func (r *UserRepositoryImpl) SearchUsersByPhoneOrDevice(ctx context.Context, que
 		SELECT COUNT(*)
 		FROM users
 		WHERE LOWER(phone_hash) LIKE $1 OR LOWER(device_id) LIKE $1 OR LOWER(device_fingerprint) LIKE $1`
-	err := r.client.QueryRow(ctx, countQuery, searchPattern).Scan(&totalCount)
+	err := db.QueryRowContext(ctx, countQuery, searchPattern).Scan(&totalCount)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to count search results: %w", err)
 	}
@@ -839,7 +820,7 @@ func (r *UserRepositoryImpl) SearchUsersByPhoneOrDevice(ctx context.Context, que
 		WHERE LOWER(phone_hash) LIKE $1 OR LOWER(device_id) LIKE $1 OR LOWER(device_fingerprint) LIKE $1
 		ORDER BY created_at DESC
 		LIMIT $2 OFFSET $3`
-	rows, err := r.client.Query(ctx, searchQuery, searchPattern, limit, offset)
+	rows, err := db.QueryContext(ctx, searchQuery, searchPattern, limit, offset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to search users: %w", err)
 	}
@@ -852,7 +833,7 @@ func (r *UserRepositoryImpl) SearchUsersByPhoneOrDevice(ctx context.Context, que
 }
 
 // UpdateKYCStatus updates KYC fields for a user.
-func (r *UserRepositoryImpl) UpdateKYCStatus(ctx context.Context, userID uuid.UUID, status, level string) error {
+func (r *UserRepositoryImpl) UpdateKYCStatus(ctx context.Context, db client.DBTX, userID uuid.UUID, status, level string) error {
 	now := time.Now().UTC()
 	isVerified := status == models.KYCStatusVerified
 	query := `
@@ -860,7 +841,7 @@ func (r *UserRepositoryImpl) UpdateKYCStatus(ctx context.Context, userID uuid.UU
 			kyc_status = $1, kyc_level = $2, kyc_verified_at = $3,
 			updated_at = $4, is_verified = $5
 		WHERE user_id = $6`
-	result, err := r.client.Exec(ctx, query, status, level, now, now, isVerified, userID)
+	result, err := db.ExecContext(ctx, query, status, level, now, now, isVerified, userID)
 	if err != nil {
 		return fmt.Errorf("failed to update KYC status: %w", err)
 	}
@@ -872,7 +853,7 @@ func (r *UserRepositoryImpl) UpdateKYCStatus(ctx context.Context, userID uuid.UU
 }
 
 // GetUsersByKYCStatus returns users with a given KYC status.
-func (r *UserRepositoryImpl) GetUsersByKYCStatus(ctx context.Context, status string, limit, offset int) ([]*models.User, int, error) {
+func (r *UserRepositoryImpl) GetUsersByKYCStatus(ctx context.Context, db client.DBTX, status string, limit, offset int) ([]*models.User, int, error) {
 	if limit <= 0 || limit > DefaultPageSize {
 		limit = DefaultPageSize
 	}
@@ -881,7 +862,7 @@ func (r *UserRepositoryImpl) GetUsersByKYCStatus(ctx context.Context, status str
 	}
 	var totalCount int
 	countQuery := `SELECT COUNT(*) FROM users WHERE kyc_status = $1`
-	err := r.client.QueryRow(ctx, countQuery, status).Scan(&totalCount)
+	err := db.QueryRowContext(ctx, countQuery, status).Scan(&totalCount)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to count users by KYC status: %w", err)
 	}
@@ -893,7 +874,7 @@ func (r *UserRepositoryImpl) GetUsersByKYCStatus(ctx context.Context, status str
 		FROM users WHERE kyc_status = $1
 		ORDER BY created_at DESC
 		LIMIT $2 OFFSET $3`
-	rows, err := r.client.Query(ctx, query, status, limit, offset)
+	rows, err := db.QueryContext(ctx, query, status, limit, offset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to query users by KYC status: %w", err)
 	}
@@ -906,7 +887,7 @@ func (r *UserRepositoryImpl) GetUsersByKYCStatus(ctx context.Context, status str
 }
 
 // GetUsersByCompany returns employees of a company.
-func (r *UserRepositoryImpl) GetUsersByCompany(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]*models.User, int, error) {
+func (r *UserRepositoryImpl) GetUsersByCompany(ctx context.Context, db client.DBTX, companyID uuid.UUID, limit, offset int) ([]*models.User, int, error) {
 	if limit <= 0 || limit > DefaultPageSize {
 		limit = DefaultPageSize
 	}
@@ -918,7 +899,7 @@ func (r *UserRepositoryImpl) GetUsersByCompany(ctx context.Context, companyID uu
 		SELECT COUNT(*)
 		FROM company_employees ce
 		WHERE ce.company_id = $1 AND ce.is_active = true`
-	err := r.client.QueryRow(ctx, countQuery, companyID).Scan(&totalCount)
+	err := db.QueryRowContext(ctx, countQuery, companyID).Scan(&totalCount)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to count company users: %w", err)
 	}
@@ -932,7 +913,7 @@ func (r *UserRepositoryImpl) GetUsersByCompany(ctx context.Context, companyID uu
 		WHERE ce.company_id = $1 AND ce.is_active = true
 		ORDER BY ce.hire_date DESC
 		LIMIT $2 OFFSET $3`
-	rows, err := r.client.Query(ctx, query, companyID, limit, offset)
+	rows, err := db.QueryContext(ctx, query, companyID, limit, offset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to query company users: %w", err)
 	}
@@ -946,14 +927,14 @@ func (r *UserRepositoryImpl) GetUsersByCompany(ctx context.Context, companyID uu
 
 // GetUserByDeviceFingerprint returns a user by device fingerprint.
 // Returns apperrors.ErrNotFound if not found.
-func (r *UserRepositoryImpl) GetUserByDeviceFingerprint(ctx context.Context, fingerprint string) (*models.User, error) {
+func (r *UserRepositoryImpl) GetUserByDeviceFingerprint(ctx context.Context, db client.DBTX, fingerprint string) (*models.User, error) {
 	query := `
 		SELECT
 			user_id, username, full_name, phone_hash, phone_encrypted, phone_key_id,
 			phone_encrypted_dek, device_id, device_fingerprint, kyc_status, kyc_level,
 			kyc_verified_at, is_verified, is_active, data_region, created_at, updated_at, last_login
 		FROM users WHERE device_fingerprint = $1`
-	rows, err := r.client.Query(ctx, query, fingerprint)
+	rows, err := db.QueryContext(ctx, query, fingerprint)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user by device fingerprint: %w", err)
 	}
@@ -965,7 +946,7 @@ func (r *UserRepositoryImpl) GetUserByDeviceFingerprint(ctx context.Context, fin
 }
 
 // GetUsersByRegion returns users in a given region.
-func (r *UserRepositoryImpl) GetUsersByRegion(ctx context.Context, region string, limit, offset int) ([]*models.User, int, error) {
+func (r *UserRepositoryImpl) GetUsersByRegion(ctx context.Context, db client.DBTX, region string, limit, offset int) ([]*models.User, int, error) {
 	if limit <= 0 || limit > DefaultPageSize {
 		limit = DefaultPageSize
 	}
@@ -974,7 +955,7 @@ func (r *UserRepositoryImpl) GetUsersByRegion(ctx context.Context, region string
 	}
 	var totalCount int
 	countQuery := `SELECT COUNT(*) FROM users WHERE data_region = $1`
-	err := r.client.QueryRow(ctx, countQuery, region).Scan(&totalCount)
+	err := db.QueryRowContext(ctx, countQuery, region).Scan(&totalCount)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to count users by region: %w", err)
 	}
@@ -986,7 +967,7 @@ func (r *UserRepositoryImpl) GetUsersByRegion(ctx context.Context, region string
 		FROM users WHERE data_region = $1
 		ORDER BY created_at DESC
 		LIMIT $2 OFFSET $3`
-	rows, err := r.client.Query(ctx, query, region, limit, offset)
+	rows, err := db.QueryContext(ctx, query, region, limit, offset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to query users by region: %w", err)
 	}
@@ -999,7 +980,7 @@ func (r *UserRepositoryImpl) GetUsersByRegion(ctx context.Context, region string
 }
 
 // GetUsersCreatedAfter returns users created after a given time.
-func (r *UserRepositoryImpl) GetUsersCreatedAfter(ctx context.Context, after time.Time, limit, offset int) ([]*models.User, int, error) {
+func (r *UserRepositoryImpl) GetUsersCreatedAfter(ctx context.Context, db client.DBTX, after time.Time, limit, offset int) ([]*models.User, int, error) {
 	if limit <= 0 || limit > DefaultPageSize {
 		limit = DefaultPageSize
 	}
@@ -1008,7 +989,7 @@ func (r *UserRepositoryImpl) GetUsersCreatedAfter(ctx context.Context, after tim
 	}
 	var totalCount int
 	countQuery := `SELECT COUNT(*) FROM users WHERE created_at > $1`
-	err := r.client.QueryRow(ctx, countQuery, after).Scan(&totalCount)
+	err := db.QueryRowContext(ctx, countQuery, after).Scan(&totalCount)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to count users created after date: %w", err)
 	}
@@ -1020,7 +1001,7 @@ func (r *UserRepositoryImpl) GetUsersCreatedAfter(ctx context.Context, after tim
 		FROM users WHERE created_at > $1
 		ORDER BY created_at ASC
 		LIMIT $2 OFFSET $3`
-	rows, err := r.client.Query(ctx, query, after, limit, offset)
+	rows, err := db.QueryContext(ctx, query, after, limit, offset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to query users created after date: %w", err)
 	}
@@ -1033,7 +1014,7 @@ func (r *UserRepositoryImpl) GetUsersCreatedAfter(ctx context.Context, after tim
 }
 
 // GetUsersByCreationDateRange returns users created between two dates.
-func (r *UserRepositoryImpl) GetUsersByCreationDateRange(ctx context.Context, start, end time.Time, limit int) ([]*models.User, error) {
+func (r *UserRepositoryImpl) GetUsersByCreationDateRange(ctx context.Context, db client.DBTX, start, end time.Time, limit int) ([]*models.User, error) {
 	if limit <= 0 || limit > DefaultPageSize {
 		limit = DefaultPageSize
 	}
@@ -1046,7 +1027,7 @@ func (r *UserRepositoryImpl) GetUsersByCreationDateRange(ctx context.Context, st
 		WHERE created_at BETWEEN $1 AND $2
 		ORDER BY created_at DESC
 		LIMIT $3`
-	rows, err := r.client.Query(ctx, query, start, end, limit)
+	rows, err := db.QueryContext(ctx, query, start, end, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query users by creation date: %w", err)
 	}
@@ -1059,9 +1040,9 @@ func (r *UserRepositoryImpl) GetUsersByCreationDateRange(ctx context.Context, st
 // -----------------------------------------------------------------------------
 
 // CountUsersByRegion returns a map of region to count.
-func (r *UserRepositoryImpl) CountUsersByRegion(ctx context.Context) (map[string]int, error) {
+func (r *UserRepositoryImpl) CountUsersByRegion(ctx context.Context, db client.DBTX) (map[string]int, error) {
 	query := `SELECT data_region, COUNT(*) FROM users GROUP BY data_region`
-	rows, err := r.client.Query(ctx, query)
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to count users by region: %w", err)
 	}
@@ -1079,9 +1060,9 @@ func (r *UserRepositoryImpl) CountUsersByRegion(ctx context.Context) (map[string
 }
 
 // CountUsersByKYCStatus returns a map of KYC status to count.
-func (r *UserRepositoryImpl) CountUsersByKYCStatus(ctx context.Context) (map[string]int, error) {
+func (r *UserRepositoryImpl) CountUsersByKYCStatus(ctx context.Context, db client.DBTX) (map[string]int, error) {
 	query := `SELECT kyc_status, COUNT(*) FROM users GROUP BY kyc_status`
-	rows, err := r.client.Query(ctx, query)
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to count users by KYC status: %w", err)
 	}
@@ -1099,10 +1080,10 @@ func (r *UserRepositoryImpl) CountUsersByKYCStatus(ctx context.Context) (map[str
 }
 
 // CountActiveUsers returns the number of active users.
-func (r *UserRepositoryImpl) CountActiveUsers(ctx context.Context) (int, error) {
+func (r *UserRepositoryImpl) CountActiveUsers(ctx context.Context, db client.DBTX) (int, error) {
 	query := `SELECT COUNT(*) FROM users WHERE is_active = true`
 	var count int
-	err := r.client.QueryRow(ctx, query).Scan(&count)
+	err := db.QueryRowContext(ctx, query).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("failed to count active users: %w", err)
 	}
@@ -1110,10 +1091,10 @@ func (r *UserRepositoryImpl) CountActiveUsers(ctx context.Context) (int, error) 
 }
 
 // CountNewUsersSince returns the number of users created since a given time.
-func (r *UserRepositoryImpl) CountNewUsersSince(ctx context.Context, since time.Time) (int, error) {
+func (r *UserRepositoryImpl) CountNewUsersSince(ctx context.Context, db client.DBTX, since time.Time) (int, error) {
 	query := `SELECT COUNT(*) FROM users WHERE created_at >= $1`
 	var count int
-	err := r.client.QueryRow(ctx, query, since).Scan(&count)
+	err := db.QueryRowContext(ctx, query, since).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("failed to count new users: %w", err)
 	}
@@ -1121,24 +1102,24 @@ func (r *UserRepositoryImpl) CountNewUsersSince(ctx context.Context, since time.
 }
 
 // GetUserActivityStats returns statistics about user activity.
-func (r *UserRepositoryImpl) GetUserActivityStats(ctx context.Context, since time.Time) (map[string]interface{}, error) {
+func (r *UserRepositoryImpl) GetUserActivityStats(ctx context.Context, db client.DBTX, since time.Time) (map[string]interface{}, error) {
 	stats := make(map[string]interface{})
 	var activeCount int
-	err := r.client.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE last_login >= $1 AND is_active = true`, since).Scan(&activeCount)
+	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE last_login >= $1 AND is_active = true`, since).Scan(&activeCount)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get active user count: %w", err)
 	}
 	stats["recently_active_users"] = activeCount
 
 	var newRegistrations int
-	err = r.client.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE created_at >= $1`, since).Scan(&newRegistrations)
+	err = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE created_at >= $1`, since).Scan(&newRegistrations)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get new registrations: %w", err)
 	}
 	stats["new_registrations"] = newRegistrations
 
 	var avgTime sql.NullFloat64
-	err = r.client.QueryRow(ctx, `
+	err = db.QueryRowContext(ctx, `
 		SELECT AVG(EXTRACT(EPOCH FROM (last_login - created_at)))
 		FROM users
 		WHERE last_login IS NOT NULL AND created_at >= $1`, since).Scan(&avgTime)
@@ -1154,14 +1135,14 @@ func (r *UserRepositoryImpl) GetUserActivityStats(ctx context.Context, since tim
 }
 
 // GetKYCDistribution returns KYC status distribution.
-func (r *UserRepositoryImpl) GetKYCDistribution(ctx context.Context) (map[string]int, error) {
-	return r.CountUsersByKYCStatus(ctx)
+func (r *UserRepositoryImpl) GetKYCDistribution(ctx context.Context, db client.DBTX) (map[string]int, error) {
+	return r.CountUsersByKYCStatus(ctx, db)
 }
 
 // GetActiveUserCountsByRegion returns active user counts by region.
-func (r *UserRepositoryImpl) GetActiveUserCountsByRegion(ctx context.Context) (map[string]int, error) {
+func (r *UserRepositoryImpl) GetActiveUserCountsByRegion(ctx context.Context, db client.DBTX) (map[string]int, error) {
 	query := `SELECT data_region, COUNT(*) FROM users WHERE is_active = true GROUP BY data_region`
-	rows, err := r.client.Query(ctx, query)
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to count active users by region: %w", err)
 	}
@@ -1179,41 +1160,41 @@ func (r *UserRepositoryImpl) GetActiveUserCountsByRegion(ctx context.Context) (m
 }
 
 // GetUserGrowthMetrics returns various growth metrics.
-func (r *UserRepositoryImpl) GetUserGrowthMetrics(ctx context.Context, since time.Time) (map[string]interface{}, error) {
+func (r *UserRepositoryImpl) GetUserGrowthMetrics(ctx context.Context, db client.DBTX, since time.Time) (map[string]interface{}, error) {
 	metrics := make(map[string]interface{})
 	var totalUsers int
-	err := r.client.QueryRow(ctx, "SELECT COUNT(*) FROM users").Scan(&totalUsers)
+	err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM users").Scan(&totalUsers)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get total users: %w", err)
 	}
 	metrics["total_users"] = totalUsers
 
-	activeUsers, err := r.CountActiveUsers(ctx)
+	activeUsers, err := r.CountActiveUsers(ctx, db)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get active users: %w", err)
 	}
 	metrics["active_users"] = activeUsers
 
-	newUsers, err := r.CountNewUsersSince(ctx, since)
+	newUsers, err := r.CountNewUsersSince(ctx, db, since)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get new users: %w", err)
 	}
 	metrics["new_users"] = newUsers
 
 	var verifiedUsers int
-	err = r.client.QueryRow(ctx, "SELECT COUNT(*) FROM users WHERE is_verified = true").Scan(&verifiedUsers)
+	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM users WHERE is_verified = true").Scan(&verifiedUsers)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get verified users: %w", err)
 	}
 	metrics["verified_users"] = verifiedUsers
 
-	kycDist, err := r.GetKYCDistribution(ctx)
+	kycDist, err := r.GetKYCDistribution(ctx, db)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get KYC distribution: %w", err)
 	}
 	metrics["kyc_distribution"] = kycDist
 
-	regionDist, err := r.GetActiveUserCountsByRegion(ctx)
+	regionDist, err := r.GetActiveUserCountsByRegion(ctx, db)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get region distribution: %w", err)
 	}
@@ -1229,7 +1210,10 @@ func (r *UserRepositoryImpl) GetUserGrowthMetrics(ctx context.Context, since tim
 }
 
 // RebuildUserIndexes rebuilds all user indexes.
-func (r *UserRepositoryImpl) RebuildUserIndexes(ctx context.Context) error {
+//
+// NOTE: REINDEX CONCURRENTLY cannot run inside a transaction. Callers MUST pass
+// the pool DBTX (not a *sql.Tx).
+func (r *UserRepositoryImpl) RebuildUserIndexes(ctx context.Context, db client.DBTX) error {
 	indexes := []string{
 		"users_pkey",
 		"users_phone_hash_idx",
@@ -1244,7 +1228,7 @@ func (r *UserRepositoryImpl) RebuildUserIndexes(ctx context.Context) error {
 	}
 	for _, index := range indexes {
 		query := fmt.Sprintf("REINDEX INDEX CONCURRENTLY %s", index)
-		_, err := r.client.Exec(ctx, query)
+		_, err := db.ExecContext(ctx, query)
 		if err != nil {
 			// ignore errors in non‑critical path
 		}
@@ -1253,9 +1237,11 @@ func (r *UserRepositoryImpl) RebuildUserIndexes(ctx context.Context) error {
 }
 
 // VacuumUserTable runs VACUUM on the users table.
-func (r *UserRepositoryImpl) VacuumUserTable(ctx context.Context) error {
+//
+// NOTE: VACUUM cannot run inside a transaction. Callers MUST pass the pool DBTX.
+func (r *UserRepositoryImpl) VacuumUserTable(ctx context.Context, db client.DBTX) error {
 	query := "VACUUM (VERBOSE, ANALYZE) users"
-	_, err := r.client.Exec(ctx, query)
+	_, err := db.ExecContext(ctx, query)
 	if err != nil {
 		return fmt.Errorf("failed to vacuum user table: %w", err)
 	}
@@ -1263,8 +1249,8 @@ func (r *UserRepositoryImpl) VacuumUserTable(ctx context.Context) error {
 }
 
 // GetUserByIDWithPartition is an alias to GetUserByID.
-func (r *UserRepositoryImpl) GetUserByIDWithPartition(ctx context.Context, userID uuid.UUID) (*models.User, error) {
-	return r.GetUserByID(ctx, userID)
+func (r *UserRepositoryImpl) GetUserByIDWithPartition(ctx context.Context, db client.DBTX, userID uuid.UUID) (*models.User, error) {
+	return r.GetUserByID(ctx, db, userID)
 }
 
 // -----------------------------------------------------------------------------
@@ -1272,13 +1258,13 @@ func (r *UserRepositoryImpl) GetUserByIDWithPartition(ctx context.Context, userI
 // -----------------------------------------------------------------------------
 
 // AddUserDevice adds a device to a user.
-func (r *UserRepositoryImpl) AddUserDevice(ctx context.Context, device *models.UserDevice) error {
+func (r *UserRepositoryImpl) AddUserDevice(ctx context.Context, db client.DBTX, device *models.UserDevice) error {
 	query := `
 		INSERT INTO user_devices (
 			device_id, user_id, device_type, device_name, os_version,
 			app_version, last_active, is_active, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
-	_, err := r.client.Exec(ctx, query,
+	_, err := db.ExecContext(ctx, query,
 		device.DeviceID, device.UserID, device.DeviceType, device.DeviceName,
 		device.OSVersion, device.AppVersion, device.LastActive, device.IsActive,
 		device.CreatedAt, device.UpdatedAt,
@@ -1290,14 +1276,14 @@ func (r *UserRepositoryImpl) AddUserDevice(ctx context.Context, device *models.U
 }
 
 // GetUserDevices returns all devices for a user.
-func (r *UserRepositoryImpl) GetUserDevices(ctx context.Context, userID uuid.UUID) ([]models.UserDevice, error) {
+func (r *UserRepositoryImpl) GetUserDevices(ctx context.Context, db client.DBTX, userID uuid.UUID) ([]models.UserDevice, error) {
 	query := `
 		SELECT device_id, user_id, device_type, device_name, os_version,
 			app_version, last_active, is_active, created_at, updated_at
 		FROM user_devices
 		WHERE user_id = $1
 		ORDER BY last_active DESC`
-	rows, err := r.client.Query(ctx, query, userID)
+	rows, err := db.QueryContext(ctx, query, userID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query user devices: %w", err)
 	}
@@ -1318,9 +1304,9 @@ func (r *UserRepositoryImpl) GetUserDevices(ctx context.Context, userID uuid.UUI
 }
 
 // RemoveUserDevice removes a device from a user.
-func (r *UserRepositoryImpl) RemoveUserDevice(ctx context.Context, userID uuid.UUID, deviceID string) error {
+func (r *UserRepositoryImpl) RemoveUserDevice(ctx context.Context, db client.DBTX, userID uuid.UUID, deviceID string) error {
 	query := `DELETE FROM user_devices WHERE user_id = $1 AND device_id = $2`
-	result, err := r.client.Exec(ctx, query, userID, deviceID)
+	result, err := db.ExecContext(ctx, query, userID, deviceID)
 	if err != nil {
 		return fmt.Errorf("failed to remove user device: %w", err)
 	}
@@ -1336,12 +1322,12 @@ func (r *UserRepositoryImpl) RemoveUserDevice(ctx context.Context, userID uuid.U
 // -----------------------------------------------------------------------------
 
 // RecordLoginAttempt records a login attempt.
-func (r *UserRepositoryImpl) RecordLoginAttempt(ctx context.Context, userID uuid.UUID, success bool, ip, userAgent string) error {
+func (r *UserRepositoryImpl) RecordLoginAttempt(ctx context.Context, db client.DBTX, userID uuid.UUID, success bool, ip, userAgent string) error {
 	query := `
 		INSERT INTO login_attempts (
 			attempt_id, user_id, success, ip_address, user_agent, attempted_at
 		) VALUES ($1, $2, $3, $4, $5, $6)`
-	_, err := r.client.Exec(ctx, query,
+	_, err := db.ExecContext(ctx, query,
 		uuid.New(), userID, success, ip, userAgent, time.Now().UTC(),
 	)
 	if err != nil {
@@ -1351,7 +1337,7 @@ func (r *UserRepositoryImpl) RecordLoginAttempt(ctx context.Context, userID uuid
 }
 
 // GetRecentLoginAttempts returns recent login attempts for a user.
-func (r *UserRepositoryImpl) GetRecentLoginAttempts(ctx context.Context, userID uuid.UUID, limit int) ([]models.LoginAttempt, error) {
+func (r *UserRepositoryImpl) GetRecentLoginAttempts(ctx context.Context, db client.DBTX, userID uuid.UUID, limit int) ([]models.LoginAttempt, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
@@ -1361,7 +1347,7 @@ func (r *UserRepositoryImpl) GetRecentLoginAttempts(ctx context.Context, userID 
 		WHERE user_id = $1
 		ORDER BY attempted_at DESC
 		LIMIT $2`
-	rows, err := r.client.Query(ctx, query, userID, limit)
+	rows, err := db.QueryContext(ctx, query, userID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query login attempts: %w", err)
 	}
@@ -1384,12 +1370,9 @@ func (r *UserRepositoryImpl) GetRecentLoginAttempts(ctx context.Context, userID 
 // Company employee search
 // -----------------------------------------------------------------------------
 
-// SearchCompanyEmployees searches employees within a company.
 // SearchCompanyEmployees performs a search on company employees.
 // It supports full‑text and autocomplete search, pagination, and optional filters.
-
-// SearchCompanyEmployees searches employees within a specific company
-func (r *UserRepositoryImpl) SearchCompanyEmployees(ctx context.Context, req *models.CompanyEmployeeSearchRequest) ([]*models.CompanyEmployeeSearchResult, int, error) {
+func (r *UserRepositoryImpl) SearchCompanyEmployees(ctx context.Context, db client.DBTX, req *models.CompanyEmployeeSearchRequest) ([]*models.CompanyEmployeeSearchResult, int, error) {
 	if req.Limit <= 0 || req.Limit > 100 {
 		req.Limit = 50
 	}
@@ -1438,7 +1421,7 @@ func (r *UserRepositoryImpl) SearchCompanyEmployees(ctx context.Context, req *mo
 		req.Limit,
 		req.Offset,
 	}
-	rows, err := r.client.Query(ctx, query, args...)
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to search company employees: %w", err)
 	}
@@ -1495,14 +1478,14 @@ func (r *UserRepositoryImpl) SearchCompanyEmployees(ctx context.Context, req *mo
 		return nil, 0, fmt.Errorf("error iterating search results: %w", err)
 	}
 
-	totalCount, err := r.countCompanyEmployeeResults(ctx, req)
+	totalCount, err := r.countCompanyEmployeeResults(ctx, db, req)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to count search results: %w", err)
 	}
 	return results, totalCount, nil
 }
 
-func (r *UserRepositoryImpl) countCompanyEmployeeResults(ctx context.Context, req *models.CompanyEmployeeSearchRequest) (int, error) {
+func (r *UserRepositoryImpl) countCompanyEmployeeResults(ctx context.Context, db client.DBTX, req *models.CompanyEmployeeSearchRequest) (int, error) {
 	conditions := []string{"ce.company_id = $1", "ce.is_active = true"}
 	args := []interface{}{req.CompanyID}
 	argCounter := 2
@@ -1560,18 +1543,18 @@ func (r *UserRepositoryImpl) countCompanyEmployeeResults(ctx context.Context, re
 		INNER JOIN roles r ON ce.role_id = r.role_id
 		WHERE %s`, whereClause)
 	var totalCount int
-	err := r.client.QueryRow(ctx, countQuery, args...).Scan(&totalCount)
+	err := db.QueryRowContext(ctx, countQuery, args...).Scan(&totalCount)
 	if err != nil {
 		return 0, fmt.Errorf("failed to count company employee results: %w", err)
 	}
 	return totalCount, nil
 }
 
-// SearchCompanyEmployeesAdvanced is an advanced search with arbitrary filters.
-// SearchCompanyEmployeesAdvanced performs an advanced search on company employees with arbitrary filters.
-// SearchCompanyEmployeesAdvanced returns a slice of EmployeeSearchResult (no sensitive data).
+// SearchCompanyEmployeesAdvanced performs an advanced search on company employees
+// with arbitrary filters. Returns a slice of EmployeeSearchResult (no sensitive data).
 func (r *UserRepositoryImpl) SearchCompanyEmployeesAdvanced(
 	ctx context.Context,
+	db client.DBTX,
 	companyID uuid.UUID,
 	filters map[string]interface{},
 	limit, offset int,
@@ -1594,7 +1577,7 @@ func (r *UserRepositoryImpl) SearchCompanyEmployeesAdvanced(
 			params = append(params, value)
 			paramCount++
 		case "department_id":
-			// ✅ FIX: use EXISTS on role_departments because ce has no department_id
+			// use EXISTS on role_departments because ce has no department_id
 			conditions = append(conditions, fmt.Sprintf(
 				"EXISTS (SELECT 1 FROM role_departments rd WHERE rd.role_id = ce.role_id AND rd.department_id = $%d)",
 				paramCount,
@@ -1634,7 +1617,6 @@ func (r *UserRepositoryImpl) SearchCompanyEmployeesAdvanced(
 
 	whereClause := strings.Join(conditions, " AND ")
 
-	// COUNT query
 	countQuery := fmt.Sprintf(`
 		SELECT COUNT(*)
 		FROM users u
@@ -1642,11 +1624,10 @@ func (r *UserRepositoryImpl) SearchCompanyEmployeesAdvanced(
 		WHERE %s`, whereClause)
 
 	var totalCount int
-	if err := r.client.QueryRow(ctx, countQuery, params...).Scan(&totalCount); err != nil {
+	if err := db.QueryRowContext(ctx, countQuery, params...).Scan(&totalCount); err != nil {
 		return nil, 0, fmt.Errorf("failed to count company employees: %w", err)
 	}
 
-	// Data query – select only the four public fields
 	dataQuery := fmt.Sprintf(`
 		SELECT
 			u.user_id,
@@ -1660,7 +1641,7 @@ func (r *UserRepositoryImpl) SearchCompanyEmployeesAdvanced(
 		LIMIT $%d OFFSET $%d`, whereClause, paramCount, paramCount+1)
 
 	params = append(params, limit, offset)
-	rows, err := r.client.Query(ctx, dataQuery, params...)
+	rows, err := db.QueryContext(ctx, dataQuery, params...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to search company employees: %w", err)
 	}
@@ -1682,12 +1663,12 @@ func (r *UserRepositoryImpl) SearchCompanyEmployeesAdvanced(
 }
 
 // GetCompanyEmployeeSuggestions returns employee suggestions for a company.
-func (r *UserRepositoryImpl) GetCompanyEmployeeSuggestions(ctx context.Context, companyID uuid.UUID, prefix string, limit int) ([]*models.UserSuggestion, error) {
+func (r *UserRepositoryImpl) GetCompanyEmployeeSuggestions(ctx context.Context, db client.DBTX, companyID uuid.UUID, prefix string, limit int) ([]*models.UserSuggestion, error) {
 	if limit <= 0 || limit > 20 {
 		limit = 10
 	}
 	query := `SELECT username, full_name, user_id, employee_id, role_name FROM get_company_employee_suggestions($1, $2, $3)`
-	rows, err := r.client.Query(ctx, query, companyID, prefix, limit)
+	rows, err := db.QueryContext(ctx, query, companyID, prefix, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get company employee suggestions: %w", err)
 	}
@@ -1721,9 +1702,9 @@ func (r *UserRepositoryImpl) GetCompanyEmployeeSuggestions(ctx context.Context, 
 
 // FindCompanyEmployeeByUsername finds an employee by username in a company.
 // Returns apperrors.ErrNotFound if not found.
-func (r *UserRepositoryImpl) FindCompanyEmployeeByUsername(ctx context.Context, companyID uuid.UUID, username string) (*models.CompanyEmployeeUser, error) {
+func (r *UserRepositoryImpl) FindCompanyEmployeeByUsername(ctx context.Context, db client.DBTX, companyID uuid.UUID, username string) (*models.CompanyEmployeeUser, error) {
 	query := `SELECT * FROM find_company_employee_by_username($1, $2)`
-	rows, err := r.client.Query(ctx, query, companyID, username)
+	rows, err := db.QueryContext(ctx, query, companyID, username)
 	if err != nil {
 		return nil, fmt.Errorf("failed to find company employee by username: %w", err)
 	}
@@ -1759,17 +1740,16 @@ func (r *UserRepositoryImpl) FindCompanyEmployeeByUsername(ctx context.Context, 
 }
 
 // FindCompanyEmployeeWithDepartment is an alias that returns employee and department info (department not used).
-func (r *UserRepositoryImpl) FindCompanyEmployeeWithDepartment(ctx context.Context, companyID uuid.UUID, username string) (*models.CompanyEmployeeUser, *models.Department, error) {
-	emp, err := r.FindCompanyEmployeeByUsername(ctx, companyID, username)
+func (r *UserRepositoryImpl) FindCompanyEmployeeWithDepartment(ctx context.Context, db client.DBTX, companyID uuid.UUID, username string) (*models.CompanyEmployeeUser, *models.Department, error) {
+	emp, err := r.FindCompanyEmployeeByUsername(ctx, db, companyID, username)
 	if err != nil {
 		return nil, nil, err
 	}
-	// Department info is not available in this implementation; return nil.
 	return emp, nil, nil
 }
 
 // GetBannedUsers returns users with is_active = false.
-func (r *UserRepositoryImpl) GetBannedUsers(ctx context.Context, limit, offset int) ([]*models.User, int, error) {
+func (r *UserRepositoryImpl) GetBannedUsers(ctx context.Context, db client.DBTX, limit, offset int) ([]*models.User, int, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
@@ -1777,7 +1757,7 @@ func (r *UserRepositoryImpl) GetBannedUsers(ctx context.Context, limit, offset i
 		offset = 0
 	}
 	var totalCount int
-	err := r.client.QueryRow(ctx, "SELECT COUNT(*) FROM users WHERE is_active = false").Scan(&totalCount)
+	err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM users WHERE is_active = false").Scan(&totalCount)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to count banned users: %w", err)
 	}
@@ -1791,7 +1771,7 @@ func (r *UserRepositoryImpl) GetBannedUsers(ctx context.Context, limit, offset i
 		WHERE is_active = false
 		ORDER BY updated_at DESC
 		LIMIT $1 OFFSET $2`
-	rows, err := r.client.Query(ctx, query, limit, offset)
+	rows, err := db.QueryContext(ctx, query, limit, offset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to get banned users: %w", err)
 	}
@@ -1808,20 +1788,16 @@ func (r *UserRepositoryImpl) GetBannedUsers(ctx context.Context, limit, offset i
 // -----------------------------------------------------------------------------
 
 // SetUserAvatar sets a new primary avatar for the user.
+// Callers must pass a *sql.Tx if they want the deactivate+insert to be atomic.
 func (r *UserRepositoryImpl) SetUserAvatar(
 	ctx context.Context,
+	db client.DBTX,
 	userID uuid.UUID,
 	avatarHash string,
 	avatarObjectKey string,
 	avatarMimeType string,
 ) error {
-	tx, err := r.client.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	_, err = tx.ExecContext(ctx, `
+	_, err := db.ExecContext(ctx, `
 		UPDATE user_avatars
 		SET is_active = false, is_primary = false, updated_at = NOW()
 		WHERE user_id = $1 AND is_primary = true
@@ -1829,7 +1805,7 @@ func (r *UserRepositoryImpl) SetUserAvatar(
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `
+	_, err = db.ExecContext(ctx, `
 		INSERT INTO user_avatars (
 			avatar_id,
 			user_id,
@@ -1857,12 +1833,13 @@ func (r *UserRepositoryImpl) SetUserAvatar(
 	if err != nil {
 		return err
 	}
-	return tx.Commit()
+	return nil
 }
 
 // GetUserAvatar returns the primary avatar for the user, or nil if none.
 func (r *UserRepositoryImpl) GetUserAvatar(
 	ctx context.Context,
+	db client.DBTX,
 	userID uuid.UUID,
 ) (*models.UserAvatar, error) {
 	query := `
@@ -1883,7 +1860,7 @@ func (r *UserRepositoryImpl) GetUserAvatar(
 		  AND is_primary = true
 		LIMIT 1`
 	var avatar models.UserAvatar
-	err := r.client.QueryRow(ctx, query, userID).Scan(
+	err := db.QueryRowContext(ctx, query, userID).Scan(
 		&avatar.AvatarID,
 		&avatar.UserID,
 		&avatar.AvatarType,
@@ -1907,9 +1884,10 @@ func (r *UserRepositoryImpl) GetUserAvatar(
 // DeactivateUserAvatar deactivates the primary avatar.
 func (r *UserRepositoryImpl) DeactivateUserAvatar(
 	ctx context.Context,
+	db client.DBTX,
 	userID uuid.UUID,
 ) error {
-	_, err := r.client.Exec(ctx, `
+	_, err := db.ExecContext(ctx, `
 		UPDATE user_avatars
 		SET is_active = false, is_primary = false, updated_at = NOW()
 		WHERE user_id = $1 AND is_primary = true
@@ -1922,9 +1900,9 @@ func (r *UserRepositoryImpl) DeactivateUserAvatar(
 // -----------------------------------------------------------------------------
 
 // HealthCheck checks the database connectivity.
-func (r *UserRepositoryImpl) HealthCheck(ctx context.Context) error {
+func (r *UserRepositoryImpl) HealthCheck(ctx context.Context, db client.DBTX) error {
 	var result int
-	err := r.client.QueryRow(ctx, "SELECT 1").Scan(&result)
+	err := db.QueryRowContext(ctx, "SELECT 1").Scan(&result)
 	if err != nil {
 		return fmt.Errorf("postgreSQL health check failed: %w", err)
 	}
@@ -1935,7 +1913,8 @@ func (r *UserRepositoryImpl) HealthCheck(ctx context.Context) error {
 }
 
 // GetRepositoryStats returns various repository statistics.
-func (r *UserRepositoryImpl) GetRepositoryStats(ctx context.Context) (map[string]interface{}, error) {
+// Note: pool-level stats come from r.client (not from db), since db may be a tx.
+func (r *UserRepositoryImpl) GetRepositoryStats(ctx context.Context, db client.DBTX) (map[string]interface{}, error) {
 	stats := make(map[string]interface{})
 	dbStats := r.client.GetStats()
 	stats["db_connections"] = map[string]interface{}{
@@ -1946,7 +1925,7 @@ func (r *UserRepositoryImpl) GetRepositoryStats(ctx context.Context) (map[string
 		"wait_duration":    dbStats.WaitDuration.String(),
 	}
 	var userCount int
-	err := r.client.QueryRow(ctx, "SELECT COUNT(*) FROM users").Scan(&userCount)
+	err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM users").Scan(&userCount)
 	if err == nil {
 		stats["user_count"] = userCount
 	}
@@ -2007,9 +1986,10 @@ func (r *UserRepositoryImpl) scanMultipleUsers(rows *sql.Rows, limit int) ([]*mo
 	return users, nil
 }
 
-// FindCompanyEmployeeSummaryByUsername returns a minimal employee summary (user_id, employee_id, username, full_name)
-// for a given company and exact username. Returns apperrors.ErrNotFound if no employee is found.
-func (r *UserRepositoryImpl) FindCompanyEmployeeSummaryByUsername(ctx context.Context, companyID uuid.UUID, username string) (*models.EmployeeSummary, error) {
+// FindCompanyEmployeeSummaryByUsername returns a minimal employee summary
+// (user_id, employee_id, username, full_name) for a given company and exact
+// username. Returns apperrors.ErrNotFound if no employee is found.
+func (r *UserRepositoryImpl) FindCompanyEmployeeSummaryByUsername(ctx context.Context, db client.DBTX, companyID uuid.UUID, username string) (*models.EmployeeSummary, error) {
 	query := `
         SELECT
             u.user_id,
@@ -2023,7 +2003,7 @@ func (r *UserRepositoryImpl) FindCompanyEmployeeSummaryByUsername(ctx context.Co
     `
 
 	var summary models.EmployeeSummary
-	err := r.client.QueryRow(ctx, query, companyID, username).Scan(
+	err := db.QueryRowContext(ctx, query, companyID, username).Scan(
 		&summary.UserID,
 		&summary.EmployeeID,
 		&summary.Username,
@@ -2038,14 +2018,14 @@ func (r *UserRepositoryImpl) FindCompanyEmployeeSummaryByUsername(ctx context.Co
 	return &summary, nil
 }
 
-func (r *UserRepositoryImpl) IsUserEmployeeOfCompany(ctx context.Context, userID, companyID uuid.UUID) (bool, error) {
+func (r *UserRepositoryImpl) IsUserEmployeeOfCompany(ctx context.Context, db client.DBTX, userID, companyID uuid.UUID) (bool, error) {
 	var exists bool
 	query := `SELECT EXISTS (
         SELECT 1
         FROM company_employees
         WHERE user_id = $1 AND company_id = $2 AND is_active = true
     )`
-	err := r.client.QueryRow(ctx, query, userID, companyID).Scan(&exists)
+	err := db.QueryRowContext(ctx, query, userID, companyID).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("failed to check employee membership: %w", err)
 	}

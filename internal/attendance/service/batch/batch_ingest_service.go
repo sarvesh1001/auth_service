@@ -14,6 +14,7 @@ import (
 	"auth-service/internal/attendance/service/enrollment"
 	"auth-service/internal/attendance/service/ingest"
 	"auth-service/internal/attendance/service/resolver"
+	"auth-service/internal/infrastructure/outbox" // central outbox
 )
 
 // OfflinePunchEvent represents a single punch from a device batch.
@@ -40,19 +41,19 @@ type BatchIngestService interface {
 }
 
 type batchIngestService struct {
-	batchRepo  repository.AttendanceBatchRepository
-	outboxRepo repository.OutboxRepository
-	deviceRepo repository.DeviceRepository
-	ingestSvc  ingest.IngestService
-	enrollSvc  enrollment.EnrollmentService
-	subjectRes resolver.SubjectResolver
-	logger     *zap.Logger
+	batchRepo     repository.AttendanceBatchRepository
+	centralOutbox outbox.Repository // 🔥 changed from outboxRepo
+	deviceRepo    repository.DeviceRepository
+	ingestSvc     ingest.IngestService
+	enrollSvc     enrollment.EnrollmentService
+	subjectRes    resolver.SubjectResolver
+	logger        *zap.Logger
 }
 
-// NewBatchIngestService creates a new batch ingest service.
+// NewBatchIngestService creates a new batch ingest service using the central outbox.
 func NewBatchIngestService(
 	batchRepo repository.AttendanceBatchRepository,
-	outboxRepo repository.OutboxRepository,
+	centralOutbox outbox.Repository, // 🔥 changed parameter
 	deviceRepo repository.DeviceRepository,
 	ingestSvc ingest.IngestService,
 	enrollSvc enrollment.EnrollmentService,
@@ -60,13 +61,13 @@ func NewBatchIngestService(
 	logger *zap.Logger,
 ) BatchIngestService {
 	return &batchIngestService{
-		batchRepo:  batchRepo,
-		outboxRepo: outboxRepo,
-		deviceRepo: deviceRepo,
-		ingestSvc:  ingestSvc,
-		enrollSvc:  enrollSvc,
-		subjectRes: subjectRes,
-		logger:     logger,
+		batchRepo:     batchRepo,
+		centralOutbox: centralOutbox,
+		deviceRepo:    deviceRepo,
+		ingestSvc:     ingestSvc,
+		enrollSvc:     enrollSvc,
+		subjectRes:    subjectRes,
+		logger:        logger,
 	}
 }
 
@@ -117,7 +118,7 @@ func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRe
 
 	successCount, failureCount := 0, 0
 
-	// 4. Emit batch received outbox (once)
+	// 4. Emit batch received via central outbox (once)
 	payloadBytes, _ := json.Marshal(map[string]interface{}{
 		"batch_id":     batch.BatchID,
 		"batch_ref":    batch.BatchRef,
@@ -126,15 +127,18 @@ func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRe
 		"total_events": batch.TotalEvents,
 		"received_at":  batch.ReceivedAt,
 	})
-	outboxEvent := &repository.OutboxEvent{
-		EventID:     uuid.New(),
-		EventType:   "attendance.batch.received",
-		AggregateID: batch.BatchID,
-		Payload:     payloadBytes,
-		CreatedAt:   time.Now().UTC(),
+	centralEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "attendance_batch",
+		AggregateID:   batch.BatchID.String(),
+		EventType:     "attendance.batch.received",
+		Topic:         "attendance.events",
+		Payload:       payloadBytes,
+		Headers: map[string]string{
+			"source": "attendance-batch",
+		},
 	}
-	// Store outbox event (no transaction for simplicity; can be wrapped if needed)
-	if err := s.outboxRepo.Store(ctx, nil, outboxEvent); err != nil {
+	if err := s.centralOutbox.Store(ctx, nil, centralEvent); err != nil {
 		s.logger.Error("Failed to store batch received outbox", zap.Error(err))
 	}
 
@@ -142,7 +146,6 @@ func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRe
 	for i, event := range req.Events {
 		s.logger.Info("Processing event", zap.Int("index", i), zap.String("external_ref", event.ExternalRef))
 
-		// Resolve subject using enrollment
 		enrollment, err := s.enrollSvc.ResolveEnrollment(ctx, req.CompanyID, req.DeviceID, req.SourceType, event.ExternalRef)
 		if err != nil {
 			s.recordFailure(ctx, batch, event, "enrollment_resolution_failed: "+err.Error())
@@ -152,10 +155,9 @@ func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRe
 		subjectType := enrollment.SubjectType
 		subjectID := enrollment.SubjectID
 
-		// Prepare punch request
 		punchReq := &ingest.PunchRequest{
 			CompanyID:      req.CompanyID,
-			ActorID:        uuid.Nil, // device punch, no actor
+			ActorID:        uuid.Nil,
 			SubjectType:    subjectType,
 			SubjectID:      subjectID,
 			EventType:      event.EventType,
@@ -170,7 +172,6 @@ func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRe
 			},
 		}
 
-		// Call ingest service
 		_, err = s.ingestSvc.IngestPunch(ctx, punchReq)
 		if err != nil {
 			s.recordFailure(ctx, batch, event, "punch_ingest_failed: "+err.Error())
@@ -180,7 +181,7 @@ func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRe
 
 		successCount++
 
-		// Emit raw event outbox per success
+		// Emit raw event via central outbox per success
 		rawPayload, _ := json.Marshal(map[string]interface{}{
 			"company_id":   req.CompanyID,
 			"device_id":    req.DeviceID,
@@ -192,14 +193,18 @@ func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRe
 			"external_ref": event.ExternalRef,
 			"source_type":  req.SourceType,
 		})
-		rawOutbox := &repository.OutboxEvent{
-			EventID:     uuid.New(),
-			EventType:   "attendance.raw.events",
-			AggregateID: batch.BatchID,
-			Payload:     rawPayload,
-			CreatedAt:   time.Now().UTC(),
+		rawCentralEvent := &outbox.Event{
+			EventID:       uuid.New().String(),
+			AggregateType: "attendance_punch",
+			AggregateID:   batch.BatchID.String(),
+			EventType:     "attendance.raw.events",
+			Topic:         "attendance.events",
+			Payload:       rawPayload,
+			Headers: map[string]string{
+				"source": "attendance-batch",
+			},
 		}
-		_ = s.outboxRepo.Store(ctx, nil, rawOutbox)
+		_ = s.centralOutbox.Store(ctx, nil, rawCentralEvent)
 	}
 
 	// 6. Update batch status

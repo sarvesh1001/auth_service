@@ -9,7 +9,6 @@ import (
 )
 
 // RegisterAttendanceRoutes mounts all attendance endpoints.
-// All permission names used below are taken from the provided permission list.
 func RegisterAttendanceRoutes(
 	r chi.Router,
 	// Handlers
@@ -30,19 +29,28 @@ func RegisterAttendanceRoutes(
 	workCenterHandler *handler.WorkCenterHandler,
 	schedulingHandler *handler.SchedulingHandler,
 	adminHandler *handler.AttendanceAdminHandler,
-	// Middleware functions (provided by main router)
+	// Auth middleware (provided by main router)
 	jwtAuthMiddleware func(http.Handler) http.Handler,
 	sessionValidationMiddleware func(http.Handler) http.Handler,
 	bitmaskPermissionMiddleware func(permission string) func(http.Handler) http.Handler,
 	deviceAuthMiddleware func(http.Handler) http.Handler,
 	companyAccessMiddleware func(http.Handler) http.Handler,
+	// 🆕 new — mirrors the protected group's middleware chain
+	subscriptionEnforcementMiddleware func(http.Handler) http.Handler,
+	locationValidationMiddleware func(http.Handler) http.Handler,
+	idempotencyMiddleware func(http.Handler) http.Handler,
 ) {
 	// ============================================================
-	// 1. USER‑AUTHENTICATED ROUTES (JWT + session + permissions)
+	// 1. USER‑AUTHENTICATED ROUTES
+	//    Chain: jwt → session → subscription → location → idempotency
+	//           → [per-route: bitmask + companyAccess] → handler
 	// ============================================================
 	r.Route("/companies/{companyID}/attendance", func(r chi.Router) {
 		r.Use(jwtAuthMiddleware)
 		r.Use(sessionValidationMiddleware)
+		r.Use(subscriptionEnforcementMiddleware) // 🆕
+		r.Use(locationValidationMiddleware)      // 🆕
+		r.Use(idempotencyMiddleware)             // 🆕
 
 		// ----- Self punches -----
 		r.With(
@@ -57,111 +65,58 @@ func RegisterAttendanceRoutes(
 		).Post("/punch", ingestHandler.PunchAttendance)
 
 		// ----- Events -----
-		r.With(
-			bitmaskPermissionMiddleware("hr.attendance.view"),
-			companyAccessMiddleware,
-		).Get("/events/search", queryHandler.SearchEvents)
-
-		r.With(
-			bitmaskPermissionMiddleware("hr.attendance.view"),
-			companyAccessMiddleware,
-		).Get("/events/{eventID}", queryHandler.GetEvent)
+		r.With(bitmaskPermissionMiddleware("hr.attendance.view"), companyAccessMiddleware).
+			Get("/events/search", queryHandler.SearchEvents)
+		r.With(bitmaskPermissionMiddleware("hr.attendance.view"), companyAccessMiddleware).
+			Get("/events/{eventID}", queryHandler.GetEvent)
 
 		// ----- Daily summaries & stats -----
-		r.With(
-			bitmaskPermissionMiddleware("hr.attendance.view"),
-			companyAccessMiddleware,
-		).Get("/summary/{subjectType}/{subjectID}/{date}", queryHandler.GetDailySummary)
-
-		r.With(
-			bitmaskPermissionMiddleware("hr.attendance.view"),
-			companyAccessMiddleware,
-		).Get("/summaries/{subjectType}/{subjectID}", queryHandler.GetSubjectSummaries)
-
-		r.With(
-			bitmaskPermissionMiddleware("hr.attendance.view"),
-			companyAccessMiddleware,
-		).Get("/stats/company", queryHandler.GetCompanyStats)
-
-		r.With(
-			bitmaskPermissionMiddleware("hr.attendance.view"),
-			companyAccessMiddleware,
-		).Get("/stats/subject/{subjectType}/{subjectID}", queryHandler.GetSubjectStats)
+		r.With(bitmaskPermissionMiddleware("hr.attendance.view"), companyAccessMiddleware).
+			Get("/summary/{subjectType}/{subjectID}/{date}", queryHandler.GetDailySummary)
+		r.With(bitmaskPermissionMiddleware("hr.attendance.view"), companyAccessMiddleware).
+			Get("/summaries/{subjectType}/{subjectID}", queryHandler.GetSubjectSummaries)
+		r.With(bitmaskPermissionMiddleware("hr.attendance.view"), companyAccessMiddleware).
+			Get("/stats/company", queryHandler.GetCompanyStats)
+		r.With(bitmaskPermissionMiddleware("hr.attendance.view"), companyAccessMiddleware).
+			Get("/stats/subject/{subjectType}/{subjectID}", queryHandler.GetSubjectStats)
 
 		// ----- Session summaries -----
-		r.With(
-			bitmaskPermissionMiddleware("hr.attendance.view"),
-			companyAccessMiddleware,
-		).Get("/session-summaries", queryHandler.ListSessionSummaries)
-
-		r.With(
-			bitmaskPermissionMiddleware("hr.attendance.view"),
-			companyAccessMiddleware,
-		).Get("/session-summary/{sessionID}", queryHandler.GetSessionSummary)
+		r.With(bitmaskPermissionMiddleware("hr.attendance.view"), companyAccessMiddleware).
+			Get("/session-summaries", queryHandler.ListSessionSummaries)
+		r.With(bitmaskPermissionMiddleware("hr.attendance.view"), companyAccessMiddleware).
+			Get("/session-summary/{sessionID}", queryHandler.GetSessionSummary)
 
 		// ----- Exemptions -----
-		r.With(
-			bitmaskPermissionMiddleware("attendance.manage_exemptions"),
-			companyAccessMiddleware,
-		).Post("/exemptions", exemptionHandler.CreateExemption)
-
-		r.With(
-			bitmaskPermissionMiddleware("attendance.manage_exemptions"),
-			companyAccessMiddleware,
-		).Put("/exemptions/{exemptionID}", exemptionHandler.UpdateExemption)
-
-		r.With(
-			bitmaskPermissionMiddleware("attendance.manage_exemptions"),
-			companyAccessMiddleware,
-		).Delete("/exemptions/{exemptionID}", exemptionHandler.DeleteExemption)
-
-		r.With(
-			bitmaskPermissionMiddleware("hr.attendance.view"),
-			companyAccessMiddleware,
-		).Get("/exemptions", queryHandler.ListExemptions)
+		r.With(bitmaskPermissionMiddleware("attendance.manage_exemptions"), companyAccessMiddleware).
+			Post("/exemptions", exemptionHandler.CreateExemption)
+		r.With(bitmaskPermissionMiddleware("attendance.manage_exemptions"), companyAccessMiddleware).
+			Put("/exemptions/{exemptionID}", exemptionHandler.UpdateExemption)
+		r.With(bitmaskPermissionMiddleware("attendance.manage_exemptions"), companyAccessMiddleware).
+			Delete("/exemptions/{exemptionID}", exemptionHandler.DeleteExemption)
+		r.With(bitmaskPermissionMiddleware("hr.attendance.view"), companyAccessMiddleware).
+			Get("/exemptions", queryHandler.ListExemptions)
 
 		// ----- Corrections -----
-		r.With(
-			bitmaskPermissionMiddleware("attendance.correct"),
-			companyAccessMiddleware,
-		).Post("/corrections", correctionHandler.CreateCorrection)
+		r.With(bitmaskPermissionMiddleware("attendance.correct"), companyAccessMiddleware).
+			Post("/corrections", correctionHandler.CreateCorrection)
 
-		// ----- Resolution / Recalculation (now using attendance.configure) -----
-		r.With(
-			bitmaskPermissionMiddleware("attendance.configure"),
-			companyAccessMiddleware,
-		).Post("/resolve/event", resolutionHandler.ResolveEvent)
-
-		r.With(
-			bitmaskPermissionMiddleware("attendance.configure"),
-			companyAccessMiddleware,
-		).Post("/resolve/day", resolutionHandler.ResolveDay)
-
-		r.With(
-			bitmaskPermissionMiddleware("attendance.configure"),
-			companyAccessMiddleware,
-		).Post("/resolve/batch", resolutionHandler.BatchResolve)
-
-		r.With(
-			bitmaskPermissionMiddleware("attendance.configure"),
-			companyAccessMiddleware,
-		).Post("/resolve/period", resolutionHandler.BatchResolveByPeriod)
-
-		r.With(
-			bitmaskPermissionMiddleware("attendance.configure"),
-			companyAccessMiddleware,
-		).Post("/resolve/day/{userID}/{date}", resolutionHandler.ResolveDayByPath)
+		// ----- Resolution / Recalculation -----
+		r.With(bitmaskPermissionMiddleware("attendance.configure"), companyAccessMiddleware).
+			Post("/resolve/event", resolutionHandler.ResolveEvent)
+		r.With(bitmaskPermissionMiddleware("attendance.configure"), companyAccessMiddleware).
+			Post("/resolve/day", resolutionHandler.ResolveDay)
+		r.With(bitmaskPermissionMiddleware("attendance.configure"), companyAccessMiddleware).
+			Post("/resolve/batch", resolutionHandler.BatchResolve)
+		r.With(bitmaskPermissionMiddleware("attendance.configure"), companyAccessMiddleware).
+			Post("/resolve/period", resolutionHandler.BatchResolveByPeriod)
+		r.With(bitmaskPermissionMiddleware("attendance.configure"), companyAccessMiddleware).
+			Post("/resolve/day/{userID}/{date}", resolutionHandler.ResolveDayByPath)
 
 		// ----- Reports -----
-		r.With(
-			bitmaskPermissionMiddleware("hr.attendance.view"),
-			companyAccessMiddleware,
-		).Get("/reports", reportHandler.GenerateReport)
-
-		r.With(
-			bitmaskPermissionMiddleware("hr.attendance.view"),
-			companyAccessMiddleware,
-		).Get("/reports/stream", reportHandler.StreamEvents)
+		r.With(bitmaskPermissionMiddleware("hr.attendance.view"), companyAccessMiddleware).
+			Get("/reports", reportHandler.GenerateReport)
+		r.With(bitmaskPermissionMiddleware("hr.attendance.view"), companyAccessMiddleware).
+			Get("/reports/stream", reportHandler.StreamEvents)
 
 		// ----- Admin (policies, rules, sources) -----
 		r.Route("/admin", func(r chi.Router) {
@@ -216,11 +171,8 @@ func RegisterAttendanceRoutes(
 			})
 		})
 
-		// ============================================================
-		// ----- Work Centers (updated to administration permissions) -----
-		// ============================================================
+		// ----- Work Centers -----
 		r.Route("/work-centers", func(r chi.Router) {
-			// Reads: administration.company.view
 			r.Use(bitmaskPermissionMiddleware("administration.company.view"))
 			r.Use(companyAccessMiddleware)
 
@@ -229,7 +181,6 @@ func RegisterAttendanceRoutes(
 			r.Get("/active", workCenterHandler.GetActiveWorkCenters)
 			r.Get("/health", workCenterHandler.HealthCheck)
 
-			// Writes: administration.company.update
 			r.With(bitmaskPermissionMiddleware("administration.company.update")).
 				Post("/", workCenterHandler.CreateWorkCenter)
 
@@ -249,7 +200,6 @@ func RegisterAttendanceRoutes(
 
 			r.Get("/health", schedulingHandler.HealthCheck)
 
-			// Calendars
 			r.Get("/calendars", schedulingHandler.ListWorkCalendars)
 			r.Post("/calendars", schedulingHandler.CreateWorkCalendar)
 			r.Get("/calendars/{calendarID}", schedulingHandler.GetWorkCalendar)
@@ -257,70 +207,60 @@ func RegisterAttendanceRoutes(
 			r.Delete("/calendars/{calendarID}", schedulingHandler.DeleteWorkCalendar)
 			r.Get("/calendars/{calendarID}/availability", schedulingHandler.GetCalendarAvailability)
 
-			// Holidays
 			r.Post("/holidays", schedulingHandler.AddHolidayToCalendar)
 			r.Post("/holidays/process", schedulingHandler.ProcessHolidayForDate)
 
-			// Templates
 			r.Get("/templates", schedulingHandler.ListScheduleTemplates)
 			r.Post("/templates", schedulingHandler.CreateScheduleTemplate)
 			r.Get("/templates/{templateID}", schedulingHandler.GetScheduleTemplate)
 			r.Put("/templates/{templateID}", schedulingHandler.UpdateScheduleTemplate)
 			r.Delete("/templates/{templateID}", schedulingHandler.DeleteScheduleTemplate)
 
-			// Instances
 			r.Get("/instances", schedulingHandler.ListScheduleInstances)
 			r.Post("/instances", schedulingHandler.CreateScheduleInstance)
-			// Bulk creation not yet implemented in SchedulingHandler – keep commented
-			// r.Post("/instances/bulk", schedulingHandler.BulkCreateScheduleInstances)
-			// Search uses ListScheduleInstances with query params
-			// r.Post("/instances/search", schedulingHandler.SearchScheduleInstances)
 			r.Get("/instances/{instanceID}", schedulingHandler.GetScheduleInstance)
 			r.Put("/instances/{instanceID}", schedulingHandler.UpdateScheduleInstance)
 			r.Delete("/instances/{instanceID}", schedulingHandler.DeleteScheduleInstance)
 
-			// Position‑based resolution
 			r.Get("/position-based/users/{userID}/position", schedulingHandler.GetUserScheduledPosition)
 			r.Get("/position-based/users/{userID}/current", schedulingHandler.GetUserCurrentAssignment)
-			// ResolveUserDay is not a separate handler; use GetUserScheduledPosition
-			// r.Get("/position-based/users/{userID}/resolve", schedulingHandler.ResolveUserDay)
 			r.Post("/position-based/instances", schedulingHandler.CreateScheduleInstanceFromPosition)
 
-			// Generate schedules
 			r.Post("/generate/user/{userID}", schedulingHandler.GenerateScheduleForUser)
 			r.Post("/generate/company", schedulingHandler.GenerateScheduleForCompany)
 
-			// Overrides
 			r.Post("/overrides", schedulingHandler.CreateScheduleOverride)
 			r.Get("/overrides", schedulingHandler.GetScheduleOverrides)
 			r.Get("/overrides/{overrideID}", schedulingHandler.GetScheduleOverrideByID)
 			r.Put("/overrides/{overrideID}", schedulingHandler.UpdateScheduleOverride)
 			r.Delete("/overrides/{overrideID}", schedulingHandler.DeleteScheduleOverride)
 
-			// Work center shifts
 			r.Get("/work-centers/{workCenterCode}/shifts", schedulingHandler.GetWorkCenterShifts)
 			r.Post("/work-center-shifts", schedulingHandler.CreateWorkCenterShiftMapping)
 			r.Put("/work-center-shifts", schedulingHandler.UpdateWorkCenterShiftMapping)
 
-			// Availability & conflict
 			r.Get("/availability/check", schedulingHandler.CheckScheduleAvailability)
 			r.Get("/availability/conflict-check", schedulingHandler.ValidateScheduleConflict)
 
-			// Reports / stats
 			r.Get("/reports/stats", schedulingHandler.GetScheduleStats)
 
-			// Query – use ListScheduleInstances for search
 			r.Get("/query/instances", schedulingHandler.ListScheduleInstances)
 			r.Get("/query/user/{userID}/assignment", schedulingHandler.GetUserCurrentAssignment)
 		})
 	})
 
 	// ============================================================
-	// 2. DEVICE‑AUTHENTICATED ROUTES (device token + middleware)
+	// 2. DEVICE‑AUTHENTICATED ROUTES
+	//    Device routes authenticate via device token; the device is
+	//    already bound to a location, so we intentionally skip the
+	//    LocationValidationMiddleware here (no X-Location-ID header
+	//    is sent by IoT devices). Subscription + idempotency are safe.
 	// ============================================================
 	r.Route("/companies/{companyID}/attendance-device", func(r chi.Router) {
 		r.Use(deviceAuthMiddleware)
+		r.Use(subscriptionEnforcementMiddleware) // 🆕
 		r.Use(companyAccessMiddleware)
+		r.Use(idempotencyMiddleware) // 🆕
 
 		r.Post("/events/punch", ingestHandler.DevicePunchAttendance)
 
@@ -345,11 +285,13 @@ func RegisterAttendanceRoutes(
 	})
 
 	// ============================================================
-	// 3. ACADEMIC‑SPECIFIC DEVICE ROUTES (student biometrics)
+	// 3. ACADEMIC‑SPECIFIC DEVICE ROUTES
 	// ============================================================
 	r.Route("/companies/{companyID}/academics/biometric-device", func(r chi.Router) {
 		r.Use(deviceAuthMiddleware)
+		r.Use(subscriptionEnforcementMiddleware) // 🆕
 		r.Use(companyAccessMiddleware)
+		r.Use(idempotencyMiddleware) // 🆕
 
 		r.Post("/sync", biometricSyncHandler.SyncEmbeddings)
 		r.Post("/full/{deviceID}", biometricSyncHandler.FullSync)

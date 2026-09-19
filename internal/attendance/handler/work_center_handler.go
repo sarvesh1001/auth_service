@@ -18,6 +18,7 @@ import (
 	"auth-service/internal/attendance/models"
 	"auth-service/internal/attendance/service/workcenter"
 	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/locationctx"
 )
 
 // WorkCenterHandler handles HTTP requests for work center management.
@@ -46,11 +47,12 @@ func NewWorkCenterHandler(
 // ---- Request/Response DTOs ----
 
 type CreateWorkCenterRequest struct {
-	WorkCenterCode string  `json:"work_center_code"`
-	Name           string  `json:"name"`
-	Description    *string `json:"description,omitempty"`
-	Timezone       string  `json:"timezone"`
-	IsActive       bool    `json:"is_active"`
+	WorkCenterCode string     `json:"work_center_code"`
+	LocationID     *uuid.UUID `json:"location_id,omitempty"` // 🆕
+	Name           string     `json:"name"`
+	Description    *string    `json:"description,omitempty"`
+	Timezone       string     `json:"timezone"`
+	IsActive       bool       `json:"is_active"`
 }
 
 type UpdateWorkCenterRequest struct {
@@ -58,6 +60,7 @@ type UpdateWorkCenterRequest struct {
 	Description *string `json:"description,omitempty"`
 	Timezone    *string `json:"timezone,omitempty"`
 	IsActive    *bool   `json:"is_active,omitempty"`
+	// NOTE: location_id is intentionally NOT updatable.
 }
 
 // ---- Handlers ----
@@ -96,6 +99,35 @@ func (h *WorkCenterHandler) CreateWorkCenter(w http.ResponseWriter, r *http.Requ
 		req.Timezone = "UTC"
 	}
 
+	// 🆕 Resolve the target location.
+	//    Prefer the body's location_id (client explicitly chose it),
+	//    fall back to the X-Location-ID header scope, else nil.
+	headerLocationID := locationctx.Filter(ctx)
+	targetLocationID := req.LocationID
+	if targetLocationID == nil {
+		targetLocationID = headerLocationID
+	}
+
+	// Log resolution for debugging
+	h.logger.Info("WorkCenter create — location resolution",
+		zap.String("company_id", companyID.String()),
+		zap.String("work_center_code", req.WorkCenterCode),
+		zap.Any("body_location_id", req.LocationID),
+		zap.Any("header_location_id", headerLocationID),
+		zap.Any("resolved_location_id", targetLocationID),
+	)
+
+	// Reject the write if the client is in "ALL" mode and didn't pick
+	// a specific location — the backend cannot guess one.
+	if targetLocationID == nil {
+		h.respondWithError(
+			w,
+			http.StatusBadRequest,
+			"location_id is required — select a specific location before creating a work center",
+		)
+		return
+	}
+
 	metadata := map[string]interface{}{
 		"ip_address":     r.RemoteAddr,
 		"user_agent":     r.UserAgent(),
@@ -106,6 +138,7 @@ func (h *WorkCenterHandler) CreateWorkCenter(w http.ResponseWriter, r *http.Requ
 	workCenter := &models.WorkCenter{
 		WorkCenterCode: req.WorkCenterCode,
 		CompanyID:      companyID,
+		LocationID:     targetLocationID, // 🆕 THIS WAS MISSING
 		Name:           req.Name,
 		Description:    req.Description,
 		Timezone:       req.Timezone,
@@ -127,6 +160,11 @@ func (h *WorkCenterHandler) CreateWorkCenter(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusInternalServerError, "Failed to create work center")
 		return
 	}
+
+	h.logger.Info("WorkCenter created",
+		zap.String("work_center_code", result.WorkCenterCode),
+		zap.Any("location_id", result.LocationID),
+	)
 
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
@@ -306,6 +344,7 @@ func (h *WorkCenterHandler) DeleteWorkCenter(w http.ResponseWriter, r *http.Requ
 	})
 }
 
+// ListWorkCenters — location scope read from X-Location-ID.
 func (h *WorkCenterHandler) ListWorkCenters(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	ctx := r.Context()
@@ -325,7 +364,9 @@ func (h *WorkCenterHandler) ListWorkCenters(w http.ResponseWriter, r *http.Reque
 		pageSize = 50
 	}
 
-	workCenters, totalCount, err := h.workCenterQueryService.ListWorkCenters(ctx, companyID, page, pageSize)
+	locFilter := locationctx.Filter(ctx)
+
+	workCenters, totalCount, err := h.workCenterQueryService.ListWorkCenters(ctx, companyID, locFilter, page, pageSize)
 	if err != nil {
 		h.logger.Error("Failed to list work centers",
 			zap.String("company_id", companyID.String()),
@@ -351,6 +392,7 @@ func (h *WorkCenterHandler) ListWorkCenters(w http.ResponseWriter, r *http.Reque
 	})
 }
 
+// SearchWorkCenters — location scope read from X-Location-ID.
 func (h *WorkCenterHandler) SearchWorkCenters(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	ctx := r.Context()
@@ -383,7 +425,9 @@ func (h *WorkCenterHandler) SearchWorkCenters(w http.ResponseWriter, r *http.Req
 		filters["work_center_code"] = code
 	}
 
-	workCenters, totalCount, err := h.workCenterQueryService.SearchWorkCenters(ctx, companyID, filters, page, pageSize)
+	locFilter := locationctx.Filter(ctx)
+
+	workCenters, totalCount, err := h.workCenterQueryService.SearchWorkCenters(ctx, companyID, locFilter, filters, page, pageSize)
 	if err != nil {
 		h.logger.Error("Failed to search work centers",
 			zap.String("company_id", companyID.String()),
@@ -410,6 +454,7 @@ func (h *WorkCenterHandler) SearchWorkCenters(w http.ResponseWriter, r *http.Req
 	})
 }
 
+// GetActiveWorkCenters — location scope read from X-Location-ID.
 func (h *WorkCenterHandler) GetActiveWorkCenters(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	ctx := r.Context()
@@ -420,7 +465,9 @@ func (h *WorkCenterHandler) GetActiveWorkCenters(w http.ResponseWriter, r *http.
 		return
 	}
 
-	workCenters, err := h.workCenterQueryService.GetActiveWorkCenters(ctx, companyID)
+	locFilter := locationctx.Filter(ctx)
+
+	workCenters, err := h.workCenterQueryService.GetActiveWorkCenters(ctx, companyID, locFilter)
 	if err != nil {
 		h.logger.Error("Failed to get active work centers",
 			zap.String("company_id", companyID.String()),
@@ -493,3 +540,5 @@ func (h *WorkCenterHandler) respondWithError(w http.ResponseWriter, status int, 
 		"code":    status,
 	})
 }
+
+

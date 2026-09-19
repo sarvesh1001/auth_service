@@ -7,13 +7,15 @@ import (
 	"github.com/google/uuid"
 )
 
+// EventContext carries free-form metadata about the circumstances of a
+// punch. Location is NOT stored here — it lives on the event itself as
+// EmploymentLocationID and GeofenceID, so it can be indexed and queried.
 type EventContext struct {
 	WorkCenterCode   *string    `json:"work_center_code,omitempty"`
-	LocationID       *uuid.UUID `json:"location_id,omitempty"`
 	Reason           *string    `json:"reason,omitempty"`
 	ExternalRef      *string    `json:"external_ref,omitempty"`
 	CorrectionReason *string    `json:"correction_reason,omitempty"`
-	SessionID        *uuid.UUID `json:"session_id,omitempty"` // 👈 new field
+	SessionID        *uuid.UUID `json:"session_id,omitempty"`
 }
 
 type EventMetadata struct {
@@ -25,22 +27,40 @@ type EventMetadata struct {
 	CorrectedBy     *uuid.UUID `json:"corrected_by,omitempty"`
 }
 
+// AttendanceEvent is the canonical attendance event row.
+//
+// Two location dimensions, both snapshots at write time:
+//
+//	EmploymentLocationID → the subject's org unit when the event occurred.
+//	                       Populated from SubjectLocationResolver.
+//	GeofenceID           → the physical fence the punch happened inside.
+//	                       Populated from the device's geofence, or GPS for
+//	                       mobile punches. NULL for admin/manual entries.
+//
+// See docs/location-architecture.md for the full model.
 type AttendanceEvent struct {
-	AttendanceEventID uuid.UUID       `json:"attendance_event_id" db:"attendance_event_id"`
-	CompanyID         uuid.UUID       `json:"company_id" db:"company_id"`
-	SubjectType       string          `json:"subject_type" db:"subject_type"` // employee / student / customer
-	SubjectID         uuid.UUID       `json:"subject_id" db:"subject_id"`
-	EventType         string          `json:"event_type" db:"event_type"`
-	EventTime         time.Time       `json:"event_time" db:"event_time"`
-	SourceType        string          `json:"source_type" db:"source_type"`
-	SourceID          *uuid.UUID      `json:"source_id,omitempty" db:"source_id"`
-	DeviceID          *string         `json:"device_id,omitempty" db:"device_id"`
-	DeviceUserCode    *string         `json:"device_user_code,omitempty" db:"device_user_code"`
-	IPAddress         *string         `json:"ip_address,omitempty" db:"ip_address"`
-	Context           EventContext    `json:"context" db:"context"`
-	Metadata          EventMetadata   `json:"metadata" db:"metadata"`
-	RawEventPayload   json.RawMessage `json:"raw_event_payload,omitempty" db:"raw_event_payload"`
-	CreatedAt         time.Time       `json:"created_at" db:"created_at"`
-	CreatedBy         *uuid.UUID      `json:"created_by,omitempty" db:"created_by"`
-	EventDate         time.Time       `json:"event_date" db:"event_date"` // generated column
+	AttendanceEventID uuid.UUID `json:"attendance_event_id" db:"attendance_event_id"`
+	CompanyID         uuid.UUID `json:"company_id" db:"company_id"`
+	SubjectType       string    `json:"subject_type" db:"subject_type"` // employee / student / customer
+	SubjectID         uuid.UUID `json:"subject_id" db:"subject_id"`
+	EventType         string    `json:"event_type" db:"event_type"`
+	EventTime         time.Time `json:"event_time" db:"event_time"`
+
+	// Two location dimensions (snapshots)
+	EmploymentLocationID *uuid.UUID `json:"employment_location_id,omitempty" db:"employment_location_id"`
+	GeofenceID           *uuid.UUID `json:"geofence_id,omitempty" db:"geofence_id"`
+
+	SourceType     string     `json:"source_type" db:"source_type"`
+	SourceID       *uuid.UUID `json:"source_id,omitempty" db:"source_id"`
+	DeviceID       *string    `json:"device_id,omitempty" db:"device_id"`
+	DeviceUserCode *string    `json:"device_user_code,omitempty" db:"device_user_code"`
+	IPAddress      *string    `json:"ip_address,omitempty" db:"ip_address"`
+
+	Context         EventContext    `json:"context" db:"context"`
+	Metadata        EventMetadata   `json:"metadata" db:"metadata"`
+	RawEventPayload json.RawMessage `json:"raw_event_payload,omitempty" db:"raw_event_payload"`
+
+	CreatedAt time.Time  `json:"created_at" db:"created_at"`
+	CreatedBy *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
+	EventDate time.Time  `json:"event_date" db:"event_date"` // generated column
 }

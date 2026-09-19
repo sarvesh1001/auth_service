@@ -13,14 +13,30 @@ import (
 )
 
 // QueryService provides high-level read operations for attendance data.
+//
+// Read methods that return a set take a `locationID *uuid.UUID` parameter.
+//
+//	nil      = no location filter (company-wide, ALL scope)
+//	non-nil  = filter to subjects/events at that employment location
+//
+// Handlers read the scope from locationctx.Filter(ctx) and pass it down.
+// The middleware has already validated that the caller is allowed to see
+// that location.
 type QueryService interface {
-	// --- Existing methods ---
 	GetEventByID(ctx context.Context, eventID uuid.UUID) (*models.AttendanceEvent, error)
-	ListEvents(ctx context.Context, filter EventFilter) ([]*models.AttendanceEvent, int64, error)
+
+	// ListEvents — locationID == nil means no filter.
+	ListEvents(ctx context.Context, filter EventFilter, locationID *uuid.UUID) ([]*models.AttendanceEvent, int64, error)
+
 	GetDailySummary(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) (*models.AttendanceDailySummary, error)
 	ListDailySummaries(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, from, to time.Time) ([]*models.AttendanceDailySummary, error)
-	ListCompanySummaries(ctx context.Context, companyID uuid.UUID, from, to time.Time) ([]*models.AttendanceDailySummary, error)
-	GetCompanyStats(ctx context.Context, companyID uuid.UUID, from, to time.Time) (*models.AttendanceStats, error)
+
+	// ListCompanySummaries — locationID == nil means no filter.
+	ListCompanySummaries(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, from, to time.Time) ([]*models.AttendanceDailySummary, error)
+
+	// GetCompanyStats — locationID == nil means no filter.
+	GetCompanyStats(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, from, to time.Time) (*models.AttendanceStats, error)
+
 	GetSubjectStats(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, from, to time.Time) (*models.UserAttendanceStats, error)
 	GetAttendancePercentage(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, from, to time.Time) (float64, error)
 	ListEventTypes(ctx context.Context, activeOnly bool) ([]*models.AttendanceEventType, error)
@@ -28,11 +44,11 @@ type QueryService interface {
 	GetAttendancePolicyByID(ctx context.Context, policyID uuid.UUID) (*models.AttendancePolicy, error)
 	GetAttendancePoliciesByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.AttendancePolicy, error)
 
-	// --- NEW: Session Summary methods ---
+	// Session summary
 	GetSessionSummary(ctx context.Context, sessionID, subjectID uuid.UUID, subjectType string) (*models.AttendanceSessionSummary, error)
 	ListSessionSummaries(ctx context.Context, filter repository.SessionSummaryFilter, page, pageSize int) ([]*models.AttendanceSessionSummary, int64, error)
 
-	// --- NEW: Exemption methods ---
+	// Exemptions
 	GetExemptionsForSubject(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) ([]*models.AttendanceExemption, error)
 	ListExemptions(ctx context.Context, filter repository.ExemptionFilter, page, pageSize int) ([]*models.AttendanceExemption, int64, error)
 }
@@ -55,20 +71,18 @@ type queryService struct {
 	summaryRepo        repository.SummaryRepository
 	sourceRepo         repository.SourceRepository
 	policyRepo         repository.PolicyRepository
-	sessionSummaryRepo repository.AttendanceSessionSummaryRepository // 👈 NEW
-	exemptionRepo      repository.AttendanceExemptionRepository      // 👈 NEW
+	sessionSummaryRepo repository.AttendanceSessionSummaryRepository
+	exemptionRepo      repository.AttendanceExemptionRepository
 	logger             *zap.Logger
 }
 
-// NewQueryService creates a new query service.
-// Now accepts sessionSummaryRepo and exemptionRepo.
 func NewQueryService(
 	eventRepo repository.EventRepository,
 	summaryRepo repository.SummaryRepository,
 	sourceRepo repository.SourceRepository,
 	policyRepo repository.PolicyRepository,
-	sessionSummaryRepo repository.AttendanceSessionSummaryRepository, // 👈 NEW PARAM
-	exemptionRepo repository.AttendanceExemptionRepository, // 👈 NEW PARAM
+	sessionSummaryRepo repository.AttendanceSessionSummaryRepository,
+	exemptionRepo repository.AttendanceExemptionRepository,
 	logger *zap.Logger,
 ) QueryService {
 	return &queryService{
@@ -82,7 +96,7 @@ func NewQueryService(
 	}
 }
 
-// --- Existing methods (unchanged) ---
+// --- Single-row reads (unchanged) ---
 
 func (s *queryService) GetEventByID(ctx context.Context, eventID uuid.UUID) (*models.AttendanceEvent, error) {
 	if eventID == uuid.Nil {
@@ -91,7 +105,14 @@ func (s *queryService) GetEventByID(ctx context.Context, eventID uuid.UUID) (*mo
 	return s.eventRepo.GetEventByID(ctx, eventID)
 }
 
-func (s *queryService) ListEvents(ctx context.Context, filter EventFilter) ([]*models.AttendanceEvent, int64, error) {
+// --- Set reads (location-scoped) ---
+
+// ListEvents — locationID == nil means no filter (ALL scope).
+func (s *queryService) ListEvents(
+	ctx context.Context,
+	filter EventFilter,
+	locationID *uuid.UUID,
+) ([]*models.AttendanceEvent, int64, error) {
 	if filter.CompanyID == uuid.Nil {
 		return nil, 0, fmt.Errorf("company ID is required")
 	}
@@ -122,6 +143,7 @@ func (s *queryService) ListEvents(ctx context.Context, filter EventFilter) ([]*m
 		EndDate:     filter.EndDate,
 		Page:        filter.Page,
 		PageSize:    filter.PageSize,
+		LocationID:  locationID, // 👈 new — pass to repo
 	}
 	return s.eventRepo.ListEvents(ctx, repoFilter)
 }
@@ -146,42 +168,47 @@ func (s *queryService) ListDailySummaries(ctx context.Context, companyID, subjec
 	return s.summaryRepo.GetBySubjectRange(ctx, companyID, subjectID, subjectType, from, to)
 }
 
-func (s *queryService) ListCompanySummaries(ctx context.Context, companyID uuid.UUID, from, to time.Time) ([]*models.AttendanceDailySummary, error) {
-	if companyID == uuid.Nil {
-		return nil, fmt.Errorf("company ID is required")
-	}
-	summaries, _, err := s.summaryRepo.GetByCompanyRange(ctx, companyID, from, to, 1, 100000)
-	if err != nil {
-		return nil, err
-	}
-	return summaries, nil
-}
-
-func (s *queryService) GetCompanyStats(ctx context.Context, companyID uuid.UUID, from, to time.Time) (*models.AttendanceStats, error) {
+// ListCompanySummaries — locationID == nil means no filter (ALL scope).
+func (s *queryService) ListCompanySummaries(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+	from, to time.Time,
+) ([]*models.AttendanceDailySummary, error) {
 	if companyID == uuid.Nil {
 		return nil, fmt.Errorf("company ID is required")
 	}
 	if from.After(to) {
 		return nil, fmt.Errorf("start date cannot be after end date")
 	}
-	summaries, err := s.ListCompanySummaries(ctx, companyID, from, to)
+	summaries, _, err := s.summaryRepo.GetByCompanyRange(ctx, companyID, locationID, from, to, 1, 100000)
+	if err != nil {
+		return nil, err
+	}
+	return summaries, nil
+}
+
+// GetCompanyStats — locationID == nil means no filter (ALL scope).
+func (s *queryService) GetCompanyStats(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+	from, to time.Time,
+) (*models.AttendanceStats, error) {
+	if companyID == uuid.Nil {
+		return nil, fmt.Errorf("company ID is required")
+	}
+	if from.After(to) {
+		return nil, fmt.Errorf("start date cannot be after end date")
+	}
+	summaries, err := s.ListCompanySummaries(ctx, companyID, locationID, from, to)
 	if err != nil {
 		return nil, err
 	}
 	stats := &models.AttendanceStats{
-		CompanyID:          companyID,
-		StartDate:          from,
-		EndDate:            to,
-		TotalEmployees:     0,
-		PresentCount:       0,
-		AbsentCount:        0,
-		LateCount:          0,
-		HalfDayCount:       0,
-		LeaveCount:         0,
-		HolidayCount:       0,
-		TotalWorkedHours:   0,
-		TotalOvertimeHours: 0,
-		AverageAttendance:  0,
+		CompanyID: companyID,
+		StartDate: from,
+		EndDate:   to,
 	}
 	var totalWorkedMin, totalOvertimeMin int
 	subjectSet := make(map[string]bool)
@@ -220,6 +247,8 @@ func (s *queryService) GetCompanyStats(ctx context.Context, companyID uuid.UUID,
 	return stats, nil
 }
 
+// --- Per-subject reads (already scoped to one subject, no location filter) ---
+
 func (s *queryService) GetSubjectStats(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, from, to time.Time) (*models.UserAttendanceStats, error) {
 	if companyID == uuid.Nil || subjectID == uuid.Nil || subjectType == "" {
 		return nil, fmt.Errorf("company_id, subject_id, and subject_type are required")
@@ -232,19 +261,9 @@ func (s *queryService) GetSubjectStats(ctx context.Context, companyID, subjectID
 		return nil, err
 	}
 	stats := &models.UserAttendanceStats{
-		UserID:             subjectID,
-		StartDate:          from,
-		EndDate:            to,
-		PresentDays:        0,
-		AbsentDays:         0,
-		LateDays:           0,
-		HalfDays:           0,
-		LeaveDays:          0,
-		TotalWorkedHours:   0,
-		TotalOvertimeHours: 0,
-		AverageInTime:      "",
-		AverageOutTime:     "",
-		AttendancePercent:  0,
+		UserID:    subjectID,
+		StartDate: from,
+		EndDate:   to,
 	}
 	var totalWorkedMin, totalOvertimeMin int
 	for _, sum := range summaries {
@@ -306,9 +325,9 @@ func (s *queryService) GetAttendancePoliciesByCompany(ctx context.Context, compa
 	return s.policyRepo.GetPoliciesByCompany(ctx, companyID, activeOnly)
 }
 
-// ─────────────────────────────────────────────────────────────
-// NEW: Session Summary Methods
-// ─────────────────────────────────────────────────────────────
+// --- Session summaries ---
+// The SessionSummaryFilter now has a LocationID field. Callers set it before
+// calling ListSessionSummaries if they want location scope.
 
 func (s *queryService) GetSessionSummary(ctx context.Context, sessionID, subjectID uuid.UUID, subjectType string) (*models.AttendanceSessionSummary, error) {
 	if sessionID == uuid.Nil || subjectID == uuid.Nil || subjectType == "" {
@@ -336,9 +355,7 @@ func (s *queryService) ListSessionSummaries(ctx context.Context, filter reposito
 	return summaries, total, nil
 }
 
-// ─────────────────────────────────────────────────────────────
-// NEW: Exemption Methods
-// ─────────────────────────────────────────────────────────────
+// --- Exemptions ---
 
 func (s *queryService) GetExemptionsForSubject(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) ([]*models.AttendanceExemption, error) {
 	if companyID == uuid.Nil || subjectID == uuid.Nil || subjectType == "" {

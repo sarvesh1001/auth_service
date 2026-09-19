@@ -2,65 +2,55 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 
 	"auth-service/internal/hr/payroll/models"
 	"auth-service/internal/hr/payroll/repository"
-	a "auth-service/internal/infrastructure/audit"
+	hrRepo "auth-service/internal/hr/repository"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+	"auth-service/internal/locationctx"
 )
 
 // ----------------------------------------------------------------------
-// Input / Output Types (Enterprise Ready)
+// Input / Output Types
 // ----------------------------------------------------------------------
 
 type CreateEmployeeFineInput struct {
-	CompanyID uuid.UUID
-	UserID    uuid.UUID
-
-	FineAmount float64
-	Reason     string
-	FineDate   time.Time
-
-	// Optional component code. If not provided, company default is used.
+	CompanyID     uuid.UUID
+	UserID        uuid.UUID
+	FineAmount    float64
+	Reason        string
+	FineDate      time.Time
 	ComponentCode *string
-
-	Category  *string // optional future extensibility
-	Reference *string // optional (attendance_id, incident_id)
-
-	CreatedBy uuid.UUID
+	Category      *string
+	Reference     *string
+	CreatedBy     uuid.UUID
 }
 
 type UpdateEmployeeFineInput struct {
-	FineID    uuid.UUID
-	CompanyID uuid.UUID
-
-	FineAmount *float64
-	Reason     *string
-	FineDate   *time.Time
-
-	// Component code can be updated, but only if fine is unprocessed.
+	FineID        uuid.UUID
+	CompanyID     uuid.UUID
+	FineAmount    *float64
+	Reason        *string
+	FineDate      *time.Time
 	ComponentCode *string
-
-	UpdatedBy uuid.UUID
+	UpdatedBy     uuid.UUID
 }
 
 type BulkCreateEmployeeFineInput struct {
-	CompanyID uuid.UUID
-	UserIDs   []uuid.UUID
-
-	FineAmount float64
-	Reason     string
-	FineDate   time.Time
-
-	// Optional component code. If not provided, company default is used.
+	CompanyID     uuid.UUID
+	UserIDs       []uuid.UUID
+	FineAmount    float64
+	Reason        string
+	FineDate      time.Time
 	ComponentCode *string
-
-	CreatedBy uuid.UUID
+	CreatedBy     uuid.UUID
 }
 
 type EmployeeFineSummary struct {
@@ -80,50 +70,22 @@ type CompanyFineSummary struct {
 }
 
 // ----------------------------------------------------------------------
-// Service Interface (as provided)
+// Service Interface
 // ----------------------------------------------------------------------
 
 type EmployeeFineService interface {
-	// Create / Update / Delete
 	CreateFine(ctx context.Context, input CreateEmployeeFineInput) (*models.EmployeeFine, error)
 	UpdateFine(ctx context.Context, input UpdateEmployeeFineInput) (*models.EmployeeFine, error)
 	DeleteFine(ctx context.Context, companyID, fineID, actorID uuid.UUID) error
-
-	// Bulk Operations
 	BulkCreateFines(ctx context.Context, input BulkCreateEmployeeFineInput) ([]*models.EmployeeFine, error)
 	BulkDeleteUnprocessed(ctx context.Context, companyID uuid.UUID, fineIDs []uuid.UUID, actorID uuid.UUID) error
-
-	// Processing / Payroll Integration
 	MarkFineAsProcessed(ctx context.Context, fineID uuid.UUID, payrollRunID uuid.UUID) error
-	LockFinesForPayrollRun(
-		ctx context.Context,
-		companyID uuid.UUID,
-		periodStart, periodEnd time.Time,
-		payrollRunID uuid.UUID,
-	) ([]models.EmployeeFine, error)
-
-	// Retrieval / Queries
+	LockFinesForPayrollRun(ctx context.Context, companyID uuid.UUID, periodStart, periodEnd time.Time, payrollRunID uuid.UUID) ([]models.EmployeeFine, error)
 	GetFineByID(ctx context.Context, companyID, fineID uuid.UUID) (*models.EmployeeFine, error)
 	ListFines(ctx context.Context, filter models.EmployeeFineFilter) ([]models.EmployeeFine, int, error)
-	GetEmployeeUnprocessedFines(
-		ctx context.Context,
-		companyID uuid.UUID,
-		userID uuid.UUID,
-		periodStart, periodEnd time.Time,
-	) ([]models.EmployeeFine, error)
-
-	// Reporting / Aggregation
-	GetFineSummaryByEmployee(
-		ctx context.Context,
-		companyID uuid.UUID,
-		userID uuid.UUID,
-		periodStart, periodEnd time.Time,
-	) (*EmployeeFineSummary, error)
-	GetCompanyFineSummary(
-		ctx context.Context,
-		companyID uuid.UUID,
-		periodStart, periodEnd time.Time,
-	) (*CompanyFineSummary, error)
+	GetEmployeeUnprocessedFines(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, periodStart, periodEnd time.Time) ([]models.EmployeeFine, error)
+	GetFineSummaryByEmployee(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, periodStart, periodEnd time.Time) (*EmployeeFineSummary, error)
+	GetCompanyFineSummary(ctx context.Context, companyID uuid.UUID, periodStart, periodEnd time.Time) (*CompanyFineSummary, error)
 }
 
 // ----------------------------------------------------------------------
@@ -131,41 +93,70 @@ type EmployeeFineService interface {
 // ----------------------------------------------------------------------
 
 type employeeFineService struct {
-	fineRepo      repository.EmployeeFineRepository
-	payrollRepo   repository.PayrollRepository         // for period lock checks
-	componentRepo repository.ComponentRepository       // to validate/fetch component metadata
-	settingsRepo  repository.CompanySettingsRepository // to get default component
-	audit         *a.AuditService
-	logger        *zap.Logger
+	fineRepo         repository.EmployeeFineRepository
+	payrollRepo      repository.PayrollRepository
+	componentRepo    repository.ComponentRepository
+	settingsRepo     repository.CompanySettingsRepository
+	employeeRepo     hrRepo.EmployeeRepository // 👈 new
+	audit            *audit.AuditService
+	idempotencyStore idempotency.Store
 }
 
-// NewEmployeeFineService creates a new instance of the service.
 func NewEmployeeFineService(
 	fineRepo repository.EmployeeFineRepository,
 	payrollRepo repository.PayrollRepository,
 	componentRepo repository.ComponentRepository,
 	settingsRepo repository.CompanySettingsRepository,
-	audit *a.AuditService,
-	logger *zap.Logger,
+	employeeRepo hrRepo.EmployeeRepository, // 👈 new
+	audit *audit.AuditService,
+	idempotencyStore idempotency.Store,
 ) EmployeeFineService {
 	return &employeeFineService{
-		fineRepo:      fineRepo,
-		payrollRepo:   payrollRepo,
-		componentRepo: componentRepo,
-		settingsRepo:  settingsRepo,
-		audit:         audit,
-		logger:        logger,
+		fineRepo:         fineRepo,
+		payrollRepo:      payrollRepo,
+		componentRepo:    componentRepo,
+		settingsRepo:     settingsRepo,
+		employeeRepo:     employeeRepo,
+		audit:            audit,
+		idempotencyStore: idempotencyStore,
 	}
+}
+
+// ensureEmployeeInScope — see HR for the shared pattern.
+// Missing location context is allowed (system/worker calls).
+func (s *employeeFineService) ensureEmployeeInScope(
+	ctx context.Context,
+	companyID, targetUserID uuid.UUID,
+) error {
+	if actorStr, ok := ctx.Value("user_id").(string); ok {
+		if actorID, err := uuid.Parse(actorStr); err == nil && actorID == targetUserID {
+			return nil
+		}
+	}
+	locCtx, err := locationctx.FromContext(ctx)
+	if err != nil {
+		return nil // system call
+	}
+	if locCtx.Mode == locationctx.ScopeAll {
+		return nil
+	}
+	empLoc, err := s.employeeRepo.GetEmploymentLocationID(ctx, companyID, targetUserID)
+	if err != nil {
+		return err
+	}
+	if empLoc == nil {
+		return ErrEmployeeHasNoLocation
+	}
+	if *empLoc != *locCtx.LocationID {
+		return ErrEmployeeOutsideScope
+	}
+	return nil
 }
 
 // ----------------------------------------------------------------------
 // Helper: resolve component code
 // ----------------------------------------------------------------------
 
-// resolveComponentCode returns the effective component code for a fine.
-// If input code is provided, it is validated and returned.
-// If not, the company default fine component is fetched from settings.
-// Returns error if code cannot be resolved or component is invalid.
 func (s *employeeFineService) resolveComponentCode(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -175,7 +166,6 @@ func (s *employeeFineService) resolveComponentCode(
 	if inputCode != nil && *inputCode != "" {
 		code = *inputCode
 	} else {
-		// fetch company default
 		settings, err := s.settingsRepo.GetPayrollSettings(ctx, companyID)
 		if err != nil {
 			return "", fmt.Errorf("failed to get company payroll settings: %w", err)
@@ -185,8 +175,6 @@ func (s *employeeFineService) resolveComponentCode(
 		}
 		code = *settings.DefaultFineComponent
 	}
-
-	// validate component exists and is active (and optionally type deduction)
 	comp, err := s.componentRepo.GetComponent(ctx, companyID, code)
 	if err != nil {
 		return "", fmt.Errorf("failed to validate component %s: %w", code, err)
@@ -194,7 +182,6 @@ func (s *employeeFineService) resolveComponentCode(
 	if comp == nil {
 		return "", fmt.Errorf("component %s not found or inactive", code)
 	}
-	// optional: enforce component type deduction
 	if comp.ComponentType != models.ComponentTypeDeduction {
 		return "", fmt.Errorf("component %s is of type %s, but fine requires deduction type", code, comp.ComponentType)
 	}
@@ -206,7 +193,20 @@ func (s *employeeFineService) resolveComponentCode(
 // ----------------------------------------------------------------------
 
 func (s *employeeFineService) CreateFine(ctx context.Context, input CreateEmployeeFineInput) (*models.EmployeeFine, error) {
-	// Validate that the fine date does not fall into a locked payroll period
+	// 👇 Location scope check
+	if err := s.ensureEmployeeInScope(ctx, input.CompanyID, input.UserID); err != nil {
+		return nil, err
+	}
+
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("fine_create-%s-%s", input.CompanyID.String(), input.UserID.String())
+	}
+	var cached *models.EmployeeFine
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
+
 	locked, err := s.payrollRepo.IsPayrollPeriodLockedRange(ctx, input.CompanyID, input.FineDate, input.FineDate)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check payroll lock: %w", err)
@@ -215,7 +215,6 @@ func (s *employeeFineService) CreateFine(ctx context.Context, input CreateEmploy
 		return nil, fmt.Errorf("cannot create fine in a locked payroll period")
 	}
 
-	// Resolve component code
 	componentCode, err := s.resolveComponentCode(ctx, input.CompanyID, input.ComponentCode)
 	if err != nil {
 		return nil, err
@@ -234,24 +233,18 @@ func (s *employeeFineService) CreateFine(ctx context.Context, input CreateEmploy
 		CreatedBy:     input.CreatedBy,
 	}
 
+	beforeJSON, _ := json.Marshal(fine)
 	if err := s.fineRepo.Create(ctx, fine); err != nil {
 		return nil, err
 	}
+	afterJSON, _ := json.Marshal(fine)
 
-	// Audit log (transaction nil)
+	ip, _ := ctx.Value("ip_address").(string)
 	_ = s.audit.LogAction(
-		ctx,
-		nil, // tx
-		&input.CompanyID,
-		"payroll",
-		"fine_created",
-		"employee_fine",
-		&fine.FineID,
-		"admin",
-		&input.CreatedBy,
-		nil,
-		nil,
+		ctx, nil, &input.CompanyID, "payroll", "fine_created", "employee_fine",
+		&fine.FineID, "user", &input.CreatedBy, beforeJSON, afterJSON,
 		map[string]interface{}{
+			"ip":             ip,
 			"user_id":        input.UserID.String(),
 			"fine_amount":    input.FineAmount,
 			"fine_date":      input.FineDate,
@@ -259,11 +252,11 @@ func (s *employeeFineService) CreateFine(ctx context.Context, input CreateEmploy
 		},
 	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, fine)
 	return fine, nil
 }
 
 func (s *employeeFineService) UpdateFine(ctx context.Context, input UpdateEmployeeFineInput) (*models.EmployeeFine, error) {
-	// Fetch existing fine
 	fine, err := s.fineRepo.GetByID(ctx, input.CompanyID, input.FineID)
 	if err != nil {
 		return nil, err
@@ -272,12 +265,24 @@ func (s *employeeFineService) UpdateFine(ctx context.Context, input UpdateEmploy
 		return nil, fmt.Errorf("fine not found")
 	}
 
-	// Cannot update processed fine
+	// 👇 Location scope check
+	if err := s.ensureEmployeeInScope(ctx, input.CompanyID, fine.UserID); err != nil {
+		return nil, err
+	}
+
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("fine_update-%s", input.FineID.String())
+	}
+	var cached *models.EmployeeFine
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
+
 	if fine.IsProcessed {
 		return nil, fmt.Errorf("cannot update a processed fine")
 	}
 
-	// Check lock on the fine's date (or new date if provided)
 	checkDate := fine.FineDate
 	if input.FineDate != nil {
 		checkDate = *input.FineDate
@@ -290,7 +295,8 @@ func (s *employeeFineService) UpdateFine(ctx context.Context, input UpdateEmploy
 		return nil, fmt.Errorf("cannot update fine in a locked payroll period")
 	}
 
-	// If component code is being updated, resolve and validate it
+	beforeJSON, _ := json.Marshal(fine)
+
 	if input.ComponentCode != nil && *input.ComponentCode != fine.ComponentCode {
 		newCode, err := s.resolveComponentCode(ctx, input.CompanyID, input.ComponentCode)
 		if err != nil {
@@ -298,8 +304,6 @@ func (s *employeeFineService) UpdateFine(ctx context.Context, input UpdateEmploy
 		}
 		fine.ComponentCode = newCode
 	}
-
-	// Apply other updates
 	if input.FineAmount != nil {
 		fine.FineAmount = *input.FineAmount
 	}
@@ -313,21 +317,14 @@ func (s *employeeFineService) UpdateFine(ctx context.Context, input UpdateEmploy
 	if err := s.fineRepo.Update(ctx, fine); err != nil {
 		return nil, err
 	}
+	afterJSON, _ := json.Marshal(fine)
 
-	// Audit log (transaction nil)
+	ip, _ := ctx.Value("ip_address").(string)
 	_ = s.audit.LogAction(
-		ctx,
-		nil,
-		&input.CompanyID,
-		"payroll",
-		"fine_updated",
-		"employee_fine",
-		&fine.FineID,
-		"admin",
-		&input.UpdatedBy,
-		nil,
-		nil,
+		ctx, nil, &input.CompanyID, "payroll", "fine_updated", "employee_fine",
+		&fine.FineID, "user", &input.UpdatedBy, beforeJSON, afterJSON,
 		map[string]interface{}{
+			"ip":             ip,
 			"user_id":        fine.UserID.String(),
 			"fine_amount":    fine.FineAmount,
 			"fine_date":      fine.FineDate,
@@ -335,11 +332,11 @@ func (s *employeeFineService) UpdateFine(ctx context.Context, input UpdateEmploy
 		},
 	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, fine)
 	return fine, nil
 }
 
 func (s *employeeFineService) DeleteFine(ctx context.Context, companyID, fineID, actorID uuid.UUID) error {
-	// Fetch fine to check lock and state
 	fine, err := s.fineRepo.GetByID(ctx, companyID, fineID)
 	if err != nil {
 		return err
@@ -347,11 +344,25 @@ func (s *employeeFineService) DeleteFine(ctx context.Context, companyID, fineID,
 	if fine == nil {
 		return fmt.Errorf("fine not found")
 	}
+
+	// 👇 Location scope check
+	if err := s.ensureEmployeeInScope(ctx, companyID, fine.UserID); err != nil {
+		return err
+	}
+
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("fine_delete-%s", fineID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
 	if fine.IsProcessed {
 		return fmt.Errorf("cannot delete processed fine")
 	}
 
-	// Check lock on the fine's date
 	locked, err := s.payrollRepo.IsPayrollPeriodLockedRange(ctx, companyID, fine.FineDate, fine.FineDate)
 	if err != nil {
 		return fmt.Errorf("failed to check payroll lock: %w", err)
@@ -360,30 +371,24 @@ func (s *employeeFineService) DeleteFine(ctx context.Context, companyID, fineID,
 		return fmt.Errorf("cannot delete fine in a locked payroll period")
 	}
 
+	beforeJSON, _ := json.Marshal(fine)
 	if err := s.fineRepo.DeleteIfUnprocessed(ctx, companyID, fineID); err != nil {
 		return err
 	}
 
-	// Audit log (transaction nil)
+	ip, _ := ctx.Value("ip_address").(string)
 	_ = s.audit.LogAction(
-		ctx,
-		nil,
-		&companyID,
-		"payroll",
-		"fine_deleted",
-		"employee_fine",
-		&fineID,
-		"admin",
-		&actorID,
-		nil,
-		nil,
+		ctx, nil, &companyID, "payroll", "fine_deleted", "employee_fine",
+		&fineID, "user", &actorID, beforeJSON, []byte("{}"),
 		map[string]interface{}{
+			"ip":          ip,
 			"user_id":     fine.UserID.String(),
 			"fine_amount": fine.FineAmount,
 			"fine_date":   fine.FineDate,
 		},
 	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
@@ -392,7 +397,22 @@ func (s *employeeFineService) DeleteFine(ctx context.Context, companyID, fineID,
 // ----------------------------------------------------------------------
 
 func (s *employeeFineService) BulkCreateFines(ctx context.Context, input BulkCreateEmployeeFineInput) ([]*models.EmployeeFine, error) {
-	// Validate that the fine date is not locked
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("fines_bulk_create-%s-%s", input.CompanyID.String(), input.FineDate.Format("2006-01-02"))
+	}
+	var cached []*models.EmployeeFine
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
+
+	// 👇 Location scope check for every target user
+	for _, userID := range input.UserIDs {
+		if err := s.ensureEmployeeInScope(ctx, input.CompanyID, userID); err != nil {
+			return nil, fmt.Errorf("user %s: %w", userID.String(), err)
+		}
+	}
+
 	locked, err := s.payrollRepo.IsPayrollPeriodLockedRange(ctx, input.CompanyID, input.FineDate, input.FineDate)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check payroll lock: %w", err)
@@ -401,7 +421,6 @@ func (s *employeeFineService) BulkCreateFines(ctx context.Context, input BulkCre
 		return nil, fmt.Errorf("cannot create fines in a locked payroll period")
 	}
 
-	// Resolve component code once for all fines in the batch
 	componentCode, err := s.resolveComponentCode(ctx, input.CompanyID, input.ComponentCode)
 	if err != nil {
 		return nil, err
@@ -427,32 +446,35 @@ func (s *employeeFineService) BulkCreateFines(ctx context.Context, input BulkCre
 		created = append(created, fine)
 	}
 
-	// Audit log (bulk action)
+	afterJSON, _ := json.Marshal(created)
+	ip, _ := ctx.Value("ip_address").(string)
 	_ = s.audit.LogAction(
-		ctx,
-		nil,
-		&input.CompanyID,
-		"payroll",
-		"fines_bulk_created",
-		"employee_fine",
-		nil,
-		"admin",
-		&input.CreatedBy,
-		nil,
-		nil,
+		ctx, nil, &input.CompanyID, "payroll", "fines_bulk_created", "employee_fine",
+		nil, "user", &input.CreatedBy, []byte("{}"), afterJSON,
 		map[string]interface{}{
+			"ip":             ip,
 			"user_count":     len(input.UserIDs),
 			"fine_amount":    input.FineAmount,
 			"fine_date":      input.FineDate,
 			"component_code": componentCode,
-			"created_ids":    createdIDs(created),
 		},
 	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, created)
 	return created, nil
 }
 
 func (s *employeeFineService) BulkDeleteUnprocessed(ctx context.Context, companyID uuid.UUID, fineIDs []uuid.UUID, actorID uuid.UUID) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("fines_bulk_delete-%s", companyID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	var fines []*models.EmployeeFine
 	for _, fid := range fineIDs {
 		fine, err := s.fineRepo.GetByID(ctx, companyID, fid)
 		if err != nil {
@@ -461,6 +483,12 @@ func (s *employeeFineService) BulkDeleteUnprocessed(ctx context.Context, company
 		if fine == nil {
 			return fmt.Errorf("fine %s not found", fid)
 		}
+
+		// 👇 Location scope check per fine
+		if err := s.ensureEmployeeInScope(ctx, companyID, fine.UserID); err != nil {
+			return err
+		}
+
 		if fine.IsProcessed {
 			return fmt.Errorf("fine %s is already processed", fid)
 		}
@@ -471,29 +499,28 @@ func (s *employeeFineService) BulkDeleteUnprocessed(ctx context.Context, company
 		if locked {
 			return fmt.Errorf("fine %s lies in a locked payroll period", fid)
 		}
+		fines = append(fines, fine)
+	}
 
+	beforeJSON, _ := json.Marshal(fines)
+
+	for _, fid := range fineIDs {
 		if err := s.fineRepo.DeleteIfUnprocessed(ctx, companyID, fid); err != nil {
 			return err
 		}
 	}
 
+	ip, _ := ctx.Value("ip_address").(string)
 	_ = s.audit.LogAction(
-		ctx,
-		nil,
-		&companyID,
-		"payroll",
-		"fines_bulk_deleted",
-		"employee_fine",
-		nil,
-		"admin",
-		&actorID,
-		nil,
-		nil,
+		ctx, nil, &companyID, "payroll", "fines_bulk_deleted", "employee_fine",
+		nil, "user", &actorID, beforeJSON, []byte("{}"),
 		map[string]interface{}{
+			"ip":       ip,
 			"fine_ids": fineIDs,
 		},
 	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
@@ -502,22 +529,87 @@ func (s *employeeFineService) BulkDeleteUnprocessed(ctx context.Context, company
 // ----------------------------------------------------------------------
 
 func (s *employeeFineService) MarkFineAsProcessed(ctx context.Context, fineID uuid.UUID, payrollRunID uuid.UUID) error {
-	err := s.fineRepo.MarkAsProcessed(ctx, fineID, payrollRunID)
+	fine, err := s.fineRepo.GetByID(ctx, uuid.Nil, fineID)
 	if err != nil {
 		return err
 	}
-	s.logger.Info("Fine marked as processed", zap.String("fine_id", fineID.String()), zap.String("payroll_run_id", payrollRunID.String()))
+	if fine == nil {
+		return fmt.Errorf("fine not found")
+	}
+
+	// 👇 Location scope check
+	if err := s.ensureEmployeeInScope(ctx, fine.CompanyID, fine.UserID); err != nil {
+		return err
+	}
+
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("fine_mark_processed-%s", fineID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	beforeJSON, _ := json.Marshal(fine)
+	if err := s.fineRepo.MarkAsProcessed(ctx, fineID, payrollRunID); err != nil {
+		return err
+	}
+	afterJSON, _ := json.Marshal(fine)
+
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.audit.LogAction(
+		ctx, nil, &fine.CompanyID, "payroll", "fine_marked_processed", "employee_fine",
+		&fineID, "system", nil, beforeJSON, afterJSON,
+		map[string]interface{}{
+			"ip":             ip,
+			"payroll_run_id": payrollRunID.String(),
+		},
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
+// LockFinesForPayrollRun — system operation invoked by the payroll engine.
+// Runs company-wide; passes nil so no location filter is applied.
 func (s *employeeFineService) LockFinesForPayrollRun(
 	ctx context.Context,
 	companyID uuid.UUID,
 	periodStart, periodEnd time.Time,
 	payrollRunID uuid.UUID,
 ) ([]models.EmployeeFine, error) {
-	// The repository method should already return fines with component codes.
-	return s.fineRepo.LockUnprocessedForPayrollRun(ctx, companyID, periodStart, periodEnd, payrollRunID)
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("fines_lock-%s", payrollRunID.String())
+	}
+	var cached []models.EmployeeFine
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
+
+	// System call → nil location filter
+	lockedFines, err := s.fineRepo.LockUnprocessedForPayrollRun(ctx, companyID, periodStart, periodEnd, payrollRunID, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	ip, _ := ctx.Value("ip_address").(string)
+	afterJSON, _ := json.Marshal(lockedFines)
+	_ = s.audit.LogAction(
+		ctx, nil, &companyID, "payroll", "fines_locked_for_payroll", "employee_fine",
+		nil, "system", nil, nil, afterJSON,
+		map[string]interface{}{
+			"ip":             ip,
+			"payroll_run_id": payrollRunID.String(),
+			"period_start":   periodStart,
+			"period_end":     periodEnd,
+			"count":          len(lockedFines),
+		},
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, lockedFines)
+	return lockedFines, nil
 }
 
 // ----------------------------------------------------------------------
@@ -528,6 +620,7 @@ func (s *employeeFineService) GetFineByID(ctx context.Context, companyID, fineID
 	return s.fineRepo.GetByID(ctx, companyID, fineID)
 }
 
+// ListFines — filter carries LocationID; caller (handler) populates it from ctx.
 func (s *employeeFineService) ListFines(ctx context.Context, filter models.EmployeeFineFilter) ([]models.EmployeeFine, int, error) {
 	return s.fineRepo.GetByFilter(ctx, filter)
 }
@@ -564,21 +657,10 @@ func (s *employeeFineService) GetFineSummaryByEmployee(
 		return nil, err
 	}
 	if total == 0 {
-		return &EmployeeFineSummary{
-			UserID:      userID,
-			TotalFines:  0,
-			FineCount:   0,
-			Processed:   0,
-			Unprocessed: 0,
-		}, nil
+		return &EmployeeFineSummary{UserID: userID}, nil
 	}
-
-	var totalFines float64
-	var processedTotal float64
-	var unprocessedTotal float64
-	var processedCount int
-	var unprocessedCount int
-
+	var totalFines, processedTotal, unprocessedTotal float64
+	var processedCount, unprocessedCount int
 	for _, f := range fines {
 		totalFines += f.FineAmount
 		if f.IsProcessed {
@@ -589,7 +671,6 @@ func (s *employeeFineService) GetFineSummaryByEmployee(
 			unprocessedCount++
 		}
 	}
-
 	return &EmployeeFineSummary{
 		UserID:      userID,
 		TotalFines:  totalFines,
@@ -599,6 +680,7 @@ func (s *employeeFineService) GetFineSummaryByEmployee(
 	}, nil
 }
 
+// GetCompanyFineSummary — admin read; scoped to the caller's location when set.
 func (s *employeeFineService) GetCompanyFineSummary(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -611,23 +693,22 @@ func (s *employeeFineService) GetCompanyFineSummary(
 		Page:      1,
 		PageSize:  10000,
 	}
+
+	// 👇 Populate LocationID from request scope when set
+	if locCtx, err := locationctx.FromContext(ctx); err == nil {
+		if locCtx.Mode == locationctx.ScopeLocation {
+			filter.LocationID = locCtx.LocationID
+		}
+	}
+
 	fines, total, err := s.fineRepo.GetByFilter(ctx, filter)
 	if err != nil {
 		return nil, err
 	}
 	if total == 0 {
-		return &CompanyFineSummary{
-			CompanyID:   companyID,
-			TotalFines:  0,
-			TotalCount:  0,
-			Processed:   0,
-			Unprocessed: 0,
-		}, nil
+		return &CompanyFineSummary{CompanyID: companyID}, nil
 	}
-
-	var totalFines float64
-	var processedTotal float64
-	var unprocessedTotal float64
+	var totalFines, processedTotal, unprocessedTotal float64
 	for _, f := range fines {
 		totalFines += f.FineAmount
 		if f.IsProcessed {
@@ -636,7 +717,6 @@ func (s *employeeFineService) GetCompanyFineSummary(
 			unprocessedTotal += f.FineAmount
 		}
 	}
-
 	return &CompanyFineSummary{
 		CompanyID:   companyID,
 		TotalFines:  totalFines,
@@ -644,16 +724,4 @@ func (s *employeeFineService) GetCompanyFineSummary(
 		Processed:   processedTotal,
 		Unprocessed: unprocessedTotal,
 	}, nil
-}
-
-// ----------------------------------------------------------------------
-// Helper
-// ----------------------------------------------------------------------
-
-func createdIDs(fines []*models.EmployeeFine) []string {
-	ids := make([]string, len(fines))
-	for i, f := range fines {
-		ids[i] = f.FineID.String()
-	}
-	return ids
 }

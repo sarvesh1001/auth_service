@@ -1287,6 +1287,33 @@ type EmployeeRoleHistory struct {
 
 
 ================================================================================
+FILE: ./models/employee/company_employee.go
+================================================================================
+
+package employee
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type CompanyEmployee struct {
+	CompanyID  uuid.UUID  `json:"company_id"`
+	UserID     uuid.UUID  `json:"user_id"`
+	EmployeeID string     `json:"employee_id"`
+	RoleID     uuid.UUID  `json:"role_id"`
+	HireDate   time.Time  `json:"hire_date"`
+	IsActive   bool       `json:"is_active"`
+	ReportsTo  *uuid.UUID `json:"reports_to,omitempty"`
+	PositionID *uuid.UUID `json:"position_id,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+}
+
+
+
+================================================================================
 FILE: ./models/employee/documents.go
 ================================================================================
 
@@ -1373,13 +1400,17 @@ import (
 )
 
 type Position struct {
-	PositionID   uuid.UUID `json:"position_id" db:"position_id"`
-	CompanyID    uuid.UUID `json:"company_id" db:"company_id"`
-	DepartmentID uuid.UUID `json:"department_id" db:"department_id"`
-	Title        *string   `json:"title" db:"title"`
-	IsOpen       bool      `json:"is_open" db:"is_open"`
-	CreatedAt    time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at" db:"updated_at"`
+	PositionID         uuid.UUID `json:"position_id" db:"position_id"`
+	CompanyID          uuid.UUID `json:"company_id" db:"company_id"`
+	DepartmentID       uuid.UUID `json:"department_id" db:"department_id"`
+	Title              *string   `json:"title" db:"title"`
+	IsOpen             bool      `json:"is_open" db:"is_open"`
+	IsSchedulable      bool      `json:"is_schedulable" db:"is_schedulable"`
+	AttendanceRequired bool      `json:"attendance_required" db:"attendance_required"`
+	OvertimeAllowed    bool      `json:"overtime_allowed" db:"overtime_allowed"`
+	WorkCenterCode     *string   `json:"work_center_code" db:"work_center_code"`
+	CreatedAt          time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at" db:"updated_at"`
 }
 
 

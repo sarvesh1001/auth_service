@@ -7,13 +7,12 @@ import (
 	"fmt"
 	"time"
 
-	"auth-service/internal/client"
-	"auth-service/internal/hr/payroll/models"
-	"auth-service/internal/util"
-
 	"github.com/google/uuid"
 	"github.com/lib/pq"
-	"go.uber.org/zap"
+
+	"auth-service/internal/client"
+	hrErrors "auth-service/internal/hr/errors"
+	"auth-service/internal/hr/payroll/models"
 )
 
 // ============================================================================
@@ -57,11 +56,12 @@ type PayrollJobRepository interface {
 		staleThreshold time.Duration,
 	) (int64, error)
 
-	// RequeueEmployeeJob resets a failed employee job to pending for retry.
 	RequeueEmployeeJob(
 		ctx context.Context,
 		jobID uuid.UUID,
 	) error
+
+	CountIncompleteEmployeeJobs(ctx context.Context, runID uuid.UUID) (int, error)
 }
 
 // ============================================================================
@@ -70,13 +70,11 @@ type PayrollJobRepository interface {
 
 type payrollJobRepository struct {
 	client *client.PostgresClient
-	logger *zap.Logger
 }
 
-func NewPayrollJobRepository(pg *client.PostgresClient, logger *zap.Logger) PayrollJobRepository {
+func NewPayrollJobRepository(pg *client.PostgresClient) PayrollJobRepository {
 	return &payrollJobRepository{
 		client: pg,
-		logger: logger,
 	}
 }
 
@@ -127,13 +125,8 @@ func (r *payrollJobRepository) Create(ctx context.Context, input *models.CreateP
 		job.Priority, job.CreatedAt,
 	)
 	if err != nil {
-		r.logger.Error("Failed to create payroll job",
-			util.String("job_id", job.JobID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to create payroll job: %w", err)
 	}
-
 	return job, nil
 }
 
@@ -163,7 +156,7 @@ func (r *payrollJobRepository) FetchNextRunnableJob(
 		WHERE pj.status = 'queued'
 		  AND (pj.next_run_at IS NULL OR pj.next_run_at <= NOW())
 		  AND pj.attempts < pj.max_attempts
-		  AND pj.retry_count < pj.max_retries   -- ✅ FIXED
+		  AND pj.retry_count < pj.max_retries
 		  AND (
 		        SELECT COUNT(*)
 		        FROM payroll.payroll_job
@@ -251,18 +244,13 @@ func (r *payrollJobRepository) MarkCompleted(ctx context.Context, jobID uuid.UUI
 
 	result, err := r.client.Exec(ctx, query, time.Now().UTC(), jobID)
 	if err != nil {
-		r.logger.Error("Failed to mark payroll job completed",
-			util.String("job_id", jobID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to mark job completed: %w", err)
 	}
 
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("payroll job not found")
+		return hrErrors.ErrPayrollJobNotFound
 	}
-
 	return nil
 }
 
@@ -295,13 +283,8 @@ func (r *payrollJobRepository) MarkFailed(ctx context.Context, jobID uuid.UUID, 
 
 	_, err := r.client.Exec(ctx, query, errorMessage, jobID)
 	if err != nil {
-		r.logger.Error("Failed to mark payroll job failed",
-			util.String("job_id", jobID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to mark job failed: %w", err)
 	}
-
 	return nil
 }
 
@@ -336,7 +319,7 @@ func (r *payrollJobRepository) GetByID(ctx context.Context, jobID uuid.UUID) (*m
 	)
 
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
+		return nil, hrErrors.ErrPayrollJobNotFound
 	}
 	if err != nil {
 		return nil, err
@@ -402,14 +385,6 @@ func (r *payrollJobRepository) ReleaseStaleLocks(
 	if err != nil {
 		return 0, err
 	}
-
-	if rows > 0 {
-		r.logger.Info("Released stale payroll job locks",
-			zap.Int64("count", rows),
-			zap.Int64("threshold_seconds", seconds),
-		)
-	}
-
 	return rows, nil
 }
 
@@ -441,7 +416,6 @@ func (r *payrollJobRepository) CreateEmployeeJobsForRun(
 	if err != nil {
 		return fmt.Errorf("failed to create employee jobs: %w", err)
 	}
-
 	return nil
 }
 
@@ -456,7 +430,6 @@ func (r *payrollJobRepository) FetchNextEmployeeJob(
 	}
 	defer tx.Rollback()
 
-	// ✅ Modified: include failed jobs and enforce attempts < 3
 	query := `
 	SELECT job_id, payroll_run_id, user_id,
 	       status, attempts,
@@ -545,7 +518,6 @@ func (r *payrollJobRepository) MarkEmployeeJobCompleted(
 	if err != nil {
 		return fmt.Errorf("failed to mark employee job completed: %w", err)
 	}
-
 	return nil
 }
 
@@ -569,7 +541,6 @@ func (r *payrollJobRepository) MarkEmployeeJobFailed(
 	if err != nil {
 		return fmt.Errorf("failed to mark employee job failed: %w", err)
 	}
-
 	return nil
 }
 
@@ -594,7 +565,6 @@ func (r *payrollJobRepository) ReleaseStaleEmployeeJobLocks(
 	if err != nil {
 		return 0, err
 	}
-
 	rows, _ := result.RowsAffected()
 	return rows, nil
 }
@@ -621,13 +591,11 @@ func (r *payrollJobRepository) RequeueEmployeeJob(
 	if err != nil {
 		return fmt.Errorf("failed to requeue employee job: %w", err)
 	}
-
 	return nil
 }
 
-// In repository/payroll_job.go
 func (r *payrollJobRepository) CountIncompleteEmployeeJobs(ctx context.Context, runID uuid.UUID) (int, error) {
-	const query = `
+	query := `
         SELECT COUNT(*)
         FROM payroll.payroll_employee_job
         WHERE payroll_run_id = $1
@@ -640,6 +608,7 @@ func (r *payrollJobRepository) CountIncompleteEmployeeJobs(ctx context.Context, 
 	}
 	return count, nil
 }
+
 func (r *payrollJobRepository) CancelEmployeeJobsForRunTx(ctx context.Context, tx *sql.Tx, runID uuid.UUID) error {
 	query := `
         UPDATE payroll.payroll_employee_job
@@ -648,14 +617,9 @@ func (r *payrollJobRepository) CancelEmployeeJobsForRunTx(ctx context.Context, t
         WHERE payroll_run_id = $1
           AND status IN ('pending', 'processing')
     `
-	result, err := tx.ExecContext(ctx, query, runID)
+	_, err := tx.ExecContext(ctx, query, runID)
 	if err != nil {
 		return fmt.Errorf("failed to cancel employee jobs: %w", err)
 	}
-	rows, _ := result.RowsAffected()
-	r.logger.Info("Cancelled employee jobs for run",
-		zap.String("run_id", runID.String()),
-		zap.Int64("rows_cancelled", rows),
-	)
 	return nil
 }

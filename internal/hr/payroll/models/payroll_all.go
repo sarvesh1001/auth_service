@@ -532,15 +532,16 @@ type ChangeTaxRegimeInput struct {
 	ChangedBy     uuid.UUID
 }
 
+// In models package:
 type StatutoryProfileFilter struct {
 	CompanyID     uuid.UUID
 	UserID        *uuid.UUID
 	StatutoryCode *string
 	ActiveOn      *time.Time
+	LocationID    *uuid.UUID // 👈 NEW — nil = no filter
 	Page          int
 	PageSize      int
 }
-
 type StatutoryProfileVersion struct {
 	ProfileID     uuid.UUID
 	CompanyID     uuid.UUID
@@ -651,6 +652,7 @@ type PayrollAdjustmentFilter struct {
 	AdjustmentType *string
 	FromMonth      *time.Time
 	ToMonth        *time.Time
+	LocationID     *uuid.UUID // 👈 new — nil = no filter
 	Page           int
 	PageSize       int
 }
@@ -806,6 +808,7 @@ type AttendanceRuleFilter struct {
 	PageSize     int
 }
 
+// In models package:
 type EmployeeFineFilter struct {
 	CompanyID    uuid.UUID
 	UserID       *uuid.UUID
@@ -813,6 +816,7 @@ type EmployeeFineFilter struct {
 	PayrollRunID *uuid.UUID
 	FromDate     *time.Time
 	ToDate       *time.Time
+	LocationID   *uuid.UUID `json:"location_id,omitempty"` // 👈 NEW — nil = no filter
 	Page         int
 	PageSize     int
 }

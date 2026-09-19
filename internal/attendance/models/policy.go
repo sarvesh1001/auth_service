@@ -6,17 +6,27 @@ import (
 	"github.com/google/uuid"
 )
 
+// AttendancePolicy defines rules for a scope.
+//
+// LocationID is an optional scope. When NULL, the policy is company-wide.
+// When set, the policy applies to a specific location. Location is
+// evaluated after Position and WorkCenter, before falling back to Company
+// — see docs/location-architecture.md for the resolution order.
 type AttendancePolicy struct {
-	PolicyID       uuid.UUID   `json:"policy_id" db:"policy_id"`
-	CompanyID      uuid.UUID   `json:"company_id" db:"company_id"`
-	WorkCenterCode *string     `json:"work_center_code,omitempty" db:"work_center_code"`
-	PositionID     *uuid.UUID  `json:"position_id,omitempty" db:"position_id"`
-	PolicyCode     string      `json:"policy_code" db:"policy_code"`
-	PolicyType     string      `json:"policy_type" db:"policy_type"`
-	Rules          PolicyRules `json:"rules" db:"rules"`
-	IsActive       bool        `json:"is_active" db:"is_active"`
-	CreatedAt      time.Time   `json:"created_at" db:"created_at"`
-	UpdatedAt      time.Time   `json:"updated_at" db:"updated_at"`
+	PolicyID       uuid.UUID  `json:"policy_id" db:"policy_id"`
+	CompanyID      uuid.UUID  `json:"company_id" db:"company_id"`
+	WorkCenterCode *string    `json:"work_center_code,omitempty" db:"work_center_code"`
+	PositionID     *uuid.UUID `json:"position_id,omitempty" db:"position_id"`
+
+	// Optional scope. nil = company-wide policy.
+	LocationID *uuid.UUID `json:"location_id,omitempty" db:"location_id"`
+
+	PolicyCode string      `json:"policy_code" db:"policy_code"`
+	PolicyType string      `json:"policy_type" db:"policy_type"`
+	Rules      PolicyRules `json:"rules" db:"rules"`
+	IsActive   bool        `json:"is_active" db:"is_active"`
+	CreatedAt  time.Time   `json:"created_at" db:"created_at"`
+	UpdatedAt  time.Time   `json:"updated_at" db:"updated_at"`
 }
 
 type PolicyRules struct {
@@ -36,11 +46,7 @@ type PolicyRules struct {
 	AllowDeviceMarking  *bool    `json:"allow_device_marking,omitempty"`
 }
 
-// UserAttendancePolicy now supports polymorphic subjects.
-// For employees, UserID is set and SubjectType = "employee".
-// For students/teachers, UserID is uuid.Nil and SubjectType/SubjectID are used.
 type UserAttendancePolicy struct {
-	// Existing fields (for backward compatibility with employees)
 	UserID        uuid.UUID  `json:"user_id" db:"user_id"`
 	PolicyID      uuid.UUID  `json:"policy_id" db:"policy_id"`
 	EffectiveFrom time.Time  `json:"effective_from" db:"effective_from"`
@@ -48,7 +54,6 @@ type UserAttendancePolicy struct {
 	AssignedBy    *uuid.UUID `json:"assigned_by,omitempty" db:"assigned_by"`
 	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
 
-	// New polymorphic fields
-	SubjectType string     `json:"subject_type,omitempty" db:"subject_type"` // "employee", "student", "teacher", etc.
-	SubjectID   *uuid.UUID `json:"subject_id,omitempty" db:"subject_id"`     // ID of the subject (student_id, teacher_id, etc.)
+	SubjectType string     `json:"subject_type,omitempty" db:"subject_type"`
+	SubjectID   *uuid.UUID `json:"subject_id,omitempty" db:"subject_id"`
 }

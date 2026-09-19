@@ -7,7 +7,6 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 
 	"auth-service/internal/hr/payroll/service"
 )
@@ -15,14 +14,12 @@ import (
 // CompensationHandler handles HTTP requests for compensation related operations.
 type CompensationHandler struct {
 	compensationSvc service.CompensationService
-	logger          *zap.Logger
 }
 
 // NewCompensationHandler creates a new CompensationHandler.
-func NewCompensationHandler(compensationSvc service.CompensationService, logger *zap.Logger) *CompensationHandler {
+func NewCompensationHandler(compensationSvc service.CompensationService) *CompensationHandler {
 	return &CompensationHandler{
 		compensationSvc: compensationSvc,
-		logger:          logger.Named("compensation_handler"),
 	}
 }
 
@@ -36,7 +33,7 @@ type GetEmployeeSalaryResponse struct {
 }
 
 func (h *CompensationHandler) GetEmployeeSalary(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -62,7 +59,9 @@ func (h *CompensationHandler) GetEmployeeSalary(w http.ResponseWriter, r *http.R
 
 	ctc, err := h.compensationSvc.ResolveCTC(ctx, companyID, userID, asOf)
 	if err != nil {
-		h.logger.Error("failed to resolve CTC", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -83,7 +82,7 @@ func (h *CompensationHandler) GetEmployeeSalary(w http.ResponseWriter, r *http.R
 // ---------------------------------------------------------------------
 
 func (h *CompensationHandler) GetSalarySnapshot(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -109,7 +108,9 @@ func (h *CompensationHandler) GetSalarySnapshot(w http.ResponseWriter, r *http.R
 
 	snapshot, err := h.compensationSvc.ResolveSalaryStructure(ctx, companyID, userID, asOf)
 	if err != nil {
-		h.logger.Error("failed to resolve salary structure", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -139,7 +140,7 @@ type PreviewEarningsRequest struct {
 }
 
 func (h *CompensationHandler) PreviewEarnings(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -180,7 +181,9 @@ func (h *CompensationHandler) PreviewEarnings(w http.ResponseWriter, r *http.Req
 		totalDays,
 	)
 	if err != nil {
-		h.logger.Error("failed to resolve earnings", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

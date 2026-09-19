@@ -25,6 +25,14 @@ func NewAttendanceSessionSummaryRepository(pg *client.PostgresClient, logger *za
 	return &sessionSummaryRepo{client: pg, logger: logger.Named("session_summary_repo")}
 }
 
+const sessionSummaryColumns = `
+	summary_id, company_id, subject_type, subject_id,
+	employment_location_id,
+	session_id, session_date, status, marked_at, marked_by,
+	source_type, device_id, is_auto, remarks,
+	metadata, created_at, updated_at
+`
+
 func (r *sessionSummaryRepo) Upsert(ctx context.Context, tx *sql.Tx, summary *models.AttendanceSessionSummary) error {
 	if summary.SummaryID == uuid.Nil {
 		summary.SummaryID = uuid.New()
@@ -37,11 +45,17 @@ func (r *sessionSummaryRepo) Upsert(ctx context.Context, tx *sql.Tx, summary *mo
 
 	query := `
 		INSERT INTO attendance.attendance_session_summary (
-			summary_id, company_id, subject_type, subject_id, session_id, session_date,
-			status, marked_at, marked_by, source_type, device_id, is_auto, remarks,
+			summary_id, company_id, subject_type, subject_id,
+			employment_location_id,
+			session_id, session_date, status, marked_at, marked_by,
+			source_type, device_id, is_auto, remarks,
 			metadata, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+			$11, $12, $13, $14, $15, $16, $17
+		)
 		ON CONFLICT (company_id, subject_type, subject_id, session_id) DO UPDATE SET
+			employment_location_id = EXCLUDED.employment_location_id,
 			session_date = EXCLUDED.session_date,
 			status = EXCLUDED.status,
 			marked_at = EXCLUDED.marked_at,
@@ -51,19 +65,21 @@ func (r *sessionSummaryRepo) Upsert(ctx context.Context, tx *sql.Tx, summary *mo
 			is_auto = EXCLUDED.is_auto,
 			remarks = EXCLUDED.remarks,
 			metadata = EXCLUDED.metadata,
-			updated_at = EXCLUDED.updated_at
-	`
-	exec := func(q string, args ...interface{}) (sql.Result, error) {
+			updated_at = EXCLUDED.updated_at`
+
+	exec := func(q string, a ...interface{}) (sql.Result, error) {
 		if tx != nil {
-			return tx.ExecContext(ctx, q, args...)
+			return tx.ExecContext(ctx, q, a...)
 		}
-		return r.client.Exec(ctx, q, args...)
+		return r.client.Exec(ctx, q, a...)
 	}
+
 	_, err := exec(query,
 		summary.SummaryID,
 		summary.CompanyID,
 		summary.SubjectType,
 		summary.SubjectID,
+		summary.EmploymentLocationID,
 		summary.SessionID,
 		summary.SessionDate,
 		summary.Status,
@@ -81,76 +97,44 @@ func (r *sessionSummaryRepo) Upsert(ctx context.Context, tx *sql.Tx, summary *mo
 }
 
 func (r *sessionSummaryRepo) GetBySessionAndSubject(ctx context.Context, tx *sql.Tx, sessionID, subjectID uuid.UUID, subjectType string) (*models.AttendanceSessionSummary, error) {
-	query := `
-		SELECT summary_id, company_id, subject_type, subject_id, session_id, session_date,
-		       status, marked_at, marked_by, source_type, device_id, is_auto, remarks,
-		       metadata, created_at, updated_at
+	query := `SELECT ` + sessionSummaryColumns + `
 		FROM attendance.attendance_session_summary
-		WHERE session_id = $1 AND subject_type = $2 AND subject_id = $3
-	`
+		WHERE session_id = $1 AND subject_type = $2 AND subject_id = $3`
 	row := r.getRow(ctx, tx, query, sessionID, subjectType, subjectID)
 	return r.scanSummary(row)
 }
 
 func (r *sessionSummaryRepo) GetBySession(ctx context.Context, tx *sql.Tx, sessionID uuid.UUID) ([]*models.AttendanceSessionSummary, error) {
-	query := `
-		SELECT summary_id, company_id, subject_type, subject_id, session_id, session_date,
-		       status, marked_at, marked_by, source_type, device_id, is_auto, remarks,
-		       metadata, created_at, updated_at
+	query := `SELECT ` + sessionSummaryColumns + `
 		FROM attendance.attendance_session_summary
 		WHERE session_id = $1
-		ORDER BY subject_type, subject_id
-	`
+		ORDER BY subject_type, subject_id`
 	rows, err := r.getRows(ctx, tx, query, sessionID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var summaries []*models.AttendanceSessionSummary
-	for rows.Next() {
-		s, err := r.scanSummaryFromRows(rows)
-		if err != nil {
-			return nil, err
-		}
-		summaries = append(summaries, s)
-	}
-	return summaries, nil
+	return r.scanSummaries(rows)
 }
 
 func (r *sessionSummaryRepo) GetBySubject(ctx context.Context, tx *sql.Tx, companyID, subjectID uuid.UUID, subjectType string, fromDate, toDate time.Time) ([]*models.AttendanceSessionSummary, error) {
-	query := `
-		SELECT summary_id, company_id, subject_type, subject_id, session_id, session_date,
-		       status, marked_at, marked_by, source_type, device_id, is_auto, remarks,
-		       metadata, created_at, updated_at
+	query := `SELECT ` + sessionSummaryColumns + `
 		FROM attendance.attendance_session_summary
 		WHERE company_id = $1 AND subject_type = $2 AND subject_id = $3
 		  AND session_date BETWEEN $4 AND $5
-		ORDER BY session_date, session_id
-	`
+		ORDER BY session_date, session_id`
 	rows, err := r.getRows(ctx, tx, query, companyID, subjectType, subjectID, fromDate, toDate)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var summaries []*models.AttendanceSessionSummary
-	for rows.Next() {
-		s, err := r.scanSummaryFromRows(rows)
-		if err != nil {
-			return nil, err
-		}
-		summaries = append(summaries, s)
-	}
-	return summaries, nil
+	return r.scanSummaries(rows)
 }
 
 func (r *sessionSummaryRepo) List(ctx context.Context, tx *sql.Tx, filter repository.SessionSummaryFilter, pag repository.Pagination) ([]*models.AttendanceSessionSummary, error) {
-	query := `
-		SELECT summary_id, company_id, subject_type, subject_id, session_id, session_date,
-		       status, marked_at, marked_by, source_type, device_id, is_auto, remarks,
-		       metadata, created_at, updated_at
+	query := `SELECT ` + sessionSummaryColumns + `
 		FROM attendance.attendance_session_summary
-		WHERE 1=1
-	`
+		WHERE 1=1`
 	args := []interface{}{}
 	argPos := 1
 
@@ -184,6 +168,12 @@ func (r *sessionSummaryRepo) List(ctx context.Context, tx *sql.Tx, filter reposi
 		args = append(args, *filter.Status)
 		argPos++
 	}
+	// 👇 NEW — location scope
+	if filter.LocationID != nil {
+		query += fmt.Sprintf(" AND employment_location_id = $%d", argPos)
+		args = append(args, *filter.LocationID)
+		argPos++
+	}
 
 	query += " ORDER BY session_date DESC, subject_type, subject_id"
 	if pag.Limit > 0 {
@@ -196,15 +186,7 @@ func (r *sessionSummaryRepo) List(ctx context.Context, tx *sql.Tx, filter reposi
 		return nil, err
 	}
 	defer rows.Close()
-	var summaries []*models.AttendanceSessionSummary
-	for rows.Next() {
-		s, err := r.scanSummaryFromRows(rows)
-		if err != nil {
-			return nil, err
-		}
-		summaries = append(summaries, s)
-	}
-	return summaries, nil
+	return r.scanSummaries(rows)
 }
 
 func (r *sessionSummaryRepo) Count(ctx context.Context, tx *sql.Tx, filter repository.SessionSummaryFilter) (int64, error) {
@@ -242,13 +224,19 @@ func (r *sessionSummaryRepo) Count(ctx context.Context, tx *sql.Tx, filter repos
 		args = append(args, *filter.Status)
 		argPos++
 	}
+	if filter.LocationID != nil {
+		query += fmt.Sprintf(" AND employment_location_id = $%d", argPos)
+		args = append(args, *filter.LocationID)
+		argPos++
+	}
 
 	var count int64
 	err := r.getRow(ctx, tx, query, args...).Scan(&count)
 	return count, err
 }
 
-// Helper functions
+// --- helpers ---
+
 func (r *sessionSummaryRepo) getRow(ctx context.Context, tx *sql.Tx, query string, args ...interface{}) *sql.Row {
 	if tx != nil {
 		return tx.QueryRowContext(ctx, query, args...)
@@ -265,15 +253,17 @@ func (r *sessionSummaryRepo) getRows(ctx context.Context, tx *sql.Tx, query stri
 
 func (r *sessionSummaryRepo) scanSummary(row *sql.Row) (*models.AttendanceSessionSummary, error) {
 	var s models.AttendanceSessionSummary
-	var markedByUUID uuid.NullUUID // 👈 Use uuid.NullUUID
-	var deviceIDStr sql.NullString
-	var remarks sql.NullString
+	var markedByUUID uuid.NullUUID
+	var deviceIDStr, remarks sql.NullString
 	var metadataJSON []byte
+	var employmentLocID sql.NullString
+
 	err := row.Scan(
 		&s.SummaryID,
 		&s.CompanyID,
 		&s.SubjectType,
 		&s.SubjectID,
+		&employmentLocID,
 		&s.SessionID,
 		&s.SessionDate,
 		&s.Status,
@@ -293,63 +283,72 @@ func (r *sessionSummaryRepo) scanSummary(row *sql.Row) (*models.AttendanceSessio
 		}
 		return nil, err
 	}
-	if markedByUUID.Valid {
-		s.MarkedBy = &markedByUUID.UUID
-	}
-	if deviceIDStr.Valid {
-		s.DeviceID = &deviceIDStr.String
-	}
-	if remarks.Valid {
-		s.Remarks = &remarks.String
-	}
-	if len(metadataJSON) > 0 {
-		if err := json.Unmarshal(metadataJSON, &s.Metadata); err != nil {
-			return nil, fmt.Errorf("unmarshal metadata: %w", err)
-		}
-	}
+	r.assignSessionSummaryNulls(&s, employmentLocID, markedByUUID, deviceIDStr, remarks, metadataJSON)
 	return &s, nil
 }
 
-func (r *sessionSummaryRepo) scanSummaryFromRows(rows *sql.Rows) (*models.AttendanceSessionSummary, error) {
-	var s models.AttendanceSessionSummary
-	var markedByUUID uuid.NullUUID // 👈 Use uuid.NullUUID
-	var deviceIDStr sql.NullString
-	var remarks sql.NullString
-	var metadataJSON []byte
-	err := rows.Scan(
-		&s.SummaryID,
-		&s.CompanyID,
-		&s.SubjectType,
-		&s.SubjectID,
-		&s.SessionID,
-		&s.SessionDate,
-		&s.Status,
-		&s.MarkedAt,
-		&markedByUUID,
-		&s.SourceType,
-		&deviceIDStr,
-		&s.IsAuto,
-		&remarks,
-		&metadataJSON,
-		&s.CreatedAt,
-		&s.UpdatedAt,
-	)
-	if err != nil {
+func (r *sessionSummaryRepo) scanSummaries(rows *sql.Rows) ([]*models.AttendanceSessionSummary, error) {
+	var summaries []*models.AttendanceSessionSummary
+	for rows.Next() {
+		var s models.AttendanceSessionSummary
+		var markedByUUID uuid.NullUUID
+		var deviceIDStr, remarks sql.NullString
+		var metadataJSON []byte
+		var employmentLocID sql.NullString
+
+		err := rows.Scan(
+			&s.SummaryID,
+			&s.CompanyID,
+			&s.SubjectType,
+			&s.SubjectID,
+			&employmentLocID,
+			&s.SessionID,
+			&s.SessionDate,
+			&s.Status,
+			&s.MarkedAt,
+			&markedByUUID,
+			&s.SourceType,
+			&deviceIDStr,
+			&s.IsAuto,
+			&remarks,
+			&metadataJSON,
+			&s.CreatedAt,
+			&s.UpdatedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+		r.assignSessionSummaryNulls(&s, employmentLocID, markedByUUID, deviceIDStr, remarks, metadataJSON)
+		summaries = append(summaries, &s)
+	}
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	if markedByUUID.Valid {
-		s.MarkedBy = &markedByUUID.UUID
+	return summaries, nil
+}
+
+func (r *sessionSummaryRepo) assignSessionSummaryNulls(
+	s *models.AttendanceSessionSummary,
+	employmentLoc sql.NullString,
+	markedBy uuid.NullUUID,
+	deviceID, remarks sql.NullString,
+	metadataJSON []byte,
+) {
+	if employmentLoc.Valid && employmentLoc.String != "" {
+		if id, err := uuid.Parse(employmentLoc.String); err == nil {
+			s.EmploymentLocationID = &id
+		}
 	}
-	if deviceIDStr.Valid {
-		s.DeviceID = &deviceIDStr.String
+	if markedBy.Valid {
+		s.MarkedBy = &markedBy.UUID
+	}
+	if deviceID.Valid {
+		s.DeviceID = &deviceID.String
 	}
 	if remarks.Valid {
 		s.Remarks = &remarks.String
 	}
 	if len(metadataJSON) > 0 {
-		if err := json.Unmarshal(metadataJSON, &s.Metadata); err != nil {
-			return nil, fmt.Errorf("unmarshal metadata: %w", err)
-		}
+		_ = json.Unmarshal(metadataJSON, &s.Metadata)
 	}
-	return &s, nil
 }

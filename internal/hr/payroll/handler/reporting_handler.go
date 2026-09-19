@@ -8,21 +8,18 @@ import (
 	"net/http"
 	"time"
 
-	"auth-service/internal/hr/payroll/service"
-
 	"github.com/google/uuid"
-	"go.uber.org/zap"
+
+	"auth-service/internal/hr/payroll/service"
 )
 
 type ReportingHandler struct {
 	reportingService service.ReportingService
-	logger           *zap.Logger
 }
 
-func NewReportingHandler(reportingService service.ReportingService, logger *zap.Logger) *ReportingHandler {
+func NewReportingHandler(reportingService service.ReportingService) *ReportingHandler {
 	return &ReportingHandler{
 		reportingService: reportingService,
-		logger:           logger.Named("reporting_handler"),
 	}
 }
 
@@ -80,7 +77,8 @@ func (r *generatePayrollRegisterRequest) validate() error {
 // ----------------------------------------------------------------------
 
 func (h *ReportingHandler) GenerateStatutoryChallan(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, err.Error())
@@ -99,7 +97,6 @@ func (h *ReportingHandler) GenerateStatutoryChallan(w http.ResponseWriter, r *ht
 
 	entries, err := h.reportingService.GenerateStatutoryChallan(ctx, companyID, req.PeriodStart, req.PeriodEnd)
 	if err != nil {
-		h.logger.Error("failed to generate statutory challan", zap.Error(err))
 		respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -122,7 +119,8 @@ func (h *ReportingHandler) GenerateStatutoryChallan(w http.ResponseWriter, r *ht
 }
 
 func (h *ReportingHandler) GeneratePayrollRegister(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, err.Error())
@@ -146,7 +144,6 @@ func (h *ReportingHandler) GeneratePayrollRegister(w http.ResponseWriter, r *htt
 
 	rows, err := h.reportingService.GeneratePayrollRegister(ctx, companyID, req.PeriodStart, req.PeriodEnd, groupBy)
 	if err != nil {
-		h.logger.Error("failed to generate payroll register", zap.Error(err))
 		respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -158,7 +155,7 @@ func (h *ReportingHandler) GeneratePayrollRegister(w http.ResponseWriter, r *htt
 }
 
 // ----------------------------------------------------------------------
-// Helper Functions (copied here to avoid missing imports)
+// Helper Functions
 // ----------------------------------------------------------------------
 
 func errMissingField(field string) error {

@@ -1,0 +1,172 @@
+package middleware
+
+import (
+	"context"
+	"net/http"
+	"strings"
+
+	"auth-service/internal/locationctx"
+	"auth-service/internal/models"
+	"auth-service/internal/service"
+	"auth-service/internal/util"
+
+	"github.com/google/uuid"
+)
+
+// AllLocationsSentinel is the reserved value for X-Location-ID that requests
+// the company-wide (consolidated) view instead of a single physical location.
+// Only users with location_scope == "ALL" are permitted to send it, and only
+// for read operations.
+const AllLocationsSentinel = "ALL"
+
+// Deprecated: use locationctx.* directly.
+//
+// Retained as aliases so existing references keep compiling during the
+// migration to locationctx. New code must import locationctx and use
+// locationctx.CtxMode / CtxLocationID / CtxAccessLevel instead.
+const (
+	CtxLocationMode        = locationctx.CtxMode
+	CtxValidatedLocationID = locationctx.CtxLocationID
+	CtxLocationAccessLevel = locationctx.CtxAccessLevel
+)
+
+// LocationValidationMiddleware normalizes X-Location-ID into a well-defined
+// organizational context and enforces access control.
+//
+// Contract:
+//   - Non-admin requests MUST send X-Location-ID.
+//   - Value is either a location UUID, or the literal "ALL".
+//   - "ALL" requires location_scope == ALL, and is rejected for writes.
+//   - On success, the request context gains:
+//     location_mode          → "LOCATION" | "ALL"
+//     validated_location_id  → uuid.UUID (uuid.Nil when mode == "ALL")
+//     location_access_level  → "VIEW" | "MANAGE"
+//
+// The strings written into the context are the same ones read by
+// locationctx.FromContext. Do not modify them here — modify
+// locationctx.CtxMode / CtxLocationID / CtxAccessLevel.
+func LocationValidationMiddleware(locationService *service.LocationService) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx := r.Context()
+
+			// ---------------------------------------------------------------
+			// 1. Admin bypass — checked before the header requirement.
+			// ---------------------------------------------------------------
+			if sessionType, _ := ctx.Value("session_type").(string); sessionType == "admin" {
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
+			if claims, ok := ctx.Value("jwt_claims").(*models.JWTClaims); ok &&
+				claims != nil && claims.SessionType == "admin" {
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
+
+			// ---------------------------------------------------------------
+			// 2. Header must be present.
+			// ---------------------------------------------------------------
+			rawHeader := strings.TrimSpace(r.Header.Get("X-Location-ID"))
+			if rawHeader == "" {
+				util.JSONError(w, http.StatusBadRequest, "X-Location-ID header required")
+				return
+			}
+
+			// ---------------------------------------------------------------
+			// 3. Resolve identity + scope once (claims preferred, ctx fallback).
+			// ---------------------------------------------------------------
+			var (
+				userID    uuid.UUID
+				companyID uuid.UUID
+				primaryID uuid.UUID
+				scope     string
+			)
+
+			if claims, ok := ctx.Value("jwt_claims").(*models.JWTClaims); ok && claims != nil {
+				userID, _ = uuid.Parse(claims.UserID)
+				companyID, _ = uuid.Parse(claims.CompanyID)
+				if claims.PrimaryLocationID != "" {
+					primaryID, _ = uuid.Parse(claims.PrimaryLocationID)
+				}
+				scope = claims.LocationScope
+			} else {
+				userID, _ = uuid.Parse(stringFromCtx(ctx, "user_id"))
+				companyID, _ = uuid.Parse(stringFromCtx(ctx, "company_id"))
+				primaryID, _ = uuid.Parse(stringFromCtx(ctx, "primary_location_id"))
+				scope = stringFromCtx(ctx, "location_scope")
+			}
+
+			if userID == uuid.Nil || companyID == uuid.Nil {
+				util.JSONError(w, http.StatusUnauthorized, "user or company not in context")
+				return
+			}
+
+			// ---------------------------------------------------------------
+			// 4. Classify the HTTP method. GET/HEAD/OPTIONS are reads.
+			// ---------------------------------------------------------------
+			isWrite := r.Method != http.MethodGet &&
+				r.Method != http.MethodHead &&
+				r.Method != http.MethodOptions
+
+			// ---------------------------------------------------------------
+			// 5. Company-wide ("ALL") context.
+			// ---------------------------------------------------------------
+			if strings.EqualFold(rawHeader, AllLocationsSentinel) {
+				if scope != models.LocationScopeAll {
+					util.JSONError(w, http.StatusForbidden,
+						"company-wide view not permitted for this user")
+					return
+				}
+				if isWrite {
+					util.JSONError(w, http.StatusBadRequest,
+						"company-wide context cannot be used for write operations")
+					return
+				}
+
+				ctx = context.WithValue(ctx, locationctx.CtxMode, string(locationctx.ScopeAll))
+				ctx = context.WithValue(ctx, locationctx.CtxLocationID, uuid.Nil)
+				ctx = context.WithValue(ctx, locationctx.CtxAccessLevel, locationctx.AccessManage)
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
+
+			// ---------------------------------------------------------------
+			// 6. Concrete location context.
+			// ---------------------------------------------------------------
+			requestedLoc, err := uuid.Parse(rawHeader)
+			if err != nil || requestedLoc == uuid.Nil {
+				util.JSONError(w, http.StatusBadRequest, "invalid X-Location-ID format")
+				return
+			}
+
+			allowed, accessLevel, err := locationService.IsLocationAllowed(
+				ctx, companyID, userID, requestedLoc, scope, primaryID,
+			)
+			if err != nil {
+				util.JSONError(w, http.StatusInternalServerError, "location validation error")
+				return
+			}
+			if !allowed {
+				util.JSONError(w, http.StatusForbidden, "location not allowed for this user")
+				return
+			}
+			if isWrite && accessLevel != models.AccessLevelManage {
+				util.JSONError(w, http.StatusForbidden, "write access denied for this location")
+				return
+			}
+
+			ctx = context.WithValue(ctx, locationctx.CtxMode, string(locationctx.ScopeLocation))
+			ctx = context.WithValue(ctx, locationctx.CtxLocationID, requestedLoc)
+			ctx = context.WithValue(ctx, locationctx.CtxAccessLevel, accessLevel)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// stringFromCtx is a small helper to safely pull a string out of context.
+func stringFromCtx(ctx context.Context, key string) string {
+	if s, ok := ctx.Value(key).(string); ok {
+		return s
+	}
+	return ""
+}

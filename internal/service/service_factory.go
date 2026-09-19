@@ -1,6 +1,7 @@
 package service
 
 import (
+	"auth-service/internal/client"
 	"auth-service/internal/encryption"
 	"auth-service/internal/hashing"
 	"auth-service/internal/infrastructure/audit"
@@ -10,6 +11,7 @@ import (
 
 // ServiceFactory creates and manages service instances.
 type ServiceFactory struct {
+	pgClient         *client.PostgresClient
 	userRepo         postgres.UserRepository
 	hasher           *hashing.Hasher
 	encryptionMgr    *encryption.EncryptionManager
@@ -20,6 +22,7 @@ type ServiceFactory struct {
 
 // NewServiceFactory creates a new service factory.
 func NewServiceFactory(
+	pgClient *client.PostgresClient,
 	userRepo postgres.UserRepository,
 	hasher *hashing.Hasher,
 	encryptionMgr *encryption.EncryptionManager,
@@ -27,6 +30,7 @@ func NewServiceFactory(
 	idempotencyStore idempotency.Store,
 ) *ServiceFactory {
 	return &ServiceFactory{
+		pgClient:         pgClient,
 		userRepo:         userRepo,
 		hasher:           hasher,
 		encryptionMgr:    encryptionMgr,
@@ -39,6 +43,7 @@ func NewServiceFactory(
 func (f *ServiceFactory) UserService() *UserService {
 	if f.userService == nil {
 		f.userService = NewUserService(
+			f.pgClient,
 			f.userRepo,
 			f.hasher,
 			f.encryptionMgr,

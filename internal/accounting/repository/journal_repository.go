@@ -150,7 +150,6 @@ func (r *journalRepository) mapDBError(err error, operation string) error {
 	if err == nil {
 		return nil
 	}
-	// Try to extract PostgreSQL error
 	if pqErr, ok := err.(*pq.Error); ok {
 		switch pqErr.Constraint {
 		case "unique_source":
@@ -165,7 +164,6 @@ func (r *journalRepository) mapDBError(err error, operation string) error {
 			return ErrCannotModifyPosted
 		}
 	}
-	// Fallback to string matching
 	errMsg := err.Error()
 	switch {
 	case strings.Contains(errMsg, "unique_source"):
@@ -183,7 +181,7 @@ func (r *journalRepository) mapDBError(err error, operation string) error {
 }
 
 // =============================================================================
-// SORT / PAGINATION / FILTER BUILDERS (unchanged)
+// SORT / PAGINATION / FILTER BUILDERS
 // =============================================================================
 var allowedJournalSortFields = map[string]bool{
 	"entry_date":   true,
@@ -268,7 +266,7 @@ func (r *journalRepository) buildJournalFilter(filter JournalFilter) (string, []
 	return "WHERE " + strings.Join(conditions, " AND "), args
 }
 
-// scanJournalEntry – updated to scan source_id as sql.NullString
+// scanJournalEntry – scans source_id as sql.NullString
 func (r *journalRepository) scanJournalEntry(scanner interface {
 	Scan(dest ...interface{}) error
 }) (*models.JournalEntry, error) {
@@ -419,7 +417,7 @@ func (r *journalRepository) Update(ctx context.Context, db DBTX, j *models.Journ
 	return nil
 }
 
-// GetByID, GetByIDForUpdate, GetBySource, GetBySourceForUpdate
+// GetByID
 func (r *journalRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.JournalEntry, error) {
 	query := `
 		SELECT journal_entry_id, company_id, journal_type, entry_date,
@@ -514,7 +512,7 @@ func (r *journalRepository) GetBySourceForUpdate(ctx context.Context, db DBTX, c
 	return j, nil
 }
 
-// List unchanged
+// List
 func (r *journalRepository) List(ctx context.Context, db DBTX, filter JournalFilter, p Pagination, s Sort) ([]*models.JournalEntry, error) {
 	where, args := r.buildJournalFilter(filter)
 	orderBy, err := r.validateSort(s)
@@ -672,7 +670,7 @@ func (r *journalRepository) ExistsBySource(ctx context.Context, db DBTX, company
 }
 
 // =============================================================================
-// STATUS TRANSITIONS (uses package-level error)
+// STATUS TRANSITIONS
 // =============================================================================
 var validTransitions = map[string]map[string]bool{
 	enums.JournalStatusDraft: {
@@ -861,6 +859,9 @@ func (r *journalRepository) HasReversal(ctx context.Context, db DBTX, originalID
 // =============================================================================
 // LINES
 // =============================================================================
+
+// AddLine inserts a single journal line, persisting cost_center_id and
+// department_id when supplied.
 func (r *journalRepository) AddLine(ctx context.Context, db DBTX, line *models.JournalLine) error {
 	var status string
 	var deletedAt sql.NullTime
@@ -878,13 +879,16 @@ func (r *journalRepository) AddLine(ctx context.Context, db DBTX, line *models.J
 	query := `
 		INSERT INTO accounting.journal_lines (
 			journal_line_id, journal_entry_id, account_id, line_number,
-			debit_amount, credit_amount, description, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+			debit_amount, credit_amount, description,
+			cost_center_id, department_id,
+			created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
 		RETURNING created_at, updated_at
 	`
 	err = db.QueryRowContext(ctx, query,
 		line.JournalLineID, line.JournalEntryID, line.AccountID, line.LineNumber,
 		line.DebitAmount, line.CreditAmount, line.Description,
+		line.CostCenterID, line.DepartmentID,
 	).Scan(&line.CreatedAt, &line.UpdatedAt)
 	if err != nil {
 		r.logger.Error("failed to add journal line",
@@ -895,7 +899,8 @@ func (r *journalRepository) AddLine(ctx context.Context, db DBTX, line *models.J
 	return nil
 }
 
-// BulkAddLines – multi‑insert without RETURNING
+// BulkAddLines – multi‑insert without RETURNING.
+// Now inserts cost_center_id and department_id per line (9 columns per row).
 func (r *journalRepository) BulkAddLines(ctx context.Context, db DBTX, lines []*models.JournalLine) error {
 	if len(lines) == 0 {
 		return nil
@@ -915,17 +920,25 @@ func (r *journalRepository) BulkAddLines(ctx context.Context, db DBTX, lines []*
 	}
 
 	valueStrings := make([]string, 0, len(lines))
-	args := make([]interface{}, 0, len(lines)*7)
+	args := make([]interface{}, 0, len(lines)*9)
 	for i, l := range lines {
-		valueStrings = append(valueStrings, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d, $%d, NOW(), NOW())",
-			i*7+1, i*7+2, i*7+3, i*7+4, i*7+5, i*7+6, i*7+7))
-		args = append(args, l.JournalLineID, l.JournalEntryID, l.AccountID, l.LineNumber,
-			l.DebitAmount, l.CreditAmount, l.Description)
+		base := i * 9
+		valueStrings = append(valueStrings, fmt.Sprintf(
+			"($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, NOW(), NOW())",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9,
+		))
+		args = append(args,
+			l.JournalLineID, l.JournalEntryID, l.AccountID, l.LineNumber,
+			l.DebitAmount, l.CreditAmount, l.Description,
+			l.CostCenterID, l.DepartmentID,
+		)
 	}
 	query := fmt.Sprintf(`
 		INSERT INTO accounting.journal_lines (
 			journal_line_id, journal_entry_id, account_id, line_number,
-			debit_amount, credit_amount, description, created_at, updated_at
+			debit_amount, credit_amount, description,
+			cost_center_id, department_id,
+			created_at, updated_at
 		) VALUES %s
 	`, strings.Join(valueStrings, ","))
 
@@ -939,11 +952,12 @@ func (r *journalRepository) BulkAddLines(ctx context.Context, db DBTX, lines []*
 	return nil
 }
 
-// GetLines
+// GetLines returns all lines for a journal, including cost center / department.
 func (r *journalRepository) GetLines(ctx context.Context, db DBTX, journalID uuid.UUID) ([]*models.JournalLine, error) {
 	query := `
 		SELECT journal_line_id, journal_entry_id, account_id, line_number,
 		       debit_amount, credit_amount, description,
+		       cost_center_id, department_id,
 		       created_at, updated_at
 		FROM accounting.journal_lines
 		WHERE journal_entry_id = $1
@@ -962,9 +976,11 @@ func (r *journalRepository) GetLines(ctx context.Context, db DBTX, journalID uui
 	for rows.Next() {
 		var line models.JournalLine
 		var description sql.NullString
+		var ccID, deptID uuid.NullUUID
 		err := rows.Scan(
 			&line.JournalLineID, &line.JournalEntryID, &line.AccountID, &line.LineNumber,
 			&line.DebitAmount, &line.CreditAmount, &description,
+			&ccID, &deptID,
 			&line.CreatedAt, &line.UpdatedAt,
 		)
 		if err != nil {
@@ -973,11 +989,18 @@ func (r *journalRepository) GetLines(ctx context.Context, db DBTX, journalID uui
 		if description.Valid {
 			line.Description = &description.String
 		}
+		if ccID.Valid {
+			line.CostCenterID = &ccID.UUID
+		}
+		if deptID.Valid {
+			line.DepartmentID = &deptID.UUID
+		}
 		lines = append(lines, &line)
 	}
 	return lines, nil
 }
 
+// UpdateLine – persists cost center / department changes too.
 func (r *journalRepository) UpdateLine(ctx context.Context, db DBTX, line *models.JournalLine) error {
 	var status string
 	var deletedAt sql.NullTime
@@ -1004,6 +1027,7 @@ func (r *journalRepository) UpdateLine(ctx context.Context, db DBTX, line *model
 		UPDATE accounting.journal_lines
 		SET account_id = $2, line_number = $3,
 		    debit_amount = $4, credit_amount = $5, description = $6,
+		    cost_center_id = $7, department_id = $8,
 		    updated_at = NOW()
 		WHERE journal_line_id = $1
 		RETURNING updated_at
@@ -1011,6 +1035,7 @@ func (r *journalRepository) UpdateLine(ctx context.Context, db DBTX, line *model
 	err = db.QueryRowContext(ctx, query,
 		line.JournalLineID, line.AccountID, line.LineNumber,
 		line.DebitAmount, line.CreditAmount, line.Description,
+		line.CostCenterID, line.DepartmentID,
 	).Scan(&line.UpdatedAt)
 	if err != nil {
 		return r.mapDBError(err, "update journal line")
@@ -1196,6 +1221,8 @@ func (r *journalRepository) GetForPosting(ctx context.Context, db DBTX, id uuid.
 // =============================================================================
 // REPORTING
 // =============================================================================
+
+// ListWithLines – also returns cost center / department per line.
 func (r *journalRepository) ListWithLines(ctx context.Context, db DBTX, filter JournalFilter, p Pagination, s Sort) ([]*JournalWithLines, error) {
 	entries, err := r.List(ctx, db, filter, p, s)
 	if err != nil {
@@ -1218,6 +1245,7 @@ func (r *journalRepository) ListWithLines(ctx context.Context, db DBTX, filter J
 	query := fmt.Sprintf(`
 		SELECT journal_line_id, journal_entry_id, account_id, line_number,
 		       debit_amount, credit_amount, description,
+		       cost_center_id, department_id,
 		       created_at, updated_at
 		FROM accounting.journal_lines
 		WHERE journal_entry_id IN (%s)
@@ -1234,9 +1262,11 @@ func (r *journalRepository) ListWithLines(ctx context.Context, db DBTX, filter J
 	for rows.Next() {
 		var line models.JournalLine
 		var description sql.NullString
+		var ccID, deptID uuid.NullUUID
 		err := rows.Scan(
 			&line.JournalLineID, &line.JournalEntryID, &line.AccountID, &line.LineNumber,
 			&line.DebitAmount, &line.CreditAmount, &description,
+			&ccID, &deptID,
 			&line.CreatedAt, &line.UpdatedAt,
 		)
 		if err != nil {
@@ -1244,6 +1274,12 @@ func (r *journalRepository) ListWithLines(ctx context.Context, db DBTX, filter J
 		}
 		if description.Valid {
 			line.Description = &description.String
+		}
+		if ccID.Valid {
+			line.CostCenterID = &ccID.UUID
+		}
+		if deptID.Valid {
+			line.DepartmentID = &deptID.UUID
 		}
 		linesMap[line.JournalEntryID] = append(linesMap[line.JournalEntryID], &line)
 	}
@@ -1262,10 +1298,12 @@ func (r *journalRepository) ListWithLines(ctx context.Context, db DBTX, filter J
 	return result, nil
 }
 
+// ListByAccount – now includes cost center / department.
 func (r *journalRepository) ListByAccount(ctx context.Context, db DBTX, accountID uuid.UUID, from, to time.Time) ([]*models.JournalLine, error) {
 	query := `
 		SELECT jl.journal_line_id, jl.journal_entry_id, jl.account_id, jl.line_number,
 		       jl.debit_amount, jl.credit_amount, jl.description,
+		       jl.cost_center_id, jl.department_id,
 		       jl.created_at, jl.updated_at
 		FROM accounting.journal_lines jl
 		INNER JOIN accounting.journal_entries je ON jl.journal_entry_id = je.journal_entry_id
@@ -1288,9 +1326,11 @@ func (r *journalRepository) ListByAccount(ctx context.Context, db DBTX, accountI
 	for rows.Next() {
 		var line models.JournalLine
 		var description sql.NullString
+		var ccID, deptID uuid.NullUUID
 		err := rows.Scan(
 			&line.JournalLineID, &line.JournalEntryID, &line.AccountID, &line.LineNumber,
 			&line.DebitAmount, &line.CreditAmount, &description,
+			&ccID, &deptID,
 			&line.CreatedAt, &line.UpdatedAt,
 		)
 		if err != nil {
@@ -1298,6 +1338,12 @@ func (r *journalRepository) ListByAccount(ctx context.Context, db DBTX, accountI
 		}
 		if description.Valid {
 			line.Description = &description.String
+		}
+		if ccID.Valid {
+			line.CostCenterID = &ccID.UUID
+		}
+		if deptID.Valid {
+			line.DepartmentID = &deptID.UUID
 		}
 		lines = append(lines, &line)
 	}

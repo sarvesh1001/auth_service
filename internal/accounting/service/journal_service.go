@@ -76,13 +76,12 @@ func NewJournalService(
 	}
 }
 
-// Helper to check idempotency errors (works with any store)
 func isIdempotencyNotFound(err error) bool {
 	return errors.Is(err, idempotency.ErrKeyNotFound) || errors.Is(err, sql.ErrNoRows)
 }
 
 // =============================================================================
-// Public Methods
+// Public
 // =============================================================================
 
 func (s *journalService) Create(ctx context.Context, req CreateJournalRequest) (*models.JournalEntry, error) {
@@ -112,17 +111,14 @@ func (s *journalService) CreateWithTx(ctx context.Context, tx *sql.Tx, req Creat
 }
 
 func (s *journalService) createWithTxInternal(ctx context.Context, tx *sql.Tx, req CreateJournalRequest, logger *zap.Logger) (*models.JournalEntry, error) {
-	// 1. Basic validation (double‑entry, non‑negative, etc.)
 	if err := s.validateJournal(req); err != nil {
 		return nil, err
 	}
 
-	// 2. RULE ENGINE VALIDATION (advanced business rules)
 	if err := s.ruleEngine.ValidateJournal(ctx, tx, req); err != nil {
 		return nil, err
 	}
 
-	// 3. DUPLICATE DETECTION
 	dup, err := s.ruleEngine.IsDuplicate(ctx, tx, req)
 	if err != nil {
 		return nil, err
@@ -132,7 +128,6 @@ func (s *journalService) createWithTxInternal(ctx context.Context, tx *sql.Tx, r
 		return nil, ErrDuplicateTransaction
 	}
 
-	// 4. Idempotency check (fixed error handling)
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 	if idempotencyKey != "" {
 		var existing models.JournalEntry
@@ -146,13 +141,12 @@ func (s *journalService) createWithTxInternal(ctx context.Context, tx *sql.Tx, r
 		}
 	}
 
-	// 5. Create journal entry (with or without source)
 	var journal *models.JournalEntry
 	var created bool
 
 	if req.SourceType != nil && req.SourceID != nil {
 		journal, created, err = s.repo.CreateOrGetBySource(
-			ctx, tx, req.CompanyID, *req.SourceType, *req.SourceID, // SourceID is *string
+			ctx, tx, req.CompanyID, *req.SourceType, *req.SourceID,
 			func() *models.JournalEntry {
 				return &models.JournalEntry{
 					JournalEntryID: uuid.New(),
@@ -193,7 +187,7 @@ func (s *journalService) createWithTxInternal(ctx context.Context, tx *sql.Tx, r
 		}
 	}
 
-	// 6. Add journal lines
+	// 👇 Line construction now carries cost_center_id / department_id
 	lines := make([]*models.JournalLine, len(req.Lines))
 	for i, lineReq := range req.Lines {
 		lines[i] = &models.JournalLine{
@@ -204,13 +198,14 @@ func (s *journalService) createWithTxInternal(ctx context.Context, tx *sql.Tx, r
 			DebitAmount:    lineReq.DebitAmount,
 			CreditAmount:   lineReq.CreditAmount,
 			Description:    lineReq.Description,
+			CostCenterID:   lineReq.CostCenterID,
+			DepartmentID:   lineReq.DepartmentID,
 		}
 	}
 	if err := s.repo.BulkAddLines(ctx, tx, lines); err != nil {
 		return nil, fmt.Errorf("create lines: %w", err)
 	}
 
-	// 7. Outbox event
 	payload := s.buildJournalEventPayload(journal, lines)
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
@@ -225,12 +220,10 @@ func (s *journalService) createWithTxInternal(ctx context.Context, tx *sql.Tx, r
 		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
-	// 8. Idempotency storage
 	if idempotencyKey != "" {
 		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, journal)
 	}
 
-	// 9. Audit log
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &req.CompanyID, "accounting", "create", "journal_entry",
 			&journal.JournalEntryID, "user", req.CreatedBy, nil, nil, nil)
@@ -257,7 +250,6 @@ func (s *journalService) Update(ctx context.Context, req UpdateJournalRequest) (
 	}
 	defer tx.Rollback()
 
-	// Idempotency check (fixed)
 	if idempotencyKey != "" {
 		var existing *models.JournalEntry
 		err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing)
@@ -281,7 +273,6 @@ func (s *journalService) Update(ctx context.Context, req UpdateJournalRequest) (
 		return nil, fmt.Errorf("%w: cannot update journal entry in status %s", ErrInvalidState, existing.Status)
 	}
 
-	// Apply full validation if lines are being updated
 	if req.Lines != nil {
 		validationReq := CreateJournalRequest{
 			CompanyID:   existing.CompanyID,
@@ -299,7 +290,6 @@ func (s *journalService) Update(ctx context.Context, req UpdateJournalRequest) (
 		}
 	}
 
-	// Apply updates
 	if req.EntryDate != nil {
 		existing.EntryDate = *req.EntryDate
 	}
@@ -320,6 +310,7 @@ func (s *journalService) Update(ctx context.Context, req UpdateJournalRequest) (
 		if err := s.repo.ClearLines(ctx, tx, existing.JournalEntryID); err != nil {
 			return nil, fmt.Errorf("delete old lines: %w", err)
 		}
+		// 👇 Line construction now carries cost_center_id / department_id
 		lines = make([]*models.JournalLine, len(req.Lines))
 		for i, lineReq := range req.Lines {
 			lines[i] = &models.JournalLine{
@@ -330,6 +321,8 @@ func (s *journalService) Update(ctx context.Context, req UpdateJournalRequest) (
 				DebitAmount:    lineReq.DebitAmount,
 				CreditAmount:   lineReq.CreditAmount,
 				Description:    lineReq.Description,
+				CostCenterID:   lineReq.CostCenterID,
+				DepartmentID:   lineReq.DepartmentID,
 			}
 		}
 		if err := s.repo.BulkAddLines(ctx, tx, lines); err != nil {
@@ -342,7 +335,6 @@ func (s *journalService) Update(ctx context.Context, req UpdateJournalRequest) (
 		}
 	}
 
-	// Outbox event
 	payload := s.buildJournalEventPayload(existing, lines)
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
@@ -388,7 +380,6 @@ func (s *journalService) Post(ctx context.Context, id uuid.UUID, postedBy *uuid.
 	}
 	defer tx.Rollback()
 
-	// Idempotency check (fixed)
 	if idempotencyKey != "" {
 		var processed bool
 		err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed)
@@ -435,7 +426,6 @@ func (s *journalService) Reverse(ctx context.Context, id uuid.UUID, reason strin
 	}
 	defer tx.Rollback()
 
-	// Idempotency check (fixed)
 	if idempotencyKey != "" {
 		var processed bool
 		err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed)
@@ -448,7 +438,6 @@ func (s *journalService) Reverse(ctx context.Context, id uuid.UUID, reason strin
 		}
 	}
 
-	// Check existing reversal
 	hasRev, err := s.repo.HasReversal(ctx, tx, id)
 	if err != nil {
 		return fmt.Errorf("check reversal existence: %w", err)
@@ -457,7 +446,6 @@ func (s *journalService) Reverse(ctx context.Context, id uuid.UUID, reason strin
 		return repository.ErrReversalAlreadyExists
 	}
 
-	// Lock & fetch original
 	original, err := s.repo.GetByIDForUpdate(ctx, tx, id)
 	if err != nil {
 		return fmt.Errorf("get original entry: %w", err)
@@ -469,7 +457,6 @@ func (s *journalService) Reverse(ctx context.Context, id uuid.UUID, reason strin
 		return fmt.Errorf("only posted entries can be reversed, status: %s", original.Status)
 	}
 
-	// Fetch original lines
 	originalLines, err := s.repo.GetLines(ctx, tx, id)
 	if err != nil {
 		return fmt.Errorf("get original lines: %w", err)
@@ -478,7 +465,6 @@ func (s *journalService) Reverse(ctx context.Context, id uuid.UUID, reason strin
 		return fmt.Errorf("original journal has no lines")
 	}
 
-	// Create reversal entry (DRAFT)
 	reversal := &models.JournalEntry{
 		JournalEntryID: uuid.New(),
 		CompanyID:      original.CompanyID,
@@ -496,7 +482,7 @@ func (s *journalService) Reverse(ctx context.Context, id uuid.UUID, reason strin
 		return fmt.Errorf("reverse journal: %w", err)
 	}
 
-	// Create reversed lines (swap debit/credit)
+	// 👇 Reversal lines carry the same cost center / department as originals
 	reversalLines := make([]*models.JournalLine, len(originalLines))
 	for i, l := range originalLines {
 		reversalLines[i] = &models.JournalLine{
@@ -507,28 +493,26 @@ func (s *journalService) Reverse(ctx context.Context, id uuid.UUID, reason strin
 			DebitAmount:    l.CreditAmount,
 			CreditAmount:   l.DebitAmount,
 			Description:    l.Description,
+			CostCenterID:   l.CostCenterID,
+			DepartmentID:   l.DepartmentID,
 		}
 	}
 	if err := s.repo.BulkAddLines(ctx, tx, reversalLines); err != nil {
 		return fmt.Errorf("create reversal lines: %w", err)
 	}
 
-	// Rule validation before post
 	if err := s.ruleEngine.ValidateBeforePost(ctx, tx, reversal, reversalLines); err != nil {
 		return err
 	}
 
-	// Post to ledger
 	if err := s.ledgerService.PostJournalToLedger(ctx, tx, reversal, reversalLines); err != nil {
 		return fmt.Errorf("post reversal to ledger: %w", err)
 	}
 
-	// Mark as POSTED
 	if err := s.repo.Post(ctx, tx, reversal.JournalEntryID, reversedBy); err != nil {
 		return fmt.Errorf("post reversal entry: %w", err)
 	}
 
-	// Outbox event
 	payload := s.buildJournalEventPayload(reversal, reversalLines)
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
@@ -578,7 +562,6 @@ func (s *journalService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uu
 	}
 	defer tx.Rollback()
 
-	// Idempotency check (fixed)
 	if idempotencyKey != "" {
 		var processed bool
 		err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed)
@@ -683,9 +666,11 @@ func (s *journalService) List(ctx context.Context, filter repository.JournalFilt
 
 func (s *journalService) buildJournalEventPayload(entry *models.JournalEntry, lines []*models.JournalLine) []byte {
 	type linePayload struct {
-		AccountID string `json:"account_id"`
-		Debit     string `json:"debit"`
-		Credit    string `json:"credit"`
+		AccountID    string  `json:"account_id"`
+		Debit        string  `json:"debit"`
+		Credit       string  `json:"credit"`
+		CostCenterID *string `json:"cost_center_id,omitempty"`
+		DepartmentID *string `json:"department_id,omitempty"`
 	}
 	payloadLines := make([]linePayload, len(lines))
 	for i, l := range lines {
@@ -693,6 +678,14 @@ func (s *journalService) buildJournalEventPayload(entry *models.JournalEntry, li
 			AccountID: l.AccountID.String(),
 			Debit:     l.DebitAmount.String(),
 			Credit:    l.CreditAmount.String(),
+		}
+		if l.CostCenterID != nil {
+			v := l.CostCenterID.String()
+			payloadLines[i].CostCenterID = &v
+		}
+		if l.DepartmentID != nil {
+			v := l.DepartmentID.String()
+			payloadLines[i].DepartmentID = &v
 		}
 	}
 	payload := struct {
@@ -778,11 +771,9 @@ func stringPtr(s string) *string {
 	return &s
 }
 
-// postWithTxInternal performs the actual posting logic using an existing transaction.
 func (s *journalService) postWithTxInternal(ctx context.Context, tx *sql.Tx, id uuid.UUID, postedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "postWithTxInternal"), zap.String("journal_id", id.String()))
 
-	// 1. Get entry for update (with row lock)
 	entry, err := s.repo.GetByIDForUpdate(ctx, tx, id)
 	if err != nil {
 		return fmt.Errorf("get entry: %w", err)
@@ -797,23 +788,19 @@ func (s *journalService) postWithTxInternal(ctx context.Context, tx *sql.Tx, id 
 		return fmt.Errorf("cannot post journal with status %s", entry.Status)
 	}
 
-	// 2. Validate before post
 	if err := s.repo.ValidateBeforePost(ctx, tx, id); err != nil {
 		return err
 	}
 
-	// 3. Get journal lines
 	lines, err := s.repo.GetLines(ctx, tx, id)
 	if err != nil {
 		return fmt.Errorf("get lines: %w", err)
 	}
 
-	// 4. Rule engine validation
 	if err := s.ruleEngine.ValidateBeforePost(ctx, tx, entry, lines); err != nil {
 		return err
 	}
 
-	// 5. Post to ledger
 	logger.Info("calling PostJournalToLedger")
 	if err := s.ledgerService.PostJournalToLedger(ctx, tx, entry, lines); err != nil {
 		logger.Error("PostJournalToLedger failed", zap.Error(err))
@@ -821,7 +808,6 @@ func (s *journalService) postWithTxInternal(ctx context.Context, tx *sql.Tx, id 
 	}
 	logger.Info("PostJournalToLedger completed successfully")
 
-	// 6. Verify ledger entries
 	var ledgerCount int
 	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounting.ledger_entries WHERE journal_entry_id = $1`, id).Scan(&ledgerCount)
 	if err != nil {
@@ -835,13 +821,11 @@ func (s *journalService) postWithTxInternal(ctx context.Context, tx *sql.Tx, id 
 	}
 	logger.Info("ValidateLedgerExists passed")
 
-	// 7. Update journal status
 	if err := s.repo.Post(ctx, tx, id, postedBy); err != nil {
 		return fmt.Errorf("post journal entry: %w", err)
 	}
 	logger.Info("journal status updated to posted")
 
-	// 8. Outbox event
 	payload := s.buildJournalEventPayload(entry, lines)
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
@@ -856,7 +840,6 @@ func (s *journalService) postWithTxInternal(ctx context.Context, tx *sql.Tx, id 
 		return fmt.Errorf("store outbox event: %w", err)
 	}
 
-	// 9. Audit log
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &entry.CompanyID, "accounting", "post", "journal_entry",
 			&id, "user", postedBy, nil, nil, nil)
@@ -864,7 +847,6 @@ func (s *journalService) postWithTxInternal(ctx context.Context, tx *sql.Tx, id 
 	return nil
 }
 
-// PostWithTx posts a journal entry using an existing transaction.
 func (s *journalService) PostWithTx(ctx context.Context, tx *sql.Tx, id uuid.UUID, postedBy *uuid.UUID) error {
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 	if idempotencyKey != "" {

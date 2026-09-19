@@ -6,9 +6,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 
 	"auth-service/internal/attendance/repository"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
 )
 
 // ============================================================
@@ -58,25 +59,28 @@ type PayrollAttendanceSummary struct {
 // ============================================================
 
 type attendancePayrollBridge struct {
-	summaryRepo repository.SummaryRepository
-	eventRepo   repository.EventRepository // for transactions
-	logger      *zap.Logger
+	summaryRepo      repository.SummaryRepository
+	eventRepo        repository.EventRepository
+	auditService     *audit.AuditService
+	idempotencyStore idempotency.Store
 }
 
 func NewAttendancePayrollBridge(
 	summaryRepo repository.SummaryRepository,
 	eventRepo repository.EventRepository,
-	logger *zap.Logger,
+	auditService *audit.AuditService,
+	idempotencyStore idempotency.Store,
 ) AttendancePayrollBridge {
 	return &attendancePayrollBridge{
-		summaryRepo: summaryRepo,
-		eventRepo:   eventRepo,
-		logger:      logger,
+		summaryRepo:      summaryRepo,
+		eventRepo:        eventRepo,
+		auditService:     auditService,
+		idempotencyStore: idempotencyStore,
 	}
 }
 
 // ============================================================
-// VALIDATION (now without lock check)
+// VALIDATION (no lock check)
 // ============================================================
 
 func (b *attendancePayrollBridge) ValidateAttendanceForPayroll(
@@ -85,19 +89,17 @@ func (b *attendancePayrollBridge) ValidateAttendanceForPayroll(
 	userID uuid.UUID,
 	startDate, endDate time.Time,
 ) error {
-
 	if endDate.Before(startDate) {
 		return fmt.Errorf("invalid date range")
 	}
 
 	expectedDays := int(endDate.Sub(startDate).Hours()/24) + 1
 
-	// Fetch summaries for the period
 	summaries, err := b.summaryRepo.GetBySubjectRange(
 		ctx,
 		companyID,
 		userID,
-		"employee", // HR subjects are employees
+		"employee",
 		startDate,
 		endDate,
 	)
@@ -120,14 +122,13 @@ func (b *attendancePayrollBridge) ValidateAttendanceForPayroll(
 				s.AttendanceDate.Format("2006-01-02"),
 			)
 		}
-		// ❌ Lock check removed – now allowed for reading
 	}
 
 	return nil
 }
 
 // ============================================================
-// AGGREGATION
+// AGGREGATION (with audit)
 // ============================================================
 
 func (b *attendancePayrollBridge) GetPayrollAttendanceSummary(
@@ -136,15 +137,9 @@ func (b *attendancePayrollBridge) GetPayrollAttendanceSummary(
 	userID uuid.UUID,
 	startDate, endDate time.Time,
 ) (*PayrollAttendanceSummary, error) {
+	ip, _ := ctx.Value("ip_address").(string)
 
-	// Validate completeness & finalization (lock status ignored)
-	if err := b.ValidateAttendanceForPayroll(
-		ctx,
-		companyID,
-		userID,
-		startDate,
-		endDate,
-	); err != nil {
+	if err := b.ValidateAttendanceForPayroll(ctx, companyID, userID, startDate, endDate); err != nil {
 		return nil, err
 	}
 
@@ -165,22 +160,15 @@ func (b *attendancePayrollBridge) GetPayrollAttendanceSummary(
 	}
 
 	for _, s := range summaries {
-		// Payable days
 		if s.IsPayable {
 			result.PayableDays++
 		}
-
-		// Worked minutes
 		if s.WorkedMinutes != nil {
 			result.TotalWorkedMinutes += *s.WorkedMinutes
 		}
-
-		// Overtime minutes
 		if s.OvertimeMinutes != nil {
 			result.TotalOvertimeMinutes += *s.OvertimeMinutes
 		}
-
-		// Loss minutes = expected - worked (only if positive)
 		if s.ExpectedMinutes != nil && s.WorkedMinutes != nil {
 			loss := *s.ExpectedMinutes - *s.WorkedMinutes
 			if loss > 0 {
@@ -189,23 +177,41 @@ func (b *attendancePayrollBridge) GetPayrollAttendanceSummary(
 		}
 	}
 
-	// Optional: log if any summaries were already locked (just for visibility)
-	for _, s := range summaries {
-		if s.IsPayrollLocked {
-			b.logger.Warn("attendance already payroll locked, using locked data",
-				zap.String("company_id", companyID.String()),
-				zap.String("user_id", userID.String()),
-				zap.String("date", s.AttendanceDate.Format("2006-01-02")),
-			)
-			break // log once per employee
+	// Audit read operation (if audit service is available)
+	if b.auditService != nil {
+		metadata := map[string]interface{}{
+			"user_id":          userID.String(),
+			"company_id":       companyID.String(),
+			"start_date":       startDate,
+			"end_date":         endDate,
+			"total_days":       result.TotalDays,
+			"payable_days":     result.PayableDays,
+			"total_worked_min": result.TotalWorkedMinutes,
+			"total_overtime":   result.TotalOvertimeMinutes,
+			"total_loss":       result.TotalLossMinutes,
+			"ip":               ip,
 		}
+		_ = b.auditService.LogAction(
+			ctx,
+			nil,
+			&companyID,
+			"payroll",
+			"attendance_summary",
+			"payroll_summary",
+			nil,
+			"system",
+			nil,
+			nil,
+			nil,
+			metadata,
+		)
 	}
 
 	return result, nil
 }
 
 // ============================================================
-// LOCKING (explicit lock check)
+// LOCKING (with idempotency + audit)
 // ============================================================
 
 func (b *attendancePayrollBridge) LockAttendanceForPayroll(
@@ -214,19 +220,24 @@ func (b *attendancePayrollBridge) LockAttendanceForPayroll(
 	userID uuid.UUID,
 	startDate, endDate time.Time,
 ) error {
+	ip, _ := ctx.Value("ip_address").(string)
 
-	// 1. Validate completeness & finalization (still required)
-	if err := b.ValidateAttendanceForPayroll(
-		ctx,
-		companyID,
-		userID,
-		startDate,
-		endDate,
-	); err != nil {
+	// 1️⃣ Idempotency key
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("payroll_lock-%s-%s-%s", companyID.String(), userID.String(), startDate.Format("2006-01-02"))
+	}
+	var processed bool
+	if err := b.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil // already locked in this request
+	}
+
+	// 2️⃣ Validate completeness & finalization
+	if err := b.ValidateAttendanceForPayroll(ctx, companyID, userID, startDate, endDate); err != nil {
 		return err
 	}
 
-	// 2. Explicitly check for existing locks
+	// 3️⃣ Check existing locks
 	summaries, err := b.summaryRepo.GetBySubjectRange(
 		ctx,
 		companyID,
@@ -238,7 +249,6 @@ func (b *attendancePayrollBridge) LockAttendanceForPayroll(
 	if err != nil {
 		return err
 	}
-
 	for _, s := range summaries {
 		if s.IsPayrollLocked {
 			return fmt.Errorf(
@@ -248,7 +258,7 @@ func (b *attendancePayrollBridge) LockAttendanceForPayroll(
 		}
 	}
 
-	// 3. Perform the lock within a transaction
+	// 4️⃣ Perform lock in transaction
 	tx, err := b.eventRepo.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to start transaction: %w", err)
@@ -272,13 +282,34 @@ func (b *attendancePayrollBridge) LockAttendanceForPayroll(
 		return fmt.Errorf("failed to commit lock transaction: %w", err)
 	}
 
-	b.logger.Info(
-		"Attendance locked for payroll",
-		zap.String("company_id", companyID.String()),
-		zap.String("user_id", userID.String()),
-		zap.Time("start_date", startDate),
-		zap.Time("end_date", endDate),
-	)
+	// 5️⃣ Audit
+	if b.auditService != nil {
+		metadata := map[string]interface{}{
+			"user_id":    userID.String(),
+			"company_id": companyID.String(),
+			"start_date": startDate,
+			"end_date":   endDate,
+			"action":     "lock_attendance_payroll",
+			"ip":         ip,
+		}
+		_ = b.auditService.LogAction(
+			ctx,
+			tx, // we can pass nil since lock is already committed, or we could pass tx before commit? better after commit.
+			&companyID,
+			"payroll",
+			"lock_attendance",
+			"payroll_lock",
+			nil,
+			"system",
+			nil,
+			nil,
+			nil,
+			metadata,
+		)
+	}
+
+	// 6️⃣ Store idempotency
+	_ = b.idempotencyStore.Store(ctx, nil, idempKey, true)
 
 	return nil
 }

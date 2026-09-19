@@ -39,12 +39,3 @@ type AccountLedgerSummary struct {
 	TotalCredit    decimal.Decimal `json:"total_credit"`
 	ClosingBalance decimal.Decimal `json:"closing_balance"`
 }
-type CostCenter struct {
-	CostCenterID uuid.UUID `db:"cost_center_id"`
-	Name         string
-}
-
-type Department struct {
-	DepartmentID uuid.UUID `db:"department_id"`
-	Name         string
-}

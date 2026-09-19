@@ -1,0 +1,152 @@
+apiVersion: 1
+
+groups:
+  - name: MPIN Alerts
+    folder: MPIN
+    interval: 1m
+    rules:
+      - uid: mpin_failure_rate_high
+        title: "MPIN Failure Rate > 10%"
+        condition: C
+        for: 2m
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: clickhouse
+            model:
+              refId: A
+              rawSql: |
+                SELECT countIf(status = 'failed') AS failed_count
+                FROM mpin_events
+                WHERE timestamp > now() - INTERVAL 2 MINUTE
+          - refId: B
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: clickhouse
+            model:
+              refId: B
+              rawSql: |
+                SELECT count(*) AS total
+                FROM mpin_events
+                WHERE timestamp > now() - INTERVAL 2 MINUTE
+          - refId: C
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "__expr__"   # ✅ expression datasource
+            model:
+              refId: C
+              type: math               # ✅ changed from 'expression' to 'math'
+              expression: "$A / $B * 100"
+        noDataState: NoData
+        execErrState: Error
+        annotations:
+          summary: "MPIN failure rate is high"
+          description: "MPIN failure rate is {{ $values.C }}% which exceeds 10%."
+        labels:
+          severity: critical
+          service: mpin
+
+      - uid: mpin_p95_latency_high
+        title: "MPIN P95 Latency > 500ms"
+        condition: A
+        for: 2m
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: clickhouse
+            model:
+              refId: A
+              rawSql: |
+                SELECT quantile(0.95)(duration_ms) AS p95
+                FROM mpin_events
+                WHERE timestamp > now() - INTERVAL 2 MINUTE
+                  AND duration_ms > 0
+        noDataState: NoData
+        execErrState: Error
+        annotations:
+          summary: "MPIN P95 latency is high"
+          description: "MPIN P95 latency is {{ $values.A }}ms which exceeds 500ms."
+        labels:
+          severity: critical
+          service: mpin
+
+      - uid: mpin_lockouts_spike
+        title: "MPIN Lockouts > 5 in 5 minutes"
+        condition: A
+        for: 1m
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: clickhouse
+            model:
+              refId: A
+              rawSql: |
+                SELECT count(*) AS lockouts
+                FROM mpin_events
+                WHERE status = 'admin_mpin_locked'
+                  AND timestamp > now() - INTERVAL 5 MINUTE
+        noDataState: NoData
+        execErrState: Error
+        annotations:
+          summary: "MPIN lockouts spike"
+          description: "MPIN lockouts count is {{ $values.A }} which exceeds 5 in 5 minutes."
+        labels:
+          severity: critical
+          service: mpin
+
+  - name: Device Alerts
+    folder: Device
+    interval: 1m
+    rules:
+      - uid: device_bind_success_low
+        title: "Device Bind Success Rate < 95%"
+        condition: C
+        for: 5m
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: clickhouse
+            model:
+              refId: A
+              rawSql: |
+                SELECT countIf(action = 'bind_device' AND status = 'success') AS success
+                FROM device_events
+                WHERE timestamp > now() - INTERVAL 1 HOUR
+          - refId: B
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: clickhouse
+            model:
+              refId: B
+              rawSql: |
+                SELECT countIf(action = 'bind_device') AS total
+                FROM device_events
+                WHERE timestamp > now() - INTERVAL 1 HOUR
+          - refId: C
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              refId: C
+              type: math               # ✅ changed
+              expression: "$A / $B * 100"
+        noDataState: NoData
+        execErrState: Error
+        annotations:
+          summary: "Device bind success rate is low"
+          description: "Device bind success rate is {{ $values.C }}% which is below 95%."
+        labels:
+          severity: warning
+          service: device

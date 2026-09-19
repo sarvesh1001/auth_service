@@ -9,21 +9,17 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 )
 
 type PayrollCommandHandler struct {
 	engine service.PayrollEngineService
-	logger *zap.Logger
 }
 
 func NewPayrollCommandHandler(
 	engine service.PayrollEngineService,
-	logger *zap.Logger,
 ) *PayrollCommandHandler {
 	return &PayrollCommandHandler{
 		engine: engine,
-		logger: logger.Named("payroll_command_handler"),
 	}
 }
 
@@ -34,7 +30,7 @@ type createRunRequest struct {
 }
 
 type reprocessRequest struct {
-	ReflectLatestAdjustments bool `json:"reflect_latest_adjustments"` // was "force"
+	ReflectLatestAdjustments bool `json:"reflect_latest_adjustments"`
 }
 
 type markPaidRequest struct {
@@ -45,7 +41,7 @@ type markPaidRequest struct {
 // CREATE DRAFT RUN
 // POST /companies/{companyID}/payroll/runs
 func (h *PayrollCommandHandler) CreateRun(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -68,7 +64,7 @@ func (h *PayrollCommandHandler) CreateRun(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	actorID := getUserIDFromContext(r.Context())
+	actorID := getUserIDFromContext(ctx)
 	if actorID == uuid.Nil {
 		h.respondErr(w, http.StatusUnauthorized, "user not authenticated")
 		return
@@ -76,7 +72,6 @@ func (h *PayrollCommandHandler) CreateRun(w http.ResponseWriter, r *http.Request
 
 	run, err := h.engine.CreateRun(ctx, companyID, req.PeriodStart, req.PeriodEnd, actorID)
 	if err != nil {
-		h.logger.Error("create run failed", zap.Error(err))
 		h.respondErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -88,7 +83,7 @@ func (h *PayrollCommandHandler) CreateRun(w http.ResponseWriter, r *http.Request
 // INITIALIZE RUN (transition from draft to processing)
 // POST /companies/{companyID}/payroll/runs/{runID}/initialize
 func (h *PayrollCommandHandler) InitializeRun(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	runID, err := uuid.Parse(chi.URLParam(r, "runID"))
 	if err != nil {
@@ -96,14 +91,13 @@ func (h *PayrollCommandHandler) InitializeRun(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	actorID := getUserIDFromContext(r.Context())
+	actorID := getUserIDFromContext(ctx)
 	if actorID == uuid.Nil {
 		h.respondErr(w, http.StatusUnauthorized, "user not authenticated")
 		return
 	}
 
 	if err := h.engine.InitializeRun(ctx, runID, actorID); err != nil {
-		h.logger.Error("initialize run failed", zap.Error(err))
 		h.respondErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -118,7 +112,7 @@ func (h *PayrollCommandHandler) InitializeRun(w http.ResponseWriter, r *http.Req
 // EXECUTE RUN (asynchronous processing)
 // POST /companies/{companyID}/payroll/runs/{runID}/execute
 func (h *PayrollCommandHandler) ExecuteRun(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	runID, err := uuid.Parse(chi.URLParam(r, "runID"))
 	if err != nil {
@@ -126,14 +120,13 @@ func (h *PayrollCommandHandler) ExecuteRun(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	actorID := getUserIDFromContext(r.Context())
+	actorID := getUserIDFromContext(ctx)
 	if actorID == uuid.Nil {
 		h.respondErr(w, http.StatusUnauthorized, "user not authenticated")
 		return
 	}
 
 	if err := h.engine.ExecuteRun(ctx, runID, actorID); err != nil {
-		h.logger.Error("execute run failed", zap.Error(err))
 		h.respondErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -148,7 +141,7 @@ func (h *PayrollCommandHandler) ExecuteRun(w http.ResponseWriter, r *http.Reques
 // APPROVE RUN
 // POST /companies/{companyID}/payroll/runs/{runID}/approve
 func (h *PayrollCommandHandler) ApproveRun(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	runID, err := uuid.Parse(chi.URLParam(r, "runID"))
 	if err != nil {
@@ -156,14 +149,13 @@ func (h *PayrollCommandHandler) ApproveRun(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	actorID := getUserIDFromContext(r.Context())
+	actorID := getUserIDFromContext(ctx)
 	if actorID == uuid.Nil {
 		h.respondErr(w, http.StatusUnauthorized, "user not authenticated")
 		return
 	}
 
 	if err := h.engine.ApproveRun(ctx, runID, actorID); err != nil {
-		h.logger.Error("approve failed", zap.Error(err))
 		h.respondErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -178,7 +170,7 @@ func (h *PayrollCommandHandler) ApproveRun(w http.ResponseWriter, r *http.Reques
 // MARK RUN AS PAID
 // POST /companies/{companyID}/payroll/runs/{runID}/mark-paid
 func (h *PayrollCommandHandler) MarkRunAsPaid(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	runID, err := uuid.Parse(chi.URLParam(r, "runID"))
 	if err != nil {
@@ -192,17 +184,16 @@ func (h *PayrollCommandHandler) MarkRunAsPaid(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if req.PaidAt.IsZero() {
-		req.PaidAt = time.Now().UTC() // default to now if not provided
+		req.PaidAt = time.Now().UTC()
 	}
 
-	actorID := getUserIDFromContext(r.Context())
+	actorID := getUserIDFromContext(ctx)
 	if actorID == uuid.Nil {
 		h.respondErr(w, http.StatusUnauthorized, "user not authenticated")
 		return
 	}
 
 	if err := h.engine.MarkRunAsPaid(ctx, runID, actorID, req.PaidAt); err != nil {
-		h.logger.Error("mark as paid failed", zap.Error(err))
 		h.respondErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -217,7 +208,7 @@ func (h *PayrollCommandHandler) MarkRunAsPaid(w http.ResponseWriter, r *http.Req
 // CANCEL RUN (only draft)
 // DELETE /companies/{companyID}/payroll/runs/{runID}
 func (h *PayrollCommandHandler) CancelRun(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	runID, err := uuid.Parse(chi.URLParam(r, "runID"))
 	if err != nil {
@@ -225,14 +216,13 @@ func (h *PayrollCommandHandler) CancelRun(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	actorID := getUserIDFromContext(r.Context())
+	actorID := getUserIDFromContext(ctx)
 	if actorID == uuid.Nil {
 		h.respondErr(w, http.StatusUnauthorized, "user not authenticated")
 		return
 	}
 
 	if err := h.engine.CancelRun(ctx, runID, actorID); err != nil {
-		h.logger.Error("cancel failed", zap.Error(err))
 		h.respondErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -247,7 +237,7 @@ func (h *PayrollCommandHandler) CancelRun(w http.ResponseWriter, r *http.Request
 // REPROCESS EMPLOYEE
 // POST /companies/{companyID}/payroll/runs/{runID}/employees/{userID}/reprocess
 func (h *PayrollCommandHandler) ReprocessEmployee(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	runID, err := uuid.Parse(chi.URLParam(r, "runID"))
 	if err != nil {
@@ -261,18 +251,16 @@ func (h *PayrollCommandHandler) ReprocessEmployee(w http.ResponseWriter, r *http
 		return
 	}
 
-	actorID := getUserIDFromContext(r.Context())
+	actorID := getUserIDFromContext(ctx)
 	if actorID == uuid.Nil {
 		h.respondErr(w, http.StatusUnauthorized, "user not authenticated")
 		return
 	}
 
 	var req reprocessRequest
-	// If body is empty, default to false
 	_ = json.NewDecoder(r.Body).Decode(&req)
 
 	if err := h.engine.ReprocessEmployee(ctx, runID, userID, actorID, req.ReflectLatestAdjustments); err != nil {
-		h.logger.Error("reprocess failed", zap.Error(err))
 		h.respondErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -287,7 +275,7 @@ func (h *PayrollCommandHandler) ReprocessEmployee(w http.ResponseWriter, r *http
 // GET RUN EXECUTION STATUS
 // GET /companies/{companyID}/payroll/runs/{runID}/status
 func (h *PayrollCommandHandler) GetRunExecutionStatus(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	runID, err := uuid.Parse(chi.URLParam(r, "runID"))
 	if err != nil {
@@ -297,7 +285,6 @@ func (h *PayrollCommandHandler) GetRunExecutionStatus(w http.ResponseWriter, r *
 
 	status, err := h.engine.GetRunExecutionStatus(ctx, runID)
 	if err != nil {
-		h.logger.Error("get execution status failed", zap.Error(err))
 		h.respondErr(w, http.StatusNotFound, err.Error())
 		return
 	}

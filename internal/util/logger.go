@@ -356,3 +356,16 @@ func Contains(slice []string, item string) bool {
 	}
 	return false
 }
+
+// JSONErrorWithCode writes an error response with a machine-readable code.
+func JSONErrorWithCode(w http.ResponseWriter, status int, code, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": false,
+		"code":    code,
+		"message": message,
+		"status":  status,
+		"time":    time.Now().UTC().Format(time.RFC3339),
+	})
+}

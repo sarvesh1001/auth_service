@@ -1,6 +1,9 @@
 package repository
 
 import (
+	"auth-service/internal/client"
+	hrErrors "auth-service/internal/hr/errors"
+	"auth-service/internal/hr/payroll/models"
 	"context"
 	"database/sql"
 	"errors"
@@ -8,12 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"auth-service/internal/client"
-	"auth-service/internal/hr/payroll/models"
-	"auth-service/internal/util"
-
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 )
 
 // DBTX defines the database methods used by the repository.
@@ -45,7 +43,10 @@ type StatutoryProfileRepository interface {
 	GetActiveProfile(ctx context.Context, companyID, userID uuid.UUID, statutoryCode string, asOf time.Time) (*EmployeeStatutoryProfile, error)
 	GetActiveProfilesForEmployee(ctx context.Context, companyID, userID uuid.UUID, asOf time.Time) ([]EmployeeStatutoryProfile, error)
 	GetProfileHistory(ctx context.Context, companyID, userID uuid.UUID, statutoryCode string) ([]EmployeeStatutoryProfile, error)
+
+	// ListProfiles — location filter applies when filter.LocationID != nil.
 	ListProfiles(ctx context.Context, filter *models.StatutoryProfileFilter) ([]EmployeeStatutoryProfile, int, error)
+
 	InsertProfile(ctx context.Context, profile *EmployeeStatutoryProfile) error
 	UpdateProfile(ctx context.Context, profile *EmployeeStatutoryProfile) error
 	DeactivateProfile(ctx context.Context, profileID uuid.UUID, deactivatedBy uuid.UUID) error
@@ -56,15 +57,13 @@ type StatutoryProfileRepository interface {
 
 // statutoryProfileRepository implements StatutoryProfileRepository.
 type statutoryProfileRepository struct {
-	db     DBTX
-	logger *zap.Logger
+	db DBTX
 }
 
 // NewStatutoryProfileRepository creates a new repository.
-func NewStatutoryProfileRepository(postgresClient *client.PostgresClient, logger *zap.Logger) StatutoryProfileRepository {
+func NewStatutoryProfileRepository(postgresClient *client.PostgresClient) StatutoryProfileRepository {
 	return &statutoryProfileRepository{
-		db:     postgresClient,
-		logger: logger.Named("statutory_profile_repo"),
+		db: postgresClient,
 	}
 }
 
@@ -81,13 +80,12 @@ func (r *statutoryProfileRepository) WithTx(ctx context.Context, fn func(Statuto
 	}
 
 	txRepo := &statutoryProfileRepository{
-		db:     &txQuerier{tx: tx},
-		logger: r.logger,
+		db: &txQuerier{tx: tx},
 	}
 
 	if err := fn(txRepo); err != nil {
 		if rbErr := tx.Rollback(); rbErr != nil {
-			r.logger.Error("transaction rollback failed", zap.Error(rbErr))
+			// ignore rollback error, return original
 		}
 		return err
 	}
@@ -173,13 +171,9 @@ func (r *statutoryProfileRepository) GetProfileByID(ctx context.Context, profile
 	row := r.db.QueryRow(ctx, query, profileID)
 	p, err := scanProfile(row)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
+		return nil, hrErrors.ErrStatutoryProfileNotFound
 	}
 	if err != nil {
-		r.logger.Error("failed to get profile by ID",
-			util.String("profile_id", profileID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("get profile by ID: %w", err)
 	}
 	return p, nil
@@ -206,16 +200,9 @@ func (r *statutoryProfileRepository) GetActiveProfile(ctx context.Context, compa
 	row := r.db.QueryRow(ctx, query, companyID, userID, statutoryCode, asOf)
 	p, err := scanProfile(row)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
+		return nil, hrErrors.ErrStatutoryProfileNotFound
 	}
 	if err != nil {
-		r.logger.Error("failed to get active profile",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.String("statutory_code", statutoryCode),
-			util.Time("as_of", asOf),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("get active profile: %w", err)
 	}
 	return p, nil
@@ -239,12 +226,6 @@ func (r *statutoryProfileRepository) GetActiveProfilesForEmployee(ctx context.Co
 	`
 	rows, err := r.db.Query(ctx, query, companyID, userID, asOf)
 	if err != nil {
-		r.logger.Error("failed to get active profiles for employee",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.Time("as_of", asOf),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("get active profiles: %w", err)
 	}
 	defer rows.Close()
@@ -279,12 +260,6 @@ func (r *statutoryProfileRepository) GetProfileHistory(ctx context.Context, comp
 	`
 	rows, err := r.db.Query(ctx, query, companyID, userID, statutoryCode)
 	if err != nil {
-		r.logger.Error("failed to get profile history",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.String("statutory_code", statutoryCode),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("get profile history: %w", err)
 	}
 	defer rows.Close()
@@ -303,7 +278,10 @@ func (r *statutoryProfileRepository) GetProfileHistory(ctx context.Context, comp
 	return profiles, nil
 }
 
-// ListProfiles implementation.
+// ListProfiles returns a page of statutory profiles.
+//
+// Location: when filter.LocationID is non-nil, only profiles for employees
+// whose current employment_location_id matches are returned.
 func (r *statutoryProfileRepository) ListProfiles(ctx context.Context, filter *models.StatutoryProfileFilter) ([]EmployeeStatutoryProfile, int, error) {
 	var conditions []string
 	var args []interface{}
@@ -332,6 +310,14 @@ func (r *statutoryProfileRepository) ListProfiles(ctx context.Context, filter *m
 		argIdx++
 		conditions = append(conditions, "is_active = true")
 	}
+	// 👇 Location filter — via company_employees (current assignment)
+	if filter.LocationID != nil {
+		conditions = append(conditions, fmt.Sprintf(
+			"user_id IN (SELECT user_id FROM company_employees WHERE company_id = $1 AND employment_location_id = $%d AND is_active = true)",
+			argIdx))
+		args = append(args, *filter.LocationID)
+		argIdx++
+	}
 
 	whereClause := ""
 	if len(conditions) > 0 {
@@ -343,7 +329,6 @@ func (r *statutoryProfileRepository) ListProfiles(ctx context.Context, filter *m
 	var total int
 	err := r.db.QueryRow(ctx, countQuery, args...).Scan(&total)
 	if err != nil {
-		r.logger.Error("failed to count profiles", util.ErrorField(err))
 		return nil, 0, fmt.Errorf("count profiles: %w", err)
 	}
 
@@ -372,7 +357,6 @@ func (r *statutoryProfileRepository) ListProfiles(ctx context.Context, filter *m
 
 	rows, err := r.db.Query(ctx, dataQuery, args...)
 	if err != nil {
-		r.logger.Error("failed to list profiles", util.ErrorField(err))
 		return nil, 0, fmt.Errorf("list profiles: %w", err)
 	}
 	defer rows.Close()
@@ -427,10 +411,6 @@ func (r *statutoryProfileRepository) InsertProfile(ctx context.Context, p *Emplo
 		nullUUID(p.RuleSetID),
 	)
 	if err != nil {
-		r.logger.Error("failed to insert profile",
-			util.String("profile_id", p.ProfileID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("insert profile: %w", err)
 	}
 	return nil
@@ -455,15 +435,11 @@ func (r *statutoryProfileRepository) UpdateProfile(ctx context.Context, p *Emplo
 		p.Version,
 	)
 	if err != nil {
-		r.logger.Error("failed to update profile",
-			util.String("profile_id", p.ProfileID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("update profile: %w", err)
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("profile %s not found or version mismatch", p.ProfileID)
+		return hrErrors.ErrStatutoryProfileVersionMismatch
 	}
 	p.Version++
 	return nil
@@ -482,19 +458,14 @@ func (r *statutoryProfileRepository) DeactivateProfile(ctx context.Context, prof
 		  AND is_active = true
 	`
 	now := time.Now().UTC()
-	// Set effective_to to one day before now (or could be a parameter)
 	effectiveTo := now.AddDate(0, 0, -1)
 	result, err := r.db.Exec(ctx, query, profileID, effectiveTo, now, deactivatedBy)
 	if err != nil {
-		r.logger.Error("failed to deactivate profile",
-			util.String("profile_id", profileID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("deactivate profile: %w", err)
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("profile %s not found or already inactive", profileID)
+		return hrErrors.ErrStatutoryProfileNotFound
 	}
 	return nil
 }
@@ -515,16 +486,12 @@ func (r *statutoryProfileRepository) CloseActiveProfile(ctx context.Context, com
 	closeDateMinusOne := closeDate.AddDate(0, 0, -1)
 	result, err := r.db.Exec(ctx, query, companyID, userID, statutoryCode, closeDateMinusOne)
 	if err != nil {
-		r.logger.Error("failed to close active profile",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.String("statutory_code", statutoryCode),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("close active profile: %w", err)
 	}
-	// It's okay if no row was updated (no active profile)
-	_ = result
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		// No active profile found – idempotent, return nil
+	}
 	return nil
 }
 
@@ -551,13 +518,6 @@ func (r *statutoryProfileRepository) HasOverlappingActiveProfile(ctx context.Con
 	var exists bool
 	err := r.db.QueryRow(ctx, query, args...).Scan(&exists)
 	if err != nil {
-		r.logger.Error("failed to check overlapping profile",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.String("statutory_code", statutoryCode),
-			util.Time("effective_from", effectiveFrom),
-			util.ErrorField(err),
-		)
 		return false, fmt.Errorf("check overlap: %w", err)
 	}
 	return exists, nil

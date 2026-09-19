@@ -22,17 +22,48 @@ type PayrollRepository interface {
 	CleanupFailedRun(ctx context.Context, runID uuid.UUID) error
 
 	// ==============================
+	// Payroll Run Population Snapshot (P1)
+	// ==============================
+	// SnapshotRunPopulationTx freezes the employee population for a run
+	// at creation time. Writes one row per employee to payroll_run_employees,
+	// capturing their employment_location_id, salary_structure_id, and
+	// monthly_ctc at that moment.
+	//
+	// Returns the user IDs that were snapshotted, so the caller can enqueue
+	// per-employee jobs in the same transaction.
+	//
+	// Runs are always company-wide. The snapshot carries employment_location_id
+	// as a data attribute, not a filter — it is what makes payroll historically
+	// correct across mid-period transfers.
+	SnapshotRunPopulationTx(
+		ctx context.Context,
+		tx *sql.Tx,
+		runID, companyID uuid.UUID,
+	) ([]uuid.UUID, error)
+
+	// ==============================
 	// Payroll Items (versioned)
 	// ==============================
 	CreatePayrollItem(ctx context.Context, item *models.PayrollItem) error
 	GetPayrollItemByID(ctx context.Context, itemID uuid.UUID) (*models.PayrollItem, error)
-	GetPayrollItemsByRun(ctx context.Context, runID uuid.UUID) ([]*models.PayrollItem, error)
+
+	// GetPayrollItemsByRun returns the payroll items for a run.
+	//
+	// locationID == nil means "no filter" (worker path, company-wide view).
+	// locationID != nil filters by the snapshotted employment_location_id
+	// captured at run creation time in payroll_run_employees.
+	GetPayrollItemsByRun(
+		ctx context.Context,
+		runID uuid.UUID,
+		locationID *uuid.UUID,
+	) ([]*models.PayrollItem, error)
+
 	GetPayrollItemDetail(ctx context.Context, itemID uuid.UUID) (*models.PayrollItemDetail, error)
 	BulkCreatePayrollItems(ctx context.Context, items []*models.PayrollItem) error
 	SupersedePayrollItemTx(ctx context.Context, tx *sql.Tx, runID uuid.UUID, userID uuid.UUID, actorID uuid.UUID) (int, error)
 
 	// ==============================
-	// Payroll Components – now company‑specific
+	// Payroll Components – company‑specific
 	// ==============================
 	CreateComponent(ctx context.Context, component *models.PayrollComponent) error
 	GetComponent(ctx context.Context, companyID uuid.UUID, code string) (*models.PayrollComponent, error)
@@ -45,7 +76,18 @@ type PayrollRepository interface {
 	// ==============================
 	CreateLedgerEntry(ctx context.Context, entry *models.PayrollLedger) error
 	GetLedgerEntriesByItem(ctx context.Context, itemID uuid.UUID) ([]*models.PayrollLedger, error)
-	GetLedgerSummaryByRun(ctx context.Context, runID uuid.UUID) ([]*models.LedgerSummary, error)
+
+	// GetLedgerSummaryByRun returns the component rollup for a run.
+	//
+	// locationID == nil means "no filter" (company-wide rollup).
+	// locationID != nil scopes the rollup to employees whose snapshotted
+	// employment_location_id at run time matches.
+	GetLedgerSummaryByRun(
+		ctx context.Context,
+		runID uuid.UUID,
+		locationID *uuid.UUID,
+	) ([]*models.LedgerSummary, error)
+
 	BulkCreateLedgerEntries(ctx context.Context, entries []*models.PayrollLedger) error
 
 	// ==============================
@@ -110,12 +152,25 @@ type PayrollRepository interface {
 	UpdatePayrollAdjustment(ctx context.Context, adjustment *models.PayrollAdjustment) error
 	DeletePayrollAdjustment(ctx context.Context, adjustmentID uuid.UUID) error
 	GetPayrollAdjustmentByID(ctx context.Context, adjustmentID uuid.UUID) (*models.PayrollAdjustment, error)
+
+	// ListPayrollAdjustments — location filter rides inside filter.LocationID.
 	ListPayrollAdjustments(ctx context.Context, filter models.PayrollAdjustmentFilter) ([]*models.PayrollAdjustment, int64, error)
+
 	FinalizeAttendanceForPeriod(ctx context.Context, companyID, userID uuid.UUID, startDate, endDate time.Time) error
 
 	// Statutory YTD context
 	BuildStatutoryYTDContext(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, financialYearStart time.Time) (*models.StatutoryYTDContext, error)
-	GetEmployeeIDsByRun(ctx context.Context, runID uuid.UUID) ([]uuid.UUID, error)
+
+	// GetEmployeeIDsByRun returns the distinct employees with items in the run.
+	//
+	// locationID == nil means "no filter" (company-wide view).
+	// locationID != nil scopes to employees whose snapshotted
+	// employment_location_id at run time matches.
+	GetEmployeeIDsByRun(
+		ctx context.Context,
+		runID uuid.UUID,
+		locationID *uuid.UUID,
+	) ([]uuid.UUID, error)
 
 	// Payroll run by period
 	GetPayrollRunByPeriod(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) (*models.PayrollRun, error)
@@ -131,7 +186,18 @@ type PayrollRepository interface {
 	// Trends and summaries
 	GetPayrollTrend(ctx context.Context, companyID uuid.UUID, from, to time.Time) ([]*models.PayrollTrendPoint, error)
 	GetComponentTrend(ctx context.Context, companyID uuid.UUID, componentCode string, from, to time.Time) ([]*models.ComponentTrendPoint, error)
-	GetRunStatutorySummary(ctx context.Context, runID uuid.UUID) ([]*models.StatutoryAggregate, error)
+
+	// GetRunStatutorySummary returns statutory aggregates for a run.
+	//
+	// locationID == nil means "no filter" (company-wide totals).
+	// locationID != nil scopes to employees whose snapshotted
+	// employment_location_id at run time matches.
+	GetRunStatutorySummary(
+		ctx context.Context,
+		runID uuid.UUID,
+		locationID *uuid.UUID,
+	) ([]*models.StatutoryAggregate, error)
+
 	GetPayableDaysInRange(
 		ctx context.Context,
 		companyID uuid.UUID,
@@ -174,4 +240,5 @@ type PayrollRepository interface {
 		tx *sql.Tx,
 		runID uuid.UUID,
 	) error
+	CreatePayrollRunTx(ctx context.Context, tx *sql.Tx, run *models.PayrollRun) error
 }

@@ -1,6 +1,9 @@
 package repository
 
 import (
+	"auth-service/internal/client"
+	hrErrors "auth-service/internal/hr/errors"
+	"auth-service/internal/hr/payroll/models"
 	"context"
 	"database/sql"
 	"errors"
@@ -8,27 +11,19 @@ import (
 	"strings"
 	"time"
 
-	"auth-service/internal/client"
-	"auth-service/internal/hr/payroll/models"
-	"auth-service/internal/util"
-
 	"github.com/google/uuid"
 	"github.com/jackc/pgconn"
-	"go.uber.org/zap"
 )
 
 type payrollRepository struct {
 	client *client.PostgresClient
-	logger *zap.Logger
 }
 
 func NewPayrollRepository(
 	postgresClient *client.PostgresClient,
-	logger *zap.Logger,
 ) PayrollRepository {
 	return &payrollRepository{
 		client: postgresClient,
-		logger: logger,
 	}
 }
 
@@ -60,12 +55,6 @@ func (r *payrollRepository) CreatePayrollRun(ctx context.Context, run *models.Pa
 		run.CreatedBy,
 	)
 	if err != nil {
-		r.logger.Error("Failed to create payroll run",
-			util.String("company_id", run.CompanyID.String()),
-			util.String("period", fmt.Sprintf("%s to %s",
-				run.PeriodStart.Format("2006-01-02"),
-				run.PeriodEnd.Format("2006-01-02"))),
-			util.ErrorField(err))
 		return fmt.Errorf("failed to create payroll run: %w", err)
 	}
 	return nil
@@ -91,11 +80,8 @@ func (r *payrollRepository) GetPayrollRunByID(ctx context.Context, runID uuid.UU
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrPayrollRunNotFound
 		}
-		r.logger.Error("Failed to get payroll run",
-			util.String("run_id", runID.String()),
-			util.ErrorField(err))
 		return nil, fmt.Errorf("failed to get payroll run: %w", err)
 	}
 	return &run, nil
@@ -152,9 +138,6 @@ func (r *payrollRepository) GetPayrollRuns(ctx context.Context, filter models.Pa
 
 	rows, err := r.client.Query(ctx, query, args...)
 	if err != nil {
-		r.logger.Error("Failed to get payroll runs",
-			util.String("company_id", filter.CompanyID.String()),
-			util.ErrorField(err))
 		return nil, 0, fmt.Errorf("failed to get payroll runs: %w", err)
 	}
 	defer rows.Close()
@@ -189,15 +172,11 @@ func (r *payrollRepository) UpdatePayrollRunStatus(ctx context.Context, runID uu
     `
 	result, err := r.client.Exec(ctx, query, status, runID)
 	if err != nil {
-		r.logger.Error("Failed to update payroll run status",
-			util.String("run_id", runID.String()),
-			util.String("status", status),
-			util.ErrorField(err))
 		return fmt.Errorf("failed to update payroll run status: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("payroll run not found")
+		return hrErrors.ErrPayrollRunNotFound
 	}
 	return nil
 }
@@ -210,14 +189,11 @@ func (r *payrollRepository) DeletePayrollRun(ctx context.Context, runID uuid.UUI
     `
 	result, err := r.client.Exec(ctx, query, runID)
 	if err != nil {
-		r.logger.Error("Failed to delete payroll run",
-			util.String("run_id", runID.String()),
-			util.ErrorField(err))
 		return fmt.Errorf("failed to delete payroll run: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("cannot delete run (not found or not draft/cancelled)")
+		return hrErrors.ErrPayrollRunNotFound
 	}
 	return nil
 }
@@ -256,14 +232,86 @@ func (r *payrollRepository) GetPayrollRunSummary(ctx context.Context, runID uuid
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrPayrollRunNotFound
 		}
-		r.logger.Error("Failed to get payroll run summary",
-			util.String("run_id", runID.String()),
-			util.ErrorField(err))
 		return nil, fmt.Errorf("failed to get payroll run summary: %w", err)
 	}
 	return &summary, nil
+}
+
+// ---------------------------------------------------------------------
+// Payroll Run Population Snapshot (P1)
+// ---------------------------------------------------------------------
+
+// SnapshotRunPopulationTx freezes the employee population for a payroll run
+// at creation time. Writes one row per employee to payroll_run_employees,
+// capturing their employment_location_id, salary_structure_id, and
+// monthly_ctc at that moment.
+//
+// Returns the user IDs that were snapshotted, so the caller can enqueue
+// per-employee jobs in the same transaction.
+//
+// Runs are always company-wide. The snapshot carries the employee's
+// employment_location_id as a data attribute, not a filter — it is what
+// makes payroll historically correct across mid-period transfers.
+func (r *payrollRepository) SnapshotRunPopulationTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	runID, companyID uuid.UUID,
+) ([]uuid.UUID, error) {
+	query := `
+		INSERT INTO payroll.payroll_run_employees (
+			payroll_run_id,
+			user_id,
+			employment_location_id,
+			salary_structure_id,
+			monthly_ctc_at_run
+		)
+		SELECT
+			$1,
+			ce.user_id,
+			ce.employment_location_id,
+			es.salary_structure_id,
+			es.monthly_ctc
+		FROM company_employees ce
+		JOIN payroll.payroll_run pr
+		  ON pr.payroll_run_id = $1
+		JOIN payroll.employee_salary es
+		  ON es.company_id = ce.company_id
+		 AND es.user_id = ce.user_id
+		 AND es.is_active = true
+		 AND es.effective_from <= pr.period_end
+		 AND (es.effective_to IS NULL OR es.effective_to >= pr.period_start)
+		LEFT JOIN employee_exit ee
+		  ON ee.company_id = ce.company_id
+		 AND ee.user_id = ce.user_id
+		 AND ee.exit_state = 'effective'
+		 AND ee.exit_date <= pr.period_end
+		WHERE ce.company_id = $2
+		  AND ce.is_active = true
+		  AND ee.user_id IS NULL
+		ON CONFLICT (payroll_run_id, user_id) DO NOTHING
+		RETURNING user_id
+	`
+
+	rows, err := tx.QueryContext(ctx, query, runID, companyID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to snapshot run population: %w", err)
+	}
+	defer rows.Close()
+
+	var userIDs []uuid.UUID
+	for rows.Next() {
+		var uid uuid.UUID
+		if err := rows.Scan(&uid); err != nil {
+			return nil, fmt.Errorf("failed to scan snapshotted user id: %w", err)
+		}
+		userIDs = append(userIDs, uid)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration error: %w", err)
+	}
+	return userIDs, nil
 }
 
 // ---------------------------------------------------------------------
@@ -315,10 +363,6 @@ func (r *payrollRepository) CreatePayrollItem(ctx context.Context, item *models.
 		item.CreatedAt,
 	)
 	if err != nil {
-		r.logger.Error("Failed to create payroll item",
-			util.String("run_id", item.PayrollRunID.String()),
-			util.String("user_id", item.UserID.String()),
-			util.ErrorField(err))
 		return fmt.Errorf("failed to create payroll item: %w", err)
 	}
 	return nil
@@ -352,33 +396,40 @@ func (r *payrollRepository) GetPayrollItemByID(ctx context.Context, itemID uuid.
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrPayrollItemNotFound
 		}
-		r.logger.Error("Failed to get payroll item",
-			util.String("item_id", itemID.String()),
-			util.ErrorField(err))
 		return nil, fmt.Errorf("failed to get payroll item: %w", err)
 	}
 	return &item, nil
 }
 
-func (r *payrollRepository) GetPayrollItemsByRun(ctx context.Context, runID uuid.UUID) ([]*models.PayrollItem, error) {
+// GetPayrollItemsByRun returns the payroll items for a run.
+//
+// Location: when locationID is non-nil, only items for employees whose
+// snapshotted employment_location_id at run time matches are returned.
+// nil = no filter (worker path, company-wide view).
+func (r *payrollRepository) GetPayrollItemsByRun(
+	ctx context.Context,
+	runID uuid.UUID,
+	locationID *uuid.UUID,
+) ([]*models.PayrollItem, error) {
 	query := `
         SELECT payroll_item_id, payroll_run_id, user_id,
                payable_days, unpaid_days,
                gross_amount, net_amount,
                version_number, is_superseded, superseded_at, superseded_by,
                created_at
-        FROM payroll.payroll_item
-        WHERE payroll_run_id = $1
-          AND is_superseded = FALSE
-        ORDER BY user_id, version_number
+        FROM payroll.payroll_item pi
+        WHERE pi.payroll_run_id = $1
+          AND pi.is_superseded = FALSE
+          AND ($2::uuid IS NULL OR pi.user_id IN (
+              SELECT user_id FROM payroll.payroll_run_employees
+              WHERE payroll_run_id = $1 AND employment_location_id = $2
+          ))
+        ORDER BY pi.user_id, pi.version_number
     `
-	rows, err := r.client.Query(ctx, query, runID)
+	rows, err := r.client.Query(ctx, query, runID, locationID)
 	if err != nil {
-		r.logger.Error("Failed to get payroll items by run",
-			util.String("run_id", runID.String()),
-			util.ErrorField(err))
 		return nil, fmt.Errorf("failed to get payroll items: %w", err)
 	}
 	defer rows.Close()
@@ -463,11 +514,8 @@ func (r *payrollRepository) GetPayrollItemDetail(ctx context.Context, itemID uui
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrPayrollItemNotFound
 		}
-		r.logger.Error("Failed to get payroll item detail",
-			util.String("item_id", itemID.String()),
-			util.ErrorField(err))
 		return nil, fmt.Errorf("failed to get payroll item detail: %w", err)
 	}
 	ledgerQuery := `
@@ -527,7 +575,7 @@ func (r *payrollRepository) SupersedePayrollItemTx(
     `
 	err := tx.QueryRowContext(ctx, query, runID, userID).Scan(&currentVersion)
 	if errors.Is(err, sql.ErrNoRows) {
-		return 0, nil
+		return 0, hrErrors.ErrPayrollItemNotFound
 	}
 	if err != nil {
 		return 0, fmt.Errorf("failed to lock current item: %w", err)
@@ -634,10 +682,6 @@ func (r *payrollRepository) PayrollItemExists(ctx context.Context, runID uuid.UU
 	var exists bool
 	err := r.client.QueryRow(ctx, query, runID, userID).Scan(&exists)
 	if err != nil {
-		r.logger.Error("Failed to check payroll item existence",
-			util.String("run_id", runID.String()),
-			util.String("user_id", userID.String()),
-			util.ErrorField(err))
 		return false, fmt.Errorf("failed to check payroll item: %w", err)
 	}
 	return exists, nil
@@ -672,10 +716,6 @@ func (r *payrollRepository) CreateComponent(ctx context.Context, component *mode
 		component.ContributionSide,
 	)
 	if err != nil {
-		r.logger.Error("Failed to create payroll component",
-			util.String("company_id", component.CompanyID.String()),
-			util.String("code", component.ComponentCode),
-			util.ErrorField(err))
 		return fmt.Errorf("failed to create payroll component: %w", err)
 	}
 	return nil
@@ -713,12 +753,8 @@ func (r *payrollRepository) GetComponent(ctx context.Context, companyID uuid.UUI
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrPayrollComponentNotFound
 		}
-		r.logger.Error("Failed to get payroll component",
-			util.String("company_id", companyID.String()),
-			util.String("code", code),
-			util.ErrorField(err))
 		return nil, fmt.Errorf("failed to get payroll component: %w", err)
 	}
 	if dbCompanyID != nil {
@@ -766,9 +802,6 @@ func (r *payrollRepository) GetComponents(ctx context.Context, companyID uuid.UU
     `, whereClause)
 	rows, err := r.client.Query(ctx, query, args...)
 	if err != nil {
-		r.logger.Error("Failed to get payroll components",
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err))
 		return nil, fmt.Errorf("failed to get payroll components: %w", err)
 	}
 	defer rows.Close()
@@ -816,15 +849,11 @@ func (r *payrollRepository) UpdateComponent(ctx context.Context, component *mode
 		component.ComponentCode,
 	)
 	if err != nil {
-		r.logger.Error("Failed to update payroll component",
-			util.String("company_id", component.CompanyID.String()),
-			util.String("code", component.ComponentCode),
-			util.ErrorField(err))
 		return fmt.Errorf("failed to update payroll component: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("payroll component not found or is system component")
+		return hrErrors.ErrPayrollComponentNotFound
 	}
 	return nil
 }
@@ -838,21 +867,17 @@ func (r *payrollRepository) DeactivateComponent(ctx context.Context, companyID u
     `
 	result, err := r.client.Exec(ctx, query, companyID, code)
 	if err != nil {
-		r.logger.Error("Failed to deactivate payroll component",
-			util.String("company_id", companyID.String()),
-			util.String("code", code),
-			util.ErrorField(err))
 		return fmt.Errorf("failed to deactivate payroll component: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("payroll component not found or is system component")
+		return hrErrors.ErrPayrollComponentNotFound
 	}
 	return nil
 }
 
 // ---------------------------------------------------------------------
-// Payroll Ledger – updated to include company_id
+// Payroll Ledger
 // ---------------------------------------------------------------------
 
 func (r *payrollRepository) CreateLedgerEntry(ctx context.Context, entry *models.PayrollLedger) error {
@@ -879,10 +904,6 @@ func (r *payrollRepository) CreateLedgerEntry(ctx context.Context, entry *models
 		entry.CreatedAt,
 	)
 	if err != nil {
-		r.logger.Error("Failed to upsert payroll ledger entry",
-			util.String("item_id", entry.PayrollItemID.String()),
-			util.String("component", entry.ComponentCode),
-			util.ErrorField(err))
 		return fmt.Errorf("failed to upsert payroll ledger entry: %w", err)
 	}
 	return nil
@@ -897,9 +918,6 @@ func (r *payrollRepository) GetLedgerEntriesByItem(ctx context.Context, itemID u
     `
 	rows, err := r.client.Query(ctx, query, itemID)
 	if err != nil {
-		r.logger.Error("Failed to get ledger entries by item",
-			util.String("item_id", itemID.String()),
-			util.ErrorField(err))
 		return nil, fmt.Errorf("failed to get ledger entries: %w", err)
 	}
 	defer rows.Close()
@@ -923,7 +941,15 @@ func (r *payrollRepository) GetLedgerEntriesByItem(ctx context.Context, itemID u
 	return entries, nil
 }
 
-func (r *payrollRepository) GetLedgerSummaryByRun(ctx context.Context, runID uuid.UUID) ([]*models.LedgerSummary, error) {
+// GetLedgerSummaryByRun returns the ledger component rollup for a run.
+//
+// Location: when locationID is non-nil, only entries for employees whose
+// snapshotted employment_location_id at run time matches are included.
+func (r *payrollRepository) GetLedgerSummaryByRun(
+	ctx context.Context,
+	runID uuid.UUID,
+	locationID *uuid.UUID,
+) ([]*models.LedgerSummary, error) {
 	query := `
         SELECT
             pl.component_code,
@@ -940,14 +966,15 @@ func (r *payrollRepository) GetLedgerSummaryByRun(ctx context.Context, runID uui
             AND (pc.company_id = pr.company_id OR pc.company_id IS NULL)
         WHERE pi.payroll_run_id = $1
           AND pi.is_superseded = FALSE
+          AND ($2::uuid IS NULL OR pi.user_id IN (
+              SELECT user_id FROM payroll.payroll_run_employees
+              WHERE payroll_run_id = $1 AND employment_location_id = $2
+          ))
         GROUP BY pl.component_code, pc.component_type, pc.description, pc.is_taxable, pc.contribution_side
         ORDER BY pc.component_type, pl.component_code
     `
-	rows, err := r.client.Query(ctx, query, runID)
+	rows, err := r.client.Query(ctx, query, runID, locationID)
 	if err != nil {
-		r.logger.Error("Failed to get ledger summary by run",
-			util.String("run_id", runID.String()),
-			util.ErrorField(err))
 		return nil, fmt.Errorf("failed to get ledger summary: %w", err)
 	}
 	defer rows.Close()
@@ -972,7 +999,6 @@ func (r *payrollRepository) GetLedgerSummaryByRun(ctx context.Context, runID uui
 	return summaries, nil
 }
 
-// BulkCreateLedgerEntries – updated with company_id
 func (r *payrollRepository) BulkCreateLedgerEntries(ctx context.Context, entries []*models.PayrollLedger) error {
 	tx, err := r.client.BeginTx(ctx, nil)
 	if err != nil {
@@ -1048,10 +1074,6 @@ func (r *payrollRepository) CreateSnapshot(ctx context.Context, snapshot *models
 		snapshot.CreatedBy,
 	)
 	if err != nil {
-		r.logger.Error("Failed to create payroll snapshot",
-			util.String("run_id", snapshot.PayrollRunID.String()),
-			util.String("type", snapshot.SnapshotType),
-			util.ErrorField(err))
 		return fmt.Errorf("failed to create payroll snapshot: %w", err)
 	}
 	return nil
@@ -1077,11 +1099,8 @@ func (r *payrollRepository) GetSnapshot(ctx context.Context, snapshotID uuid.UUI
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrPayrollSnapshotNotFound
 		}
-		r.logger.Error("Failed to get payroll snapshot",
-			util.String("snapshot_id", snapshotID.String()),
-			util.ErrorField(err))
 		return nil, fmt.Errorf("failed to get payroll snapshot: %w", err)
 	}
 	return &snapshot, nil
@@ -1097,9 +1116,6 @@ func (r *payrollRepository) GetSnapshotsByRun(ctx context.Context, runID uuid.UU
     `
 	rows, err := r.client.Query(ctx, query, runID)
 	if err != nil {
-		r.logger.Error("Failed to get payroll snapshots by run",
-			util.String("run_id", runID.String()),
-			util.ErrorField(err))
 		return nil, fmt.Errorf("failed to get payroll snapshots: %w", err)
 	}
 	defer rows.Close()
@@ -1152,12 +1168,6 @@ func (r *payrollRepository) CreatePayrollPeriodLock(ctx context.Context, lock *m
 		lock.Reason,
 	)
 	if err != nil {
-		r.logger.Error("Failed to create payroll period lock",
-			util.String("company_id", lock.CompanyID.String()),
-			util.String("period", fmt.Sprintf("%s to %s",
-				lock.PeriodStart.Format("2006-01-02"),
-				lock.PeriodEnd.Format("2006-01-02"))),
-			util.ErrorField(err))
 		return fmt.Errorf("failed to create payroll period lock: %w", err)
 	}
 	return nil
@@ -1172,17 +1182,11 @@ func (r *payrollRepository) DeletePayrollPeriodLock(ctx context.Context, company
     `
 	result, err := r.client.Exec(ctx, query, companyID, periodStart, periodEnd)
 	if err != nil {
-		r.logger.Error("Failed to delete payroll period lock",
-			util.String("company_id", companyID.String()),
-			util.String("period", fmt.Sprintf("%s to %s",
-				periodStart.Format("2006-01-02"),
-				periodEnd.Format("2006-01-02"))),
-			util.ErrorField(err))
 		return fmt.Errorf("failed to delete payroll period lock: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("payroll period lock not found")
+		return hrErrors.ErrPayrollPeriodLockNotFound
 	}
 	return nil
 }
@@ -1200,10 +1204,6 @@ func (r *payrollRepository) IsPayrollPeriodLocked(ctx context.Context, companyID
 	var locked bool
 	err := r.client.QueryRow(ctx, query, companyID, date).Scan(&locked)
 	if err != nil {
-		r.logger.Error("Failed to check if payroll period is locked",
-			util.String("company_id", companyID.String()),
-			util.String("date", date.Format("2006-01-02")),
-			util.ErrorField(err))
 		return false, fmt.Errorf("failed to check payroll period lock: %w", err)
 	}
 	return locked, nil
@@ -1222,9 +1222,6 @@ func (r *payrollRepository) IsPayrollPeriodLockedRange(ctx context.Context, comp
 	var locked bool
 	err := r.client.QueryRow(ctx, query, companyID, startDate, endDate).Scan(&locked)
 	if err != nil {
-		r.logger.Error("Failed to check payroll period lock range",
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err))
 		return false, fmt.Errorf("failed to check payroll period lock range: %w", err)
 	}
 	return locked, nil
@@ -1250,9 +1247,6 @@ func (r *payrollRepository) ListPayrollLocks(ctx context.Context, companyID uuid
 	`
 	rows, err := r.client.Query(ctx, query, companyID, from, to)
 	if err != nil {
-		r.logger.Error("Failed to list payroll locks",
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err))
 		return nil, fmt.Errorf("failed to list payroll locks: %w", err)
 	}
 	defer rows.Close()
@@ -1314,11 +1308,6 @@ func (r *payrollRepository) GetEmployeeIDsForPayroll(ctx context.Context, compan
 	`
 	rows, err := r.client.Query(ctx, query, companyID, periodStart, periodEnd)
 	if err != nil {
-		r.logger.Error("Failed to get employee IDs for payroll",
-			util.String("company_id", companyID.String()),
-			util.String("period_start", periodStart.Format("2006-01-02")),
-			util.String("period_end", periodEnd.Format("2006-01-02")),
-			util.ErrorField(err))
 		return nil, fmt.Errorf("failed to get employee IDs: %w", err)
 	}
 	defer rows.Close()
@@ -1342,7 +1331,6 @@ func (r *payrollRepository) HealthCheck(ctx context.Context) error {
 	row := r.client.QueryRow(ctx, query)
 	err := row.Scan(&result)
 	if err != nil {
-		r.logger.Error("Payroll repository health check failed", util.ErrorField(err))
 		return fmt.Errorf("payroll repository health check failed: %w", err)
 	}
 	return nil
@@ -1351,7 +1339,6 @@ func (r *payrollRepository) HealthCheck(ctx context.Context) error {
 func (r *payrollRepository) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
 	tx, err := r.client.BeginTx(ctx, opts)
 	if err != nil {
-		r.logger.Error("Failed to begin transaction", util.ErrorField(err))
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	return tx, nil
@@ -1383,7 +1370,7 @@ func (r *payrollRepository) GetPayrollRunForUpdateTx(ctx context.Context, tx *sq
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrPayrollRunNotFound
 		}
 		return nil, fmt.Errorf("failed to lock payroll run: %w", err)
 	}
@@ -1402,7 +1389,7 @@ func (r *payrollRepository) UpdatePayrollRunStatusTx(ctx context.Context, tx *sq
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("payroll run not found")
+		return hrErrors.ErrPayrollRunNotFound
 	}
 	return nil
 }
@@ -1475,7 +1462,6 @@ func (r *payrollRepository) CreatePayrollItemTx(ctx context.Context, tx *sql.Tx,
 	return nil
 }
 
-// BulkCreateLedgerEntriesTx – updated with company_id
 func (r *payrollRepository) BulkCreateLedgerEntriesTx(ctx context.Context, tx *sql.Tx, entries []*models.PayrollLedger) error {
 	query := `
         INSERT INTO payroll.payroll_ledger (
@@ -1608,11 +1594,8 @@ func (r *payrollRepository) GetPayrollRunByPeriod(ctx context.Context, companyID
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrPayrollRunNotFound
 		}
-		r.logger.Error("Failed to get payroll run by period",
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err))
 		return nil, fmt.Errorf("failed to get payroll run by period: %w", err)
 	}
 	return &run, nil
@@ -1655,7 +1638,7 @@ func (r *payrollRepository) GetPayrollRunByPeriodTx(ctx context.Context, tx *sql
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrPayrollRunNotFound
 		}
 		return nil, fmt.Errorf("failed to get payroll run by period (tx): %w", err)
 	}
@@ -1675,7 +1658,7 @@ func (r *payrollRepository) DeletePayrollPeriodLockTx(ctx context.Context, tx *s
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("payroll period lock not found")
+		return hrErrors.ErrPayrollPeriodLockNotFound
 	}
 	return nil
 }
@@ -1975,7 +1958,15 @@ func (r *payrollRepository) GetComponentTrend(ctx context.Context, companyID uui
 	return result, nil
 }
 
-func (r *payrollRepository) GetRunStatutorySummary(ctx context.Context, runID uuid.UUID) ([]*models.StatutoryAggregate, error) {
+// GetRunStatutorySummary returns the statutory aggregates for a run.
+//
+// Location: when locationID is non-nil, only contributions for employees
+// whose snapshotted employment_location_id at run time matches are included.
+func (r *payrollRepository) GetRunStatutorySummary(
+	ctx context.Context,
+	runID uuid.UUID,
+	locationID *uuid.UUID,
+) ([]*models.StatutoryAggregate, error) {
 	query := `
 	SELECT
 	    esc.statutory_code,
@@ -1986,10 +1977,14 @@ func (r *payrollRepository) GetRunStatutorySummary(ctx context.Context, runID uu
 	JOIN payroll.payroll_item pi
 	    ON esc.payroll_item_id = pi.payroll_item_id
 	WHERE pi.payroll_run_id = $1
+	  AND ($2::uuid IS NULL OR pi.user_id IN (
+	      SELECT user_id FROM payroll.payroll_run_employees
+	      WHERE payroll_run_id = $1 AND employment_location_id = $2
+	  ))
 	GROUP BY esc.statutory_code
 	ORDER BY esc.statutory_code
 	`
-	rows, err := r.client.Query(ctx, query, runID)
+	rows, err := r.client.Query(ctx, query, runID, locationID)
 	if err != nil {
 		return nil, err
 	}
@@ -2050,10 +2045,6 @@ func (r *payrollRepository) CreatePayrollAdjustment(ctx context.Context, adjustm
 		adjustment.CreatedBy,
 	)
 	if err != nil {
-		r.logger.Error("Failed to create payroll adjustment",
-			util.String("company_id", adjustment.CompanyID.String()),
-			util.String("user_id", adjustment.UserID.String()),
-			util.ErrorField(err))
 		return fmt.Errorf("failed to create payroll adjustment: %w", err)
 	}
 	return nil
@@ -2076,7 +2067,7 @@ func (r *payrollRepository) UpdatePayrollAdjustment(ctx context.Context, adjustm
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("adjustment not found")
+		return hrErrors.ErrPayrollAdjustmentNotFound
 	}
 	return nil
 }
@@ -2092,7 +2083,7 @@ func (r *payrollRepository) DeletePayrollAdjustment(ctx context.Context, adjustm
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("adjustment not found")
+		return hrErrors.ErrPayrollAdjustmentNotFound
 	}
 	return nil
 }
@@ -2129,13 +2120,17 @@ func (r *payrollRepository) GetPayrollAdjustmentByID(ctx context.Context, adjust
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrPayrollAdjustmentNotFound
 		}
 		return nil, fmt.Errorf("failed to get payroll adjustment: %w", err)
 	}
 	return &a, nil
 }
 
+// ListPayrollAdjustments returns a page of payroll adjustments.
+//
+// Location: when filter.LocationID is non-nil, only adjustments for employees
+// whose current employment_location_id matches are returned.
 func (r *payrollRepository) ListPayrollAdjustments(ctx context.Context, filter models.PayrollAdjustmentFilter) ([]*models.PayrollAdjustment, int64, error) {
 	var conditions []string
 	var args []interface{}
@@ -2166,6 +2161,14 @@ func (r *payrollRepository) ListPayrollAdjustments(ctx context.Context, filter m
 	if filter.ToMonth != nil {
 		conditions = append(conditions, fmt.Sprintf("applicable_month <= $%d", argIdx))
 		args = append(args, *filter.ToMonth)
+		argIdx++
+	}
+	// 👇 Location filter — via company_employees (current assignment)
+	if filter.LocationID != nil {
+		conditions = append(conditions, fmt.Sprintf(
+			"user_id IN (SELECT user_id FROM company_employees WHERE company_id = $1 AND employment_location_id = $%d AND is_active = true)",
+			argIdx))
+		args = append(args, *filter.LocationID)
 		argIdx++
 	}
 	whereClause := "WHERE " + strings.Join(conditions, " AND ")
@@ -2258,11 +2261,8 @@ func (r *payrollRepository) GetPayrollRunForUpdate(ctx context.Context, runID uu
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrPayrollRunNotFound
 		}
-		r.logger.Error("Failed to lock payroll run",
-			util.String("run_id", runID.String()),
-			util.ErrorField(err))
 		return nil, fmt.Errorf("failed to lock payroll run: %w", err)
 	}
 	return &run, nil
@@ -2281,9 +2281,6 @@ func (r *payrollRepository) MarkRunProcessing(ctx context.Context, runID uuid.UU
     `
 	result, err := r.client.Exec(ctx, query, totalEmployees, runID)
 	if err != nil {
-		r.logger.Error("Failed to mark run as processing",
-			util.String("run_id", runID.String()),
-			util.ErrorField(err))
 		return fmt.Errorf("failed to mark run processing: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
@@ -2304,9 +2301,6 @@ func (r *payrollRepository) UpdateRunProgress(ctx context.Context, runID uuid.UU
     `
 	result, err := r.client.Exec(ctx, query, processedInc, failedInc, runID)
 	if err != nil {
-		r.logger.Error("Failed to update run progress",
-			util.String("run_id", runID.String()),
-			util.ErrorField(err))
 		return fmt.Errorf("failed to update run progress: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
@@ -2377,10 +2371,6 @@ func (r *payrollRepository) GetAdjustmentsForEmployee(ctx context.Context, compa
     `
 	rows, err := r.client.Query(ctx, query, companyID, userID, startDate, endDate)
 	if err != nil {
-		r.logger.Error("Failed to get payroll adjustments",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.ErrorField(err))
 		return nil, fmt.Errorf("failed to get adjustments: %w", err)
 	}
 	defer rows.Close()
@@ -2413,12 +2403,6 @@ func (r *payrollRepository) GetAdjustmentsForEmployee(ctx context.Context, compa
 func (r *payrollRepository) GetPayableDaysInRange(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, startDate, endDate time.Time) (float64, error) {
 	totalDays, payableDays, err := r.GetPayrollAttendanceDays(ctx, companyID, userID, startDate, endDate)
 	if err != nil {
-		r.logger.Error("Failed to fetch payable days in range",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.String("start_date", startDate.Format("2006-01-02")),
-			util.String("end_date", endDate.Format("2006-01-02")),
-			util.ErrorField(err))
 		return 0, fmt.Errorf("failed to get payable days: %w", err)
 	}
 	if payableDays > totalDays {
@@ -2608,7 +2592,7 @@ func (r *payrollRepository) GetPayrollRunTx(ctx context.Context, tx *sql.Tx, run
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrPayrollRunNotFound
 		}
 		return nil, fmt.Errorf("failed to get payroll run: %w", err)
 	}
@@ -2630,9 +2614,6 @@ func (r *payrollRepository) RecalculatePayrollItemNet(ctx context.Context, itemI
 	`
 	_, err := r.client.Exec(ctx, query, itemID)
 	if err != nil {
-		r.logger.Error("Failed to recalculate payroll item net",
-			zap.String("item_id", itemID.String()),
-			zap.Error(err))
 		return fmt.Errorf("failed to recalculate payroll net: %w", err)
 	}
 	return nil
@@ -2664,11 +2645,8 @@ func (r *payrollRepository) GetPayrollRunExecutionStatus(ctx context.Context, ru
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrPayrollRunNotFound
 		}
-		r.logger.Error("Failed to get payroll run execution status",
-			util.String("run_id", runID.String()),
-			util.ErrorField(err))
 		return nil, fmt.Errorf("failed to fetch payroll run execution status: %w", err)
 	}
 	return &run, nil
@@ -2720,14 +2698,26 @@ func (r *payrollRepository) ResetPayrollRunDataTx(ctx context.Context, tx *sql.T
 // Employee IDs by Run
 // ---------------------------------------------------------------------
 
-func (r *payrollRepository) GetEmployeeIDsByRun(ctx context.Context, runID uuid.UUID) ([]uuid.UUID, error) {
+// GetEmployeeIDsByRun returns the distinct employees with items in the run.
+//
+// Location: when locationID is non-nil, only employees whose snapshotted
+// employment_location_id at run time matches are returned.
+func (r *payrollRepository) GetEmployeeIDsByRun(
+	ctx context.Context,
+	runID uuid.UUID,
+	locationID *uuid.UUID,
+) ([]uuid.UUID, error) {
 	query := `
         SELECT DISTINCT user_id
-        FROM payroll.payroll_item
-        WHERE payroll_run_id = $1
-          AND is_superseded = FALSE
+        FROM payroll.payroll_item pi
+        WHERE pi.payroll_run_id = $1
+          AND pi.is_superseded = FALSE
+          AND ($2::uuid IS NULL OR pi.user_id IN (
+              SELECT user_id FROM payroll.payroll_run_employees
+              WHERE payroll_run_id = $1 AND employment_location_id = $2
+          ))
     `
-	rows, err := r.client.Query(ctx, query, runID)
+	rows, err := r.client.Query(ctx, query, runID, locationID)
 	if err != nil {
 		return nil, fmt.Errorf("get employee IDs: %w", err)
 	}
@@ -2744,7 +2734,7 @@ func (r *payrollRepository) GetEmployeeIDsByRun(ctx context.Context, runID uuid.
 }
 
 // ---------------------------------------------------------------------
-// Attendance Days (final)
+// Attendance Days
 // ---------------------------------------------------------------------
 
 func (r *payrollRepository) GetPayrollAttendanceDays(
@@ -2783,10 +2773,6 @@ func (r *payrollRepository) GetPayrollAttendanceDays(
 		endDate,
 	).Scan(&totalDays, &payableDays)
 	if err != nil {
-		r.logger.Error("Failed to get payroll attendance days",
-			zap.String("company_id", companyID.String()),
-			zap.String("user_id", userID.String()),
-			zap.Error(err))
 		return 0, 0, fmt.Errorf("failed to get payroll attendance days: %w", err)
 	}
 	return totalDays, payableDays, nil
@@ -2810,23 +2796,30 @@ func (r *payrollRepository) FinalizeAttendanceForPeriod(
           AND attendance_date BETWEEN $3 AND $4
           AND is_finalized = false
     `
-	result, err := r.client.Exec(ctx, query, companyID, userID, startDate, endDate)
+	_, err := r.client.Exec(ctx, query, companyID, userID, startDate, endDate)
 	if err != nil {
-		r.logger.Error("Failed to finalize attendance for period",
-			zap.String("company_id", companyID.String()),
-			zap.String("user_id", userID.String()),
-			zap.Time("start", startDate),
-			zap.Time("end", endDate),
-			zap.Error(err))
 		return fmt.Errorf("finalize attendance: %w", err)
 	}
-	rowsAffected, _ := result.RowsAffected()
-	r.logger.Info("Finalized attendance summaries",
-		zap.String("company_id", companyID.String()),
-		zap.String("user_id", userID.String()),
-		zap.Time("start", startDate),
-		zap.Time("end", endDate),
-		zap.Int64("rows_finalized", rowsAffected),
+	return nil
+}
+func (r *payrollRepository) CreatePayrollRunTx(ctx context.Context, tx *sql.Tx, run *models.PayrollRun) error {
+	if run.PayrollRunID == uuid.Nil {
+		run.PayrollRunID = uuid.New()
+	}
+	if run.CreatedAt.IsZero() {
+		run.CreatedAt = time.Now().UTC()
+	}
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO payroll.payroll_run (
+			payroll_run_id, company_id, period_start, period_end,
+			status, created_at, created_by
+		) VALUES ($1, $2, $3, $4, $5, $6, $7)
+	`,
+		run.PayrollRunID, run.CompanyID, run.PeriodStart, run.PeriodEnd,
+		run.Status, run.CreatedAt, run.CreatedBy,
 	)
+	if err != nil {
+		return fmt.Errorf("failed to create payroll run (tx): %w", err)
+	}
 	return nil
 }

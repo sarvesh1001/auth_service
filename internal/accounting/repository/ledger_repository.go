@@ -51,6 +51,12 @@ type LedgerEntry struct {
 	Debit          decimal.Decimal `json:"debit"`
 	Credit         decimal.Decimal `json:"credit"`
 	RunningBalance decimal.Decimal `json:"running_balance"`
+
+	// 👇 ADDED — populated by GetAccountLedger via joins
+	CostCenterID   *uuid.UUID `json:"cost_center_id,omitempty"`
+	CostCenterName *string    `json:"cost_center_name,omitempty"`
+	DepartmentID   *uuid.UUID `json:"department_id,omitempty"`
+	DepartmentName *string    `json:"department_name,omitempty"`
 }
 
 // =====================================================
@@ -84,6 +90,9 @@ type LedgerRepository interface {
 	GetAccountMovementByPeriod(ctx context.Context, db DBTX, companyID, accountID uuid.UUID, fiscalYear, period int) (debit, credit decimal.Decimal, err error)
 	GetClosingBalance(ctx context.Context, db DBTX, companyID, accountID uuid.UUID, fiscalYear, period int) (decimal.Decimal, error)
 	HasLedgerEntries(ctx context.Context, db DBTX, journalEntryID uuid.UUID) (bool, error)
+
+	// 👇 ADDED — cost-center reporting
+	GetAccountMovementByCostCenter(ctx context.Context, db DBTX, companyID, costCenterID uuid.UUID, from, to time.Time) (debit, credit decimal.Decimal, err error)
 
 	// Recompute (efficient)
 	RecomputeAccount(ctx context.Context, db DBTX, companyID, accountID uuid.UUID, fiscalYear int) error
@@ -417,6 +426,8 @@ func (r *ledgerRepository) ComputeBalanceSheet(ctx context.Context, db DBTX, com
 // LEDGER (account statement) – uses running_balance from DB
 // -----------------------------------------------------------------
 
+// GetAccountLedger returns the account statement with cost center and
+// department resolved via joins.
 func (r *ledgerRepository) GetAccountLedger(ctx context.Context, db DBTX, companyID, accountID uuid.UUID, from, to time.Time) ([]*LedgerEntry, error) {
 	query := `
 		SELECT
@@ -426,9 +437,18 @@ func (r *ledgerRepository) GetAccountLedger(ctx context.Context, db DBTX, compan
 			je.description,
 			le.debit_amount,
 			le.credit_amount,
-			le.running_balance
+			le.running_balance,
+			le.cost_center_id,
+			cc.cost_center_name,
+			le.department_id,
+			d.department_name
 		FROM accounting.ledger_entries le
-		JOIN accounting.journal_entries je ON le.journal_entry_id = je.journal_entry_id
+		JOIN accounting.journal_entries je
+			ON le.journal_entry_id = je.journal_entry_id
+		LEFT JOIN accounting.cost_centers cc
+			ON cc.cost_center_id = le.cost_center_id
+		LEFT JOIN departments d
+			ON d.department_id = le.department_id
 		WHERE le.account_id = $1
 		  AND le.company_id = $2
 		  AND le.entry_date >= $3
@@ -440,11 +460,33 @@ func (r *ledgerRepository) GetAccountLedger(ctx context.Context, db DBTX, compan
 		return nil, fmt.Errorf("get account ledger: %w", err)
 	}
 	defer rows.Close()
+
 	var entries []*LedgerEntry
 	for rows.Next() {
 		var e LedgerEntry
-		if err := rows.Scan(&e.JournalEntryID, &e.Date, &e.Reference, &e.Description, &e.Debit, &e.Credit, &e.RunningBalance); err != nil {
+		var ccID, deptID uuid.NullUUID
+		var ccName, deptName sql.NullString
+
+		if err := rows.Scan(
+			&e.JournalEntryID, &e.Date, &e.Reference, &e.Description,
+			&e.Debit, &e.Credit, &e.RunningBalance,
+			&ccID, &ccName,
+			&deptID, &deptName,
+		); err != nil {
 			return nil, fmt.Errorf("scan: %w", err)
+		}
+
+		if ccID.Valid {
+			e.CostCenterID = &ccID.UUID
+		}
+		if ccName.Valid {
+			e.CostCenterName = &ccName.String
+		}
+		if deptID.Valid {
+			e.DepartmentID = &deptID.UUID
+		}
+		if deptName.Valid {
+			e.DepartmentName = &deptName.String
 		}
 		entries = append(entries, &e)
 	}
@@ -491,6 +533,34 @@ func (r *ledgerRepository) GetAccountMovementByPeriod(ctx context.Context, db DB
 	err = db.QueryRowContext(ctx, query, accountID, companyID, fiscalYear, period).Scan(&debit, &credit)
 	if err != nil {
 		return decimal.Zero, decimal.Zero, fmt.Errorf("get movement by period: %w", err)
+	}
+	return debit, credit, nil
+}
+
+// 👇 ADDED — cost-center movement query.
+// Uses the idx_ledger_cost_center index. Returns debit/credit sums for a
+// single cost center across the given date window.
+func (r *ledgerRepository) GetAccountMovementByCostCenter(
+	ctx context.Context,
+	db DBTX,
+	companyID, costCenterID uuid.UUID,
+	from, to time.Time,
+) (debit, credit decimal.Decimal, err error) {
+	query := `
+		SELECT COALESCE(SUM(debit_amount), 0), COALESCE(SUM(credit_amount), 0)
+		FROM accounting.ledger_entries
+		WHERE company_id = $1
+		  AND cost_center_id = $2
+		  AND entry_date >= $3
+		  AND entry_date < $4
+	`
+	err = db.QueryRowContext(ctx, query, companyID, costCenterID, from, to).Scan(&debit, &credit)
+	if err != nil {
+		r.logger.Error("failed to sum movement by cost center",
+			util.String("company_id", companyID.String()),
+			util.String("cost_center_id", costCenterID.String()),
+			util.ErrorField(err))
+		return decimal.Zero, decimal.Zero, fmt.Errorf("get movement by cost center: %w", err)
 	}
 	return debit, credit, nil
 }
@@ -828,21 +898,37 @@ func (r *ledgerRepository) AtomicAddToBalance(ctx context.Context, db DBTX, comp
 	return nil
 }
 
-// repository/ledger_repository.go
+// CreateLedgerEntry inserts a ledger row. Fiscal year and period are set
+// by the DB trigger (trg_set_ledger_fiscal), so we don't pass them.
+// cost_center_id and department_id are now persisted when supplied.
 func (r *ledgerRepository) CreateLedgerEntry(ctx context.Context, db DBTX, le *models.LedgerEntry) error {
 	query := `
 		INSERT INTO accounting.ledger_entries (
 			ledger_entry_id, company_id, journal_entry_id, journal_line_id,
 			account_id, entry_date, debit_amount, credit_amount,
-			running_balance, is_reversal, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+			running_balance,
+			cost_center_id, department_id,
+			is_reversal, created_at
+		) VALUES (
+			$1, $2, $3, $4,
+			$5, $6, $7, $8,
+			$9,
+			$10, $11,
+			$12, NOW()
+		)
 	`
 	_, err := db.ExecContext(ctx, query,
 		le.LedgerEntryID, le.CompanyID, le.JournalEntryID, le.JournalLineID,
 		le.AccountID, le.EntryDate, le.DebitAmount, le.CreditAmount,
-		le.RunningBalance, le.IsReversal,
+		le.RunningBalance,
+		le.CostCenterID, le.DepartmentID,
+		le.IsReversal,
 	)
 	if err != nil {
+		r.logger.Error("failed to create ledger entry",
+			util.String("journal_entry_id", le.JournalEntryID.String()),
+			util.String("account_id", le.AccountID.String()),
+			util.ErrorField(err))
 		return fmt.Errorf("create ledger entry: %w", err)
 	}
 	return nil

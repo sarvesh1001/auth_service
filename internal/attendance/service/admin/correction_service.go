@@ -14,6 +14,7 @@ import (
 	"auth-service/internal/attendance/repository"
 	"auth-service/internal/attendance/service/resolver"
 	auditservice "auth-service/internal/infrastructure/audit"
+	"auth-service/internal/locationctx"
 )
 
 // CorrectionRequest is the input for creating an attendance correction.
@@ -26,7 +27,7 @@ type CorrectionRequest struct {
 	BusinessDate   time.Time
 	CorrectionType string // manual_check_in, manual_check_out, attendance_adjustment, manual_override
 	EventTime      *time.Time
-	OverrideStatus string // present, absent, late, half_day, etc. (for manual_override or adjustment)
+	OverrideStatus string // present, absent, late, half_day, etc.
 	Reason         string
 }
 
@@ -36,17 +37,17 @@ type CorrectionService interface {
 }
 
 type correctionService struct {
-	eventRepo   repository.EventRepository
-	summaryRepo repository.SummaryRepository
-	admin       AdminService // for validation of event types, etc.
-	resolver    resolver.SubjectResolver
-	resolution  ResolutionService // we'll define this interface later; for now we call RecalculateDay
-	logger      *zap.Logger
-	audit       *auditservice.AuditService
+	eventRepo        repository.EventRepository
+	summaryRepo      repository.SummaryRepository
+	admin            AdminService
+	resolver         resolver.SubjectResolver
+	locationResolver resolver.SubjectLocationResolver
+	resolution       ResolutionService
+	logger           *zap.Logger
+	audit            *auditservice.AuditService
 }
 
 // ResolutionService is a minimal interface for recalculating a day.
-// This will be implemented by the resolution service later.
 type ResolutionService interface {
 	RecalculateDay(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) error
 }
@@ -56,18 +57,20 @@ func NewCorrectionService(
 	summaryRepo repository.SummaryRepository,
 	admin AdminService,
 	resolver resolver.SubjectResolver,
+	locationResolver resolver.SubjectLocationResolver,
 	resolution ResolutionService,
 	logger *zap.Logger,
 	audit *auditservice.AuditService,
 ) CorrectionService {
 	return &correctionService{
-		eventRepo:   eventRepo,
-		summaryRepo: summaryRepo,
-		admin:       admin,
-		resolver:    resolver,
-		resolution:  resolution,
-		logger:      logger,
-		audit:       audit,
+		eventRepo:        eventRepo,
+		summaryRepo:      summaryRepo,
+		admin:            admin,
+		resolver:         resolver,
+		locationResolver: locationResolver,
+		resolution:       resolution,
+		logger:           logger,
+		audit:            audit,
 	}
 }
 
@@ -117,8 +120,21 @@ func (s *correctionService) CreateCorrection(ctx context.Context, req *Correctio
 		return fmt.Errorf("correction already exists for this event")
 	}
 
-	// 5. Resolve subject (optional) – we could check if subject is active
-	// but that's not required for correction.
+	// 5. Row-level authorization — the target subject must be in the caller's scope.
+	if err := s.ensureSubjectInScope(ctx, req.CompanyID, req.SubjectType, req.SubjectID); err != nil {
+		s.logger.Warn("Correction target outside caller scope",
+			zap.String("subject_type", req.SubjectType),
+			zap.String("subject_id", req.SubjectID.String()),
+			zap.Error(err),
+		)
+		return err
+	}
+
+	// 5b. Resolve and stamp the subject's location (snapshot).
+	subjectLocation, err := s.locationResolver.ResolveLocation(ctx, req.CompanyID, req.SubjectType, req.SubjectID)
+	if err != nil {
+		return fmt.Errorf("resolve subject location: %w", err)
+	}
 
 	// 6. Create event
 	event := &models.AttendanceEvent{
@@ -128,10 +144,13 @@ func (s *correctionService) CreateCorrection(ctx context.Context, req *Correctio
 		SubjectID:         req.SubjectID,
 		EventType:         req.CorrectionType,
 		EventTime:         eventTime,
-		SourceType:        "correction",
-		SourceID:          nil,
-		DeviceID:          nil,
-		IPAddress:         nil,
+
+		EmploymentLocationID: subjectLocation,
+
+		SourceType: "correction",
+		SourceID:   nil,
+		DeviceID:   nil,
+		IPAddress:  nil,
 		Context: models.EventContext{
 			CorrectionReason: &req.Reason,
 		},
@@ -184,6 +203,39 @@ func (s *correctionService) CreateCorrection(ctx context.Context, req *Correctio
 		zap.Time("business_date", req.BusinessDate),
 		zap.Duration("duration", time.Since(startTime)),
 	)
+	return nil
+}
+
+// ensureSubjectInScope verifies the target subject is within the caller's
+// current location scope.
+//
+//   - ScopeAll      → permitted
+//   - ScopeLocation → target's employment location must match the scope
+//   - No location context → error (correction routes are always wrapped)
+func (s *correctionService) ensureSubjectInScope(
+	ctx context.Context,
+	companyID uuid.UUID,
+	subjectType string,
+	subjectID uuid.UUID,
+) error {
+	locCtx, err := locationctx.FromContext(ctx)
+	if err != nil {
+		return fmt.Errorf("location context missing: %w", err)
+	}
+	if locCtx.Mode == locationctx.ScopeAll {
+		return nil
+	}
+
+	subjectLoc, err := s.locationResolver.ResolveLocation(ctx, companyID, subjectType, subjectID)
+	if err != nil {
+		return err
+	}
+	if subjectLoc == nil {
+		return resolver.ErrSubjectHasNoLocation
+	}
+	if *subjectLoc != *locCtx.LocationID {
+		return resolver.ErrSubjectOutsideScope
+	}
 	return nil
 }
 

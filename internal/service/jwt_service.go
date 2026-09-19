@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
+	"auth-service/internal/client"
 	"auth-service/internal/config"
 	appErrors "auth-service/internal/errors"
 	"auth-service/internal/infrastructure/audit"
@@ -18,42 +20,49 @@ import (
 )
 
 // JWTService handles JWT token creation, validation, and refresh token generation.
-// It uses audit logging for token operations and does not use zap logger.
 type JWTService struct {
+	pgClient     *client.PostgresClient
 	config       *config.Config
 	companyRepo  postgres.CompanyRepository
 	adminRepo    postgres.AdminRepository
 	auditService *audit.AuditService
+	locationRepo postgres.LocationRepository
 }
 
 // NewJWTService creates a new JWTService with audit capability.
+// NOTE: `pgClient` is a new first parameter — update the wire/main call site.
 func NewJWTService(
+	pgClient *client.PostgresClient,
 	cfg *config.Config,
 	companyRepo postgres.CompanyRepository,
 	adminRepo postgres.AdminRepository,
 	auditService *audit.AuditService,
+	locationRepo postgres.LocationRepository,
 ) *JWTService {
 	return &JWTService{
+		pgClient:     pgClient,
 		config:       cfg,
 		companyRepo:  companyRepo,
 		adminRepo:    adminRepo,
 		auditService: auditService,
+		locationRepo: locationRepo,
 	}
 }
 
 // CreateAccessTokenRequest holds parameters for access token creation.
 type CreateAccessTokenRequest struct {
-	UserID         string
-	Role           string
-	DeviceID       string
-	SessionType    string
-	CompanyID      string
-	IPAddress      string
-	PermissionMask []uint64
+	UserID            string
+	Role              string
+	DeviceID          string
+	SessionType       string
+	CompanyID         string
+	IPAddress         string
+	PermissionMask    []uint64
+	PrimaryLocationID string
+	LocationScope     string
 }
 
 // CreateAccessToken generates a new JWT access token with the given claims.
-// It validates required fields and builds a permission mask if not provided.
 func (s *JWTService) CreateAccessToken(ctx context.Context, req *CreateAccessTokenRequest) (string, string, error) {
 	if req.UserID == "" {
 		return "", "", appErrors.ErrInvalidInput
@@ -68,7 +77,6 @@ func (s *JWTService) CreateAccessToken(ctx context.Context, req *CreateAccessTok
 		return "", "", appErrors.ErrInvalidInput
 	}
 
-	// Extract IP from context if not provided in request
 	ip, _ := ctx.Value("ip_address").(string)
 	if ip == "" && req.IPAddress != "" {
 		ip = req.IPAddress
@@ -79,11 +87,9 @@ func (s *JWTService) CreateAccessToken(ctx context.Context, req *CreateAccessTok
 
 	var permissionMask []uint64
 
-	// Use provided permission mask if given
 	if req.PermissionMask != nil {
 		permissionMask = req.PermissionMask
 	} else {
-		// Fallback to fetching based on session type
 		switch req.SessionType {
 		case "admin":
 			adminID, err := uuid.Parse(req.UserID)
@@ -92,7 +98,6 @@ func (s *JWTService) CreateAccessToken(ctx context.Context, req *CreateAccessTok
 			}
 			mask, err := s.adminRepo.GetAdminPermissionBitmask(ctx, adminID)
 			if err != nil {
-				// On error, use full access mask (13 blocks)
 				permissionMask = models.CreateFullPermissionMask()
 			} else {
 				permissionMask = mask
@@ -111,34 +116,66 @@ func (s *JWTService) CreateAccessToken(ctx context.Context, req *CreateAccessTok
 			}
 			mask, err := s.companyRepo.GetUserPermissionBitmask(ctx, companyID, userID)
 			if err != nil {
-				// On error, use empty mask (13 zeros)
 				permissionMask = make([]uint64, 13)
 			} else {
 				permissionMask = mask
 			}
 		default:
-			// For other session types, use empty mask (13 blocks)
 			permissionMask = make([]uint64, 13)
 		}
 	}
 
-	// Normalise mask to exactly 13 blocks
 	if len(permissionMask) < 13 {
 		fullMask := make([]uint64, 13)
 		copy(fullMask, permissionMask)
 		permissionMask = fullMask
 	}
 
+	// ──────────────────────────────────────────────────────────────────────────────
+	// FETCH LOCATION DETAILS FOR USER SESSIONS
+	// Uses s.pgClient.Pool() — this is a read-only lookup outside any transaction.
+	// ──────────────────────────────────────────────────────────────────────────────
+	var primaryLocationID string
+	var locationScope string
+
+	if req.SessionType == "user" {
+		if req.PrimaryLocationID != "" && req.LocationScope != "" {
+			primaryLocationID = req.PrimaryLocationID
+			locationScope = req.LocationScope
+		} else {
+			companyID, _ := uuid.Parse(req.CompanyID)
+			userID, _ := uuid.Parse(req.UserID)
+
+			loc, err := s.locationRepo.GetEmployeeLocationDetails(ctx, s.pgClient.Pool(), companyID, userID)
+			if err != nil {
+				if errors.Is(err, appErrors.ErrNotFound) {
+					locationScope = "ALL"
+				} else {
+					locationScope = "ALL"
+				}
+			} else if loc != nil {
+				if loc.PrimaryLocationID != uuid.Nil {
+					primaryLocationID = loc.PrimaryLocationID.String()
+				}
+				locationScope = loc.LocationScope
+			} else {
+				locationScope = "ALL"
+			}
+		}
+	}
+
 	claims := &models.JWTClaims{
-		UserID:         req.UserID,
-		Role:           req.Role,
-		DeviceID:       req.DeviceID,
-		SessionType:    req.SessionType,
-		CompanyID:      req.CompanyID,
-		JTI:            jti,
-		IssuedAt:       now.Unix(),
-		ExpiresAt:      now.Add(s.config.JWT.AccessTTL).Unix(),
-		PermissionMask: permissionMask,
+		UserID:            req.UserID,
+		Role:              req.Role,
+		DeviceID:          req.DeviceID,
+		SessionType:       req.SessionType,
+		CompanyID:         req.CompanyID,
+		JTI:               jti,
+		IssuedAt:          now.Unix(),
+		ExpiresAt:         now.Add(s.config.JWT.AccessTTL).Unix(),
+		PermissionMask:    permissionMask,
+		PrimaryLocationID: primaryLocationID,
+		LocationScope:     locationScope,
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
@@ -147,18 +184,19 @@ func (s *JWTService) CreateAccessToken(ctx context.Context, req *CreateAccessTok
 		return "", "", fmt.Errorf("%w: failed to sign token", appErrors.ErrInternal)
 	}
 
-	// Audit log for token creation
 	if s.auditService != nil {
 		actorID, _ := uuid.Parse(req.UserID)
 		_ = s.auditService.LogAction(ctx, nil, nil, "jwt", "create_access_token", "session",
 			nil, req.SessionType, &actorID, nil, nil, map[string]interface{}{
-				"jti":          jti,
-				"device_id":    req.DeviceID,
-				"session_type": req.SessionType,
-				"role":         req.Role,
-				"company_id":   req.CompanyID,
-				"ip_address":   ip,
-				"expires_at":   claims.ExpiresAt,
+				"jti":                 jti,
+				"device_id":           req.DeviceID,
+				"session_type":        req.SessionType,
+				"role":                req.Role,
+				"company_id":          req.CompanyID,
+				"primary_location_id": primaryLocationID,
+				"location_scope":      locationScope,
+				"ip_address":          ip,
+				"expires_at":          claims.ExpiresAt,
 			})
 	}
 
@@ -166,7 +204,6 @@ func (s *JWTService) CreateAccessToken(ctx context.Context, req *CreateAccessTok
 }
 
 // ValidateAccessToken parses and validates a JWT token string.
-// It returns the claims if valid, or an error.
 func (s *JWTService) ValidateAccessToken(ctx context.Context, tokenStr string) (*models.JWTClaims, error) {
 	if tokenStr == "" {
 		return nil, appErrors.ErrInvalidInput
@@ -197,7 +234,6 @@ func (s *JWTService) ValidateAccessToken(ctx context.Context, tokenStr string) (
 		return nil, fmt.Errorf("%w: non-admin token missing company ID", appErrors.ErrUnauthorized)
 	}
 
-	// Audit log for validation success (only if claims are valid)
 	if s.auditService != nil {
 		actorID, _ := uuid.Parse(claims.UserID)
 		ip, _ := ctx.Value("ip_address").(string)
@@ -224,7 +260,6 @@ func (s *JWTService) GenerateRefreshToken() (string, error) {
 }
 
 // CreateTokenPair generates both an access token and a refresh token.
-// It uses CreateAccessToken internally and adds audit logging for the pair creation.
 func (s *JWTService) CreateTokenPair(ctx context.Context, req *CreateAccessTokenRequest) (*models.TokenPairResponse, error) {
 	accessToken, jti, err := s.CreateAccessToken(ctx, req)
 	if err != nil {
@@ -235,7 +270,6 @@ func (s *JWTService) CreateTokenPair(ctx context.Context, req *CreateAccessToken
 		return nil, err
 	}
 
-	// Audit log for token pair creation
 	if s.auditService != nil {
 		actorID, _ := uuid.Parse(req.UserID)
 		ip, _ := ctx.Value("ip_address").(string)

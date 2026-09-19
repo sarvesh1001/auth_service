@@ -1,0 +1,9 @@
+apiVersion: 1
+policies:
+  - receiver: default
+    group_by: ['alertname', 'severity']
+    continue: false
+    routes:
+      - receiver: default
+        match_re:
+          severity: critical|warning

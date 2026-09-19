@@ -3,6 +3,7 @@ package repository
 import (
 	"auth-service/internal/hr/models/employee"
 	"context"
+	"database/sql" // 👈 ADD
 	"time"
 
 	"github.com/google/uuid"
@@ -16,8 +17,16 @@ type EmployeeRepository interface {
 	GetEmployeeProfileByUserID(ctx context.Context, userID, companyID uuid.UUID) (*employee.EmployeeProfile, error)
 	UpdateEmployeeProfile(ctx context.Context, profile *employee.EmployeeProfile) error
 	DeleteEmployeeProfile(ctx context.Context, profileID uuid.UUID) error
-	ListEmployeeProfilesByCompany(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]*employee.EmployeeProfile, int, error)
-	SearchEmployeeProfiles(ctx context.Context, companyID uuid.UUID, filters map[string]interface{}, limit, offset int) ([]*employee.EmployeeProfile, int, error)
+
+	// ListEmployeeProfilesByCompany returns a page of profiles for a company,
+	// optionally filtered by employment location.
+	// locationID == nil means "no location filter" (company-wide).
+	ListEmployeeProfilesByCompany(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, limit, offset int) ([]*employee.EmployeeProfile, int, error)
+
+	// SearchEmployeeProfiles applies arbitrary filters plus an optional
+	// employment-location filter.
+	SearchEmployeeProfiles(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, filters map[string]interface{}, limit, offset int) ([]*employee.EmployeeProfile, int, error)
+
 	// Validation helpers
 	UserExists(ctx context.Context, userID uuid.UUID) (bool, error)
 	IsUserEmployeeOfCompany(ctx context.Context, userID, companyID uuid.UUID) (bool, error)
@@ -28,6 +37,7 @@ type EmployeeRepository interface {
 	GetDepartmentHistoryByUserID(ctx context.Context, userID, companyID uuid.UUID) ([]*employee.EmployeeDepartmentHistory, error)
 	UpdateDepartmentHistory(ctx context.Context, history *employee.EmployeeDepartmentHistory) error
 	EndDepartmentAssignment(ctx context.Context, userID uuid.UUID, endDate time.Time) error
+	GetEmploymentLocationID(ctx context.Context, companyID, userID uuid.UUID) (*uuid.UUID, error)
 
 	// EmployeeDocument operations
 	CreateEmployeeDocument(ctx context.Context, doc *employee.EmployeeDocument) error
@@ -64,9 +74,16 @@ type EmployeeRepository interface {
 	CreateEmployeeDocumentsBatch(ctx context.Context, documents []*employee.EmployeeDocument) error
 
 	// Search and analytics
-	GetEmployeeStatsByCompany(ctx context.Context, companyID uuid.UUID) (map[string]interface{}, error)
+	// GetEmployeeStatsByCompany returns aggregate stats, optionally scoped
+	// to a single employment location.
+	GetEmployeeStatsByCompany(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID) (map[string]interface{}, error)
+
 	GetEmployeeCountByDepartment(ctx context.Context, companyID uuid.UUID) (map[uuid.UUID]int, error)
-	GetActiveEmployeesByDateRange(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) ([]*employee.EmployeeProfile, error)
+
+	// GetActiveEmployeesByDateRange returns active employees whose profile
+	// was created within [startDate, endDate], optionally scoped to a
+	// single employment location.
+	GetActiveEmployeesByDateRange(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, startDate, endDate time.Time) ([]*employee.EmployeeProfile, error)
 
 	GetActiveDepartmentAssignment(
 		ctx context.Context,
@@ -85,6 +102,7 @@ type EmployeeRepository interface {
 	HealthCheck(ctx context.Context) error
 	// GetActiveUsersByPosition returns all active user IDs for a given position.
 	GetActiveUsersByPosition(ctx context.Context, positionID uuid.UUID) ([]uuid.UUID, error)
+	CreateEmployeeProfileTx(ctx context.Context, tx *sql.Tx, profile *employee.EmployeeProfile) error
 
 	// GetActiveEmployeesByCompany returns all active employee user IDs for a company.
 	GetActiveEmployeesByCompany(ctx context.Context, companyID uuid.UUID) ([]uuid.UUID, error)

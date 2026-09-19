@@ -38,7 +38,8 @@ func (h *AttendanceClassHandler) MarkClassAttendance(
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
-	ctx := r.Context()
+	// === INJECT IDEMPOTENCY & IP ===
+	ctx := injectCommonContext(r.Context(), r)
 
 	actorIDStr := ctx.Value("user_id").(string)
 	companyIDStr := ctx.Value("company_id").(string)

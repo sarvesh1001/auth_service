@@ -5,16 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"auth-service/internal/hr/payroll/models"
 	"auth-service/internal/hr/payroll/repository"
 	"auth-service/internal/hr/payroll/service"
-	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 )
 
 // PayrollRunHandler handles HTTP requests for payroll run and component operations.
@@ -22,7 +21,6 @@ type PayrollRunHandler struct {
 	engineService service.PayrollEngineService
 	queryService  service.PayrollQueryService
 	jobRepo       repository.PayrollJobRepository
-	logger        *zap.Logger
 }
 
 // NewPayrollRunHandler creates a new PayrollRunHandler.
@@ -30,13 +28,11 @@ func NewPayrollRunHandler(
 	engineService service.PayrollEngineService,
 	queryService service.PayrollQueryService,
 	jobRepo repository.PayrollJobRepository,
-	logger *zap.Logger,
 ) *PayrollRunHandler {
 	return &PayrollRunHandler{
 		engineService: engineService,
 		queryService:  queryService,
 		jobRepo:       jobRepo,
-		logger:        logger.Named("payroll_run_handler"),
 	}
 }
 
@@ -84,7 +80,7 @@ type UpdateComponentRequest struct {
 
 // CreateRun handles POST /companies/{companyID}/payroll/runs
 func (h *PayrollRunHandler) CreateRun(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -116,7 +112,6 @@ func (h *PayrollRunHandler) CreateRun(w http.ResponseWriter, r *http.Request) {
 
 	run, err := h.engineService.CreateRun(ctx, companyID, req.PeriodStart, req.PeriodEnd, actorID)
 	if err != nil {
-		h.logger.Error("failed to create payroll run", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -138,7 +133,7 @@ func (h *PayrollRunHandler) CreateRun(w http.ResponseWriter, r *http.Request) {
 
 // InitializeRun handles POST /companies/{companyID}/payroll/runs/{runID}/initialize
 func (h *PayrollRunHandler) InitializeRun(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -165,7 +160,6 @@ func (h *PayrollRunHandler) InitializeRun(w http.ResponseWriter, r *http.Request
 	}
 
 	if err := h.engineService.InitializeRun(ctx, runID, actorID); err != nil {
-		h.logger.Error("failed to initialize payroll run", zap.String("run_id", runID.String()), zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -178,7 +172,7 @@ func (h *PayrollRunHandler) InitializeRun(w http.ResponseWriter, r *http.Request
 
 // ExecuteRun handles POST /companies/{companyID}/payroll/runs/{runID}/execute
 func (h *PayrollRunHandler) ExecuteRun(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -212,10 +206,6 @@ func (h *PayrollRunHandler) ExecuteRun(w http.ResponseWriter, r *http.Request) {
 		MaxAttempts:  3,
 	})
 	if err != nil {
-		h.logger.Error("failed to create payroll job",
-			zap.String("run_id", runID.String()),
-			zap.Error(err),
-		)
 		h.respondWithError(w, http.StatusInternalServerError, "failed to queue payroll run")
 		return
 	}
@@ -233,7 +223,7 @@ func (h *PayrollRunHandler) ExecuteRun(w http.ResponseWriter, r *http.Request) {
 
 // ApproveRun handles POST /companies/{companyID}/payroll/runs/{runID}/approve
 func (h *PayrollRunHandler) ApproveRun(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -260,7 +250,6 @@ func (h *PayrollRunHandler) ApproveRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.engineService.ApproveRun(ctx, runID, actorID); err != nil {
-		h.logger.Error("failed to approve payroll run", zap.String("run_id", runID.String()), zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -273,7 +262,7 @@ func (h *PayrollRunHandler) ApproveRun(w http.ResponseWriter, r *http.Request) {
 
 // MarkRunAsPaid handles POST /companies/{companyID}/payroll/runs/{runID}/mark-paid
 func (h *PayrollRunHandler) MarkRunAsPaid(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -310,7 +299,6 @@ func (h *PayrollRunHandler) MarkRunAsPaid(w http.ResponseWriter, r *http.Request
 	}
 
 	if err := h.engineService.MarkRunAsPaid(ctx, runID, actorID, req.PaidAt); err != nil {
-		h.logger.Error("failed to mark payroll run as paid", zap.String("run_id", runID.String()), zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -322,11 +310,8 @@ func (h *PayrollRunHandler) MarkRunAsPaid(w http.ResponseWriter, r *http.Request
 }
 
 // CancelRun handles POST /companies/{companyID}/payroll/runs/{runID}/cancel
-
-// hr/payroll/handler/payroll_run_handler.go
-
 func (h *PayrollRunHandler) CancelRun(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -354,9 +339,6 @@ func (h *PayrollRunHandler) CancelRun(w http.ResponseWriter, r *http.Request) {
 
 	err = h.engineService.CancelRun(ctx, runID, actorID)
 	if err != nil {
-		h.logger.Error("failed to cancel payroll run", zap.String("run_id", runID.String()), zap.Error(err))
-
-		// Handle specific errors with appropriate status codes
 		if strings.Contains(err.Error(), "already in terminal state") {
 			h.respondWithError(w, http.StatusConflict, err.Error())
 		} else if strings.Contains(err.Error(), "run not found") {
@@ -377,7 +359,7 @@ func (h *PayrollRunHandler) CancelRun(w http.ResponseWriter, r *http.Request) {
 
 // CreateComponent handles POST /companies/{companyID}/payroll/components
 func (h *PayrollRunHandler) CreateComponent(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -408,7 +390,6 @@ func (h *PayrollRunHandler) CreateComponent(w http.ResponseWriter, r *http.Reque
 
 	component, err := h.engineService.CreateComponent(ctx, input, actorID)
 	if err != nil {
-		h.logger.Error("failed to create component", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -421,7 +402,7 @@ func (h *PayrollRunHandler) CreateComponent(w http.ResponseWriter, r *http.Reque
 
 // UpdateComponent handles PUT /companies/{companyID}/payroll/components/{componentCode}
 func (h *PayrollRunHandler) UpdateComponent(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -454,7 +435,6 @@ func (h *PayrollRunHandler) UpdateComponent(w http.ResponseWriter, r *http.Reque
 
 	component, err := h.engineService.UpdateComponent(ctx, input, actorID)
 	if err != nil {
-		h.logger.Error("failed to update component", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -467,7 +447,7 @@ func (h *PayrollRunHandler) UpdateComponent(w http.ResponseWriter, r *http.Reque
 
 // DeactivateComponent handles DELETE /companies/{companyID}/payroll/components/{componentCode}
 func (h *PayrollRunHandler) DeactivateComponent(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -485,7 +465,6 @@ func (h *PayrollRunHandler) DeactivateComponent(w http.ResponseWriter, r *http.R
 
 	err = h.engineService.DeactivateComponent(ctx, companyID, componentCode, actorID)
 	if err != nil {
-		h.logger.Error("failed to deactivate component", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -498,7 +477,7 @@ func (h *PayrollRunHandler) DeactivateComponent(w http.ResponseWriter, r *http.R
 
 // ListComponents handles GET /companies/{companyID}/payroll/components
 func (h *PayrollRunHandler) ListComponents(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
@@ -508,7 +487,6 @@ func (h *PayrollRunHandler) ListComponents(w http.ResponseWriter, r *http.Reques
 
 	components, err := h.engineService.ListComponents(ctx, companyID)
 	if err != nil {
-		h.logger.Error("failed to list components", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -524,17 +502,24 @@ func (h *PayrollRunHandler) ListComponents(w http.ResponseWriter, r *http.Reques
 // getActorID extracts the actor UUID from the request context.
 // It assumes that the auth middleware has set "user_id".
 func (h *PayrollRunHandler) getActorID(ctx context.Context) (uuid.UUID, error) {
-	userIDStr, ok := ctx.Value("user_id").(string)
-	if !ok || userIDStr == "" {
-		return uuid.Nil, errors.New("unauthenticated user")
+	// Try modern key first
+	if v := ctx.Value("current_user_id"); v != nil {
+		if id, ok := v.(uuid.UUID); ok {
+			return id, nil
+		}
 	}
-
-	userID, err := uuid.Parse(userIDStr)
-	if err != nil {
-		return uuid.Nil, errors.New("invalid user_id in context")
+	// Fallback to old key
+	if v := ctx.Value("user_id"); v != nil {
+		switch raw := v.(type) {
+		case uuid.UUID:
+			return raw, nil
+		case string:
+			return uuid.Parse(raw)
+		default:
+			return uuid.Nil, errors.New("invalid user_id type")
+		}
 	}
-
-	return userID, nil
+	return uuid.Nil, errors.New("user not authenticated")
 }
 
 // respondWithJSON writes a JSON response.

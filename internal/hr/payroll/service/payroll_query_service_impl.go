@@ -7,52 +7,80 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
+
 	"auth-service/internal/hr/payroll/models"
 	"auth-service/internal/hr/payroll/repository"
-	a "auth-service/internal/infrastructure/audit"
-
-	"github.com/google/uuid"
-	"go.uber.org/zap"
+	hrRepo "auth-service/internal/hr/repository"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/locationctx"
 )
 
-// PayrollQueryService defines the interface for payroll query operations.
+// PDFGenerator abstracts the PDF creation logic.
+type PDFGenerator interface {
+	GeneratePayslipPDF(payslip *models.Payslip) ([]byte, error)
+}
 
 type payrollQueryService struct {
 	payrollRepo  repository.PayrollRepository
 	bankRepo     repository.BankDetailsRepository
 	payslipRepo  repository.PayslipRepository
-	pdfGenerator PDFGenerator // interface for PDF generation (could be injected)
-	audit        *a.AuditService
-	logger       *zap.Logger
+	employeeRepo hrRepo.EmployeeRepository // 👈 new
+	pdfGenerator PDFGenerator
+	audit        *audit.AuditService
 }
 
-// PDFGenerator abstracts the PDF creation logic (to be implemented separately).
-type PDFGenerator interface {
-	GeneratePayslipPDF(payslip *models.Payslip) ([]byte, error)
-}
-
-// NewPayrollQueryService creates a new payroll query service with all required repositories.
 func NewPayrollQueryService(
 	payrollRepo repository.PayrollRepository,
 	bankRepo repository.BankDetailsRepository,
 	payslipRepo repository.PayslipRepository,
+	employeeRepo hrRepo.EmployeeRepository, // 👈 new
 	pdfGen PDFGenerator,
-	audit *a.AuditService,
-	logger *zap.Logger,
+	audit *audit.AuditService,
 ) PayrollQueryService {
 	return &payrollQueryService{
 		payrollRepo:  payrollRepo,
 		bankRepo:     bankRepo,
 		payslipRepo:  payslipRepo,
+		employeeRepo: employeeRepo,
 		pdfGenerator: pdfGen,
 		audit:        audit,
-		logger:       logger.Named("payroll_query_service"),
 	}
 }
 
-// ---------------------------------------------------------------------
-// Existing methods (unchanged, but some may be enhanced)
-// ---------------------------------------------------------------------
+// ensureEmployeeInScope — same helper pattern.
+func (s *payrollQueryService) ensureEmployeeInScope(
+	ctx context.Context,
+	companyID, targetUserID uuid.UUID,
+) error {
+	if actorStr, ok := ctx.Value("user_id").(string); ok {
+		if actorID, err := uuid.Parse(actorStr); err == nil && actorID == targetUserID {
+			return nil
+		}
+	}
+	locCtx, err := locationctx.FromContext(ctx)
+	if err != nil {
+		return nil // system call
+	}
+	if locCtx.Mode == locationctx.ScopeAll {
+		return nil
+	}
+	empLoc, err := s.employeeRepo.GetEmploymentLocationID(ctx, companyID, targetUserID)
+	if err != nil {
+		return err
+	}
+	if empLoc == nil {
+		return ErrEmployeeHasNoLocation
+	}
+	if *empLoc != *locCtx.LocationID {
+		return ErrEmployeeOutsideScope
+	}
+	return nil
+}
+
+// ------------------------------------------------------------------
+// Run-scoped reads — pass location filter through.
+// ------------------------------------------------------------------
 
 func (s *payrollQueryService) GetRunSummary(ctx context.Context, companyID, runID uuid.UUID) (*models.PayrollRunDashboard, error) {
 	run, err := s.payrollRepo.GetPayrollRunByID(ctx, runID)
@@ -68,7 +96,9 @@ func (s *payrollQueryService) GetRunSummary(ctx context.Context, companyID, runI
 		return nil, err
 	}
 
-	ledgerSummary, err := s.payrollRepo.GetLedgerSummaryByRun(ctx, runID)
+	// 👇 Location-scope: ledger summary reflects only the caller's scope.
+	locFilter := locationctx.Filter(ctx)
+	ledgerSummary, err := s.payrollRepo.GetLedgerSummaryByRun(ctx, runID, locFilter)
 	if err != nil {
 		return nil, err
 	}
@@ -106,32 +136,24 @@ func (s *payrollQueryService) GetRunLedgerSummary(ctx context.Context, companyID
 	if err != nil || run == nil || run.CompanyID != companyID {
 		return nil, fmt.Errorf("run not found or access denied")
 	}
-	return s.payrollRepo.GetLedgerSummaryByRun(ctx, runID)
+	locFilter := locationctx.Filter(ctx)
+	return s.payrollRepo.GetLedgerSummaryByRun(ctx, runID, locFilter)
 }
 
-func (s *payrollQueryService) GetRunExecutionStatus(
-	ctx context.Context,
-	companyID,
-	runID uuid.UUID,
-) (*models.PayrollExecutionStatus, error) {
-
+func (s *payrollQueryService) GetRunExecutionStatus(ctx context.Context, companyID, runID uuid.UUID) (*models.PayrollExecutionStatus, error) {
 	run, err := s.payrollRepo.GetPayrollRunExecutionStatus(ctx, runID)
 	if err != nil {
 		return nil, err
 	}
-
 	if run == nil || run.CompanyID != companyID {
 		return nil, fmt.Errorf("run not found")
 	}
-
 	total := derefInt(run.TotalEmployees)
 	processed := derefInt(run.ProcessedCount)
-
 	var pct float64
 	if total > 0 {
 		pct = (float64(processed) / float64(total)) * 100
 	}
-
 	return &models.PayrollExecutionStatus{
 		RunID:          run.PayrollRunID,
 		Status:         run.Status,
@@ -142,6 +164,10 @@ func (s *payrollQueryService) GetRunExecutionStatus(
 		LastUpdatedAt:  run.LastProcessedAt,
 	}, nil
 }
+
+// ------------------------------------------------------------------
+// Employee-scoped reads — validate target.
+// ------------------------------------------------------------------
 
 func (s *payrollQueryService) GetEmployeePayrollDetail(ctx context.Context, companyID, payrollItemID uuid.UUID) (*models.PayrollItemDetail, error) {
 	detail, err := s.payrollRepo.GetPayrollItemDetail(ctx, payrollItemID)
@@ -160,17 +186,19 @@ func (s *payrollQueryService) GetEmployeePayrollDetail(ctx context.Context, comp
 		return nil, fmt.Errorf("access denied")
 	}
 
-	// Audit
-	actorID := getUserIDFromContext(ctx)
-	if actorID == nil {
-		s.logger.Warn("No actor ID in context for GetEmployeePayrollDetail audit",
-			zap.String("payroll_item_id", payrollItemID.String()))
+	// 👇 Location scope check
+	if err := s.ensureEmployeeInScope(ctx, companyID, detail.UserID); err != nil {
+		return nil, err
 	}
+
+	ip, _ := ctx.Value("ip_address").(string)
+	actorID := getUserIDFromContext(ctx)
 	metadata := map[string]interface{}{
 		"payroll_run_id": detail.PayrollRunID.String(),
 		"user_id":        detail.UserID.String(),
 		"period_start":   run.PeriodStart,
 		"period_end":     run.PeriodEnd,
+		"ip":             ip,
 	}
 	_ = s.audit.LogAction(ctx, nil, &companyID, "payroll", "payroll_detail_viewed", "payroll_item", &payrollItemID, "user", actorID, nil, nil, metadata)
 
@@ -182,18 +210,32 @@ func (s *payrollQueryService) ListEmployeesInRun(ctx context.Context, companyID,
 	if err != nil || run == nil || run.CompanyID != companyID {
 		return nil, fmt.Errorf("run not found")
 	}
-	return s.payrollRepo.GetPayrollItemsByRun(ctx, runID)
+	// 👇 Location-scoped read
+	locFilter := locationctx.Filter(ctx)
+	return s.payrollRepo.GetPayrollItemsByRun(ctx, runID, locFilter)
 }
 
 func (s *payrollQueryService) GetEmployeePayrollHistory(ctx context.Context, companyID, userID uuid.UUID, from, to time.Time) ([]*models.PayrollItemDetail, error) {
+	// 👇 Location scope check
+	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
+		return nil, err
+	}
 	return s.payrollRepo.GetEmployeePayrollHistory(ctx, companyID, userID, from, to)
 }
 
 func (s *payrollQueryService) GetEmployeeYTD(ctx context.Context, companyID, userID uuid.UUID, financialYearStart time.Time) (*models.EmployeeYTDSummary, error) {
+	// 👇 Location scope check
+	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
+		return nil, err
+	}
 	return s.payrollRepo.GetEmployeeYTDSummary(ctx, companyID, userID, financialYearStart, time.Now())
 }
 
 func (s *payrollQueryService) GetEmployeeStatutorySummary(ctx context.Context, companyID, userID uuid.UUID, financialYearStart time.Time) (*models.EmployeeStatutorySummary, error) {
+	// 👇 Location scope check
+	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
+		return nil, err
+	}
 	ytdCtx, err := s.payrollRepo.BuildStatutoryYTDContext(ctx, companyID, userID, financialYearStart)
 	if err != nil {
 		return nil, err
@@ -217,8 +259,13 @@ func (s *payrollQueryService) GetRunStatutorySummary(ctx context.Context, compan
 	if err != nil || run == nil || run.CompanyID != companyID {
 		return nil, fmt.Errorf("run not found")
 	}
-	return s.payrollRepo.GetRunStatutorySummary(ctx, runID)
+	locFilter := locationctx.Filter(ctx)
+	return s.payrollRepo.GetRunStatutorySummary(ctx, runID, locFilter)
 }
+
+// ------------------------------------------------------------------
+// Trends (company-level rollups)
+// ------------------------------------------------------------------
 
 func (s *payrollQueryService) GetCompanyPayrollTrend(ctx context.Context, companyID uuid.UUID, from, to time.Time) ([]*models.PayrollTrendPoint, error) {
 	return s.payrollRepo.GetPayrollTrend(ctx, companyID, from, to)
@@ -228,8 +275,6 @@ func (s *payrollQueryService) GetComponentBreakdownTrend(ctx context.Context, co
 	return s.payrollRepo.GetComponentTrend(ctx, companyID, componentCode, from, to)
 }
 
-// GetEmployeePayslip returns a data structure representation of a payslip.
-// This method is kept for backward compatibility and as a data source for PDF generation.
 func (s *payrollQueryService) GetEmployeePayslip(ctx context.Context, companyID, payrollItemID uuid.UUID) (*models.Payslip, error) {
 	detail, err := s.GetEmployeePayrollDetail(ctx, companyID, payrollItemID)
 	if err != nil {
@@ -268,16 +313,22 @@ func (s *payrollQueryService) GetEmployeePayslip(ctx context.Context, companyID,
 	return payslip, nil
 }
 
-// ExportRunToCSV exports basic payroll item data as CSV.
+// ------------------------------------------------------------------
+// Exports
+// ------------------------------------------------------------------
+
 func (s *payrollQueryService) ExportRunToCSV(ctx context.Context, companyID, runID uuid.UUID) ([]byte, error) {
 	run, err := s.payrollRepo.GetPayrollRunByID(ctx, runID)
 	if err != nil || run == nil || run.CompanyID != companyID {
 		return nil, fmt.Errorf("run not found")
 	}
-	items, err := s.payrollRepo.GetPayrollItemsByRun(ctx, runID)
+
+	locFilter := locationctx.Filter(ctx)
+	items, err := s.payrollRepo.GetPayrollItemsByRun(ctx, runID, locFilter)
 	if err != nil {
 		return nil, err
 	}
+
 	var buf bytes.Buffer
 	writer := csv.NewWriter(&buf)
 	_ = writer.Write([]string{"UserID", "GrossAmount", "NetAmount", "PayableDays", "UnpaidDays"})
@@ -294,26 +345,23 @@ func (s *payrollQueryService) ExportRunToCSV(ctx context.Context, companyID, run
 	if err := writer.Error(); err != nil {
 		return nil, err
 	}
-	// Audit
+
+	ip, _ := ctx.Value("ip_address").(string)
 	actorID := getUserIDFromContext(ctx)
 	metadata := map[string]interface{}{
-		"period_start": run.PeriodStart,
-		"period_end":   run.PeriodEnd,
-		"status":       run.Status,
-		"record_count": len(items),
+		"period_start":   run.PeriodStart,
+		"period_end":     run.PeriodEnd,
+		"status":         run.Status,
+		"record_count":   len(items),
+		"ip":             ip,
+		"location_scope": locationScopeLabel(locFilter),
 	}
 	_ = s.audit.LogAction(ctx, nil, &companyID, "payroll", "payroll_run_export", "payroll_run", &runID, "user", actorID, nil, nil, metadata)
 	return buf.Bytes(), nil
 }
 
-// ---------------------------------------------------------------------
-// New methods for missing features
-// ---------------------------------------------------------------------
-
-// ExportBankFile generates a bank upload file (CSV) for a payroll run.
-// bankFormat can be "hdfc", "icici", etc. (adjust as needed).
+// ExportBankFile — company-wide artifact; requires ALL scope.
 func (s *payrollQueryService) ExportBankFile(ctx context.Context, companyID, runID uuid.UUID, bankFormat string) ([]byte, error) {
-	// 1. Verify run exists and is approved/paid.
 	run, err := s.payrollRepo.GetPayrollRunByID(ctx, runID)
 	if err != nil || run == nil || run.CompanyID != companyID {
 		return nil, fmt.Errorf("run not found")
@@ -322,32 +370,34 @@ func (s *payrollQueryService) ExportBankFile(ctx context.Context, companyID, run
 		return nil, fmt.Errorf("run must be approved or paid to export bank file")
 	}
 
-	// 2. Get all payroll items for the run.
-	items, err := s.payrollRepo.GetPayrollItemsByRun(ctx, runID)
+	// 👇 Bank file is one CSV for the entire company — require ALL scope.
+	locCtx, err := locationctx.FromContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("location context missing: %w", err)
+	}
+	if locCtx.Mode != locationctx.ScopeAll {
+		return nil, ErrCompanyWideScopeRequired
+	}
+
+	items, err := s.payrollRepo.GetPayrollItemsByRun(ctx, runID, nil)
 	if err != nil {
 		return nil, err
 	}
 	if len(items) == 0 {
-		return nil, fmt.Errorf("no payroll items found for this run")
+		return nil, fmt.Errorf("no payroll items found")
 	}
 
-	// 3. Collect user IDs.
 	userIDs := make([]uuid.UUID, len(items))
 	for i, item := range items {
 		userIDs[i] = item.UserID
 	}
-
-	// 4. Fetch active bank details for all employees.
 	bankMap, err := s.bankRepo.GetBankDetailsForPayrollRun(ctx, companyID, userIDs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch bank details: %w", err)
 	}
 
-	// 5. Build CSV according to format.
 	var buf bytes.Buffer
 	writer := csv.NewWriter(&buf)
-
-	// Write header based on format (simplified example; adapt to actual bank specs)
 	switch bankFormat {
 	case "hdfc", "icici", "sbi":
 		_ = writer.Write([]string{"EmployeeID", "AccountNumber", "IFSC", "Amount", "Narration"})
@@ -358,37 +408,26 @@ func (s *payrollQueryService) ExportBankFile(ctx context.Context, companyID, run
 	for _, item := range items {
 		bank, ok := bankMap[item.UserID]
 		if !ok {
-			s.logger.Warn("No active bank details for user", zap.String("user_id", item.UserID.String()))
-			continue // skip this employee (or you could return an error)
+			continue
 		}
-		// Amount should be net amount (or gross depending on policy)
 		amount := item.NetAmount
-		// For HDFC/ICICI, you might need to format amount without decimals, etc.
 		switch bankFormat {
 		case "hdfc":
-			// Example: Employee ID, Account Number, IFSC, Amount (as integer paise), Narration
 			_ = writer.Write([]string{
-				"", // employee code if available
-				bank.AccountNumber,
-				bank.IFSCCode,
-				fmt.Sprintf("%.0f", amount*100), // amount in paise
+				"", bank.AccountNumber, bank.IFSCCode,
+				fmt.Sprintf("%.0f", amount*100),
 				fmt.Sprintf("Salary %s", run.PeriodStart.Format("Jan 2006")),
 			})
 		case "icici":
-			// Similar
 			_ = writer.Write([]string{
-				bank.AccountNumber,
-				bank.IFSCCode,
+				bank.AccountNumber, bank.IFSCCode,
 				fmt.Sprintf("%.2f", amount),
 				fmt.Sprintf("Salary %s", run.PeriodStart.Format("Jan 2006")),
 			})
 		default:
 			_ = writer.Write([]string{
-				item.UserID.String(),
-				bank.AccountNumber,
-				bank.IFSCCode,
-				fmt.Sprintf("%.2f", amount),
-				"",
+				item.UserID.String(), bank.AccountNumber, bank.IFSCCode,
+				fmt.Sprintf("%.2f", amount), "",
 			})
 		}
 	}
@@ -397,25 +436,22 @@ func (s *payrollQueryService) ExportBankFile(ctx context.Context, companyID, run
 		return nil, err
 	}
 
-	// Audit
+	ip, _ := ctx.Value("ip_address").(string)
 	actorID := getUserIDFromContext(ctx)
 	metadata := map[string]interface{}{
 		"run_id":    runID.String(),
 		"format":    bankFormat,
 		"employees": len(items),
+		"ip":        ip,
 	}
 	_ = s.audit.LogAction(ctx, nil, &companyID, "payroll", "bank_file_export", "payroll_run", &runID, "user", actorID, nil, nil, metadata)
 
 	return buf.Bytes(), nil
 }
 
-// GetMyPayslips returns all payslip records for the authenticated user in a date range.
-
-// DownloadPayslip retrieves the PDF content for a given payslip ID.
-
-// ---------------------------------------------------------------------
-// Helper functions
-// ---------------------------------------------------------------------
+// ------------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------------
 
 func derefInt(v *int) int {
 	if v == nil {
@@ -424,9 +460,6 @@ func derefInt(v *int) int {
 	return *v
 }
 
-// getUserIDFromContext extracts the current user ID from context.
-// Implement according to your auth middleware.
 func getUserIDFromContext(ctx context.Context) *uuid.UUID {
-	// Example: if uid, ok := ctx.Value("userID").(uuid.UUID); ok { return &uid }
 	return nil
 }

@@ -1,0 +1,9 @@
+apiVersion: 1
+
+contactPoints:
+  - name: default
+    receivers:
+      - uid: email
+        type: email
+        settings:
+          addresses: "savichhabra05@gmail.com"

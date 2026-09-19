@@ -1,0 +1,185 @@
+{
+    "title": "OTP Monitoring",
+    "uid": "otp-dashboard",
+    "tags": ["auth", "otp"],
+    "timezone": "browser",
+    "schemaVersion": 36,
+    "version": 2,
+    "refresh": "30s",
+    "time": {
+      "from": "now-7d",
+      "to": "now"
+    },
+    "panels": [
+      {
+        "id": 1,
+        "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+        "type": "stat",
+        "title": "OTP Send Success Rate (last 7d)",
+        "targets": [
+          {
+            "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+            "format": "table",
+            "queryType": "raw",
+            "rawSql": "SELECT sumIf(total_events, status='sent') / sum(total_events) * 100 AS rate FROM otp_events_daily WHERE $__timeFilter(event_date)",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "min": 0,
+            "max": 100,
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                { "color": "red", "value": null },
+                { "color": "orange", "value": 90 },
+                { "color": "green", "value": 95 }
+              ]
+            }
+          }
+        },
+        "alert": {
+          "alertRuleTags": { "service": "otp", "severity": "critical" },
+          "conditions": [
+            {
+              "evaluator": { "params": [95], "type": "lt" },
+              "operator": { "type": "and" },
+              "query": { "params": ["A"] },
+              "reducer": { "params": [], "type": "avg" },
+              "type": "query"
+            }
+          ],
+          "executionErrorState": "alerting",
+          "for": "2m",
+          "frequency": "1m",
+          "handler": 1,
+          "name": "OTP Send Success Rate Low"
+        }
+      },
+      {
+        "id": 2,
+        "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+        "type": "stat",
+        "title": "OTP Verification Success Rate (last 7d)",
+        "targets": [
+          {
+            "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+            "format": "table",
+            "queryType": "raw",
+            "rawSql": "SELECT sumIf(total_events, status='verified') / sum(total_events) * 100 AS rate FROM otp_events_daily WHERE $__timeFilter(event_date)",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "min": 0,
+            "max": 100,
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                { "color": "red", "value": null },
+                { "color": "orange", "value": 85 },
+                { "color": "green", "value": 90 }
+              ]
+            }
+          }
+        },
+        "alert": {
+          "alertRuleTags": { "service": "otp", "severity": "critical" },
+          "conditions": [
+            {
+              "evaluator": { "params": [90], "type": "lt" },
+              "operator": { "type": "and" },
+              "query": { "params": ["A"] },
+              "reducer": { "params": [], "type": "avg" },
+              "type": "query"
+            }
+          ],
+          "executionErrorState": "alerting",
+          "for": "2m",
+          "frequency": "1m",
+          "handler": 1,
+          "name": "OTP Verification Success Rate Low"
+        }
+      },
+      {
+        "id": 3,
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+        "type": "timeseries",
+        "title": "OTP P95 Latency (last 7d)",
+        "targets": [
+          {
+            "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+            "format": "table",
+            "queryType": "raw",
+            "rawSql": "SELECT $__timeGroup(timestamp, 1m) AS time, quantile(0.95)(duration_ms) AS p95 FROM otp_events WHERE $__timeFilter(timestamp) AND duration_ms > 0 GROUP BY time",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "ms",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                { "color": "green", "value": null },
+                { "color": "yellow", "value": 300 },
+                { "color": "red", "value": 500 }
+              ]
+            }
+          }
+        },
+        "alert": {
+          "alertRuleTags": { "service": "otp", "severity": "critical" },
+          "conditions": [
+            {
+              "evaluator": { "params": [500], "type": "gt" },
+              "operator": { "type": "and" },
+              "query": { "params": ["A"] },
+              "reducer": { "params": [], "type": "avg" },
+              "type": "query"
+            }
+          ],
+          "executionErrorState": "alerting",
+          "for": "2m",
+          "frequency": "1m",
+          "handler": 1,
+          "name": "OTP High Latency Alert"
+        }
+      },
+      {
+        "id": 4,
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+        "type": "timeseries",
+        "title": "OTP Volume (last 7d)",
+        "targets": [
+          {
+            "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+            "format": "table",
+            "queryType": "raw",
+            "rawSql": "SELECT event_date AS time, sum(total_events) AS total FROM otp_events_daily WHERE $__timeFilter(event_date) GROUP BY event_date ORDER BY time",
+            "refId": "A"
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+        "type": "barchart",
+        "title": "OTP Send vs Verify (last 7d)",
+        "targets": [
+          {
+            "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+            "format": "table",
+            "queryType": "raw",
+            "rawSql": "SELECT event_date AS time, sumIf(total_events, status='sent') AS sent, sumIf(total_events, status='verified') AS verified FROM otp_events_daily WHERE $__timeFilter(event_date) GROUP BY event_date ORDER BY time",
+            "refId": "A"
+          }
+        ]
+      }
+    ],
+    "templating": { "list": [] }
+  }

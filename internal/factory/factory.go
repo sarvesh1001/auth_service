@@ -1,3 +1,4 @@
+// internal/factory/factory.go
 package factory
 
 import (
@@ -6,6 +7,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"auth-service/internal/repository/clickhouse"
+	"auth-service/internal/repository/elasticsearch"
 
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/go-chi/chi/v5"
@@ -24,6 +28,7 @@ import (
 	"auth-service/internal/email"
 	"auth-service/internal/encryption"
 	"auth-service/internal/handler"
+	locationhandler "auth-service/internal/handler" // 🆕 LOCATION
 	"auth-service/internal/hashing"
 	"auth-service/internal/hashing/pepperstore"
 	hrhandler "auth-service/internal/hr/handler"
@@ -211,8 +216,18 @@ type Factory struct {
 	outboxProcessor              *outbox.Processor
 	outboxCancel                 context.CancelFunc
 	emailSender                  email.Sender
+	analyticsCHRepo              *clickhouse.AnalyticsRepository
+	analyticsESRepo              *elasticsearch.AnalyticsESRepository
+	analyticsService             *service.AnalyticsService
+	analyticsHandler             *handler.AnalyticsHandler
 
-	attendanceFactory *AttendanceFactory
+	attendanceFactory   *AttendanceFactory
+	auditConsumer       *audit.AuditClickHouseConsumer
+	auditConsumerCancel context.CancelFunc
+
+	// NEW: Audit Elasticsearch consumer
+	auditESConsumer       *audit.AuditESConsumer
+	auditESConsumerCancel context.CancelFunc
 
 	// ==================== KYC ====================
 	kycRepo    kycRepo.KYCDocumentRepository
@@ -226,11 +241,34 @@ type Factory struct {
 	avatarService avatarSvc.AvatarService
 	avatarHandler *avatarHandler.AvatarHandler
 	// ===============================================
+
+	// 🆕 LOCATION ====================================
+	locationRepo    postgres.LocationRepository
+	locationService *service.LocationService
+	locationHandler *locationhandler.LocationHandler
+	// ================================================
+
+	// 🆕 SUBSCRIPTION ====================================
+	subscriptionPlanRepo        postgres.SubscriptionPlanRepository
+	companyPaymentRepo          postgres.CompanyPaymentRepository
+	subscriptionInvoiceRepo     postgres.SubscriptionInvoiceRepository
+	subscriptionInvoiceItemRepo postgres.SubscriptionInvoiceItemRepository
+	subscriptionReminderRepo    postgres.SubscriptionReminderRepository
+	subscriptionPlanService     *service.SubscriptionPlanService
+	paymentService              *service.PaymentService
+	invoiceService              *service.SubscriptionInvoiceService
+	reminderService             *service.ReminderService
+	lifecycleService            *service.SubscriptionLifecycleService
+	planHandler                 *handler.SubscriptionPlanHandler
+	paymentHandler              *handler.PaymentHandler
+	invoiceHandler              *handler.InvoiceHandler
+	reminderHandler             *handler.ReminderHandler
+	lifecycleHandler            *handler.SubscriptionLifecycleHandler
+	// ===================================================
 }
 
 type KafkaLoggingManager struct {
 	producer   *service.LogProducerService
-	esConsumer *consumer.ESConsumer
 	chConsumer *consumer.ClickHouseConsumer
 	cancelCtx  context.CancelFunc
 	wg         sync.WaitGroup
@@ -267,11 +305,6 @@ func (m *KafkaLoggingManager) HealthCheck(ctx context.Context) map[string]error 
 	}
 	if m.producer == nil {
 		errs["kafka_producer"] = fmt.Errorf("kafka producer not initialized")
-	}
-	if m.esConsumer != nil {
-		if err := m.esConsumer.Health(ctx); err != nil {
-			errs["es_consumer"] = err
-		}
 	}
 	if m.chConsumer != nil {
 		if err := m.chConsumer.Health(ctx); err != nil {
@@ -366,9 +399,6 @@ func NewFactory() (*Factory, error) {
 	}
 	f.inventoryInfra = inventoryInfra
 
-	// -------------------------------------------------------------
-	// SALES INFRA – initially with nil updater
-	// -------------------------------------------------------------
 	salesInfra := NewSalesInfraFactory(
 		f.PostgresClient(),
 		f.outboxRepo,
@@ -381,9 +411,6 @@ func NewFactory() (*Factory, error) {
 	)
 	f.salesInfra = salesInfra
 
-	// -------------------------------------------------------------
-	// SUBSCRIPTION INFRA
-	// -------------------------------------------------------------
 	subscriptionInfra := NewSubscriptionInfraFactory(
 		f.PostgresClient(),
 		f.outboxRepo,
@@ -398,14 +425,8 @@ func NewFactory() (*Factory, error) {
 	)
 	f.subscriptionInfra = subscriptionInfra
 
-	// -------------------------------------------------------------
-	// INJECT UPDATER INTO SALES INFRA
-	// -------------------------------------------------------------
 	f.salesInfra.SetPlanItemUpdater(f.subscriptionInfra.PlanItemService())
 
-	// -------------------------------------------------------------
-	// ATTENDANCE FACTORY
-	// -------------------------------------------------------------
 	attendanceFactory := NewAttendanceFactory(
 		f.PostgresClient(),
 		f.RedisClient(),
@@ -424,9 +445,6 @@ func NewFactory() (*Factory, error) {
 	)
 	f.attendanceFactory = attendanceFactory
 
-	// -------------------------------------------------------------
-	// NEW: INJECT CUSTOMER RESOLVER & USAGE INTEGRATION DEPENDENCIES
-	// -------------------------------------------------------------
 	customerRepo := salesRepo.NewCustomerRepository(f.logger)
 	subscriptionRepo := subRepo.NewSubscriptionRepository(f.logger)
 	trialRepo := subRepo.NewTrialRepository(f.logger)
@@ -448,19 +466,16 @@ func NewFactory() (*Factory, error) {
 	)
 	attendanceFactory.SetUsageIntegrationService(usageSvc)
 
-	// -------------------------------------------------------------
-
-	// Start attendance background services
 	ctx := context.Background()
 	f.attendanceFactory.StartBackgroundServices(ctx)
 
-	// Kafka logging
 	kafkaLoggingMgr, err := f.InitializeKafkaLogging()
 	if err != nil {
 		logger.Error("failed to initialize Kafka logging", zap.Error(err))
 	}
 	f.kafkaLoggingMgr = kafkaLoggingMgr
 
+	// Central outbox processor
 	if f.kafkaProducer != nil {
 		f.outboxProcessor = outbox.NewProcessor(
 			f.outboxRepo,
@@ -470,7 +485,7 @@ func NewFactory() (*Factory, error) {
 		ctx, cancel := context.WithCancel(context.Background())
 		f.outboxCancel = cancel
 		go f.outboxProcessor.Start(ctx)
-		f.logger.Info("Central outbox processor started – handles all domains (sales, accounting, inventory, academics, etc.)")
+		f.logger.Info("Central outbox processor started – handles all domains")
 	} else {
 		f.logger.Error("Kafka producer not available – central outbox disabled")
 	}
@@ -484,24 +499,11 @@ func NewFactory() (*Factory, error) {
 		return nil, err
 	}
 
-	if outbox := f.GetAuditOutboxService(); outbox != nil {
-		ctx, cancel := context.WithCancel(context.Background())
-		f.auditOutboxCancel = cancel
-		go func() {
-			if err := outbox.Start(ctx); err != nil {
-				f.logger.Error(
-					"Audit outbox service stopped with error",
-					zap.Error(err),
-				)
-			}
-		}()
-		f.logger.Info("Audit outbox service started")
-	}
-
 	f.initializePayrollWorker()
 
-	// Analytics, student, accounting, inventory, sales consumers
+	// Start Kafka consumers
 	if f.kafkaProducer != nil && len(f.config.Kafka.Brokers) > 0 {
+		// --- Existing consumers (analytics, student, accounting, inventory, sales, subscription) ---
 		analyticsTopic := "academics-events"
 		analyticsKafkaConsumer, err := client.NewKafkaConsumer(
 			f.config,
@@ -649,9 +651,6 @@ func NewFactory() (*Factory, error) {
 			f.logger.Info("✅ Sales consumer started", zap.String("topic", salesTopic))
 		}
 
-		// -------------------------------------------------------------
-		// NEW: SUBSCRIPTION CONSUMER FOR PRODUCT SYNC
-		// -------------------------------------------------------------
 		subscriptionTopic := "subscription-events"
 		subscriptionKafkaConsumer, err := client.NewKafkaConsumer(
 			f.config,
@@ -678,8 +677,69 @@ func NewFactory() (*Factory, error) {
 			}()
 			f.logger.Info("✅ Subscription consumer started (product sync)", zap.String("topic", subscriptionTopic))
 		}
+
+		// ============================================================
+		// AUDIT CLICKHOUSE CONSUMER
+		// ============================================================
+		auditTopic := "audit-logs"
+		auditKafkaConsumer, err := client.NewKafkaConsumer(
+			f.config,
+			auditTopic,
+			"audit-clickhouse-consumer-group",
+			f.logger,
+		)
+		if err != nil {
+			f.logger.Error("Failed to create audit Kafka consumer", zap.Error(err))
+		} else {
+			auditConsumer := audit.NewAuditClickHouseConsumer(
+				auditKafkaConsumer,
+				f.GetAuditClickHouseRepository(),
+				f.logger,
+				f.config.Kafka.Brokers,
+			)
+			f.auditConsumer = auditConsumer
+			ctx, cancel := context.WithCancel(context.Background())
+			f.auditConsumerCancel = cancel
+			go func() {
+				auditConsumer.Start(ctx)
+				f.logger.Info("Audit ClickHouse consumer stopped")
+			}()
+			f.logger.Info("✅ Audit ClickHouse consumer started", zap.String("topic", auditTopic))
+		}
+
+		// ============================================================
+		// NEW: AUDIT ELASTICSEARCH CONSUMER
+		// ============================================================
+		if f.config.Elasticsearch.URL != "" && f.esClient != nil {
+			auditESConsumer, err := client.NewKafkaConsumer(
+				f.config,
+				"audit-logs",
+				"audit-es-consumer-group", // separate group
+				f.logger,
+			)
+			if err != nil {
+				f.logger.Error("Failed to create audit ES Kafka consumer", zap.Error(err))
+			} else {
+				esConsumer := audit.NewAuditESConsumer(
+					auditESConsumer,
+					f.esClient,
+					f.logger,
+					f.config.Environment,
+				)
+				f.auditESConsumer = esConsumer
+				ctx, cancel := context.WithCancel(context.Background())
+				f.auditESConsumerCancel = cancel
+				go func() {
+					esConsumer.Start(ctx)
+					f.logger.Info("Audit ES consumer stopped")
+				}()
+				f.logger.Info("✅ Audit ES consumer started", zap.String("topic", "audit-logs"))
+			}
+		} else {
+			f.logger.Warn("Elasticsearch not available – audit ES consumer disabled")
+		}
 	} else {
-		f.logger.Warn("Kafka not available – analytics, student, accounting, inventory, sales, and subscription consumers disabled")
+		f.logger.Warn("Kafka not available – consumers disabled")
 	}
 
 	return f, nil
@@ -714,9 +774,26 @@ func (f *Factory) Close() error {
 			}
 		}
 
-		if f.auditOutboxCancel != nil {
-			f.logger.Info("Stopping audit outbox service...")
-			f.auditOutboxCancel()
+		// Shutdown audit ClickHouse consumer
+		if f.auditConsumerCancel != nil {
+			f.logger.Info("Stopping audit ClickHouse consumer...")
+			f.auditConsumerCancel()
+		}
+		if f.auditConsumer != nil {
+			if err := f.auditConsumer.Close(); err != nil {
+				f.logger.Error("Failed to close audit ClickHouse consumer", zap.Error(err))
+			}
+		}
+
+		// NEW: Shutdown audit ES consumer
+		if f.auditESConsumerCancel != nil {
+			f.logger.Info("Stopping audit ES consumer...")
+			f.auditESConsumerCancel()
+		}
+		if f.auditESConsumer != nil {
+			if err := f.auditESConsumer.Close(); err != nil {
+				f.logger.Error("Failed to close audit ES consumer", zap.Error(err))
+			}
 		}
 
 		if f.payrollWorkerCancel != nil {
@@ -825,6 +902,48 @@ func (f *Factory) Close() error {
 	return nil
 }
 
+// AnalyticsCHRepo returns the ClickHouse analytics repository.
+func (f *Factory) AnalyticsCHRepo() *clickhouse.AnalyticsRepository {
+	if f.analyticsCHRepo == nil {
+		f.analyticsCHRepo = clickhouse.NewAnalyticsRepository(f.clickhouseClient)
+	}
+	return f.analyticsCHRepo
+}
+
+// AnalyticsESRepo returns the Elasticsearch analytics repository.
+func (f *Factory) AnalyticsESRepo() *elasticsearch.AnalyticsESRepository {
+	if f.analyticsESRepo == nil {
+		f.analyticsESRepo = elasticsearch.NewAnalyticsESRepository(f.esClient.Client, f.logger)
+	}
+	return f.analyticsESRepo
+}
+
+// AnalyticsService returns the analytics service.
+func (f *Factory) AnalyticsService() *service.AnalyticsService {
+	if f.analyticsService == nil {
+		f.analyticsService = service.NewAnalyticsService(
+			f.AnalyticsCHRepo(),
+			f.AnalyticsESRepo(),
+			f.clickhouseClient,
+			f.esClient.Client,
+			f.logger,
+			f.GetCompanyService(), // optional, for multi-tenant validation
+		)
+	}
+	return f.analyticsService
+}
+
+// AnalyticsHandler returns the analytics HTTP handler.
+func (f *Factory) AnalyticsHandler() *handler.AnalyticsHandler {
+	if f.analyticsHandler == nil {
+		f.analyticsHandler = handler.NewAnalyticsHandler(
+			f.AnalyticsService(),
+			f.logger,
+		)
+	}
+	return f.analyticsHandler
+}
+
 // ----------------------------------------------------------------------------
 // All getters and helper methods
 // ----------------------------------------------------------------------------
@@ -833,7 +952,6 @@ func (f *Factory) PayrollJobRepository() payrollrepo.PayrollJobRepository {
 	if f.payrollJobRepo == nil {
 		f.payrollJobRepo = payrollrepo.NewPayrollJobRepository(
 			f.PostgresClient(),
-			f.logger,
 		)
 	}
 	return f.payrollJobRepo
@@ -843,7 +961,6 @@ func (f *Factory) ComponentRepository() payrollrepo.ComponentRepository {
 	if f.componentRepo == nil {
 		f.componentRepo = payrollrepo.NewComponentRepository(
 			f.PostgresClient(),
-			f.logger,
 		)
 	}
 	return f.componentRepo
@@ -853,7 +970,6 @@ func (f *Factory) CompanySettingsRepository() payrollrepo.CompanySettingsReposit
 	if f.companySettingsRepo == nil {
 		f.companySettingsRepo = payrollrepo.NewCompanySettingsRepository(
 			f.PostgresClient(),
-			f.logger,
 		)
 	}
 	return f.companySettingsRepo
@@ -863,7 +979,6 @@ func (f *Factory) ArrearsRepository() payrollrepo.ArrearsRepository {
 	if f.arrearsRepo == nil {
 		f.arrearsRepo = payrollrepo.NewArrearsRepository(
 			f.PostgresClient(),
-			f.logger,
 		)
 	}
 	return f.arrearsRepo
@@ -873,7 +988,6 @@ func (f *Factory) LoanRepository() payrollrepo.LoanRepository {
 	if f.loanRepo == nil {
 		f.loanRepo = payrollrepo.NewLoanRepository(
 			f.PostgresClient(),
-			f.logger,
 		)
 	}
 	return f.loanRepo
@@ -884,7 +998,6 @@ func (f *Factory) BankDetailsRepository() payrollrepo.BankDetailsRepository {
 		f.bankDetailsRepo = payrollrepo.NewBankDetailsRepository(
 			f.PostgresClient(),
 			f.EncryptionManager(),
-			f.logger,
 		)
 	}
 	return f.bankDetailsRepo
@@ -894,7 +1007,6 @@ func (f *Factory) PayslipRepository() payrollrepo.PayslipRepository {
 	if f.payslipRepo == nil {
 		f.payslipRepo = payrollrepo.NewPayslipRepository(
 			f.PostgresClient(),
-			f.logger,
 		)
 	}
 	return f.payslipRepo
@@ -904,7 +1016,6 @@ func (f *Factory) TaxDeclarationRepository() payrollrepo.TaxDeclarationRepositor
 	if f.taxDeclarationRepo == nil {
 		f.taxDeclarationRepo = payrollrepo.NewTaxDeclarationRepository(
 			f.PostgresClient(),
-			f.logger,
 		)
 	}
 	return f.taxDeclarationRepo
@@ -931,18 +1042,20 @@ func (f *Factory) BankExportService() payrollsvc.BankExportService {
 		f.bankExportSvc = payrollsvc.NewBankExportService(
 			f.PayrollRepository(),
 			f.BankDetailsRepository(),
-			f.logger,
+			f.HREmployeeRepository(),
+			f.idempotencyStore,
+			f.GetAuditService(),
 		)
 	}
 	return f.bankExportSvc
 }
-
 func (f *Factory) ComponentService() payrollsvc.ComponentService {
 	if f.componentSvc == nil {
 		f.componentSvc = payrollsvc.NewComponentService(
 			f.ComponentRepository(),
 			f.CompanySettingsRepository(),
-			f.logger,
+			f.GetAuditService(),
+			f.idempotencyStore,
 		)
 	}
 	return f.componentSvc
@@ -955,29 +1068,32 @@ func (f *Factory) LoanService() payrollsvc.LoanService {
 			f.ComponentRepository(),
 			f.CompanySettingsRepository(),
 			f.CompensationService(),
+			f.HREmployeeRepository(),
+			f.idempotencyStore,
 			f.GetAuditService(),
 			f.logger,
 		)
 	}
 	return f.loanSvc
 }
-
 func (f *Factory) PayslipService() payrollsvc.PayslipService {
 	if f.payslipSvc == nil {
 		f.payslipSvc = payrollsvc.NewPayslipService(
 			f.PayslipRepository(),
+			f.HREmployeeRepository(),
 			f.emailSender,
-			f.logger,
+			f.idempotencyStore,
+			f.GetAuditService(),
 		)
 	}
 	return f.payslipSvc
 }
-
 func (f *Factory) ReportingService() payrollsvc.ReportingService {
 	if f.reportingSvc == nil {
 		f.reportingSvc = payrollsvc.NewReportingService(
 			f.PayrollRepository(),
-			f.logger,
+			f.GetAuditService(),
+			f.idempotencyStore,
 		)
 	}
 	return f.reportingSvc
@@ -987,19 +1103,20 @@ func (f *Factory) TaxDeclarationService() payrollsvc.TaxDeclarationService {
 	if f.taxDeclarationSvc == nil {
 		f.taxDeclarationSvc = payrollsvc.NewTaxDeclarationService(
 			f.TaxDeclarationRepository(),
+			f.HREmployeeRepository(),
 			f.GetAuditService(),
-			f.logger,
+			f.idempotencyStore,
 		)
 	}
 	return f.taxDeclarationSvc
 }
-
 func (f *Factory) AttendanceRuleService() payrollsvc.AttendanceRuleService {
 	if f.attendanceRuleSvc == nil {
 		f.attendanceRuleSvc = payrollsvc.NewAttendanceRuleService(
 			f.AttendanceRuleRepository(),
 			f.ComponentRepository(),
-			f.logger,
+			f.idempotencyStore,
+			f.GetAuditService(),
 		)
 	}
 	return f.attendanceRuleSvc
@@ -1012,13 +1129,13 @@ func (f *Factory) EmployeeFineService() payrollsvc.EmployeeFineService {
 			f.PayrollRepository(),
 			f.ComponentRepository(),
 			f.CompanySettingsRepository(),
+			f.HREmployeeRepository(),
 			f.GetAuditService(),
-			f.logger,
+			f.idempotencyStore,
 		)
 	}
 	return f.employeeFineSvc
 }
-
 func (f *Factory) PayrollEngineService() payrollsvc.PayrollEngineService {
 	if f.payrollEngineSvc == nil {
 		f.payrollEngineSvc = payrollsvc.NewPayrollEngineService(
@@ -1028,13 +1145,13 @@ func (f *Factory) PayrollEngineService() payrollsvc.PayrollEngineService {
 			f.StatutoryEngine(),
 			f.GetAttendancePayrollBridge(),
 			f.GetAuditService(),
+			f.idempotencyStore,
 			f.AttendanceRuleRepository(),
 			f.EmployeeFineRepository(),
 			f.ArrearsRepository(),
 			f.LoanRepository(),
 			f.ComponentRepository(),
 			f.CompanySettingsRepository(),
-			f.logger,
 		)
 	}
 	return f.payrollEngineSvc
@@ -1046,14 +1163,13 @@ func (f *Factory) PayrollQueryService() payrollsvc.PayrollQueryService {
 			f.PayrollRepository(),
 			f.BankDetailsRepository(),
 			f.PayslipRepository(),
+			f.HREmployeeRepository(),
 			f.PDFGenerator(),
 			f.GetAuditService(),
-			f.logger,
 		)
 	}
 	return f.payrollQuerySvc
 }
-
 func (f *Factory) SalaryStructureService() payrollsvc.SalaryStructureService {
 	if f.salaryStructureSvc == nil {
 		f.salaryStructureSvc = payrollsvc.NewSalaryStructureService(
@@ -1061,8 +1177,9 @@ func (f *Factory) SalaryStructureService() payrollsvc.SalaryStructureService {
 			f.PayrollLockService(),
 			f.CompensationService(),
 			f.ArrearsService(),
+			f.HREmployeeRepository(),
 			f.GetAuditService(),
-			f.logger,
+			f.idempotencyStore,
 		)
 	}
 	return f.salaryStructureSvc
@@ -1072,7 +1189,6 @@ func (f *Factory) AttendanceRuleRepository() payrollrepo.AttendanceRuleRepositor
 	if f.attendanceRuleRepo == nil {
 		f.attendanceRuleRepo = payrollrepo.NewAttendanceRuleRepository(
 			f.PostgresClient(),
-			f.logger,
 		)
 	}
 	return f.attendanceRuleRepo
@@ -1082,7 +1198,6 @@ func (f *Factory) GetAttendanceRuleHandler() *payrollhandler.AttendanceRuleHandl
 	if f.attendanceRuleHandler == nil {
 		f.attendanceRuleHandler = payrollhandler.NewAttendanceRuleHandler(
 			f.AttendanceRuleService(),
-			f.logger,
 		)
 	}
 	return f.attendanceRuleHandler
@@ -1092,7 +1207,6 @@ func (f *Factory) EmployeeFineRepository() payrollrepo.EmployeeFineRepository {
 	if f.employeeFineRepo == nil {
 		f.employeeFineRepo = payrollrepo.NewEmployeeFineRepository(
 			f.PostgresClient(),
-			f.logger,
 		)
 	}
 	return f.employeeFineRepo
@@ -1102,7 +1216,6 @@ func (f *Factory) GetEmployeeFineHandler() *payrollhandler.EmployeeFineHandler {
 	if f.employeeFineHandler == nil {
 		f.employeeFineHandler = payrollhandler.NewEmployeeFineHandler(
 			f.EmployeeFineService(),
-			f.logger,
 		)
 	}
 	return f.employeeFineHandler
@@ -1112,7 +1225,6 @@ func (f *Factory) CompensationRepository() payrollrepo.CompensationRepository {
 	if f.compensationRepo == nil {
 		f.compensationRepo = payrollrepo.NewCompensationRepository(
 			f.PostgresClient(),
-			f.logger,
 		)
 	}
 	return f.compensationRepo
@@ -1122,7 +1234,6 @@ func (f *Factory) SalaryStructureRepository() payrollrepo.SalaryStructureReposit
 	if f.salaryStructureRepo == nil {
 		f.salaryStructureRepo = payrollrepo.NewSalaryStructureRepository(
 			f.PostgresClient(),
-			f.logger,
 		)
 	}
 	return f.salaryStructureRepo
@@ -1132,7 +1243,6 @@ func (f *Factory) StatutoryProfileRepository() payrollrepo.StatutoryProfileRepos
 	if f.statutoryProfileRepo == nil {
 		f.statutoryProfileRepo = payrollrepo.NewStatutoryProfileRepository(
 			f.PostgresClient(),
-			f.logger,
 		)
 	}
 	return f.statutoryProfileRepo
@@ -1142,7 +1252,6 @@ func (f *Factory) StatutoryRepository() payrollrepo.StatutoryRepository {
 	if f.statutoryRepo == nil {
 		f.statutoryRepo = payrollrepo.NewStatutoryRepository(
 			f.PostgresClient(),
-			f.logger,
 		)
 	}
 	return f.statutoryRepo
@@ -1152,7 +1261,6 @@ func (f *Factory) PayrollRepository() payrollrepo.PayrollRepository {
 	if f.payrollRepository == nil {
 		f.payrollRepository = payrollrepo.NewPayrollRepository(
 			f.PostgresClient(),
-			f.logger,
 		)
 	}
 	return f.payrollRepository
@@ -1163,30 +1271,31 @@ func (f *Factory) CompensationService() payrollsvc.CompensationService {
 		f.compensationSvc = payrollsvc.NewCompensationService(
 			f.CompensationRepository(),
 			f.PayrollRepository(),
+			f.HREmployeeRepository(),
 			f.GetAuditService(),
+			f.idempotencyStore,
 			f.logger,
 		)
 	}
 	return f.compensationSvc
 }
-
 func (f *Factory) PayrollAdjustmentService() payrollsvc.PayrollAdjustmentService {
 	if f.payrollAdjustmentSvc == nil {
 		f.payrollAdjustmentSvc = payrollsvc.NewPayrollAdjustmentService(
 			f.PayrollRepository(),
+			f.HREmployeeRepository(),
 			f.GetAuditService(),
-			f.logger,
+			f.idempotencyStore,
 		)
 	}
 	return f.payrollAdjustmentSvc
 }
-
 func (f *Factory) PayrollLockService() payrollsvc.PayrollLockService {
 	if f.payrollLockSvc == nil {
 		f.payrollLockSvc = payrollsvc.NewPayrollLockService(
 			f.PayrollRepository(),
 			f.GetAuditService(),
-			f.logger,
+			f.idempotencyStore,
 		)
 	}
 	return f.payrollLockSvc
@@ -1200,19 +1309,19 @@ func (f *Factory) StatutoryProfileService() payrollsvc.StatutoryProfileService {
 	if f.statutoryProfileSvc == nil {
 		f.statutoryProfileSvc = payrollsvc.NewStatutoryProfileService(
 			f.StatutoryProfileRepository(),
+			f.HREmployeeRepository(),
 			f.GetAuditService(),
-			f.logger,
+			f.idempotencyStore,
 		)
 	}
 	return f.statutoryProfileSvc
 }
-
 func (f *Factory) StatutoryEngine() payrollsvc.StatutoryEngine {
 	if f.statutoryEngineSvc == nil {
 		f.statutoryEngineSvc = payrollsvc.NewStatutoryEngine(
 			f.StatutoryRepository(),
 			f.GetAuditService(),
-			f.logger,
+			f.idempotencyStore,
 		)
 	}
 	return f.statutoryEngineSvc
@@ -1222,7 +1331,6 @@ func (f *Factory) GetCompensationHandler() *payrollhandler.CompensationHandler {
 	if f.compensationHandler == nil {
 		f.compensationHandler = payrollhandler.NewCompensationHandler(
 			f.CompensationService(),
-			f.logger,
 		)
 	}
 	return f.compensationHandler
@@ -1232,7 +1340,6 @@ func (f *Factory) GetPayrollAdjustmentHandler() *payrollhandler.PayrollAdjustmen
 	if f.payrollAdjustmentHandler == nil {
 		f.payrollAdjustmentHandler = payrollhandler.NewPayrollAdjustmentHandler(
 			f.PayrollAdjustmentService(),
-			f.logger,
 		)
 	}
 	return f.payrollAdjustmentHandler
@@ -1242,7 +1349,6 @@ func (f *Factory) GetPayrollLockHandler() *payrollhandler.PayrollLockHandler {
 	if f.payrollLockHandler == nil {
 		f.payrollLockHandler = payrollhandler.NewPayrollLockHandler(
 			f.PayrollLockService(),
-			f.logger,
 		)
 	}
 	return f.payrollLockHandler
@@ -1252,7 +1358,6 @@ func (f *Factory) GetPayrollCommandHandler() *payrollhandler.PayrollCommandHandl
 	if f.payrollCommandHandler == nil {
 		f.payrollCommandHandler = payrollhandler.NewPayrollCommandHandler(
 			f.PayrollEngineService(),
-			f.logger,
 		)
 	}
 	return f.payrollCommandHandler
@@ -1262,7 +1367,6 @@ func (f *Factory) GetPayrollQueryHandler() *payrollhandler.PayrollQueryHandler {
 	if f.payrollQueryHandler == nil {
 		f.payrollQueryHandler = payrollhandler.NewPayrollQueryHandler(
 			f.PayrollQueryService(),
-			f.logger,
 		)
 	}
 	return f.payrollQueryHandler
@@ -1274,7 +1378,6 @@ func (f *Factory) GetPayrollRunHandler() *payrollhandler.PayrollRunHandler {
 			f.PayrollEngineService(),
 			f.PayrollQueryService(),
 			f.PayrollJobRepository(),
-			f.logger,
 		)
 	}
 	return f.payrollRunHandler
@@ -1284,7 +1387,6 @@ func (f *Factory) GetSalaryStructureHandler() *payrollhandler.SalaryStructureHan
 	if f.salaryStructureHandler == nil {
 		f.salaryStructureHandler = payrollhandler.NewSalaryStructureHandler(
 			f.SalaryStructureService(),
-			f.logger,
 		)
 	}
 	return f.salaryStructureHandler
@@ -1295,7 +1397,6 @@ func (f *Factory) GetStatutoryProfileHandler() *payrollhandler.StatutoryProfileH
 		f.statutoryProfileHandler = payrollhandler.NewStatutoryProfileHandler(
 			f.StatutoryProfileService(),
 			f.StatutoryEngine(),
-			f.logger,
 		)
 	}
 	return f.statutoryProfileHandler
@@ -1305,7 +1406,6 @@ func (f *Factory) GetBankExportHandler() *payrollhandler.BankExportHandler {
 	if f.bankExportHandler == nil {
 		f.bankExportHandler = payrollhandler.NewBankExportHandler(
 			f.BankExportService(),
-			f.logger,
 		)
 	}
 	return f.bankExportHandler
@@ -1315,7 +1415,6 @@ func (f *Factory) GetComponentHandler() *payrollhandler.ComponentHandler {
 	if f.componentHandler == nil {
 		f.componentHandler = payrollhandler.NewComponentHandler(
 			f.ComponentService(),
-			f.logger,
 		)
 	}
 	return f.componentHandler
@@ -1325,7 +1424,6 @@ func (f *Factory) GetLoanHandler() *payrollhandler.LoanHandler {
 	if f.loanHandler == nil {
 		f.loanHandler = payrollhandler.NewLoanHandler(
 			f.LoanService(),
-			f.logger,
 		)
 	}
 	return f.loanHandler
@@ -1335,7 +1433,6 @@ func (f *Factory) GetPayslipHandler() *payrollhandler.PayslipHandler {
 	if f.payslipHandler == nil {
 		f.payslipHandler = payrollhandler.NewPayslipHandler(
 			f.PayslipService(),
-			f.logger,
 		)
 	}
 	return f.payslipHandler
@@ -1345,7 +1442,6 @@ func (f *Factory) GetReportingHandler() *payrollhandler.ReportingHandler {
 	if f.reportingHandler == nil {
 		f.reportingHandler = payrollhandler.NewReportingHandler(
 			f.ReportingService(),
-			f.logger,
 		)
 	}
 	return f.reportingHandler
@@ -1355,7 +1451,6 @@ func (f *Factory) GetTaxDeclarationHandler() *payrollhandler.TaxDeclarationHandl
 	if f.taxDeclarationHandler == nil {
 		f.taxDeclarationHandler = payrollhandler.NewTaxDeclarationHandler(
 			f.TaxDeclarationService(),
-			f.logger,
 		)
 	}
 	return f.taxDeclarationHandler
@@ -1389,7 +1484,8 @@ func (f *Factory) GetAttendancePayrollBridge() hrservice.AttendancePayrollBridge
 	return hrservice.NewAttendancePayrollBridge(
 		f.attendanceFactory.SummaryRepository(),
 		f.attendanceFactory.EventRepository(),
-		f.logger,
+		f.GetAuditService(),
+		f.idempotencyStore,
 	)
 }
 
@@ -1399,7 +1495,6 @@ func (f *Factory) HREmployeeRepository() hrpostgres.EmployeeRepository {
 	if f.hrEmployeeRepository == nil {
 		f.hrEmployeeRepository = hrpostgres.NewEmployeeRepository(
 			f.PostgresClient(),
-			f.logger,
 		)
 	}
 	return f.hrEmployeeRepository
@@ -1409,7 +1504,6 @@ func (f *Factory) OrgUnitRepository() hrpostgres.OrgUnitRepository {
 	if f.orgUnitRepository == nil {
 		f.orgUnitRepository = hrpostgres.NewOrgUnitRepository(
 			f.PostgresClient(),
-			f.logger,
 		)
 	}
 	return f.orgUnitRepository
@@ -1419,20 +1513,9 @@ func (f *Factory) LeaveRepository() leaverepo.LeaveRepository {
 	if f.leaveRepository == nil {
 		f.leaveRepository = leaverepo.NewLeaveRepository(
 			f.PostgresClient(),
-			f.logger,
 		)
 	}
 	return f.leaveRepository
-}
-
-func (f *Factory) AuditRepository() audit.AuditRepository {
-	if f.auditRepository == nil {
-		f.auditRepository = audit.NewAuditRepository(
-			f.PostgresClient(),
-			f.logger,
-		)
-	}
-	return f.auditRepository
 }
 
 // ----- Services -----
@@ -1442,22 +1525,24 @@ func (f *Factory) GetEmployeeService() *hrservice.EmployeeService {
 		f.employeeService = hrservice.NewEmployeeService(
 			f.HREmployeeRepository(),
 			f.GetAuditService(),
+			f.idempotencyStore,
 			hrservice.EmployeeServiceConfig{
 				MaxDocumentSizeMB: f.config.HR.Documents.MaxSizeMB,
 				DocumentStorage:   f.DocumentStorage(),
+				EncryptionMgr:     f.EncryptionManager(), // 👈 ADD THIS LINE
 			},
-			f.logger,
 		)
 	}
 	return f.employeeService
 }
-
 func (f *Factory) GetEmployeeQueryService() *hrservice.EmployeeQueryService {
 	if f.employeeQueryService == nil {
 		f.employeeQueryService = hrservice.NewEmployeeQueryService(
 			f.HREmployeeRepository(),
 			f.DocumentStorage(),
-			f.logger,
+			f.GetAuditService(),
+			f.EncryptionManager(), // 👈 ADD THIS LINE (fixes the compiler error)
+
 		)
 	}
 	return f.employeeQueryService
@@ -1468,7 +1553,7 @@ func (f *Factory) GetOrgUnitService() *hrservice.OrgUnitService {
 		f.orgUnitService = hrservice.NewOrgUnitService(
 			f.OrgUnitRepository(),
 			f.GetAuditService(),
-			f.logger,
+			f.idempotencyStore,
 		)
 	}
 	return f.orgUnitService
@@ -1478,7 +1563,7 @@ func (f *Factory) GetOrgUnitQueryService() *hrservice.OrgUnitQueryService {
 	if f.orgUnitQueryService == nil {
 		f.orgUnitQueryService = hrservice.NewOrgUnitQueryService(
 			f.OrgUnitRepository(),
-			f.logger,
+			f.GetAuditService(),
 		)
 	}
 	return f.orgUnitQueryService
@@ -1486,20 +1571,20 @@ func (f *Factory) GetOrgUnitQueryService() *hrservice.OrgUnitQueryService {
 
 func (f *Factory) GetAuditService() *audit.AuditService {
 	if f.auditService == nil {
-		f.auditService = audit.NewAuditService(
-			f.AuditRepository(),
-			f.logger,
-		)
+		f.auditService = audit.NewAuditService(f.outboxRepo, f.PostgresClient(), f.logger)
 	}
 	return f.auditService
 }
-
+func (f *Factory) GetAuditClickHouseRepository() audit.AuditRepository {
+	if f.auditRepository == nil {
+		f.auditRepository = audit.NewAuditRepositoryClickHouse(f.clickhouseClient, f.logger)
+	}
+	return f.auditRepository
+}
 func (f *Factory) GetAuditQueryService() *audit.AuditQueryService {
 	if f.auditQueryService == nil {
-		f.auditQueryService = audit.NewAuditQueryService(
-			f.AuditRepository(),
-			f.logger,
-		)
+		chRepo := f.GetAuditClickHouseRepository()
+		f.auditQueryService = audit.NewAuditQueryService(chRepo, f.logger)
 	}
 	return f.auditQueryService
 }
@@ -1510,7 +1595,8 @@ func (f *Factory) LeavePolicyService() leavesvc.LeavePolicyService {
 	if f.leavePolicyService == nil {
 		f.leavePolicyService = leavesvc.NewLeavePolicyService(
 			f.LeaveRepository(),
-			f.logger,
+			f.idempotencyStore,
+			f.GetAuditService(),
 		)
 	}
 	return f.leavePolicyService
@@ -1520,7 +1606,8 @@ func (f *Factory) LeavePolicyConfigService() leavesvc.LeavePolicyConfigService {
 	if f.leavePolicyConfigService == nil {
 		f.leavePolicyConfigService = leavesvc.NewLeavePolicyConfigService(
 			f.LeaveRepository(),
-			f.logger,
+			f.idempotencyStore,
+			f.GetAuditService(),
 		)
 	}
 	return f.leavePolicyConfigService
@@ -1530,7 +1617,8 @@ func (f *Factory) LeaveAccrualService() leavesvc.LeaveAccrualService {
 	if f.leaveAccrualService == nil {
 		f.leaveAccrualService = leavesvc.NewLeaveAccrualService(
 			f.LeaveRepository(),
-			f.logger,
+			f.idempotencyStore,
+			f.GetAuditService(),
 		)
 	}
 	return f.leaveAccrualService
@@ -1540,7 +1628,8 @@ func (f *Factory) LeaveQueryService() leavesvc.LeaveQueryService {
 	if f.leaveQueryService == nil {
 		f.leaveQueryService = leavesvc.NewLeaveQueryService(
 			f.LeaveRepository(),
-			f.logger,
+			f.HREmployeeRepository(),
+			f.GetAuditService(),
 		)
 	}
 	return f.leaveQueryService
@@ -1550,7 +1639,8 @@ func (f *Factory) LeaveBalanceService() leavesvc.LeaveBalanceService {
 	if f.leaveBalanceService == nil {
 		f.leaveBalanceService = leavesvc.NewLeaveBalanceService(
 			f.LeaveRepository(),
-			f.logger,
+			f.idempotencyStore,
+			f.GetAuditService(),
 		)
 	}
 	return f.leaveBalanceService
@@ -1560,8 +1650,10 @@ func (f *Factory) LeaveRequestService() leavesvc.LeaveRequestService {
 	if f.leaveRequestService == nil {
 		f.leaveRequestService = leavesvc.NewLeaveRequestService(
 			f.LeaveRepository(),
+			f.HREmployeeRepository(),
 			f.LeaveBalanceService(),
-			f.logger,
+			f.idempotencyStore,
+			f.GetAuditService(),
 		)
 	}
 	return f.leaveRequestService
@@ -1571,7 +1663,8 @@ func (f *Factory) GetLeavePolicyResolutionService() leavesvc.LeavePolicyResoluti
 	if f.leavePolicyResolutionService == nil {
 		f.leavePolicyResolutionService = leavesvc.NewLeavePolicyResolutionService(
 			f.LeaveRepository(),
-			f.logger,
+			f.idempotencyStore,
+			f.GetAuditService(),
 		)
 	}
 	return f.leavePolicyResolutionService
@@ -1581,7 +1674,6 @@ func (f *Factory) GetLeavePolicyResolutionHandler() *leavehandler.LeavePolicyRes
 	if f.leavePolicyResolutionHandler == nil {
 		f.leavePolicyResolutionHandler = leavehandler.NewLeavePolicyResolutionHandler(
 			f.GetLeavePolicyResolutionService(),
-			f.logger,
 		)
 	}
 	return f.leavePolicyResolutionHandler
@@ -1593,7 +1685,6 @@ func (f *Factory) LeaveAdminHandler() *leavehandler.LeaveAdminHandler {
 			f.LeavePolicyService(),
 			f.LeavePolicyConfigService(),
 			f.LeaveAccrualService(),
-			f.logger,
 		)
 	}
 	return f.leaveAdminHandler
@@ -1603,7 +1694,6 @@ func (f *Factory) LeaveQueryHandler() *leavehandler.LeaveQueryHandler {
 	if f.leaveQueryHandler == nil {
 		f.leaveQueryHandler = leavehandler.NewLeaveQueryHandler(
 			f.LeaveQueryService(),
-			f.logger,
 		)
 	}
 	return f.leaveQueryHandler
@@ -1615,7 +1705,6 @@ func (f *Factory) LeaveRequestHandler() *leavehandler.LeaveRequestHandler {
 			f.LeaveRequestService(),
 			f.LeaveQueryService(),
 			f.attendanceFactory.SchedulingService(),
-			f.logger,
 		)
 	}
 	return f.leaveRequestHandler
@@ -1630,7 +1719,6 @@ func (f *Factory) initializeDocumentStorage() error {
 	ds, err := hrservice.NewLocalDocumentStorage(
 		basePath,
 		maxSizeMB,
-		f.logger,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to initialize document storage: %w", err)
@@ -1700,51 +1788,7 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 		cancelCtx: cancel,
 		logger:    logger,
 	}
-	if f.config.Elasticsearch.URL != "" && f.esClient != nil {
-		esTopics := []string{
-			"admin-events",
-			"user-events",
-			"security-events",
-			"session-events",
-		}
-		esConsumers := make(map[string]*client.KafkaConsumer)
-		for _, topic := range esTopics {
-			kafkaConsumer, err := client.NewKafkaConsumer(
-				f.config,
-				topic,
-				"es-consumer-group",
-				logger,
-			)
-			if err != nil {
-				logger.Error("failed to create Elasticsearch Kafka consumer",
-					zap.String("topic", topic),
-					zap.Error(err))
-				continue
-			}
-			esConsumers[topic] = kafkaConsumer
-		}
-		if len(esConsumers) > 0 {
-			esConsumer, err := consumer.NewESConsumer(
-				esConsumers,
-				f.esClient.Client,
-			)
-			if err != nil {
-				logger.Error("failed to create Elasticsearch consumer", zap.Error(err))
-			} else {
-				mgr.esConsumer = esConsumer
-				mgr.wg.Add(1)
-				go func() {
-					defer mgr.wg.Done()
-					if err := esConsumer.Start(consumerCtx); err != nil {
-						logger.Error("ES consumer error", zap.Error(err))
-					}
-				}()
-				logger.Info("Elasticsearch multi-topic consumer started for search events",
-					zap.Int("topic_count", len(esConsumers)),
-					zap.Strings("topics", esTopics))
-			}
-		}
-	}
+
 	if f.config.Clickhouse.URL != "" && f.clickhouseClient != nil {
 		chTopics := []string{
 			"device-events",
@@ -1789,7 +1833,7 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 		}
 	}
 	logger.Info("Kafka logging system initialized with optimized event distribution",
-		zap.Bool("es_enabled", mgr.esConsumer != nil),
+		zap.Bool("es_enabled", false),
 		zap.Bool("ch_enabled", mgr.chConsumer != nil),
 	)
 	return mgr, nil
@@ -1951,13 +1995,18 @@ func (f *Factory) AdminRepository() postgres.AdminRepository {
 	return f.adminRepository
 }
 
+// ============================================================
+// ✅ FIX #1 — NewJWTService now takes *client.PostgresClient first
+// ============================================================
 func (f *Factory) GetJWTService() *service.JWTService {
 	if f.jwtService == nil {
 		f.jwtService = service.NewJWTService(
+			f.PostgresClient(), // ✅ FIX #1
 			f.Config(),
 			f.CompanyRepository(),
 			f.AdminRepository(),
 			f.GetAuditService(),
+			f.LocationRepository(),
 		)
 	}
 	return f.jwtService
@@ -1975,6 +2024,7 @@ func (f *Factory) GetRBACInitService() *service.RBACInitService {
 func (f *Factory) ServiceFactory() *service.ServiceFactory {
 	if f.serviceFactory == nil {
 		f.serviceFactory = service.NewServiceFactory(
+			f.PostgresClient(), // ← new first arg
 			f.UserRepository(),
 			f.Hasher(),
 			f.EncryptionManager(),
@@ -1995,14 +2045,11 @@ func (f *Factory) GetUserService() *service.UserService {
 			distCache = service.NewDistributedCache(f.redisClient.Client(), f.logger)
 		}
 		f.userService = service.NewUserServiceWithCache(
+			f.PostgresClient(), // ← new first arg
 			repo, hasher, encMgr, distCache,
 			f.GetAuditService(),
 			f.idempotencyStore,
 		)
-		logProducer := f.GetLogProducerService()
-		if logProducer != nil {
-			f.userService.SetLogProducerService(logProducer)
-		}
 	})
 	return f.userService
 }
@@ -2039,6 +2086,7 @@ func (f *Factory) GetOTPService() *service.OTPService {
 			f.idempotencyStore,
 			phoneValidator,
 			f.AdminDeviceTrustRepository(),
+			f.GetAdminDeviceService(),
 			f.smsManager,
 		)
 
@@ -2049,11 +2097,18 @@ func (f *Factory) GetOTPService() *service.OTPService {
 	return f.otpService
 }
 
+// ============================================================
+// ✅ FIX #2 — NewAdminService now takes *client.PostgresClient
+//
+//	right after CompanyRepository
+//
+// ============================================================
 func (f *Factory) GetAdminService() *service.AdminService {
 	if f.adminService == nil {
 		f.adminService = service.NewAdminService(
 			f.AdminRepository(),
 			f.CompanyRepository(),
+			f.PostgresClient(), // ✅ FIX #2
 			f.GetSessionService(),
 			f.GetOTPService(),
 			f.GetMPINService(),
@@ -2062,7 +2117,6 @@ func (f *Factory) GetAdminService() *service.AdminService {
 			f.EncryptionManager(),
 			f.GetAuditService(),
 			f.idempotencyStore,
-			f.GetLogProducerService(),
 		)
 	}
 	return f.adminService
@@ -2084,6 +2138,7 @@ func (f *Factory) GetMPINService() *service.MPINService {
 		}
 		logProducer := f.GetLogProducerService()
 		f.mpinService = service.NewMPINService(
+			f.PostgresClient(), // ← new first arg
 			mpinRepo,
 			userRepo,
 			deviceTrustRepo,
@@ -2102,20 +2157,26 @@ func (f *Factory) GetMPINService() *service.MPINService {
 	return f.mpinService
 }
 
+// ============================================================
+// ✅ FIX #3 — NewSessionService now takes *client.PostgresClient
+//
+//	as the final argument
+//
+// ============================================================
 func (f *Factory) GetSessionService() *service.SessionService {
 	if f.sessionService == nil {
 		sessionRepo := f.SessionRepository()
 		cfg := f.Config()
 		jwtService := f.GetJWTService()
-		logProducer := f.GetLogProducerService()
 		companyRepo := f.CompanyRepository()
 		f.sessionService = service.NewSessionService(
 			sessionRepo,
 			cfg,
 			jwtService,
-			logProducer,
 			companyRepo,
 			f.GetAuditService(),
+			f.LocationRepository(),
+			f.PostgresClient(), // ✅ FIX #3
 		)
 	}
 	return f.sessionService
@@ -2156,19 +2217,34 @@ func (f *Factory) GetDeviceService() *service.DeviceService {
 	return f.deviceService
 }
 
+// ============================================================
+// ✅ FIX #4 — NewCompanyService now takes *client.PostgresClient
+//
+//	as the first argument
+//
+// ============================================================
 func (f *Factory) GetCompanyService() *service.CompanyService {
 	if f.companyService == nil {
 		f.companyService = service.NewCompanyService(
+			f.PostgresClient(),
 			f.CompanyRepository(),
+			f.LocationRepository(),
+			f.HREmployeeRepository(), // 👈 ADD THIS LINE
+			f.GetEmployeeService(),
 			f.GetUserService(),
+			f.SubscriptionPlanService(),
+			f.PaymentService(),
+			f.InvoiceService(),
+			f.ReminderService(),
+			f.LifecycleService(),
 			f.GetAuditService(),
 			f.idempotencyStore,
 			*f.config,
+			f.RedisClient().Client(),
 		)
 	}
 	return f.companyService
 }
-
 func (f *Factory) GetAdminDeviceService() *service.AdminDeviceService {
 	if f.adminDeviceService == nil {
 		deviceRepo := f.AdminDeviceRepository()
@@ -2298,6 +2374,7 @@ func (f *Factory) GetPairingService() *service.PairingService {
 			f.config,
 			f.GetAuditService(),
 			f.idempotencyStore,
+			f.GetCompanyService(),
 		)
 	}
 	return f.pairingService
@@ -2413,26 +2490,19 @@ func (f *Factory) initializeManagers() {
 
 // ==================== STORAGE GETTER ====================
 
-// Storage returns the storage instance (local disk for now).
-// Storage returns the storage instance (local disk for now).
 func (f *Factory) Storage() storage.Storage {
 	if f.storage == nil {
 		basePath := "/data"
 
-		// Use the configured public base URL (e.g., ngrok) if set.
-		// This should be the root API base, e.g., "https://domain.com/api/v1"
 		baseURL := f.config.Server.PublicBaseURL
 		if baseURL == "" {
-			// Fallback for local development.
 			baseURL = fmt.Sprintf("http://localhost:%d/api/v1", f.config.Server.Port)
 			if f.config.Server.EnableTLS {
 				baseURL = fmt.Sprintf("https://localhost:%d/api/v1", f.config.Server.Port)
 			}
 		} else {
-			// Strip any trailing "/admin" (or "/admin/") because avatar routes are NOT under /admin.
 			baseURL = strings.TrimSuffix(baseURL, "/admin")
 			baseURL = strings.TrimSuffix(baseURL, "/admin/")
-			// Ensure it ends with /api/v1 (or at least not with a trailing slash)
 			baseURL = strings.TrimSuffix(baseURL, "/")
 		}
 
@@ -2498,7 +2568,7 @@ func (f *Factory) AvatarService() avatarSvc.AvatarService {
 			f.PostgresClient(),
 			f.idempotencyStore,
 			f.GetAuditService(),
-			f.config, // <-- ADD THIS
+			f.config,
 			f.logger,
 		)
 	}
@@ -2510,7 +2580,7 @@ func (f *Factory) AvatarHandler() *avatarHandler.AvatarHandler {
 		f.avatarHandler = avatarHandler.NewAvatarHandler(
 			f.AvatarService(),
 			f.Storage(),
-			f.config, // <-- ADD THIS
+			f.config,
 			f.logger,
 		)
 	}
@@ -2519,7 +2589,231 @@ func (f *Factory) AvatarHandler() *avatarHandler.AvatarHandler {
 
 // ==================== END AVATAR GETTERS ====================
 
-// InitializeHandlers – updated to include both KYC and avatar handlers
+// 🆕 LOCATION GETTERS ========================================
+
+// LocationRepository returns the location repository.
+func (f *Factory) LocationRepository() postgres.LocationRepository {
+	if f.locationRepo == nil {
+		f.locationRepo = postgres.NewLocationRepository(f.PostgresClient())
+	}
+	return f.locationRepo
+}
+
+// ============================================================
+// ✅ FIX #5 — NewLocationService now takes *client.PostgresClient
+//
+//	as the first argument
+//
+// ============================================================
+func (f *Factory) LocationService() *service.LocationService {
+	if f.locationService == nil {
+		cfg := service.DefaultLocationConfig()
+		f.locationService = service.NewLocationService(
+			f.PostgresClient(), // ✅ FIX #5
+			f.LocationRepository(),
+			f.CompanyRepository(),
+			f.GetAuditService(),
+			f.idempotencyStore,
+			&cfg,
+			f.RedisClient().Client(),
+		)
+	}
+	return f.locationService
+}
+
+// LocationHandler returns the location HTTP handler.
+func (f *Factory) LocationHandler() *locationhandler.LocationHandler {
+	if f.locationHandler == nil {
+		f.locationHandler = locationhandler.NewLocationHandler(
+			f.LocationService(),
+		)
+	}
+	return f.locationHandler
+}
+
+// ============================================================
+
+// 🆕 SUBSCRIPTION GETTERS =====================================
+
+// SubscriptionPlanRepository returns the subscription plan repository.
+func (f *Factory) SubscriptionPlanRepository() postgres.SubscriptionPlanRepository {
+	if f.subscriptionPlanRepo == nil {
+		f.subscriptionPlanRepo = postgres.NewSubscriptionPlanRepository(f.PostgresClient())
+	}
+	return f.subscriptionPlanRepo
+}
+
+// CompanyPaymentRepository returns the company payment repository.
+func (f *Factory) CompanyPaymentRepository() postgres.CompanyPaymentRepository {
+	if f.companyPaymentRepo == nil {
+		f.companyPaymentRepo = postgres.NewCompanyPaymentRepository(f.PostgresClient())
+	}
+	return f.companyPaymentRepo
+}
+
+// SubscriptionInvoiceRepository returns the subscription invoice repository.
+func (f *Factory) SubscriptionInvoiceRepository() postgres.SubscriptionInvoiceRepository {
+	if f.subscriptionInvoiceRepo == nil {
+		f.subscriptionInvoiceRepo = postgres.NewSubscriptionInvoiceRepository(f.PostgresClient())
+	}
+	return f.subscriptionInvoiceRepo
+}
+
+// SubscriptionInvoiceItemRepository returns the invoice item repository.
+func (f *Factory) SubscriptionInvoiceItemRepository() postgres.SubscriptionInvoiceItemRepository {
+	if f.subscriptionInvoiceItemRepo == nil {
+		f.subscriptionInvoiceItemRepo = postgres.NewSubscriptionInvoiceItemRepository(f.PostgresClient())
+	}
+	return f.subscriptionInvoiceItemRepo
+}
+
+// SubscriptionReminderRepository returns the reminder repository.
+func (f *Factory) SubscriptionReminderRepository() postgres.SubscriptionReminderRepository {
+	if f.subscriptionReminderRepo == nil {
+		f.subscriptionReminderRepo = postgres.NewSubscriptionReminderRepository(f.PostgresClient())
+	}
+	return f.subscriptionReminderRepo
+}
+
+// SubscriptionPlanService returns the subscription plan service.
+func (f *Factory) SubscriptionPlanService() *service.SubscriptionPlanService {
+	if f.subscriptionPlanService == nil {
+		f.subscriptionPlanService = service.NewSubscriptionPlanService(
+			f.SubscriptionPlanRepository(),
+			f.GetAuditService(),
+			f.idempotencyStore,
+			nil, // use defaults
+		)
+	}
+	return f.subscriptionPlanService
+}
+
+// InvoiceService returns the subscription invoice service.
+func (f *Factory) InvoiceService() *service.SubscriptionInvoiceService {
+	if f.invoiceService == nil {
+		cfg := service.DefaultInvoiceConfig()
+		f.invoiceService = service.NewSubscriptionInvoiceService(
+			f.SubscriptionInvoiceRepository(),
+			f.SubscriptionInvoiceItemRepository(),
+			f.CompanyRepository(),
+			f.GetAuditService(),
+			f.idempotencyStore,
+			&cfg,
+		)
+	}
+	return f.invoiceService
+}
+
+// PaymentService returns the payment service.
+func (f *Factory) PaymentService() *service.PaymentService {
+	if f.paymentService == nil {
+		cfg := service.DefaultPaymentConfig()
+		f.paymentService = service.NewPaymentService(
+			f.CompanyPaymentRepository(),
+			f.CompanyRepository(),
+			f.SubscriptionPlanRepository(),
+			f.InvoiceService(),
+			f.GetAuditService(),
+			f.idempotencyStore,
+			f.PostgresClient(),
+			&cfg,
+		)
+	}
+	return f.paymentService
+}
+
+// ReminderService returns the reminder service.
+func (f *Factory) ReminderService() *service.ReminderService {
+	if f.reminderService == nil {
+		cfg := service.DefaultReminderConfig()
+		var notificationSender service.NotificationSender
+		f.reminderService = service.NewReminderService(
+			f.SubscriptionReminderRepository(),
+			f.CompanyRepository(),
+			f.GetUserService(),
+			notificationSender,
+			f.GetAuditService(),
+			f.idempotencyStore,
+			f.PostgresClient(),
+			&cfg,
+		)
+	}
+	return f.reminderService
+}
+
+// LifecycleService returns the subscription lifecycle service.
+func (f *Factory) LifecycleService() *service.SubscriptionLifecycleService {
+	if f.lifecycleService == nil {
+		cfg := service.DefaultLifecycleConfig()
+		f.lifecycleService = service.NewSubscriptionLifecycleService(
+			f.PostgresClient(),
+			f.CompanyRepository(),
+			f.GetAuditService(),
+			f.idempotencyStore,
+			&cfg,
+		)
+	}
+	return f.lifecycleService
+}
+
+// SubscriptionPlanHandler returns the subscription plan HTTP handler.
+func (f *Factory) SubscriptionPlanHandler() *handler.SubscriptionPlanHandler {
+	if f.planHandler == nil {
+		f.planHandler = handler.NewSubscriptionPlanHandler(
+			f.SubscriptionPlanService(),
+			f.idempotencyStore,
+		)
+	}
+	return f.planHandler
+}
+
+// PaymentHandler returns the payment HTTP handler.
+func (f *Factory) PaymentHandler() *handler.PaymentHandler {
+	if f.paymentHandler == nil {
+		f.paymentHandler = handler.NewPaymentHandler(
+			f.PaymentService(),
+			f.idempotencyStore,
+		)
+	}
+	return f.paymentHandler
+}
+
+// InvoiceHandler returns the invoice HTTP handler.
+func (f *Factory) InvoiceHandler() *handler.InvoiceHandler {
+	if f.invoiceHandler == nil {
+		f.invoiceHandler = handler.NewInvoiceHandler(
+			f.InvoiceService(),
+			f.idempotencyStore,
+		)
+	}
+	return f.invoiceHandler
+}
+
+// ReminderHandler returns the reminder HTTP handler.
+func (f *Factory) ReminderHandler() *handler.ReminderHandler {
+	if f.reminderHandler == nil {
+		f.reminderHandler = handler.NewReminderHandler(
+			f.ReminderService(),
+			f.idempotencyStore,
+		)
+	}
+	return f.reminderHandler
+}
+
+// LifecycleHandler returns the lifecycle HTTP handler.
+func (f *Factory) LifecycleHandler() *handler.SubscriptionLifecycleHandler {
+	if f.lifecycleHandler == nil {
+		f.lifecycleHandler = handler.NewSubscriptionLifecycleHandler(
+			f.LifecycleService(),
+			f.idempotencyStore,
+		)
+	}
+	return f.lifecycleHandler
+}
+
+// ============================================================
+
+// InitializeHandlers – updated to include KYC, avatar, location and subscription handlers.
 func (f *Factory) InitializeHandlers() error {
 	logger := f.logger
 
@@ -2549,7 +2843,12 @@ func (f *Factory) InitializeHandlers() error {
 		sessionService,
 		jwtService,
 	)
-	rbacHandler := handler.NewRBACHandler(companyService)
+	rbacHandler := handler.NewRBACHandler(
+		companyService,
+		userService,
+		f.GetAuditService(),
+		f.idempotencyStore,
+	)
 	authHandler := handler.NewAuthHandler(
 		userOTPService,
 		mpinService,
@@ -2564,7 +2863,6 @@ func (f *Factory) InitializeHandlers() error {
 	pairingHandler := f.GetPairingHandler()
 	wsHandler := f.GetWebSocketHandler()
 
-	// Payload handlers (payroll, academics, accounting, inventory, etc.)
 	compensationHandler := f.GetCompensationHandler()
 	payrollAdjustmentHandler := f.GetPayrollAdjustmentHandler()
 	payrollLockHandler := f.GetPayrollLockHandler()
@@ -2619,8 +2917,8 @@ func (f *Factory) InitializeHandlers() error {
 		AccountingSettingsHandler: f.accountingInfra.AccountingSettingsHandler(),
 		AnalyticsHandler:          f.accountingInfra.AnalyticsHandler(),
 		PeriodLockHandler:         f.accountingInfra.PeriodLockHandler(),
+		CostCenterHandler:         f.accountingInfra.CostCenterHandler(), // 👈 ADD
 	}
-
 	inventoryHandlers := f.GetInventoryHandlers()
 
 	salesHandlers := &sales.SalesHandlers{
@@ -2670,7 +2968,6 @@ func (f *Factory) InitializeHandlers() error {
 	attendanceReportHandler := f.attendanceFactory.ReportHandler()
 	deviceAuthMiddleware := f.attendanceFactory.DeviceAuthMiddleware()
 
-	// HR handlers
 	leavePolicyResolutionHandler := f.GetLeavePolicyResolutionHandler()
 	orgUnitHandler := f.GetOrgUnitHandler()
 	employeeHandler := f.GetHREmployeeHandler()
@@ -2678,13 +2975,16 @@ func (f *Factory) InitializeHandlers() error {
 	leaveRequestHandler := f.LeaveRequestHandler()
 	leaveQueryHandler := f.LeaveQueryHandler()
 
-	// ==================== KYC HANDLER ====================
 	kycHandler := f.KYCDocumentHandler()
-
-	// ==================== AVATAR HANDLER ====================
 	avatarHandler := f.AvatarHandler()
+	locationHandler := f.LocationHandler()
 
-	// Build the router – now includes both KYC and avatar
+	planHandler := f.SubscriptionPlanHandler()
+	paymentHandler := f.PaymentHandler()
+	invoiceHandler := f.InvoiceHandler()
+	reminderHandler := f.ReminderHandler()
+	lifecycleHandler := f.LifecycleHandler()
+
 	f.router = handler.NewRouter(
 		otpHandler,
 		adminHandler,
@@ -2724,7 +3024,13 @@ func (f *Factory) InitializeHandlers() error {
 		salesHandlers,
 		subscriptionHandlers,
 		kycHandler,
-		avatarHandler, // <-- NEW
+		avatarHandler,
+		locationHandler,
+		planHandler,
+		paymentHandler,
+		invoiceHandler,
+		reminderHandler,
+		lifecycleHandler,
 		attendanceIngestHandler,
 		attendanceQueryHandler,
 		attendanceExemptionHandler,
@@ -2744,9 +3050,12 @@ func (f *Factory) InitializeHandlers() error {
 		attendanceAdminHandler,
 		f.academicsInfra.SessionGenerationHandler(),
 		deviceAuthMiddleware,
+		f.AnalyticsHandler(),
+		f.LocationService(),
+		companyService,
 	)
 
-	logger.Info("Handlers and router initialized with JWT, bitmask, QR web login, attendance, leave, payroll, biometric, accounting, inventory, subscription, sales, KYC, and avatar systems")
+	logger.Info("Handlers and router initialized with JWT, bitmask, QR web login, attendance, leave, payroll, biometric, accounting, inventory, subscription, sales, KYC, avatar, location, and subscription lifecycle systems")
 	return nil
 }
 
@@ -2840,8 +3149,6 @@ func (f *Factory) PDFGenerator() payrollsvc.PDFGenerator {
 	return f.pdfGenerator
 }
 
-// ----- HR handlers (non-attendance) -----
-
 func (f *Factory) GetHRAuditHandler() *audit.AuditHandler {
 	if f.hrAuditHandler == nil {
 		f.hrAuditHandler = audit.NewAuditHandler(
@@ -2857,6 +3164,7 @@ func (f *Factory) GetHREmployeeHandler() *hrhandler.EmployeeHandler {
 		f.hrEmployeeHandler = hrhandler.NewEmployeeHandler(
 			f.GetEmployeeService(),
 			f.GetEmployeeQueryService(),
+			f.GetCompanyService(), // 👈 ADD — CompanyService
 			f.GetAuditService(),
 			f.logger,
 			f.config.HR.Documents.MaxSizeMB,
@@ -2864,7 +3172,6 @@ func (f *Factory) GetHREmployeeHandler() *hrhandler.EmployeeHandler {
 	}
 	return f.hrEmployeeHandler
 }
-
 func (f *Factory) GetOrgUnitHandler() *hrhandler.OrgUnitHandler {
 	if f.orgUnitHandler == nil {
 		f.orgUnitHandler = hrhandler.NewOrgUnitHandler(

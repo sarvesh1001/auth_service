@@ -39,7 +39,7 @@ type createJournalRequest struct {
 	Description *string              `json:"description,omitempty"`
 	Lines       []journalLineRequest `json:"lines"`
 	SourceType  *string              `json:"source_type,omitempty"`
-	SourceID    *string              `json:"source_id,omitempty"` // ✅ new
+	SourceID    *string              `json:"source_id,omitempty"`
 }
 
 type journalLineRequest struct {
@@ -47,6 +47,11 @@ type journalLineRequest struct {
 	DebitAmount  decimal.Decimal `json:"debit_amount"`
 	CreditAmount decimal.Decimal `json:"credit_amount"`
 	Description  *string         `json:"description,omitempty"`
+
+	// 👇 ADDED — accounting dimensions. Optional; when set they get
+	// snapshotted onto the resulting ledger_entries row at post time.
+	CostCenterID *uuid.UUID `json:"cost_center_id,omitempty"`
+	DepartmentID *uuid.UUID `json:"department_id,omitempty"`
 }
 
 type updateJournalRequest struct {
@@ -168,6 +173,8 @@ func (h *JournalHandler) Create(w http.ResponseWriter, r *http.Request) {
 			DebitAmount:  l.DebitAmount,
 			CreditAmount: l.CreditAmount,
 			Description:  l.Description,
+			CostCenterID: l.CostCenterID,
+			DepartmentID: l.DepartmentID,
 		}
 	}
 
@@ -256,6 +263,8 @@ func (h *JournalHandler) Update(w http.ResponseWriter, r *http.Request) {
 				DebitAmount:  l.DebitAmount,
 				CreditAmount: l.CreditAmount,
 				Description:  l.Description,
+				CostCenterID: l.CostCenterID,
+				DepartmentID: l.DepartmentID,
 			}
 		}
 	}

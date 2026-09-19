@@ -1,37 +1,37 @@
 package handler
 
 import (
-	"auth-service/internal/hr/leave/models"
-	"auth-service/internal/hr/leave/service"
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
-	"go.uber.org/zap"
+
+	"auth-service/internal/hr/leave/models"
+	"auth-service/internal/hr/leave/service"
 )
 
 type LeaveAdminHandler struct {
 	policyService       service.LeavePolicyService
-	policyConfigService service.LeavePolicyConfigService // ✅ ADD
+	policyConfigService service.LeavePolicyConfigService
 	accrualService      service.LeaveAccrualService
-	logger              *zap.Logger
 }
 
 func NewLeaveAdminHandler(
 	policyService service.LeavePolicyService,
-	policyConfigService service.LeavePolicyConfigService, // ✅ ADD
+	policyConfigService service.LeavePolicyConfigService,
 	accrualService service.LeaveAccrualService,
-	logger *zap.Logger,
 ) *LeaveAdminHandler {
 	return &LeaveAdminHandler{
 		policyService:       policyService,
 		policyConfigService: policyConfigService,
 		accrualService:      accrualService,
-		logger:              logger,
 	}
 }
+
+// ---------- request/response DTOs ----------
 
 type CreateLeaveTypeRequest struct {
 	Code              string `json:"code"`
@@ -62,8 +62,64 @@ type ProcessAccrualsRequest struct {
 	AccrualDate time.Time `json:"accrual_date"`
 }
 
+type CreateLeavePolicyRequest struct {
+	PolicyName              string     `json:"policy_name"`
+	AppliesToType           string     `json:"applies_to_type"`
+	AppliesToPositionID     *uuid.UUID `json:"applies_to_position_id,omitempty"`
+	AppliesToWorkCenterCode *string    `json:"applies_to_work_center_code,omitempty"`
+	Priority                int        `json:"priority"`
+	EffectiveFrom           time.Time  `json:"effective_from"`
+	EffectiveTo             *time.Time `json:"effective_to,omitempty"`
+}
+
+type AddPolicyRuleRequest struct {
+	LeaveTypeID       uuid.UUID `json:"leave_type_id"`
+	TotalDays         int       `json:"total_days"`
+	AccrualMethod     string    `json:"accrual_method"`
+	CarryForwardLimit *int      `json:"carry_forward_limit,omitempty"`
+}
+
+type UpdateLeavePolicyRequest struct {
+	PolicyName              *string    `json:"policy_name,omitempty"`
+	AppliesToType           *string    `json:"applies_to_type,omitempty"`
+	AppliesToPositionID     *uuid.UUID `json:"applies_to_position_id,omitempty"`
+	AppliesToWorkCenterCode *string    `json:"applies_to_work_center_code,omitempty"`
+	Priority                *int       `json:"priority,omitempty"`
+	EffectiveFrom           *time.Time `json:"effective_from,omitempty"`
+	EffectiveTo             *time.Time `json:"effective_to,omitempty"`
+	IsActive                *bool      `json:"is_active,omitempty"`
+}
+
+type UpdatePolicyRuleRequest struct {
+	TotalDays         *int    `json:"total_days,omitempty"`
+	AccrualMethod     *string `json:"accrual_method,omitempty"`
+	CarryForwardLimit *int    `json:"carry_forward_limit,omitempty"`
+}
+
+// ---------- helpers ----------
+
+func (h *LeaveAdminHandler) getActor(ctx context.Context) (actorType string, actorID uuid.UUID, err error) {
+	actorID, err = getUserIDFromContext(ctx)
+	if err != nil {
+		return "", uuid.Nil, err
+	}
+	actorType = "admin"
+	return actorType, actorID, nil
+}
+
+func (h *LeaveAdminHandler) getMetadata(ctx context.Context) map[string]interface{} {
+	meta := make(map[string]interface{})
+	if ip, ok := ctx.Value("ip_address").(string); ok {
+		meta["ip_address"] = ip
+	}
+	return meta
+}
+
+// ---------- leave type CRUD ----------
+
 func (h *LeaveAdminHandler) CreateLeaveType(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -76,24 +132,21 @@ func (h *LeaveAdminHandler) CreateLeaveType(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	actorType, actorID, err := h.getActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	metadata := h.getMetadata(ctx)
+
 	var req CreateLeaveTypeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if req.Code == "" {
-		h.respondWithError(w, http.StatusBadRequest, "leave type code is required")
-		return
-	}
-
-	if req.Name == "" {
-		h.respondWithError(w, http.StatusBadRequest, "leave type name is required")
-		return
-	}
-
-	if req.AccrualMethod == "" {
-		h.respondWithError(w, http.StatusBadRequest, "accrual method is required")
+	if req.Code == "" || req.Name == "" || req.AccrualMethod == "" {
+		h.respondWithError(w, http.StatusBadRequest, "code, name, and accrual method are required")
 		return
 	}
 
@@ -107,13 +160,9 @@ func (h *LeaveAdminHandler) CreateLeaveType(w http.ResponseWriter, r *http.Reque
 		CarryForwardLimit: req.CarryForwardLimit,
 	}
 
-	leaveType, err := h.policyService.CreateLeaveType(ctx, companyID, createReq)
+	leaveType, err := h.policyService.CreateLeaveType(ctx, companyID, createReq, actorType, actorID, metadata)
 	if err != nil {
-		h.logger.Error("Failed to create leave type",
-			zap.String("company_id", companyID.String()),
-			zap.String("code", req.Code),
-			zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, "failed to create leave type")
+		h.respondWithError(w, http.StatusInternalServerError, "failed to create leave type: "+err.Error())
 		return
 	}
 
@@ -125,7 +174,8 @@ func (h *LeaveAdminHandler) CreateLeaveType(w http.ResponseWriter, r *http.Reque
 }
 
 func (h *LeaveAdminHandler) UpdateLeaveType(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -145,6 +195,13 @@ func (h *LeaveAdminHandler) UpdateLeaveType(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	actorType, actorID, err := h.getActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	metadata := h.getMetadata(ctx)
+
 	var req UpdateLeaveTypeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
@@ -159,11 +216,8 @@ func (h *LeaveAdminHandler) UpdateLeaveType(w http.ResponseWriter, r *http.Reque
 		CarryForwardLimit: req.CarryForwardLimit,
 	}
 
-	if err := h.policyService.UpdateLeaveType(ctx, leaveTypeID, update); err != nil {
-		h.logger.Error("Failed to update leave type",
-			zap.String("leave_type_id", leaveTypeID.String()),
-			zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, "failed to update leave type")
+	if err := h.policyService.UpdateLeaveType(ctx, leaveTypeID, update, actorType, actorID, metadata); err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, "failed to update leave type: "+err.Error())
 		return
 	}
 
@@ -174,7 +228,8 @@ func (h *LeaveAdminHandler) UpdateLeaveType(w http.ResponseWriter, r *http.Reque
 }
 
 func (h *LeaveAdminHandler) GetLeaveType(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -194,13 +249,9 @@ func (h *LeaveAdminHandler) GetLeaveType(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Get all leave types and filter by ID
 	leaveTypes, err := h.policyService.GetLeaveTypesByCompany(ctx, companyID)
 	if err != nil {
-		h.logger.Error("Failed to get leave types",
-			zap.String("company_id", companyID.String()),
-			zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve leave types")
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve leave types: "+err.Error())
 		return
 	}
 
@@ -224,7 +275,8 @@ func (h *LeaveAdminHandler) GetLeaveType(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *LeaveAdminHandler) ListLeaveTypes(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -239,10 +291,7 @@ func (h *LeaveAdminHandler) ListLeaveTypes(w http.ResponseWriter, r *http.Reques
 
 	leaveTypes, err := h.policyService.GetLeaveTypesByCompany(ctx, companyID)
 	if err != nil {
-		h.logger.Error("Failed to list leave types",
-			zap.String("company_id", companyID.String()),
-			zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, "failed to list leave types")
+		h.respondWithError(w, http.StatusInternalServerError, "failed to list leave types: "+err.Error())
 		return
 	}
 
@@ -258,7 +307,8 @@ func (h *LeaveAdminHandler) ListLeaveTypes(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *LeaveAdminHandler) DeleteLeaveType(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -278,14 +328,18 @@ func (h *LeaveAdminHandler) DeleteLeaveType(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if err := h.policyService.DeleteLeaveType(ctx, leaveTypeID); err != nil {
-		h.logger.Error("Failed to delete leave type",
-			zap.String("leave_type_id", leaveTypeID.String()),
-			zap.Error(err))
+	actorType, actorID, err := h.getActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	metadata := h.getMetadata(ctx)
+
+	if err := h.policyService.DeleteLeaveType(ctx, leaveTypeID, actorType, actorID, metadata); err != nil {
 		if err.Error() == "cannot delete leave type: it is being used in existing entitlements" {
 			h.respondWithError(w, http.StatusBadRequest, err.Error())
 		} else {
-			h.respondWithError(w, http.StatusInternalServerError, "failed to delete leave type")
+			h.respondWithError(w, http.StatusInternalServerError, "failed to delete leave type: "+err.Error())
 		}
 		return
 	}
@@ -296,8 +350,11 @@ func (h *LeaveAdminHandler) DeleteLeaveType(w http.ResponseWriter, r *http.Reque
 	})
 }
 
+// ---------- entitlements ----------
+
 func (h *LeaveAdminHandler) CreateEntitlement(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -310,29 +367,21 @@ func (h *LeaveAdminHandler) CreateEntitlement(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	actorType, actorID, err := h.getActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	metadata := h.getMetadata(ctx)
+
 	var req CreateEntitlementRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if req.UserID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "user ID is required")
-		return
-	}
-
-	if req.LeaveTypeID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "leave type ID is required")
-		return
-	}
-
-	if req.TotalDays <= 0 {
-		h.respondWithError(w, http.StatusBadRequest, "total days must be greater than 0")
-		return
-	}
-
-	if req.EffectiveFrom.IsZero() {
-		h.respondWithError(w, http.StatusBadRequest, "effective from date is required")
+	if req.UserID == uuid.Nil || req.LeaveTypeID == uuid.Nil || req.TotalDays <= 0 || req.EffectiveFrom.IsZero() {
+		h.respondWithError(w, http.StatusBadRequest, "missing or invalid fields")
 		return
 	}
 
@@ -345,13 +394,9 @@ func (h *LeaveAdminHandler) CreateEntitlement(w http.ResponseWriter, r *http.Req
 		EffectiveTo:   req.EffectiveTo,
 	}
 
-	entitlement, err := h.policyService.AssignEntitlementToUser(ctx, entitlementReq)
+	entitlement, err := h.policyService.AssignEntitlementToUser(ctx, entitlementReq, actorType, actorID, metadata)
 	if err != nil {
-		h.logger.Error("Failed to create leave entitlement",
-			zap.String("user_id", req.UserID.String()),
-			zap.String("leave_type_id", req.LeaveTypeID.String()),
-			zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, "failed to create entitlement")
+		h.respondWithError(w, http.StatusInternalServerError, "failed to create entitlement: "+err.Error())
 		return
 	}
 
@@ -362,8 +407,10 @@ func (h *LeaveAdminHandler) CreateEntitlement(w http.ResponseWriter, r *http.Req
 	})
 }
 
+// ---------- accruals ----------
+
 func (h *LeaveAdminHandler) ProcessMonthlyAccruals(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -377,33 +424,23 @@ func (h *LeaveAdminHandler) ProcessMonthlyAccruals(w http.ResponseWriter, r *htt
 		return
 	}
 
-	var req ProcessAccrualsRequest
+	actorType, actorID, err := h.getActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	metadata := h.getMetadata(ctx)
 
-	// Try decoding body
+	var req ProcessAccrualsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.AccrualDate.IsZero() {
-		// If no body or empty date → use current month
-		now := time.Now().UTC()
-		req.AccrualDate = now
+		req.AccrualDate = time.Now().UTC()
 	}
 
-	// ✅ ENTERPRISE FIX: Normalize to first day of month UTC
-	normalized := time.Date(
-		req.AccrualDate.Year(),
-		req.AccrualDate.Month(),
-		1,
-		0, 0, 0, 0,
-		time.UTC,
-	)
+	normalized := time.Date(req.AccrualDate.Year(), req.AccrualDate.Month(), 1, 0, 0, 0, 0, time.UTC)
 
-	processed, err := h.accrualService.AccrueMonthlyLeave(ctx, companyID, normalized)
+	processed, err := h.accrualService.AccrueMonthlyLeave(ctx, companyID, normalized, actorType, actorID, metadata)
 	if err != nil {
-		h.logger.Error("Failed to process monthly accruals",
-			zap.String("company_id", companyID.String()),
-			zap.Time("accrual_date", normalized),
-			zap.Error(err),
-		)
-
-		h.respondWithError(w, http.StatusInternalServerError, "failed to process accruals")
+		h.respondWithError(w, http.StatusInternalServerError, "failed to process accruals: "+err.Error())
 		return
 	}
 
@@ -419,7 +456,8 @@ func (h *LeaveAdminHandler) ProcessMonthlyAccruals(w http.ResponseWriter, r *htt
 }
 
 func (h *LeaveAdminHandler) GetAccrualsByDate(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -446,11 +484,7 @@ func (h *LeaveAdminHandler) GetAccrualsByDate(w http.ResponseWriter, r *http.Req
 
 	accruals, err := h.accrualService.GetAccrualsByDate(ctx, companyID, date)
 	if err != nil {
-		h.logger.Error("Failed to get accruals by date",
-			zap.String("company_id", companyID.String()),
-			zap.Time("date", date),
-			zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve accruals")
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve accruals: "+err.Error())
 		return
 	}
 
@@ -465,7 +499,8 @@ func (h *LeaveAdminHandler) GetAccrualsByDate(w http.ResponseWriter, r *http.Req
 }
 
 func (h *LeaveAdminHandler) RecalculateEntitlement(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -485,12 +520,16 @@ func (h *LeaveAdminHandler) RecalculateEntitlement(w http.ResponseWriter, r *htt
 		return
 	}
 
-	balance, err := h.accrualService.RecalculateEntitlement(ctx, entitlementID)
+	actorType, actorID, err := h.getActor(ctx)
 	if err != nil {
-		h.logger.Error("Failed to recalculate entitlement",
-			zap.String("entitlement_id", entitlementID.String()),
-			zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, "failed to recalculate entitlement")
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	metadata := h.getMetadata(ctx)
+
+	balance, err := h.accrualService.RecalculateEntitlement(ctx, entitlementID, actorType, actorID, metadata)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, "failed to recalculate entitlement: "+err.Error())
 		return
 	}
 
@@ -501,45 +540,24 @@ func (h *LeaveAdminHandler) RecalculateEntitlement(w http.ResponseWriter, r *htt
 	})
 }
 
-// Helper methods
-func (h *LeaveAdminHandler) hasPermission(ctx interface{}, companyID uuid.UUID, permission string) bool {
-	// TODO: Implement actual permission checking
-	return true
-}
-
-func (h *LeaveAdminHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
-}
-
-func (h *LeaveAdminHandler) respondWithError(w http.ResponseWriter, status int, message string) {
-	h.respondWithJSON(w, status, map[string]interface{}{
-		"success": false,
-		"error":   message,
-	})
-}
-
-type CreateLeavePolicyRequest struct {
-	PolicyName              string     `json:"policy_name"`
-	AppliesToType           string     `json:"applies_to_type"` // company | position | work_center
-	AppliesToPositionID     *uuid.UUID `json:"applies_to_position_id,omitempty"`
-	AppliesToWorkCenterCode *string    `json:"applies_to_work_center_code,omitempty"`
-	Priority                int        `json:"priority"`
-	EffectiveFrom           time.Time  `json:"effective_from"`
-	EffectiveTo             *time.Time `json:"effective_to,omitempty"`
-}
-
-type AddPolicyRuleRequest struct {
-	LeaveTypeID       uuid.UUID `json:"leave_type_id"`
-	TotalDays         int       `json:"total_days"`
-	AccrualMethod     string    `json:"accrual_method"`
-	CarryForwardLimit *int      `json:"carry_forward_limit,omitempty"`
-}
+// ---------- leave policies (config) ----------
 
 func (h *LeaveAdminHandler) CreateLeavePolicy(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	companyID := uuid.MustParse(chi.URLParam(r, "companyID"))
+	ctx := injectCommonContext(r.Context(), r)
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	actorType, actorID, err := h.getActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	metadata := h.getMetadata(ctx)
 
 	var req CreateLeavePolicyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -558,7 +576,7 @@ func (h *LeaveAdminHandler) CreateLeavePolicy(w http.ResponseWriter, r *http.Req
 		EffectiveTo:             req.EffectiveTo,
 	}
 
-	created, err := h.policyConfigService.CreatePolicy(ctx, policy)
+	created, err := h.policyConfigService.CreatePolicy(ctx, policy, actorType, actorID, metadata)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -569,11 +587,25 @@ func (h *LeaveAdminHandler) CreateLeavePolicy(w http.ResponseWriter, r *http.Req
 		"data":    created,
 	})
 }
-func (h *LeaveAdminHandler) DeactivateLeavePolicy(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	policyID := uuid.MustParse(chi.URLParam(r, "policyID"))
 
-	if err := h.policyConfigService.DeactivatePolicy(ctx, policyID); err != nil {
+func (h *LeaveAdminHandler) DeactivateLeavePolicy(w http.ResponseWriter, r *http.Request) {
+	ctx := injectCommonContext(r.Context(), r)
+
+	policyIDStr := chi.URLParam(r, "policyID")
+	policyID, err := uuid.Parse(policyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid policy ID")
+		return
+	}
+
+	actorType, actorID, err := h.getActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	metadata := h.getMetadata(ctx)
+
+	if err := h.policyConfigService.DeactivatePolicy(ctx, policyID, actorType, actorID, metadata); err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -583,9 +615,16 @@ func (h *LeaveAdminHandler) DeactivateLeavePolicy(w http.ResponseWriter, r *http
 		"message": "Policy deactivated",
 	})
 }
+
 func (h *LeaveAdminHandler) GetLeavePolicy(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	policyID := uuid.MustParse(chi.URLParam(r, "policyID"))
+	ctx := injectCommonContext(r.Context(), r)
+
+	policyIDStr := chi.URLParam(r, "policyID")
+	policyID, err := uuid.Parse(policyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid policy ID")
+		return
+	}
 
 	policy, err := h.policyConfigService.GetPolicy(ctx, policyID)
 	if err != nil {
@@ -598,9 +637,16 @@ func (h *LeaveAdminHandler) GetLeavePolicy(w http.ResponseWriter, r *http.Reques
 		"data":    policy,
 	})
 }
+
 func (h *LeaveAdminHandler) ListActiveLeavePolicies(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	companyID := uuid.MustParse(chi.URLParam(r, "companyID"))
+	ctx := injectCommonContext(r.Context(), r)
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
 
 	asOf := time.Now().UTC()
 	policies, err := h.policyConfigService.ListActivePolicies(ctx, companyID, asOf)
@@ -616,25 +662,38 @@ func (h *LeaveAdminHandler) ListActiveLeavePolicies(w http.ResponseWriter, r *ht
 }
 
 func (h *LeaveAdminHandler) AddPolicyRule(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	policyID := uuid.MustParse(chi.URLParam(r, "policyID"))
+	ctx := injectCommonContext(r.Context(), r)
+
+	policyIDStr := chi.URLParam(r, "policyID")
+	policyID, err := uuid.Parse(policyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid policy ID")
+		return
+	}
+
+	actorType, actorID, err := h.getActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	metadata := h.getMetadata(ctx)
 
 	var req AddPolicyRuleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	accrualMethod := req.AccrualMethod
 
+	accrualMethod := req.AccrualMethod
 	rule := &models.LeavePolicyRule{
 		PolicyID:          policyID,
 		LeaveTypeID:       req.LeaveTypeID,
 		TotalDays:         req.TotalDays,
-		AccrualMethod:     &accrualMethod, // ✅ FIX
+		AccrualMethod:     &accrualMethod,
 		CarryForwardLimit: req.CarryForwardLimit,
 	}
 
-	created, err := h.policyConfigService.AddPolicyRule(ctx, rule)
+	created, err := h.policyConfigService.AddPolicyRule(ctx, rule, actorType, actorID, metadata)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -645,9 +704,16 @@ func (h *LeaveAdminHandler) AddPolicyRule(w http.ResponseWriter, r *http.Request
 		"data":    created,
 	})
 }
+
 func (h *LeaveAdminHandler) GetPolicyRules(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	policyID := uuid.MustParse(chi.URLParam(r, "policyID"))
+	ctx := injectCommonContext(r.Context(), r)
+
+	policyIDStr := chi.URLParam(r, "policyID")
+	policyID, err := uuid.Parse(policyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid policy ID")
+		return
+	}
 
 	rules, err := h.policyConfigService.GetPolicyRules(ctx, policyID)
 	if err != nil {
@@ -660,8 +726,9 @@ func (h *LeaveAdminHandler) GetPolicyRules(w http.ResponseWriter, r *http.Reques
 		"data":    rules,
 	})
 }
+
 func (h *LeaveAdminHandler) DeletePolicyRule(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	policyRuleIDStr := chi.URLParam(r, "policyRuleID")
 	policyRuleID, err := uuid.Parse(policyRuleIDStr)
@@ -670,12 +737,15 @@ func (h *LeaveAdminHandler) DeletePolicyRule(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if err := h.policyConfigService.RemovePolicyRule(ctx, policyRuleID); err != nil {
-		h.logger.Error("Failed to delete policy rule",
-			zap.String("policy_rule_id", policyRuleID.String()),
-			zap.Error(err),
-		)
-		h.respondWithError(w, http.StatusInternalServerError, "failed to delete policy rule")
+	actorType, actorID, err := h.getActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	metadata := h.getMetadata(ctx)
+
+	if err := h.policyConfigService.RemovePolicyRule(ctx, policyRuleID, actorType, actorID, metadata); err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, "failed to delete policy rule: "+err.Error())
 		return
 	}
 
@@ -684,8 +754,9 @@ func (h *LeaveAdminHandler) DeletePolicyRule(w http.ResponseWriter, r *http.Requ
 		"message": "Policy rule deleted successfully",
 	})
 }
+
 func (h *LeaveAdminHandler) UpdateLeavePolicy(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	policyIDStr := chi.URLParam(r, "policyID")
 	policyID, err := uuid.Parse(policyIDStr)
@@ -693,6 +764,13 @@ func (h *LeaveAdminHandler) UpdateLeavePolicy(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusBadRequest, "invalid policy ID")
 		return
 	}
+
+	actorType, actorID, err := h.getActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	metadata := h.getMetadata(ctx)
 
 	var req UpdateLeavePolicyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -711,12 +789,7 @@ func (h *LeaveAdminHandler) UpdateLeavePolicy(w http.ResponseWriter, r *http.Req
 		IsActive:                req.IsActive,
 	}
 
-	err = h.policyConfigService.UpdatePolicy(ctx, policyID, update)
-	if err != nil {
-		h.logger.Error("Failed to update leave policy",
-			zap.String("policy_id", policyID.String()),
-			zap.Error(err),
-		)
+	if err := h.policyConfigService.UpdatePolicy(ctx, policyID, update, actorType, actorID, metadata); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -727,24 +800,8 @@ func (h *LeaveAdminHandler) UpdateLeavePolicy(w http.ResponseWriter, r *http.Req
 	})
 }
 
-type UpdateLeavePolicyRequest struct {
-	PolicyName              *string    `json:"policy_name,omitempty"`
-	AppliesToType           *string    `json:"applies_to_type,omitempty"`
-	AppliesToPositionID     *uuid.UUID `json:"applies_to_position_id,omitempty"`
-	AppliesToWorkCenterCode *string    `json:"applies_to_work_center_code,omitempty"`
-	Priority                *int       `json:"priority,omitempty"`
-	EffectiveFrom           *time.Time `json:"effective_from,omitempty"`
-	EffectiveTo             *time.Time `json:"effective_to,omitempty"`
-	IsActive                *bool      `json:"is_active,omitempty"`
-}
-type UpdatePolicyRuleRequest struct {
-	TotalDays         *int    `json:"total_days,omitempty"`
-	AccrualMethod     *string `json:"accrual_method,omitempty"`
-	CarryForwardLimit *int    `json:"carry_forward_limit,omitempty"`
-}
-
 func (h *LeaveAdminHandler) UpdatePolicyRule(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -765,6 +822,13 @@ func (h *LeaveAdminHandler) UpdatePolicyRule(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	actorType, actorID, err := h.getActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	metadata := h.getMetadata(ctx)
+
 	var req UpdatePolicyRuleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
@@ -777,17 +841,7 @@ func (h *LeaveAdminHandler) UpdatePolicyRule(w http.ResponseWriter, r *http.Requ
 		CarryForwardLimit: req.CarryForwardLimit,
 	}
 
-	if err := h.policyConfigService.UpdatePolicyRule(
-		ctx,
-		companyID,
-		policyRuleID,
-		update,
-	); err != nil {
-		h.logger.Error("Failed to update policy rule",
-			zap.String("company_id", companyID.String()),
-			zap.String("policy_rule_id", policyRuleID.String()),
-			zap.Error(err),
-		)
+	if err := h.policyConfigService.UpdatePolicyRule(ctx, companyID, policyRuleID, update, actorType, actorID, metadata); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -795,5 +849,25 @@ func (h *LeaveAdminHandler) UpdatePolicyRule(w http.ResponseWriter, r *http.Requ
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "Policy rule updated successfully",
+	})
+}
+
+// ---------- helper methods ----------
+
+func (h *LeaveAdminHandler) hasPermission(ctx context.Context, companyID uuid.UUID, permission string) bool {
+	// TODO: implement actual permission check
+	return true
+}
+
+func (h *LeaveAdminHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(data)
+}
+
+func (h *LeaveAdminHandler) respondWithError(w http.ResponseWriter, status int, message string) {
+	h.respondWithJSON(w, status, map[string]interface{}{
+		"success": false,
+		"error":   message,
 	})
 }

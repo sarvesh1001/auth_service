@@ -33,6 +33,7 @@ type AdminDeviceRepository interface {
 	GetAdminRepositoryStats(ctx context.Context) (map[string]interface{}, error)
 	GetUsersByDevice(ctx context.Context, deviceID string) ([]*models.UserActiveDevice, error)
 	BindUserDevice(ctx context.Context, userID uuid.UUID, deviceID, bindToken string) error
+	BindAndTrust(ctx context.Context, req BindAndTrustRequest) (*models.TrustBindingResult, error)
 }
 
 type AdminDeviceRepositoryImpl struct {
@@ -446,4 +447,95 @@ func (r *AdminDeviceRepositoryImpl) hashBindToken(token string) string {
 // For compatibility with admin device repository
 func (r *AdminDeviceRepositoryImpl) BindUserDevice(ctx context.Context, userID uuid.UUID, deviceID, bindToken string) error {
 	return r.BindAdminDevice(ctx, userID, deviceID, bindToken)
+}
+
+type BindAndTrustRequest struct {
+	AdminID         uuid.UUID
+	DeviceID        string
+	BindToken       string
+	IPAddress       string
+	IPSubnet        string
+	UserAgent       string
+	DeviceModel     string
+	OSVersion       string
+	AppVersion      string
+	FingerprintHash string // canonical via internal/devicefp.Hash; "" allowed
+	Now             time.Time
+}
+
+func (r *AdminDeviceRepositoryImpl) BindAndTrust(
+	ctx context.Context,
+	req BindAndTrustRequest,
+) (*models.TrustBindingResult, error) {
+	startTime := time.Now()
+	defer func() { r.metrics.RecordQuery(time.Since(startTime), true) }()
+
+	if req.AdminID == uuid.Nil {
+		return nil, apperrors.ErrInvalidInput
+	}
+	if req.DeviceID == "" || req.BindToken == "" {
+		return nil, apperrors.ErrInvalidInput
+	}
+	if req.IPAddress == "" {
+		return nil, fmt.Errorf("bind_and_trust: %w: ip address required", apperrors.ErrInvalidInput)
+	}
+	if req.Now.IsZero() {
+		req.Now = time.Now().UTC()
+	}
+
+	hashedToken := r.hashBindToken(req.BindToken)
+
+	// Both tables are partitioned by admin_id → single-partition logged batch.
+	batch := r.client.Batch(gocql.LoggedBatch)
+
+	batch.Query(`
+		INSERT INTO admin_active_device
+			(admin_id, device_id, session_id, bound_at, bind_token)
+		VALUES (?, ?, ?, ?, ?)`,
+		gocql.UUID(req.AdminID),
+		req.DeviceID,
+		nil,
+		req.Now,
+		hashedToken,
+	)
+
+	batch.Query(`
+		INSERT INTO admin_device_trust_levels
+			(admin_id, device_id, trust_status, device_fingerprint,
+			 os_version, app_version, ip_address, last_ip_subnet,
+			 user_agent, device_model, risk_score, is_blocked,
+			 first_successful_login, last_login)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		gocql.UUID(req.AdminID),
+		req.DeviceID,
+		string(models.TrustStatusTrusted),
+		req.FingerprintHash,
+		req.OSVersion,
+		req.AppVersion,
+		req.IPAddress, // column is ip_address (inet), NOT last_ip_address
+		req.IPSubnet,
+		req.UserAgent,
+		req.DeviceModel,
+		0,       // risk_score
+		false,   // is_blocked
+		req.Now, // first_successful_login — only meaningful on first bind,
+		// but harmless to write on rebind since this is an UPSERT
+		req.Now, // last_login
+	)
+
+	if err := r.client.ExecuteBatch(batch); err != nil {
+		return nil, fmt.Errorf("bind_and_trust: %w", err)
+	}
+
+	return &models.TrustBindingResult{
+		Trusted:     true,
+		State:       models.TrustStatusTrusted,
+		AdminID:     req.AdminID,
+		DeviceID:    req.DeviceID,
+		BindToken:   req.BindToken,
+		IPAddress:   req.IPAddress,
+		IPSubnet:    req.IPSubnet,
+		Fingerprint: req.FingerprintHash,
+		UpdatedAt:   req.Now,
+	}, nil
 }

@@ -17,4 +17,10 @@ type JournalLine struct {
 	Description    *string         `db:"description" json:"description,omitempty"`
 	CreatedAt      time.Time       `db:"created_at" json:"created_at"`
 	UpdatedAt      time.Time       `db:"updated_at" json:"updated_at"`
+
+	// 👇 ADDED — cost / department dimensions. Both are nullable and are
+	// snapshotted onto ledger_entries on post so the account statement and
+	// cost-center reporting have them without re-joining back to lines.
+	CostCenterID *uuid.UUID `db:"cost_center_id" json:"cost_center_id,omitempty"`
+	DepartmentID *uuid.UUID `db:"department_id"  json:"department_id,omitempty"`
 }

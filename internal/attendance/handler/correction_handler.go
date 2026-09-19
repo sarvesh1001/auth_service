@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
@@ -10,17 +11,18 @@ import (
 	"go.uber.org/zap"
 
 	"auth-service/internal/attendance/service/admin"
+	"auth-service/internal/attendance/service/resolver"
 )
 
 // AttendanceCorrectionHandler handles attendance correction requests.
 type AttendanceCorrectionHandler struct {
-	correctionSvc admin.CorrectionService // ✅ Use CorrectionService
+	correctionSvc admin.CorrectionService
 	logger        *zap.Logger
 }
 
 // NewAttendanceCorrectionHandler creates a new handler.
 func NewAttendanceCorrectionHandler(
-	correctionSvc admin.CorrectionService, // ✅ inject CorrectionService
+	correctionSvc admin.CorrectionService,
 	logger *zap.Logger,
 ) *AttendanceCorrectionHandler {
 	return &AttendanceCorrectionHandler{
@@ -37,6 +39,22 @@ type CorrectionRequest struct {
 	EventTime      string    `json:"event_time,omitempty"`
 	OverrideStatus string    `json:"override_status,omitempty"`
 	Reason         string    `json:"reason"`
+}
+
+// mapCorrectionError converts subject-scope errors from the correction
+// service into the appropriate HTTP status.
+func (h *AttendanceCorrectionHandler) mapCorrectionError(w http.ResponseWriter, err error) bool {
+	switch {
+	case errors.Is(err, resolver.ErrSubjectOutsideScope):
+		h.respondWithError(w, http.StatusForbidden,
+			"subject belongs to a different location than your current scope")
+		return true
+	case errors.Is(err, resolver.ErrSubjectHasNoLocation):
+		h.respondWithError(w, http.StatusBadRequest,
+			"target subject has no employment location assigned")
+		return true
+	}
+	return false
 }
 
 // CreateCorrection creates a new attendance correction.
@@ -112,8 +130,10 @@ func (h *AttendanceCorrectionHandler) CreateCorrection(w http.ResponseWriter, r 
 		Reason:         req.Reason,
 	}
 
-	// ✅ Use correctionSvc.CreateCorrection
 	if err := h.correctionSvc.CreateCorrection(ctx, corrReq); err != nil {
+		if h.mapCorrectionError(w, err) {
+			return
+		}
 		h.logger.Error("Failed to create attendance correction",
 			zap.String("company_id", companyID.String()),
 			zap.String("target_user_id", req.TargetUserID.String()),

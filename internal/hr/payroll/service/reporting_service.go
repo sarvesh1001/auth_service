@@ -2,36 +2,33 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
+
 	"auth-service/internal/hr/payroll/models"
 	"auth-service/internal/hr/payroll/repository"
-
-	"github.com/google/uuid"
-	"go.uber.org/zap"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+	"auth-service/internal/locationctx"
 )
 
 // ReportingService defines the interface for generating payroll reports.
 type ReportingService interface {
-	// GenerateStatutoryChallan returns the statutory contribution summary for a payroll period.
 	GenerateStatutoryChallan(ctx context.Context, companyID uuid.UUID, periodStart, periodEnd time.Time) ([]StatutoryChallanEntry, error)
-
-	// GeneratePayrollRegister returns a detailed employee‑wise payroll register for a period.
-	// groupBy can be "department", "cost_centre", or "" (no grouping). Implementation can be extended.
 	GeneratePayrollRegister(ctx context.Context, companyID uuid.UUID, periodStart, periodEnd time.Time, groupBy string) ([]PayrollRegisterRow, error)
 }
 
-// StatutoryChallanEntry represents one line in a statutory challan (e.g., PF, ESI).
 type StatutoryChallanEntry struct {
 	StatutoryCode  string  `json:"statutory_code"`
-	Description    string  `json:"description"` // optional, can be fetched from definitions
+	Description    string  `json:"description"`
 	EmployeeAmount float64 `json:"employee_amount"`
 	EmployerAmount float64 `json:"employer_amount"`
 	TotalAmount    float64 `json:"total_amount"`
 }
 
-// PayrollRegisterRow represents one employee's payroll details for a period.
 type PayrollRegisterRow struct {
 	UserID                uuid.UUID                `json:"user_id"`
 	EmployeeID            string                   `json:"employee_id"`
@@ -47,7 +44,6 @@ type PayrollRegisterRow struct {
 	EmployerContributions []PayrollComponentDetail `json:"employer_contributions,omitempty"`
 }
 
-// PayrollComponentDetail represents a single payroll component amount for an employee.
 type PayrollComponentDetail struct {
 	ComponentCode string  `json:"component_code"`
 	Description   string  `json:"description"`
@@ -55,139 +51,115 @@ type PayrollComponentDetail struct {
 	IsTaxable     bool    `json:"is_taxable"`
 }
 
-// reportingService is the concrete implementation.
 type reportingService struct {
-	payrollRepo repository.PayrollRepository
-	// We may need other repos for statutory definitions etc., but for now we use payrollRepo.
-	logger *zap.Logger
+	payrollRepo      repository.PayrollRepository
+	auditService     *audit.AuditService
+	idempotencyStore idempotency.Store
 }
 
-// NewReportingService creates a new reporting service.
 func NewReportingService(
 	payrollRepo repository.PayrollRepository,
-	logger *zap.Logger,
+	auditService *audit.AuditService,
+	idempotencyStore idempotency.Store,
 ) ReportingService {
 	return &reportingService{
-		payrollRepo: payrollRepo,
-		logger:      logger.Named("reporting_service"),
+		payrollRepo:      payrollRepo,
+		auditService:     auditService,
+		idempotencyStore: idempotencyStore,
 	}
 }
 
-// GenerateStatutoryChallan retrieves the aggregated statutory contributions for the given period.
+// GenerateStatutoryChallan — aggregated statutory contributions for the period.
+//
+// Location: when the request is location-scoped, only contributions for
+// employees whose snapshotted employment_location_id at run time matches are
+// included. When scope is ALL (or missing), the whole company is returned.
 func (s *reportingService) GenerateStatutoryChallan(
 	ctx context.Context,
 	companyID uuid.UUID,
 	periodStart, periodEnd time.Time,
 ) ([]StatutoryChallanEntry, error) {
-	// Find the payroll run for this exact period.
 	run, err := s.payrollRepo.GetPayrollRunByPeriod(ctx, companyID, periodStart, periodEnd)
 	if err != nil {
-		s.logger.Error("failed to get payroll run by period",
-			zap.String("company_id", companyID.String()),
-			zap.Time("period_start", periodStart),
-			zap.Time("period_end", periodEnd),
-			zap.Error(err),
-		)
 		return nil, fmt.Errorf("failed to fetch payroll run: %w", err)
 	}
 	if run == nil {
-		s.logger.Warn("no payroll run found for the given period",
-			zap.String("company_id", companyID.String()),
-			zap.Time("period_start", periodStart),
-			zap.Time("period_end", periodEnd),
-		)
 		return []StatutoryChallanEntry{}, nil
 	}
 
-	// Get statutory summary for the run.
-	aggregates, err := s.payrollRepo.GetRunStatutorySummary(ctx, run.PayrollRunID)
+	// 👇 Location scope filter (nil = no filter)
+	locFilter := locationctx.Filter(ctx)
+
+	aggregates, err := s.payrollRepo.GetRunStatutorySummary(ctx, run.PayrollRunID, locFilter)
 	if err != nil {
-		s.logger.Error("failed to get statutory summary",
-			zap.String("run_id", run.PayrollRunID.String()),
-			zap.Error(err),
-		)
 		return nil, fmt.Errorf("failed to fetch statutory summary: %w", err)
 	}
 
-	// Convert to output DTOs.
 	entries := make([]StatutoryChallanEntry, 0, len(aggregates))
 	for _, agg := range aggregates {
 		entries = append(entries, StatutoryChallanEntry{
 			StatutoryCode:  agg.StatutoryCode,
-			Description:    "", // could be enriched by fetching statutory definition
+			Description:    "",
 			EmployeeAmount: agg.EmployeeTotal,
 			EmployerAmount: agg.EmployerTotal,
 			TotalAmount:    agg.CombinedTotal,
 		})
 	}
 
+	ip, _ := ctx.Value("ip_address").(string)
+	resultJSON, _ := json.Marshal(entries)
+	_ = s.auditService.LogAction(
+		ctx, nil, &companyID, "payroll", "report.statutory_challan", "payroll_run",
+		&run.PayrollRunID, "system", nil, nil, resultJSON,
+		map[string]interface{}{
+			"ip":             ip,
+			"period_start":   periodStart,
+			"period_end":     periodEnd,
+			"run_id":         run.PayrollRunID.String(),
+			"location_scope": locationScopeLabel(locFilter),
+		},
+	)
+
 	return entries, nil
 }
 
-// GeneratePayrollRegister produces a detailed employee‑wise payroll register.
-// It uses GetPayrollItemDetail for each item, which may be inefficient for large runs.
-// For production use with many employees, consider extending the repository to return
-// all required data in bulk.
+// GeneratePayrollRegister — detailed employee-wise register.
+//
+// Location: when location-scoped, only items for employees whose snapshotted
+// employment_location_id at run time matches are included.
 func (s *reportingService) GeneratePayrollRegister(
 	ctx context.Context,
 	companyID uuid.UUID,
 	periodStart, periodEnd time.Time,
-	groupBy string, // currently unused, kept for future extension
+	groupBy string,
 ) ([]PayrollRegisterRow, error) {
-	// Find the payroll run for this exact period.
 	run, err := s.payrollRepo.GetPayrollRunByPeriod(ctx, companyID, periodStart, periodEnd)
 	if err != nil {
-		s.logger.Error("failed to get payroll run by period",
-			zap.String("company_id", companyID.String()),
-			zap.Time("period_start", periodStart),
-			zap.Time("period_end", periodEnd),
-			zap.Error(err),
-		)
 		return nil, fmt.Errorf("failed to fetch payroll run: %w", err)
 	}
 	if run == nil {
-		s.logger.Warn("no payroll run found for the given period",
-			zap.String("company_id", companyID.String()),
-			zap.Time("period_start", periodStart),
-			zap.Time("period_end", periodEnd),
-		)
 		return []PayrollRegisterRow{}, nil
 	}
 
-	// Get all payroll items for the run (active, non‑superseded).
-	items, err := s.payrollRepo.GetPayrollItemsByRun(ctx, run.PayrollRunID)
+	// 👇 Location scope filter
+	locFilter := locationctx.Filter(ctx)
+
+	items, err := s.payrollRepo.GetPayrollItemsByRun(ctx, run.PayrollRunID, locFilter)
 	if err != nil {
-		s.logger.Error("failed to get payroll items",
-			zap.String("run_id", run.PayrollRunID.String()),
-			zap.Error(err),
-		)
 		return nil, fmt.Errorf("failed to fetch payroll items: %w", err)
 	}
 
 	rows := make([]PayrollRegisterRow, 0, len(items))
 
-	// For each item, fetch detailed information (including components and employee details).
 	for _, item := range items {
 		detail, err := s.payrollRepo.GetPayrollItemDetail(ctx, item.PayrollItemID)
-		if err != nil {
-			s.logger.Error("failed to get payroll item detail",
-				zap.String("item_id", item.PayrollItemID.String()),
-				zap.Error(err),
-			)
-			// Skip this employee or fail? For robustness, we skip and log.
-			continue
-		}
-		if detail == nil {
-			s.logger.Warn("payroll item detail not found",
-				zap.String("item_id", item.PayrollItemID.String()),
-			)
+		if err != nil || detail == nil {
 			continue
 		}
 
-		// Separate components into earnings, deductions, and employer contributions.
-		var earnings, deductions, _ []PayrollComponentDetail
+		var earnings, deductions []PayrollComponentDetail
 		for _, comp := range detail.Components {
-			detail := PayrollComponentDetail{
+			detailDTO := PayrollComponentDetail{
 				ComponentCode: comp.ComponentCode,
 				Description:   comp.Description,
 				Amount:        comp.Amount,
@@ -195,45 +167,58 @@ func (s *reportingService) GeneratePayrollRegister(
 			}
 			switch comp.ComponentType {
 			case models.ComponentTypeEarning:
-				earnings = append(earnings, detail)
+				earnings = append(earnings, detailDTO)
 			case models.ComponentTypeDeduction:
-				deductions = append(deductions, detail)
-			default:
-				// Employer contributions are usually tracked separately in the ledger,
-				// but if they are stored as a component type, handle accordingly.
-				// For now, we treat any component with contribution_side = 'employer' as employer contribution,
-				// but that field is not in the component summary. We may need to fetch that separately.
-				// As a fallback, we put them in deductions or ignore.
-				// To keep it simple, we put them in employer slice if component code suggests it.
-				// In a real implementation, you might need to join with payroll_component to get contribution_side.
-				// Since we don't have that here, we'll skip for now.
+				deductions = append(deductions, detailDTO)
 			}
 		}
 
-		row := PayrollRegisterRow{
+		rows = append(rows, PayrollRegisterRow{
 			UserID:       detail.UserID,
 			EmployeeID:   detail.EmployeeID,
 			EmployeeName: detail.FullName,
-			Department:   nullString(detail.DepartmentName),
-			Position:     nullString(detail.PositionTitle),
+			Department:   safeString(detail.DepartmentName),
+			Position:     safeString(detail.PositionTitle),
 			PayableDays:  detail.PayableDays,
 			UnpaidDays:   detail.UnpaidDays,
 			GrossAmount:  detail.GrossAmount,
 			NetAmount:    detail.NetAmount,
 			Earnings:     earnings,
 			Deductions:   deductions,
-			// EmployerContributions: employer, // left empty for now
-		}
-		rows = append(rows, row)
+		})
 	}
+
+	ip, _ := ctx.Value("ip_address").(string)
+	resultJSON, _ := json.Marshal(rows)
+	_ = s.auditService.LogAction(
+		ctx, nil, &companyID, "payroll", "report.payroll_register", "payroll_run",
+		&run.PayrollRunID, "system", nil, nil, resultJSON,
+		map[string]interface{}{
+			"ip":             ip,
+			"period_start":   periodStart,
+			"period_end":     periodEnd,
+			"group_by":       groupBy,
+			"run_id":         run.PayrollRunID.String(),
+			"row_count":      len(rows),
+			"location_scope": locationScopeLabel(locFilter),
+		},
+	)
 
 	return rows, nil
 }
 
-// Helper to convert *string to string, handling nil.
-func nullString(s *string) string {
+// safeString converts *string to string, handling nil.
+func safeString(s *string) string {
 	if s == nil {
 		return ""
 	}
 	return *s
+}
+
+// locationScopeLabel returns a human-readable label for audit metadata.
+func locationScopeLabel(locID *uuid.UUID) string {
+	if locID == nil {
+		return "ALL"
+	}
+	return locID.String()
 }

@@ -1,34 +1,30 @@
 package handler
 
 import (
-	"context" // added missing import
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
-	"strings" // for error message matching
+	"strings"
 	"time"
-
-	"auth-service/internal/hr/payroll/service"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
-	"go.uber.org/zap"
+
+	"auth-service/internal/hr/payroll/service"
 )
 
 // PayrollLockHandler handles HTTP requests for payroll period locks.
 type PayrollLockHandler struct {
 	lockService service.PayrollLockService
-	logger      *zap.Logger
 }
 
 // NewPayrollLockHandler creates a new PayrollLockHandler.
 func NewPayrollLockHandler(
 	lockService service.PayrollLockService,
-	logger *zap.Logger,
 ) *PayrollLockHandler {
 	return &PayrollLockHandler{
 		lockService: lockService,
-		logger:      logger,
 	}
 }
 
@@ -39,9 +35,31 @@ type createLockRequest struct {
 	Reason      string    `json:"reason"`
 }
 
+// getAdminActor extracts actor UUID from the context (using injected user_id).
+func (h *PayrollLockHandler) getAdminActor(ctx context.Context) (uuid.UUID, error) {
+	// Try modern key first
+	if v := ctx.Value("current_user_id"); v != nil {
+		if id, ok := v.(uuid.UUID); ok {
+			return id, nil
+		}
+	}
+	// Fallback to old key
+	if v := ctx.Value("user_id"); v != nil {
+		switch raw := v.(type) {
+		case uuid.UUID:
+			return raw, nil
+		case string:
+			return uuid.Parse(raw)
+		default:
+			return uuid.Nil, errors.New("invalid user_id type")
+		}
+	}
+	return uuid.Nil, errors.New("user not authenticated")
+}
+
 // CreateLock handles POST /companies/{companyID}/payroll/locks
 func (h *PayrollLockHandler) CreateLock(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	// Parse company ID from URL
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
@@ -50,7 +68,7 @@ func (h *PayrollLockHandler) CreateLock(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Get actor ID from admin session
+	// Get actor ID from admin session (using the enriched context)
 	actorID, err := h.getAdminActor(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
@@ -77,7 +95,6 @@ func (h *PayrollLockHandler) CreateLock(w http.ResponseWriter, r *http.Request) 
 	// Call service
 	err = h.lockService.LockPeriod(ctx, companyID, req.PeriodStart, req.PeriodEnd, actorID, req.Reason)
 	if err != nil {
-		// Map service errors to HTTP status codes based on error message content
 		status := http.StatusBadRequest
 		if strings.Contains(err.Error(), "already locked") {
 			status = http.StatusConflict
@@ -94,7 +111,7 @@ func (h *PayrollLockHandler) CreateLock(w http.ResponseWriter, r *http.Request) 
 
 // DeleteLock handles DELETE /companies/{companyID}/payroll/locks?start=...&end=...
 func (h *PayrollLockHandler) DeleteLock(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	// Parse company ID
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
@@ -132,8 +149,6 @@ func (h *PayrollLockHandler) DeleteLock(w http.ResponseWriter, r *http.Request) 
 	// Call service
 	err = h.lockService.UnlockPeriod(ctx, companyID, start, end, actorID)
 	if err != nil {
-		// The service currently does not return a specific "not found" error,
-		// so we always return 400 for any error.
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -146,7 +161,7 @@ func (h *PayrollLockHandler) DeleteLock(w http.ResponseWriter, r *http.Request) 
 
 // ListLocks handles GET /companies/{companyID}/payroll/locks?from=...&to=...
 func (h *PayrollLockHandler) ListLocks(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	// Parse company ID
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
@@ -183,21 +198,6 @@ func (h *PayrollLockHandler) ListLocks(w http.ResponseWriter, r *http.Request) {
 		"success": true,
 		"data":    locks,
 	})
-}
-
-// getAdminActor extracts actor UUID from context, replicating the logic from the reference handler.
-func (h *PayrollLockHandler) getAdminActor(ctx context.Context) (uuid.UUID, error) {
-	userIDStr, ok := ctx.Value("user_id").(string)
-	if !ok || userIDStr == "" {
-		return uuid.Nil, errors.New("unauthenticated user")
-	}
-
-	userID, err := uuid.Parse(userIDStr)
-	if err != nil {
-		return uuid.Nil, errors.New("invalid user_id in context")
-	}
-
-	return userID, nil
 }
 
 // respondWithJSON writes a JSON response with the given status and data.

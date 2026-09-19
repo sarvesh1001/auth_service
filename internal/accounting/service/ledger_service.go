@@ -27,7 +27,6 @@ type LedgerService interface {
 	GetAccountBalance(ctx context.Context, companyID, accountID uuid.UUID, fiscalYear, period int) (*models.AccountBalance, error)
 	RecomputeBalances(ctx context.Context, companyID uuid.UUID, fiscalYear int) error
 
-	// Reporting
 	ComputeTrialBalance(ctx context.Context, companyID uuid.UUID, from, to time.Time) ([]*repository.TrialBalanceRow, error)
 	ComputePAndL(ctx context.Context, companyID uuid.UUID, from, to time.Time) ([]*repository.PAndLRow, error)
 	ComputeBalanceSheet(ctx context.Context, companyID uuid.UUID, asOf time.Time) ([]*repository.BalanceSheetRow, error)
@@ -73,7 +72,8 @@ func NewLedgerService(
 }
 
 // --------------------------------------------------------------------------
-// PostJournalToLedger – with idempotency + type assertion for *sql.Tx
+// PostJournalToLedger – now snapshots cost_center_id / department_id from
+// each journal line onto the corresponding ledger entry.
 // --------------------------------------------------------------------------
 func (s *ledgerService) PostJournalToLedger(
 	ctx context.Context,
@@ -88,13 +88,11 @@ func (s *ledgerService) PostJournalToLedger(
 
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 
-	// Assert the concrete *sql.Tx (idempotency store requires it)
 	sqlTx, ok := tx.(*sql.Tx)
 	if !ok {
 		return fmt.Errorf("expected *sql.Tx for idempotency, got %T", tx)
 	}
 
-	// Idempotency check
 	if idempotencyKey != "" {
 		var done bool
 		err := s.idempotencyStore.Get(ctx, sqlTx, idempotencyKey, &done)
@@ -137,6 +135,7 @@ func (s *ledgerService) PostJournalToLedger(
 		return fmt.Errorf("batch get account types: %w", err)
 	}
 
+	// 👇 Snapshot cost center / department from the line onto the ledger row
 	for _, line := range lines {
 		le := &models.LedgerEntry{
 			LedgerEntryID:  uuid.New(),
@@ -148,6 +147,9 @@ func (s *ledgerService) PostJournalToLedger(
 			DebitAmount:    line.DebitAmount,
 			CreditAmount:   line.CreditAmount,
 			IsReversal:     entry.ReversalOf != nil,
+
+			CostCenterID: line.CostCenterID,
+			DepartmentID: line.DepartmentID,
 		}
 		if err := s.ledgerRepo.CreateLedgerEntry(ctx, tx, le); err != nil {
 			return fmt.Errorf("insert ledger entry for line %s: %w", line.JournalLineID, err)
@@ -207,7 +209,6 @@ func (s *ledgerService) PostJournalToLedger(
 		}
 	}
 
-	// outbox also needs *sql.Tx – reuse sqlTx
 	payloadBytes, err := json.Marshal(eventPayload)
 	if err != nil {
 		return fmt.Errorf("marshal ledger event payload: %w", err)
@@ -225,7 +226,6 @@ func (s *ledgerService) PostJournalToLedger(
 		return fmt.Errorf("store outbox event: %w", err)
 	}
 
-	// Store idempotency result
 	if idempotencyKey != "" {
 		_ = s.idempotencyStore.Store(ctx, sqlTx, idempotencyKey, true)
 	}
@@ -238,8 +238,9 @@ func (s *ledgerService) PostJournalToLedger(
 }
 
 // --------------------------------------------------------------------------
-// ReverseLedgerEntries – idempotency handled by PostJournalToLedger
+// Everything below is unchanged from your version
 // --------------------------------------------------------------------------
+
 func (s *ledgerService) ReverseLedgerEntries(
 	ctx context.Context,
 	tx repository.DBTX,
@@ -260,9 +261,6 @@ func (s *ledgerService) ReverseLedgerEntries(
 	return s.PostJournalToLedger(ctx, tx, reversalEntry, reversalLines)
 }
 
-// --------------------------------------------------------------------------
-// GetAccountBalance – read-only
-// --------------------------------------------------------------------------
 func (s *ledgerService) GetAccountBalance(
 	ctx context.Context,
 	companyID, accountID uuid.UUID,
@@ -271,9 +269,6 @@ func (s *ledgerService) GetAccountBalance(
 	return s.ledgerRepo.GetBalance(ctx, s.pgClient.DB, companyID, accountID, fiscalYear, period)
 }
 
-// --------------------------------------------------------------------------
-// RecomputeBalances – uses its own *sql.Tx (no DBTX assertion needed)
-// --------------------------------------------------------------------------
 func (s *ledgerService) RecomputeBalances(ctx context.Context, companyID uuid.UUID, fiscalYear int) error {
 	logger := s.logger.With(
 		zap.String("method", "RecomputeBalances"),
@@ -317,9 +312,6 @@ func (s *ledgerService) RecomputeBalances(ctx context.Context, companyID uuid.UU
 	return nil
 }
 
-// --------------------------------------------------------------------------
-// Reporting (read-only, no idempotency)
-// --------------------------------------------------------------------------
 func (s *ledgerService) ComputeTrialBalance(ctx context.Context, companyID uuid.UUID, from, to time.Time) ([]*repository.TrialBalanceRow, error) {
 	return s.ledgerRepo.ComputeTrialBalance(ctx, s.pgClient.DB, companyID, from, to)
 }
@@ -398,9 +390,6 @@ func (s *ledgerService) UpdateRunningBalances(ctx context.Context, companyID, ac
 	return s.ledgerRepo.UpdateRunningBalances(ctx, s.pgClient.DB, companyID, accountID)
 }
 
-// --------------------------------------------------------------------------
-// Helper
-// --------------------------------------------------------------------------
 func (s *ledgerService) getFiscalPeriod(ctx context.Context, companyID uuid.UUID, date time.Time) (int, int, error) {
 	return s.settingsRepo.GetFiscalYear(ctx, s.pgClient.DB, companyID, date)
 }

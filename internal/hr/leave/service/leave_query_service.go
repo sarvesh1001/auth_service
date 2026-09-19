@@ -5,130 +5,128 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
+
 	"auth-service/internal/hr/leave/models"
 	"auth-service/internal/hr/leave/repository"
-
-	"github.com/google/uuid"
-	"go.uber.org/zap"
+	hrRepo "auth-service/internal/hr/repository"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/locationctx"
 )
 
 type LeaveQueryService interface {
-	GetLeaveBalance(
-		ctx context.Context,
-		companyID uuid.UUID,
-		userID uuid.UUID,
-		asOfDate time.Time,
-	) ([]*models.LeaveBalance, error)
+	// Balance — P3 validates the target user
+	GetLeaveBalance(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, asOfDate time.Time, actorType string, actorID uuid.UUID, metadata map[string]interface{}) ([]*models.LeaveBalance, error)
+	GetLeaveBalanceByType(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, leaveTypeID uuid.UUID, asOfDate time.Time, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.LeaveBalance, error)
 
-	GetLeaveBalanceByType(
-		ctx context.Context,
-		companyID uuid.UUID,
-		userID uuid.UUID,
-		leaveTypeID uuid.UUID,
-		asOfDate time.Time,
-	) (*models.LeaveBalance, error)
+	// Internal scheduling resolver — no request ctx, no P3
+	IsUserOnLeave(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, date time.Time) (bool, *models.LeaveRequest, error)
+	GetApprovedLeaveForDate(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, date time.Time) (*models.LeaveRequest, error)
 
-	IsUserOnLeave(
-		ctx context.Context,
-		companyID uuid.UUID,
-		userID uuid.UUID,
-		date time.Time,
-	) (bool, *models.LeaveRequest, error)
+	// History — P3 validates the target user (signature now takes companyID)
+	GetUserLeaveHistory(ctx context.Context, companyID, userID uuid.UUID, startDate, endDate time.Time) ([]*models.LeaveRequest, error)
+	GetLeaveTransactionHistory(ctx context.Context, companyID, userID uuid.UUID, startDate, endDate time.Time) ([]*models.LeaveTransaction, error)
 
-	// GetApprovedLeaveForDate returns the approved leave request for a user on a specific date, if any.
-	GetApprovedLeaveForDate(
-		ctx context.Context,
-		companyID uuid.UUID,
-		userID uuid.UUID,
-		date time.Time,
-	) (*models.LeaveRequest, error)
+	GetLeaveTypeByID(ctx context.Context, companyID uuid.UUID, leaveTypeID uuid.UUID) (*models.LeaveType, error)
+	GetLeaveForecast(ctx context.Context, userID uuid.UUID, months int) ([]*models.LeaveBalance, error)
 
-	GetUserLeaveHistory(
-		ctx context.Context,
-		userID uuid.UUID,
-		startDate, endDate time.Time,
-	) ([]*models.LeaveRequest, error)
-
-	GetLeaveTransactionHistory(
-		ctx context.Context,
-		userID uuid.UUID,
-		startDate, endDate time.Time,
-	) ([]*models.LeaveTransaction, error)
-
-	GetLeaveTypeByID(
-		ctx context.Context,
-		companyID uuid.UUID,
-		leaveTypeID uuid.UUID,
-	) (*models.LeaveType, error)
-
-	GetLeaveForecast(
-		ctx context.Context,
-		userID uuid.UUID,
-		months int,
-	) ([]*models.LeaveBalance, error)
-
+	// GetLeaveUtilizationReport — location filter applies when locationID != nil.
 	GetLeaveUtilizationReport(
 		ctx context.Context,
 		companyID uuid.UUID,
+		locationID *uuid.UUID,
 		startDate, endDate time.Time,
 	) ([]*models.LeaveBalance, error)
 
-	CheckLeaveAvailability(
-		ctx context.Context,
-		companyID uuid.UUID,
-		userID uuid.UUID,
-		leaveTypeID uuid.UUID,
-		days int,
-		startDate time.Time,
-	) (bool, float64, error)
+	CheckLeaveAvailability(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, leaveTypeID uuid.UUID, days int, startDate time.Time) (bool, float64, error)
 }
 
 type leaveQueryService struct {
-	repo   repository.LeaveRepository
-	logger *zap.Logger
+	repo         repository.LeaveRepository
+	employeeRepo hrRepo.EmployeeRepository // 👈 new — for P3
+	auditService *audit.AuditService
 }
 
 func NewLeaveQueryService(
 	repo repository.LeaveRepository,
-	logger *zap.Logger,
+	employeeRepo hrRepo.EmployeeRepository, // 👈 new
+	auditService *audit.AuditService,
 ) LeaveQueryService {
 	return &leaveQueryService{
-		repo:   repo,
-		logger: logger.Named("leave_query_service"),
+		repo:         repo,
+		employeeRepo: employeeRepo,
+		auditService: auditService,
 	}
 }
 
-// =====================================================
-// BALANCE
-// =====================================================
+// ensureEmployeeInScope verifies that the target employee is within the
+// request's current location scope.
+//
+//   - ScopeAll      → pass
+//   - ScopeLocation → target must be at that location
+//   - missing ctx   → error (route not wrapped → wiring bug)
+func (s *leaveQueryService) ensureEmployeeInScope(
+	ctx context.Context,
+	companyID, userID uuid.UUID,
+) error {
+	locCtx, err := locationctx.FromContext(ctx)
+	if err != nil {
+		return fmt.Errorf("location context missing: %w", err)
+	}
+	if locCtx.Mode == locationctx.ScopeAll {
+		return nil
+	}
+	empLoc, err := s.employeeRepo.GetEmploymentLocationID(ctx, companyID, userID)
+	if err != nil {
+		return err
+	}
+	if empLoc == nil {
+		return ErrEmployeeHasNoLocation
+	}
+	if *empLoc != *locCtx.LocationID {
+		return ErrEmployeeOutsideScope
+	}
+	return nil
+}
+
+// ============================================================================
+// BALANCE (P3 validates target)
+// ============================================================================
 
 func (s *leaveQueryService) GetLeaveBalance(
 	ctx context.Context,
 	companyID uuid.UUID,
 	userID uuid.UUID,
 	asOfDate time.Time,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
 ) ([]*models.LeaveBalance, error) {
+	// 👇 P3 — row-level authorization
+	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
+		return nil, err
+	}
 
 	positionID, _, err := s.repo.GetUserPositionContext(ctx, companyID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve user position: %w", err)
 	}
-
-	balances, err := s.repo.GetLeaveBalancesByUser(
-		ctx,
-		userID,
-		positionID,
-		asOfDate,
-	)
+	balances, err := s.repo.GetLeaveBalancesByUser(ctx, userID, positionID, asOfDate)
 	if err != nil {
-		s.logger.Error("Failed to get leave balances",
-			zap.String("user_id", userID.String()),
-			zap.Time("as_of", asOfDate),
-			zap.Error(err),
-		)
-		return nil, fmt.Errorf("failed to get leave balances: %w", err)
+		return nil, err
 	}
 
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"user_id": userID.String(),
+		"as_of":   asOfDate,
+		"count":   len(balances),
+		"ip":      ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx, nil, &companyID, "leave", "query.balance", "leave_balance",
+		nil, actorType, &actorID, nil, nil, auditMeta,
+	)
 	return balances, nil
 }
 
@@ -138,36 +136,42 @@ func (s *leaveQueryService) GetLeaveBalanceByType(
 	userID uuid.UUID,
 	leaveTypeID uuid.UUID,
 	asOfDate time.Time,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
 ) (*models.LeaveBalance, error) {
+	// 👇 P3 — row-level authorization
+	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
+		return nil, err
+	}
 
 	positionID, _, err := s.repo.GetUserPositionContext(ctx, companyID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve user position: %w", err)
 	}
-
-	balance, err := s.repo.CalculateLeaveBalance(
-		ctx,
-		userID,
-		leaveTypeID,
-		asOfDate,
-		positionID,
-	)
+	balance, err := s.repo.CalculateLeaveBalance(ctx, userID, leaveTypeID, asOfDate, positionID)
 	if err != nil {
-		s.logger.Error("Failed to calculate leave balance",
-			zap.String("user_id", userID.String()),
-			zap.String("leave_type_id", leaveTypeID.String()),
-			zap.Time("as_of", asOfDate),
-			zap.Error(err),
-		)
-		return nil, fmt.Errorf("failed to calculate leave balance: %w", err)
+		return nil, err
 	}
 
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"user_id":    userID.String(),
+		"leave_type": leaveTypeID.String(),
+		"as_of":      asOfDate,
+		"balance":    balance.Balance,
+		"ip":         ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx, nil, &companyID, "leave", "query.balance_by_type", "leave_balance",
+		nil, actorType, &actorID, nil, nil, auditMeta,
+	)
 	return balance, nil
 }
 
-// =====================================================
-// STATUS / HISTORY
-// =====================================================
+// ============================================================================
+// INTERNAL (no P3 — called by scheduler resolver without request ctx)
+// ============================================================================
 
 func (s *leaveQueryService) IsUserOnLeave(
 	ctx context.Context,
@@ -175,98 +179,105 @@ func (s *leaveQueryService) IsUserOnLeave(
 	userID uuid.UUID,
 	date time.Time,
 ) (bool, *models.LeaveRequest, error) {
-
 	start := date.AddDate(0, 0, -1)
 	end := date.AddDate(0, 0, 1)
-
 	requests, err := s.repo.GetLeaveRequestsByUser(ctx, userID, start, end)
 	if err != nil {
-		return false, nil, fmt.Errorf("failed to check leave status: %w", err)
+		return false, nil, err
 	}
-
 	for _, r := range requests {
-		if r.Status == "approved" &&
-			!date.Before(r.StartDate) &&
-			!date.After(r.EndDate) {
+		if r.Status == "approved" && !date.Before(r.StartDate) && !date.After(r.EndDate) {
 			return true, r, nil
 		}
 	}
-
 	return false, nil, nil
 }
 
-// GetApprovedLeaveForDate returns the approved leave request for a user on a specific date, if any.
 func (s *leaveQueryService) GetApprovedLeaveForDate(
 	ctx context.Context,
 	companyID uuid.UUID,
 	userID uuid.UUID,
 	date time.Time,
 ) (*models.LeaveRequest, error) {
-	// Query requests for the exact day (or range that includes the date)
 	start := date.Truncate(24 * time.Hour)
 	end := start.Add(24 * time.Hour).Add(-time.Second)
-
 	requests, err := s.repo.GetLeaveRequestsByUser(ctx, userID, start, end)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get leave requests: %w", err)
+		return nil, err
 	}
-
 	for _, r := range requests {
-		if r.Status == "approved" &&
-			!date.Before(r.StartDate) &&
-			!date.After(r.EndDate) {
-			// Ensure it belongs to the company (optional check)
-			if r.CompanyID == companyID {
-				return r, nil
-			}
+		if r.Status == "approved" && !date.Before(r.StartDate) &&
+			!date.After(r.EndDate) && r.CompanyID == companyID {
+			return r, nil
 		}
 	}
 	return nil, nil
 }
 
+// ============================================================================
+// HISTORY (P3 validates target; signature changed to accept companyID)
+// ============================================================================
+
 func (s *leaveQueryService) GetUserLeaveHistory(
 	ctx context.Context,
-	userID uuid.UUID,
+	companyID, userID uuid.UUID,
 	startDate, endDate time.Time,
 ) ([]*models.LeaveRequest, error) {
-
+	// 👇 P3 — row-level authorization
+	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
+		return nil, err
+	}
 	return s.repo.GetLeaveRequestsByUser(ctx, userID, startDate, endDate)
 }
 
 func (s *leaveQueryService) GetLeaveTransactionHistory(
 	ctx context.Context,
-	userID uuid.UUID,
+	companyID, userID uuid.UUID,
 	startDate, endDate time.Time,
 ) ([]*models.LeaveTransaction, error) {
-
+	// 👇 P3 — row-level authorization
+	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
+		return nil, err
+	}
 	return s.repo.GetLeaveTransactionHistory(ctx, userID, startDate, endDate)
 }
 
-// =====================================================
-// REPORTS
-// =====================================================
+// ============================================================================
+// LEAVE TYPE / FORECAST / UTILIZATION / AVAILABILITY
+// ============================================================================
+
+func (s *leaveQueryService) GetLeaveTypeByID(
+	ctx context.Context,
+	companyID uuid.UUID,
+	leaveTypeID uuid.UUID,
+) (*models.LeaveType, error) {
+	lt, err := s.repo.GetLeaveTypeByID(ctx, leaveTypeID)
+	if err != nil {
+		return nil, err
+	}
+	if lt.CompanyID != companyID {
+		return nil, fmt.Errorf("leave type does not belong to company")
+	}
+	return lt, nil
+}
 
 func (s *leaveQueryService) GetLeaveForecast(
 	ctx context.Context,
 	userID uuid.UUID,
 	months int,
 ) ([]*models.LeaveBalance, error) {
-
 	return s.repo.GetLeaveForecast(ctx, userID, months)
 }
 
+// GetLeaveUtilizationReport — location filter applied when locationID != nil.
 func (s *leaveQueryService) GetLeaveUtilizationReport(
 	ctx context.Context,
 	companyID uuid.UUID,
+	locationID *uuid.UUID,
 	startDate, endDate time.Time,
 ) ([]*models.LeaveBalance, error) {
-
-	return s.repo.GetLeaveUtilizationReport(ctx, companyID, startDate, endDate)
+	return s.repo.GetLeaveUtilizationReport(ctx, companyID, locationID, startDate, endDate)
 }
-
-// =====================================================
-// AVAILABILITY
-// =====================================================
 
 func (s *leaveQueryService) CheckLeaveAvailability(
 	ctx context.Context,
@@ -276,37 +287,9 @@ func (s *leaveQueryService) CheckLeaveAvailability(
 	days int,
 	startDate time.Time,
 ) (bool, float64, error) {
-
 	positionID, _, err := s.repo.GetUserPositionContext(ctx, companyID, userID)
 	if err != nil {
 		return false, 0, fmt.Errorf("failed to resolve user position: %w", err)
 	}
-
-	return s.repo.CheckLeaveAvailability(
-		ctx,
-		userID,
-		leaveTypeID,
-		days,
-		startDate,
-		positionID,
-	)
-}
-
-func (s *leaveQueryService) GetLeaveTypeByID(
-	ctx context.Context,
-	companyID uuid.UUID,
-	leaveTypeID uuid.UUID,
-) (*models.LeaveType, error) {
-
-	leaveType, err := s.repo.GetLeaveTypeByID(ctx, leaveTypeID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get leave type: %w", err)
-	}
-
-	// Safety: ensure leave type belongs to company
-	if leaveType.CompanyID != companyID {
-		return nil, fmt.Errorf("leave type does not belong to company")
-	}
-
-	return leaveType, nil
+	return s.repo.CheckLeaveAvailability(ctx, userID, leaveTypeID, days, startDate, positionID)
 }

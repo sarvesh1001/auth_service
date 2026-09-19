@@ -12,15 +12,15 @@ type Tool interface {
 	Execute(ctx context.Context, input models.ToolCallInput) (*models.ToolResult, error)
 }
 
-// UPDATED: added DeviceID field
 type ToolExecutionInput struct {
 	UserID         string
 	CompanyID      interface{}
 	SessionType    string
 	PermissionMask interface{}
 	AuthHeader     string
-	DeviceID       string // NEW
+	DeviceID       string
 	ToolCall       models.ToolCall
+	IdempotencyKey string // <-- NEW
 }
 
 type ToolExecutor struct {
@@ -43,14 +43,14 @@ func (e *ToolExecutor) Execute(ctx context.Context, input ToolExecutionInput) (*
 		return nil, fmt.Errorf("unknown tool: %s", input.ToolCall.Name)
 	}
 
-	// UPDATED: pass DeviceID to ToolCallInput
 	return tool.Execute(ctx, models.ToolCallInput{
 		UserID:         input.UserID,
 		CompanyID:      input.CompanyID,
 		SessionType:    input.SessionType,
 		PermissionMask: input.PermissionMask,
 		AuthHeader:     input.AuthHeader,
-		DeviceID:       input.DeviceID, // NEW
+		DeviceID:       input.DeviceID,
 		Arguments:      input.ToolCall.Arguments,
+		IdempotencyKey: input.IdempotencyKey, // <-- NEW
 	})
 }

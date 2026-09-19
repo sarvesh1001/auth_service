@@ -22,8 +22,7 @@ func NewHRClient(baseURL string) *HRClient {
 	}
 }
 
-// Do sends an HTTP request to the HR service. The body parameter should be an io.Reader
-// (e.g., bytes.Reader) containing the already‑marshalled JSON payload, or nil.
+// Do sends an HTTP request to the HR service.
 func (c *HRClient) Do(
 	ctx context.Context,
 	method string,
@@ -31,6 +30,7 @@ func (c *HRClient) Do(
 	authHeader string,
 	deviceID string,
 	companyID string,
+	idempotencyKey string, // <-- NEW
 	body io.Reader,
 ) ([]byte, int, error) {
 	req, err := http.NewRequestWithContext(
@@ -47,6 +47,9 @@ func (c *HRClient) Do(
 	req.Header.Set("Authorization", authHeader)
 	req.Header.Set("X-Device-ID", deviceID)
 	req.Header.Set("X-Company-ID", companyID)
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey) // <-- NEW
+	}
 
 	resp, err := c.Client.Do(req)
 	if err != nil {

@@ -6,6 +6,7 @@ package client
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -186,4 +187,110 @@ func (p *PostgresClient) GetStats() sql.DBStats {
 	}
 
 	return p.DB.Stats()
+}
+
+// ============================================================
+// ✅ NEW — DBTX interface + WithTx helper
+// ============================================================
+//
+// DBTX is the subset of methods shared by *sql.DB and *sql.Tx. Repository
+// methods that need to participate in a transaction (or optionally take
+// one) accept a DBTX as their first argument. Callers pass:
+//
+//   - r.client.Pool()          → runs against the pool (auto-commit)
+//   - tx  (an active *sql.Tx)  → runs inside the caller's transaction
+//
+// This means a single repository method works in both contexts without
+// needing two method variants. Where you want to keep an existing method
+// signature for backward-compat, you can keep the non-Tx variant and add
+// a new Tx variant that calls into the same query body.
+
+// DBTX is satisfied by both *sql.DB and *sql.Tx.
+type DBTX interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+}
+
+// Compile-time guarantees that both types satisfy DBTX.
+var (
+	_ DBTX = (*sql.DB)(nil)
+	_ DBTX = (*sql.Tx)(nil)
+)
+
+// Pool returns the underlying *sql.DB as a DBTX so callers that don't
+// want to hold a transaction can still pass something to a repo method
+// expecting a DBTX.
+//
+// Usage:
+//
+//	rows, err := repo.ListLocations(ctx, r.client.Pool(), companyID, limit, offset)
+func (p *PostgresClient) Pool() DBTX {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.DB
+}
+
+// TxFunc is the function signature accepted by WithTx. Any error returned
+// causes the transaction to roll back; a nil return commits.
+type TxFunc func(tx *sql.Tx) error
+
+// WithTx runs fn inside a database transaction. Behaviour:
+//
+//   - begins a transaction on the pool
+//   - runs fn(tx)
+//   - if fn returns nil  → commits
+//   - if fn returns err  → rolls back, returns the original error
+//   - if fn panics       → rolls back, re-panics
+//   - if Commit fails    → returns a wrapped error; the tx is considered
+//     aborted by the driver
+//
+// The context passed in is used for Begin/Commit/Rollback. Repository
+// methods called inside fn should use the tx (not the pool) so their
+// statements run on the same connection.
+//
+// Do NOT nest calls to WithTx — the inner WithTx would begin a new
+// connection-level transaction and the outer one would fail to see the
+// inner's writes. If you need to compose services, thread the *sql.Tx
+// through to inner service methods explicitly.
+func (p *PostgresClient) WithTx(ctx context.Context, fn TxFunc) (err error) {
+	p.mu.RLock()
+	db := p.DB
+	p.mu.RUnlock()
+
+	if db == nil {
+		return fmt.Errorf("postgreSQL client not initialized")
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+
+	defer func() {
+		// Recover-panic path: always roll back before re-panicking so the
+		// connection isn't left open.
+		if r := recover(); r != nil {
+			if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+				util.Error("tx rollback after panic failed", zap.Error(rbErr))
+			}
+			panic(r)
+		}
+
+		// Error path: fn returned an error → roll back.
+		if err != nil {
+			if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+				util.Error("tx rollback failed", zap.Error(rbErr))
+			}
+		}
+	}()
+
+	if err = fn(tx); err != nil {
+		return err
+	}
+
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+	return nil
 }

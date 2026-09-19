@@ -2,8 +2,6 @@ package service
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"net"
 	"regexp"
@@ -13,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"auth-service/internal/config"
+	"auth-service/internal/devicefp"
 	"auth-service/internal/encryption"
 	appErrors "auth-service/internal/errors"
 	"auth-service/internal/hashing"
@@ -169,49 +168,30 @@ func NewAdminMPINService(
 
 // ---- Helper methods ----
 
-func (s *AdminMPINService) hashDeviceFingerprint(fingerprint string) string {
-	if fingerprint == "" {
-		return ""
-	}
-	hash := sha256.Sum256([]byte(fingerprint))
-	return hex.EncodeToString(hash[:])
-}
+// isDeviceTrusted returns (trusted, trustLevel, err).
+//
+// Hard rules (must pass):
+//  1. Trust record exists
+//  2. Device is not blocked
+//  3. TrustStatus is Primary or Trusted
+//  4. Fingerprint is not contradicted by a non-empty mismatch
+//
+// Soft rules (scored, threshold = 60):
+//   - IP subnet change → 35
+//   - IP same subnet, different address → 10
+//   - Stored IP empty, incoming IP present → 20
+//   - Stored fingerprint present, incoming empty → 40
+//   - Stored fingerprint empty, incoming present → 5
+//   - Both empty → 10
+//
+// This is what lets admins stay trusted across docker restarts, NAT
+// changes and mobile network hops, while still flagging genuine reuse.
+func (s *AdminMPINService) isDeviceTrusted(
+	ctx context.Context,
+	adminID uuid.UUID,
+	deviceID, ipAddress, deviceFingerprint string,
+) (bool, *models.DeviceTrustLevel, error) {
 
-func (s *AdminMPINService) getSubnet(ipAddress string) string {
-	if ipAddress == "" {
-		return ""
-	}
-	parsedIP := net.ParseIP(ipAddress)
-	if parsedIP == nil {
-		return ""
-	}
-	if ipv4 := parsedIP.To4(); ipv4 != nil {
-		mask := net.CIDRMask(24, 32)
-		maskedIP := ipv4.Mask(mask)
-		return maskedIP.String()
-	}
-	if ipv6 := parsedIP.To16(); ipv6 != nil {
-		mask := net.CIDRMask(64, 128)
-		maskedIP := ipv6.Mask(mask)
-		return maskedIP.String()
-	}
-	return ""
-}
-
-func (s *AdminMPINService) isSubnetMatch(ip1, ip2 string) bool {
-	if ip1 == "" || ip2 == "" {
-		return true
-	}
-	subnet1 := s.getSubnet(ip1)
-	subnet2 := s.getSubnet(ip2)
-	if subnet1 == "" || subnet2 == "" {
-		return true
-	}
-	return subnet1 == subnet2
-}
-
-// isDeviceTrusted – with extensive logging for debugging
-func (s *AdminMPINService) isDeviceTrusted(ctx context.Context, adminID uuid.UUID, deviceID, ipAddress, deviceFingerprint string) (bool, *models.DeviceTrustLevel, error) {
 	trustLevel, err := s.deviceTrustRepo.GetAdminDeviceTrustLevel(ctx, adminID, deviceID)
 	if err != nil {
 		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
@@ -233,6 +213,7 @@ func (s *AdminMPINService) isDeviceTrusted(ctx context.Context, adminID uuid.UUI
 		})
 		return false, nil, err
 	}
+
 	if trustLevel == nil {
 		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -252,6 +233,7 @@ func (s *AdminMPINService) isDeviceTrusted(ctx context.Context, adminID uuid.UUI
 		})
 		return false, nil, nil
 	}
+
 	if trustLevel.IsBlocked {
 		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -271,7 +253,10 @@ func (s *AdminMPINService) isDeviceTrusted(ctx context.Context, adminID uuid.UUI
 		})
 		return false, trustLevel, nil
 	}
-	if trustLevel.TrustStatus != models.TrustStatusPrimary && trustLevel.TrustStatus != models.TrustStatusTrusted {
+
+	if trustLevel.TrustStatus != models.TrustStatusPrimary &&
+		trustLevel.TrustStatus != models.TrustStatusTrusted {
+
 		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
 			LogEnvelope: models.LogEnvelope{
 				EventID:     uuid.New().String(),
@@ -290,8 +275,27 @@ func (s *AdminMPINService) isDeviceTrusted(ctx context.Context, adminID uuid.UUI
 		})
 		return false, trustLevel, nil
 	}
-	if ipAddress != "" && trustLevel.LastIPAddress != "" && !s.isSubnetMatch(trustLevel.LastIPAddress, ipAddress) {
-		trustLevel.RiskScore += 15
+
+	// ---- Soft signals: score, do not hard reject on a single mismatch ----
+	score := 0
+	reasons := make([]string, 0, 3)
+
+	// Fingerprint — canonical hash, empty stays empty.
+	incomingFP := devicefp.Hash(deviceFingerprint)
+	switch {
+	case trustLevel.DeviceFingerprint == "" && incomingFP == "":
+		score += 10
+		reasons = append(reasons, "no_fingerprint")
+	case trustLevel.DeviceFingerprint != "" && incomingFP == "":
+		score += 40
+		reasons = append(reasons, "fingerprint_missing")
+	case trustLevel.DeviceFingerprint == "" && incomingFP != "":
+		score += 5
+		reasons = append(reasons, "fingerprint_added")
+	case trustLevel.DeviceFingerprint != incomingFP:
+		// Both non-empty and disagree — different physical device.
+		// This is a hard reject (do not let a mismatched fingerprint through).
+		trustLevel.RiskScore += 40
 		if err := s.deviceTrustRepo.SetAdminDeviceTrustLevel(ctx, adminID, deviceID, trustLevel); err != nil {
 			s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
 				LogEnvelope: models.LogEnvelope{
@@ -302,7 +306,7 @@ func (s *AdminMPINService) isDeviceTrusted(ctx context.Context, adminID uuid.UUI
 					Environment: s.config.Environment,
 					Version:     AdminServiceVersion,
 					Level:       string(models.LogLevelWarning),
-					Message:     "Failed to update risk score for subnet mismatch",
+					Message:     "Failed to bump risk score for fingerprint mismatch",
 				},
 				UserID:       adminID.String(),
 				Status:       "risk_update_failed",
@@ -320,47 +324,7 @@ func (s *AdminMPINService) isDeviceTrusted(ctx context.Context, adminID uuid.UUI
 				Environment: s.config.Environment,
 				Version:     AdminServiceVersion,
 				Level:       string(models.LogLevelWarning),
-				Message:     fmt.Sprintf("Device trust: IP subnet mismatch (stored: %s, current: %s)", trustLevel.LastIPAddress, ipAddress),
-			},
-			UserID:        adminID.String(),
-			DeviceID:      deviceID,
-			Status:        "trust_check_failed",
-			FailureReason: "ip_subnet_mismatch",
-		})
-		return false, trustLevel, nil
-	}
-	hashedFingerprint := s.hashDeviceFingerprint(deviceFingerprint)
-	if deviceFingerprint != "" && trustLevel.DeviceFingerprint != "" && trustLevel.DeviceFingerprint != hashedFingerprint {
-		trustLevel.RiskScore += 10
-		if err := s.deviceTrustRepo.SetAdminDeviceTrustLevel(ctx, adminID, deviceID, trustLevel); err != nil {
-			s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-				LogEnvelope: models.LogEnvelope{
-					EventID:     uuid.New().String(),
-					EventType:   string(models.LogEventTypeMPIN),
-					ServiceName: "auth-service",
-					Timestamp:   time.Now(),
-					Environment: s.config.Environment,
-					Version:     AdminServiceVersion,
-					Level:       string(models.LogLevelWarning),
-					Message:     "Failed to update risk score for fingerprint mismatch",
-				},
-				UserID:       adminID.String(),
-				Status:       "risk_update_failed",
-				DeviceID:     deviceID,
-				ErrorCode:    "RISK_UPDATE_FAILED",
-				ErrorMessage: err.Error(),
-			})
-		}
-		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     AdminServiceVersion,
-				Level:       string(models.LogLevelWarning),
-				Message:     "Device trust: fingerprint mismatch",
+				Message:     "Device trust: fingerprint mismatch (hard reject)",
 			},
 			UserID:        adminID.String(),
 			DeviceID:      deviceID,
@@ -369,7 +333,62 @@ func (s *AdminMPINService) isDeviceTrusted(ctx context.Context, adminID uuid.UUI
 		})
 		return false, trustLevel, nil
 	}
-	// All checks passed
+
+	// IP — soft, scored by subnet.
+	switch {
+	case trustLevel.LastIPAddress == "":
+		score += 20
+		reasons = append(reasons, "no_stored_ip")
+	case extractSubnet24(ipAddress) != extractSubnet24(trustLevel.LastIPAddress):
+		score += 35
+		reasons = append(reasons, "ip_subnet_changed")
+	case trustLevel.LastIPAddress != ipAddress:
+		score += 10
+		reasons = append(reasons, "ip_changed_same_subnet")
+	}
+
+	if score >= 60 {
+		// Persist increased risk so future checks see the accumulated signal.
+		trustLevel.RiskScore += score
+		if err := s.deviceTrustRepo.SetAdminDeviceTrustLevel(ctx, adminID, deviceID, trustLevel); err != nil {
+			s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+				LogEnvelope: models.LogEnvelope{
+					EventID:     uuid.New().String(),
+					EventType:   string(models.LogEventTypeMPIN),
+					ServiceName: "auth-service",
+					Timestamp:   time.Now(),
+					Environment: s.config.Environment,
+					Version:     AdminServiceVersion,
+					Level:       string(models.LogLevelWarning),
+					Message:     "Failed to persist increased device risk score",
+				},
+				UserID:       adminID.String(),
+				Status:       "risk_update_failed",
+				DeviceID:     deviceID,
+				ErrorCode:    "RISK_UPDATE_FAILED",
+				ErrorMessage: err.Error(),
+			})
+		}
+		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     AdminServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     fmt.Sprintf("Device trust: risk score threshold exceeded (score=%d, reasons=%v)", score, reasons),
+			},
+			UserID:        adminID.String(),
+			DeviceID:      deviceID,
+			Status:        "trust_check_failed",
+			FailureReason: "risk_score_high",
+		})
+		return false, trustLevel, nil
+	}
+
+	// Trusted (possibly with accumulated soft signals below threshold).
 	s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
 		LogEnvelope: models.LogEnvelope{
 			EventID:     uuid.New().String(),
@@ -379,7 +398,7 @@ func (s *AdminMPINService) isDeviceTrusted(ctx context.Context, adminID uuid.UUI
 			Environment: s.config.Environment,
 			Version:     AdminServiceVersion,
 			Level:       string(models.LogLevelInfo),
-			Message:     "Device trust: device is trusted",
+			Message:     fmt.Sprintf("Device trust: device is trusted (score=%d)", score),
 		},
 		UserID:   adminID.String(),
 		DeviceID: deviceID,
@@ -798,7 +817,7 @@ func (s *AdminMPINService) SetupAdminMPIN(ctx context.Context, req *AdminMPINSet
 		UserID:            req.AdminID,
 		DeviceID:          req.DeviceID,
 		TrustStatus:       models.TrustStatusTrusted,
-		DeviceFingerprint: s.hashDeviceFingerprint(req.DeviceFingerprint),
+		DeviceFingerprint: devicefp.Hash(req.DeviceFingerprint),
 		LastIPAddress:     req.IPAddress,
 		UserAgent:         req.UserAgent,
 		IsBlocked:         false,
@@ -935,7 +954,7 @@ func (s *AdminMPINService) VerifyAdminMPIN(ctx context.Context, req *AdminMPINVe
 		UserAgent: req.UserAgent,
 	})
 
-	// ---- ★ NEW: Enforce device trust ----
+	// ---- ★ Enforce device trust ----
 	trusted, trustLevel, err := s.isDeviceTrusted(ctx, req.AdminID, req.DeviceID, req.IPAddress, req.DeviceFingerprint)
 	if err != nil {
 		return nil, fmt.Errorf("device trust check failed: %w", err)
@@ -1167,7 +1186,7 @@ func (s *AdminMPINService) VerifyAdminMPIN(ctx context.Context, req *AdminMPINVe
 			UserID:            req.AdminID,
 			DeviceID:          req.DeviceID,
 			TrustStatus:       models.TrustStatusTrusted,
-			DeviceFingerprint: s.hashDeviceFingerprint(req.DeviceFingerprint),
+			DeviceFingerprint: devicefp.Hash(req.DeviceFingerprint),
 			LastIPAddress:     req.IPAddress,
 			UserAgent:         req.UserAgent,
 			IsBlocked:         false,
@@ -2056,7 +2075,7 @@ func (s *AdminMPINService) VerifyForgotAdminMPINOTP(ctx context.Context, req *Ad
 		UserID:            req.AdminID,
 		DeviceID:          req.DeviceID,
 		TrustStatus:       models.TrustStatusTrusted,
-		DeviceFingerprint: s.hashDeviceFingerprint(req.DeviceFingerprint),
+		DeviceFingerprint: devicefp.Hash(req.DeviceFingerprint),
 		LastIPAddress:     req.IPAddress,
 		UserAgent:         req.UserAgent,
 		IsBlocked:         false,

@@ -1,7 +1,6 @@
 package factory
 
 import (
-	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
 	"auth-service/internal/client"
@@ -9,11 +8,9 @@ import (
 	"auth-service/internal/infrastructure/audit"
 	"auth-service/internal/infrastructure/idempotency"
 	"auth-service/internal/infrastructure/outbox"
-	"auth-service/internal/sales"
 	"auth-service/internal/sales/handler"
 	"auth-service/internal/sales/repository"
 	"auth-service/internal/sales/service"
-	mainservice "auth-service/internal/service"
 
 	accountingService "auth-service/internal/accounting/service"
 )
@@ -856,31 +853,6 @@ func (f *SalesInfraFactory) TaxHandler() *handler.TaxHandler {
 // ----------------------------------------------------------------------------
 // Route registration
 // ----------------------------------------------------------------------------
-
-// RegisterRoutes mounts all sales routes on the given router.
-func (f *SalesInfraFactory) RegisterRoutes(r chi.Router, jwtService *mainservice.JWTService) {
-	handlers := &sales.SalesHandlers{
-		CommissionHandler:  f.CommissionHandler(),
-		CouponHandler:      f.CouponHandler(),
-		CreditCheckHandler: f.CreditCheckHandler(),
-		CreditNoteHandler:  f.CreditNoteHandler(),
-		CustomerHandler:    f.CustomerHandler(),
-		DiscountHandler:    f.DiscountHandler(),
-		InvoiceHandler:     f.InvoiceHandler(),
-		OrderHandler:       f.OrderHandler(),
-		PaymentHandler:     f.PaymentHandler(),
-		PaymentTermHandler: f.PaymentTermHandler(),
-		PricingHandler:     f.PricingHandler(),
-		ProductHandler:     f.ProductHandler(),
-		PromotionHandler:   f.PromotionHandler(),
-		QuoteHandler:       f.QuoteHandler(),
-		ReportHandler:      f.ReportHandler(),
-		ReturnHandler:      f.ReturnHandler(),
-		SalesRepHandler:    f.SalesRepHandler(),
-		TaxHandler:         f.TaxHandler(),
-	}
-	sales.RegisterSalesRoutes(r, handlers, jwtService)
-}
 
 // Close performs any necessary cleanup (placeholder for future use).
 func (f *SalesInfraFactory) Close() {

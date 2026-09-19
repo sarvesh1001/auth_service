@@ -39,11 +39,6 @@ type EmployeeFineRepository interface {
 		companyID, fineID uuid.UUID,
 	) (*models.EmployeeFine, error)
 
-	GetByFilter(
-		ctx context.Context,
-		filter models.EmployeeFineFilter,
-	) ([]models.EmployeeFine, int, error)
-
 	GetUnprocessedByUserAndPeriod(
 		ctx context.Context,
 		companyID uuid.UUID,
@@ -51,23 +46,22 @@ type EmployeeFineRepository interface {
 		periodStart, periodEnd time.Time,
 	) ([]models.EmployeeFine, error)
 
+	GetByFilter(ctx context.Context, filter models.EmployeeFineFilter) ([]models.EmployeeFine, int, error) // unchanged signature; filter struct changed
+
 	GetUnprocessedByCompanyAndPeriod(
 		ctx context.Context,
 		companyID uuid.UUID,
 		periodStart, periodEnd time.Time,
+		locationID *uuid.UUID, // 👈 new
 	) ([]models.EmployeeFine, error)
-
-	// =========================================================================
-	// Run Safety
-	// =========================================================================
 
 	LockUnprocessedForPayrollRun(
 		ctx context.Context,
 		companyID uuid.UUID,
 		periodStart, periodEnd time.Time,
 		payrollRunID uuid.UUID,
+		locationID *uuid.UUID, // 👈 new
 	) ([]models.EmployeeFine, error)
-
 	// =========================================================================
 	// Audit / Integrity
 	// =========================================================================

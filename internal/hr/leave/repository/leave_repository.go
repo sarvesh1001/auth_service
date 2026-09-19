@@ -21,7 +21,15 @@ type LeaveRepository interface {
 	GetLeaveEntitlementByID(ctx context.Context, entitlementID uuid.UUID) (*models.LeaveEntitlement, error)
 	GetLeaveEntitlementsByUser(ctx context.Context, userID uuid.UUID, positionID *uuid.UUID,
 	) ([]*models.LeaveEntitlement, error)
-	GetLeaveEntitlementsByCompany(ctx context.Context, companyID uuid.UUID, page, pageSize int) ([]*models.LeaveEntitlement, int64, error)
+
+	// GetLeaveEntitlementsByCompany — location filter applies when non-nil.
+	GetLeaveEntitlementsByCompany(
+		ctx context.Context,
+		companyID uuid.UUID,
+		locationID *uuid.UUID,
+		page, pageSize int,
+	) ([]*models.LeaveEntitlement, int64, error)
+
 	UpdateLeaveEntitlement(ctx context.Context, entitlementID uuid.UUID, update *models.LeaveEntitlementUpdate) error
 	EndLeaveEntitlement(ctx context.Context, entitlementID uuid.UUID, endDate time.Time) error
 	GetActiveLeaveEntitlement(
@@ -41,8 +49,17 @@ type LeaveRepository interface {
 	CreateLeaveRequest(ctx context.Context, request *models.LeaveRequest) error
 	GetLeaveRequestByID(ctx context.Context, requestID uuid.UUID) (*models.LeaveRequest, error)
 	GetLeaveRequestsByUser(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time) ([]*models.LeaveRequest, error)
+	// GetLeaveRequestsByCompany — location filter applied via filter.LocationID.
 	GetLeaveRequestsByCompany(ctx context.Context, filter models.LeaveRequestFilter) ([]*models.LeaveRequest, int64, error)
-	GetPendingLeaveRequests(ctx context.Context, companyID uuid.UUID, approverID uuid.UUID) ([]*models.LeaveRequest, error)
+
+	// GetPendingLeaveRequests — location filter applies when non-nil.
+	GetPendingLeaveRequests(
+		ctx context.Context,
+		companyID uuid.UUID,
+		approverID uuid.UUID,
+		locationID *uuid.UUID,
+	) ([]*models.LeaveRequest, error)
+
 	UpdateLeaveRequest(ctx context.Context, requestID uuid.UUID, update *models.LeaveRequestUpdate) error
 	CancelLeaveRequest(ctx context.Context, requestID uuid.UUID) error
 	CheckLeaveOverlap(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time, excludeRequestID *uuid.UUID) (bool, error)
@@ -70,7 +87,15 @@ type LeaveRepository interface {
 
 	ProcessLeaveRequest(ctx context.Context, requestID uuid.UUID, approved bool, approvedBy uuid.UUID) error
 	ProcessLeaveAccruals(ctx context.Context, companyID uuid.UUID, accrualDate time.Time) (int, error)
-	GetLeaveUtilizationReport(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) ([]*models.LeaveBalance, error)
+
+	// GetLeaveUtilizationReport — location filter applies when non-nil.
+	GetLeaveUtilizationReport(
+		ctx context.Context,
+		companyID uuid.UUID,
+		locationID *uuid.UUID,
+		startDate, endDate time.Time,
+	) ([]*models.LeaveBalance, error)
+
 	GetLeaveForecast(ctx context.Context, userID uuid.UUID, months int) ([]*models.LeaveBalance, error)
 	CalculateLeaveBalance(
 		ctx context.Context,
@@ -110,7 +135,7 @@ type LeaveRepository interface {
 
 	HealthCheck(ctx context.Context) error
 
-	// NEW METHODS: Leave Policy Management
+	// Leave Policy Management
 	CreateLeavePolicy(ctx context.Context, policy *models.LeavePolicy) error
 	GetLeavePolicyByID(ctx context.Context, policyID uuid.UUID) (*models.LeavePolicy, error)
 	GetActiveLeavePoliciesByCompany(ctx context.Context, companyID uuid.UUID, asOf time.Time) ([]*models.LeavePolicy, error)
@@ -121,7 +146,7 @@ type LeaveRepository interface {
 	GetPolicyRules(ctx context.Context, policyID uuid.UUID) ([]*models.LeavePolicyRule, error)
 	DeletePolicyRule(ctx context.Context, policyRuleID uuid.UUID) error
 
-	// Policy Resolution (SAP-style)
+	// Policy Resolution
 	CreateLeavePolicyResolution(
 		ctx context.Context,
 		companyID uuid.UUID,
@@ -136,6 +161,7 @@ type LeaveRepository interface {
 		userID uuid.UUID,
 		asOf time.Time,
 	) ([]*models.LeavePolicyRuleResolution, error)
+
 	// Policy Entitlement Helpers
 	EndActivePolicyEntitlements(
 		ctx context.Context,
@@ -157,13 +183,16 @@ type LeaveRepository interface {
 		effectiveTo time.Time,
 		positionID *uuid.UUID,
 	) error
-	// In LeaveRepository interface
+
+	// GetLeaveEntitlementsByCompanyAndUser — location filter applies when non-nil.
 	GetLeaveEntitlementsByCompanyAndUser(
 		ctx context.Context,
 		companyID uuid.UUID,
 		userID *uuid.UUID,
+		locationID *uuid.UUID,
 		page, pageSize int,
 	) ([]*models.LeaveEntitlement, int64, error)
+
 	GetUserPositionContext(
 		ctx context.Context,
 		companyID uuid.UUID,

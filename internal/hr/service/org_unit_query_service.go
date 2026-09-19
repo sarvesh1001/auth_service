@@ -1,26 +1,33 @@
 package service
 
 import (
-	"auth-service/internal/hr/models/orgunit"
-	"auth-service/internal/hr/repository"
 	"context"
+	"encoding/json"
+	"time"
 
 	"github.com/google/uuid"
-	"go.uber.org/zap"
+
+	"auth-service/internal/hr/models/orgunit"
+	"auth-service/internal/hr/repository"
+	"auth-service/internal/infrastructure/audit"
 )
 
+// OrgUnitQueryService handles read operations for org units with audit logging
 type OrgUnitQueryService struct {
-	orgUnitRepo repository.OrgUnitRepository
-	logger      *zap.Logger
+	orgUnitRepo  repository.OrgUnitRepository
+	auditService *audit.AuditService
 }
 
 func NewOrgUnitQueryService(
 	orgUnitRepo repository.OrgUnitRepository,
-	logger *zap.Logger,
+	auditService *audit.AuditService,
 ) *OrgUnitQueryService {
+	if auditService == nil {
+		panic("auditService is required for OrgUnitQueryService")
+	}
 	return &OrgUnitQueryService{
-		orgUnitRepo: orgUnitRepo,
-		logger:      logger,
+		orgUnitRepo:  orgUnitRepo,
+		auditService: auditService,
 	}
 }
 
@@ -30,10 +37,42 @@ func (s *OrgUnitQueryService) GetOrgUnit(
 	orgUnitID uuid.UUID,
 	withDetails bool,
 ) (interface{}, error) {
+	startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
+
+	var result interface{}
+	var err error
 	if withDetails {
-		return s.orgUnitRepo.GetOrgUnitWithDetails(ctx, companyID, orgUnitID)
+		result, err = s.orgUnitRepo.GetOrgUnitWithDetails(ctx, companyID, orgUnitID)
+	} else {
+		result, err = s.orgUnitRepo.GetOrgUnitByID(ctx, companyID, orgUnitID)
 	}
-	return s.orgUnitRepo.GetOrgUnitByID(ctx, companyID, orgUnitID)
+	if err != nil {
+		return nil, err
+	}
+
+	afterJSON, _ := json.Marshal(result)
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&companyID,
+		"hr",
+		"org_unit.read",
+		"org_units",
+		&orgUnitID,
+		"system",
+		nil,
+		nil,
+		afterJSON,
+		map[string]interface{}{
+			"ip":           ip,
+			"company_id":   companyID.String(),
+			"with_details": withDetails,
+			"duration_ms":  time.Since(startTime).Milliseconds(),
+		},
+	)
+
+	return result, nil
 }
 
 func (s *OrgUnitQueryService) ListOrgUnits(
@@ -43,15 +82,48 @@ func (s *OrgUnitQueryService) ListOrgUnits(
 	orgUnitType *string,
 	isActive *bool,
 ) ([]*orgunit.OrgUnit, int, error) {
+	startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
+
 	if page < 1 {
 		page = 1
 	}
 	if pageSize < 1 || pageSize > 100 {
 		pageSize = 50
 	}
-
 	offset := (page - 1) * pageSize
-	return s.orgUnitRepo.ListOrgUnits(ctx, companyID, orgUnitType, isActive, pageSize, offset)
+
+	orgUnits, total, err := s.orgUnitRepo.ListOrgUnits(ctx, companyID, orgUnitType, isActive, pageSize, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&companyID,
+		"hr",
+		"org_unit.list",
+		"org_units",
+		nil,
+		"system",
+		nil,
+		nil,
+		nil,
+		map[string]interface{}{
+			"ip":          ip,
+			"company_id":  companyID.String(),
+			"page":        page,
+			"page_size":   pageSize,
+			"type":        orgUnitType,
+			"is_active":   isActive,
+			"total":       total,
+			"returned":    len(orgUnits),
+			"duration_ms": time.Since(startTime).Milliseconds(),
+		},
+	)
+
+	return orgUnits, total, nil
 }
 
 func (s *OrgUnitQueryService) SearchOrgUnits(
@@ -60,22 +132,82 @@ func (s *OrgUnitQueryService) SearchOrgUnits(
 	filters map[string]interface{},
 	page, pageSize int,
 ) ([]*orgunit.OrgUnit, int, error) {
+	startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
+
 	if page < 1 {
 		page = 1
 	}
 	if pageSize < 1 || pageSize > 100 {
 		pageSize = 50
 	}
-
 	offset := (page - 1) * pageSize
-	return s.orgUnitRepo.SearchOrgUnits(ctx, companyID, filters, pageSize, offset)
+
+	orgUnits, total, err := s.orgUnitRepo.SearchOrgUnits(ctx, companyID, filters, pageSize, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&companyID,
+		"hr",
+		"org_unit.search",
+		"org_units",
+		nil,
+		"system",
+		nil,
+		nil,
+		nil,
+		map[string]interface{}{
+			"ip":          ip,
+			"company_id":  companyID.String(),
+			"filters":     filters,
+			"page":        page,
+			"page_size":   pageSize,
+			"total":       total,
+			"returned":    len(orgUnits),
+			"duration_ms": time.Since(startTime).Milliseconds(),
+		},
+	)
+
+	return orgUnits, total, nil
 }
 
 func (s *OrgUnitQueryService) GetActiveOrgUnits(
 	ctx context.Context,
 	companyID uuid.UUID,
 ) ([]*orgunit.OrgUnit, error) {
-	return s.orgUnitRepo.GetActiveOrgUnits(ctx, companyID)
+	startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
+
+	orgUnits, err := s.orgUnitRepo.GetActiveOrgUnits(ctx, companyID)
+	if err != nil {
+		return nil, err
+	}
+
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&companyID,
+		"hr",
+		"org_unit.active_list",
+		"org_units",
+		nil,
+		"system",
+		nil,
+		nil,
+		nil,
+		map[string]interface{}{
+			"ip":          ip,
+			"company_id":  companyID.String(),
+			"count":       len(orgUnits),
+			"duration_ms": time.Since(startTime).Milliseconds(),
+		},
+	)
+
+	return orgUnits, nil
 }
 
 func (s *OrgUnitQueryService) GetUserMemberships(
@@ -83,7 +215,36 @@ func (s *OrgUnitQueryService) GetUserMemberships(
 	userID uuid.UUID,
 	onlyActive bool,
 ) ([]*orgunit.UserOrgUnitMembership, error) {
-	return s.orgUnitRepo.GetUserMemberships(ctx, userID, onlyActive)
+	startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
+
+	memberships, err := s.orgUnitRepo.GetUserMemberships(ctx, userID, onlyActive)
+	if err != nil {
+		return nil, err
+	}
+
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		nil, // no company in this call
+		"hr",
+		"org_unit.user_memberships",
+		"org_unit_members",
+		nil,
+		"system",
+		nil,
+		nil,
+		nil,
+		map[string]interface{}{
+			"ip":          ip,
+			"user_id":     userID.String(),
+			"only_active": onlyActive,
+			"count":       len(memberships),
+			"duration_ms": time.Since(startTime).Milliseconds(),
+		},
+	)
+
+	return memberships, nil
 }
 
 func (s *OrgUnitQueryService) GetOrgUnitMembers(
@@ -91,7 +252,36 @@ func (s *OrgUnitQueryService) GetOrgUnitMembers(
 	orgUnitID uuid.UUID,
 	onlyActive bool,
 ) ([]*orgunit.OrgUnitMember, error) {
-	return s.orgUnitRepo.GetOrgUnitMembers(ctx, orgUnitID, onlyActive)
+	startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
+
+	members, err := s.orgUnitRepo.GetOrgUnitMembers(ctx, orgUnitID, onlyActive)
+	if err != nil {
+		return nil, err
+	}
+
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		nil, // company unknown
+		"hr",
+		"org_unit.members_list",
+		"org_unit_members",
+		&orgUnitID,
+		"system",
+		nil,
+		nil,
+		nil,
+		map[string]interface{}{
+			"ip":          ip,
+			"org_unit_id": orgUnitID.String(),
+			"only_active": onlyActive,
+			"count":       len(members),
+			"duration_ms": time.Since(startTime).Milliseconds(),
+		},
+	)
+
+	return members, nil
 }
 
 func (s *OrgUnitQueryService) GetOrgUnitRoles(
@@ -99,7 +289,36 @@ func (s *OrgUnitQueryService) GetOrgUnitRoles(
 	orgUnitID uuid.UUID,
 	onlyActive bool,
 ) ([]*orgunit.OrgUnitRole, error) {
-	return s.orgUnitRepo.GetOrgUnitRoles(ctx, orgUnitID, onlyActive)
+	startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
+
+	roles, err := s.orgUnitRepo.GetOrgUnitRoles(ctx, orgUnitID, onlyActive)
+	if err != nil {
+		return nil, err
+	}
+
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		nil,
+		"hr",
+		"org_unit.roles_list",
+		"org_unit_roles",
+		&orgUnitID,
+		"system",
+		nil,
+		nil,
+		nil,
+		map[string]interface{}{
+			"ip":          ip,
+			"org_unit_id": orgUnitID.String(),
+			"only_active": onlyActive,
+			"count":       len(roles),
+			"duration_ms": time.Since(startTime).Milliseconds(),
+		},
+	)
+
+	return roles, nil
 }
 
 func (s *OrgUnitQueryService) HealthCheck(ctx context.Context) error {

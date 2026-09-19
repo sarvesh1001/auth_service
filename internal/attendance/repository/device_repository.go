@@ -38,6 +38,9 @@ type DeviceRepository interface {
 	// GetDevicesBySourceType lists devices by source type
 	GetDevicesBySourceType(ctx context.Context, companyID uuid.UUID, sourceType string, activeOnly bool) ([]*models.AttendanceDevice, error)
 
+	// GetDevicesByGeofence lists devices that sit inside a specific geofence
+	GetDevicesByGeofence(ctx context.Context, companyID uuid.UUID, geofenceID uuid.UUID, activeOnly bool) ([]*models.AttendanceDevice, error)
+
 	// CreateDevice inserts a new device
 	CreateDevice(ctx context.Context, device *models.AttendanceDevice) error
 

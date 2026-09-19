@@ -13,24 +13,20 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 )
 
 type StatutoryProfileHandler struct {
 	profileService service.StatutoryProfileService
 	engine         service.StatutoryEngine
-	logger         *zap.Logger
 }
 
 func NewStatutoryProfileHandler(
 	profileService service.StatutoryProfileService,
 	engine service.StatutoryEngine,
-	logger *zap.Logger,
 ) *StatutoryProfileHandler {
 	return &StatutoryProfileHandler{
 		profileService: profileService,
 		engine:         engine,
-		logger:         logger,
 	}
 }
 
@@ -308,7 +304,7 @@ func mapProfileToResponse(p *models.StatutoryProfileVersion) statutoryProfileRes
 // ----------------------------------------------------------------------
 
 func (h *StatutoryProfileHandler) CreateProfile(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -340,7 +336,9 @@ func (h *StatutoryProfileHandler) CreateProfile(w http.ResponseWriter, r *http.R
 	}
 	profile, err := h.profileService.CreateProfile(ctx, input)
 	if err != nil {
-		h.logger.Error("failed to create statutory profile", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -351,7 +349,7 @@ func (h *StatutoryProfileHandler) CreateProfile(w http.ResponseWriter, r *http.R
 }
 
 func (h *StatutoryProfileHandler) UpdateProfile(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	profileID, err := parseUUIDParam(r, "profileID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -381,7 +379,9 @@ func (h *StatutoryProfileHandler) UpdateProfile(w http.ResponseWriter, r *http.R
 	}
 	profile, err := h.profileService.UpdateProfile(ctx, input)
 	if err != nil {
-		h.logger.Error("failed to update statutory profile", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -392,7 +392,7 @@ func (h *StatutoryProfileHandler) UpdateProfile(w http.ResponseWriter, r *http.R
 }
 
 func (h *StatutoryProfileHandler) DeactivateProfile(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	profileID, err := parseUUIDParam(r, "profileID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -404,7 +404,9 @@ func (h *StatutoryProfileHandler) DeactivateProfile(w http.ResponseWriter, r *ht
 		return
 	}
 	if err := h.profileService.DeactivateProfile(ctx, profileID, actorID); err != nil {
-		h.logger.Error("failed to deactivate statutory profile", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -415,7 +417,7 @@ func (h *StatutoryProfileHandler) DeactivateProfile(w http.ResponseWriter, r *ht
 }
 
 func (h *StatutoryProfileHandler) ChangeTaxRegime(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -451,7 +453,9 @@ func (h *StatutoryProfileHandler) ChangeTaxRegime(w http.ResponseWriter, r *http
 	}
 	profile, err := h.profileService.ChangeTaxRegime(ctx, input)
 	if err != nil {
-		h.logger.Error("failed to change tax regime", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -462,7 +466,7 @@ func (h *StatutoryProfileHandler) ChangeTaxRegime(w http.ResponseWriter, r *http
 }
 
 func (h *StatutoryProfileHandler) BulkUpsertProfiles(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -496,7 +500,9 @@ func (h *StatutoryProfileHandler) BulkUpsertProfiles(w http.ResponseWriter, r *h
 		})
 	}
 	if err := h.profileService.BulkUpsertProfiles(ctx, inputs); err != nil {
-		h.logger.Error("failed to bulk upsert statutory profiles", zap.Error(err))
+		if mapPayrollLocationError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -507,7 +513,7 @@ func (h *StatutoryProfileHandler) BulkUpsertProfiles(w http.ResponseWriter, r *h
 }
 
 func (h *StatutoryProfileHandler) GetActiveProfile(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -530,7 +536,6 @@ func (h *StatutoryProfileHandler) GetActiveProfile(w http.ResponseWriter, r *htt
 	}
 	profile, err := h.profileService.GetActiveProfile(ctx, companyID, userID, statutoryCode, asOf)
 	if err != nil {
-		h.logger.Error("failed to get active statutory profile", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -548,7 +553,7 @@ func (h *StatutoryProfileHandler) GetActiveProfile(w http.ResponseWriter, r *htt
 }
 
 func (h *StatutoryProfileHandler) GetEmployeeActiveProfiles(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -566,7 +571,6 @@ func (h *StatutoryProfileHandler) GetEmployeeActiveProfiles(w http.ResponseWrite
 	}
 	profiles, err := h.profileService.GetEmployeeActiveProfiles(ctx, companyID, userID, asOf)
 	if err != nil {
-		h.logger.Error("failed to get employee active profiles", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -581,7 +585,7 @@ func (h *StatutoryProfileHandler) GetEmployeeActiveProfiles(w http.ResponseWrite
 }
 
 func (h *StatutoryProfileHandler) GetProfileHistory(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -599,7 +603,6 @@ func (h *StatutoryProfileHandler) GetProfileHistory(w http.ResponseWriter, r *ht
 	}
 	profiles, err := h.profileService.GetProfileHistory(ctx, companyID, userID, statutoryCode)
 	if err != nil {
-		h.logger.Error("failed to get profile history", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -614,7 +617,7 @@ func (h *StatutoryProfileHandler) GetProfileHistory(w http.ResponseWriter, r *ht
 }
 
 func (h *StatutoryProfileHandler) ListProfiles(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -650,12 +653,12 @@ func (h *StatutoryProfileHandler) ListProfiles(w http.ResponseWriter, r *http.Re
 		UserID:        userID,
 		StatutoryCode: statutoryCode,
 		ActiveOn:      activeOn,
+		LocationID:    locationFilterFromCtx(ctx), // 👈 Location scope
 		Page:          page,
 		PageSize:      pageSize,
 	}
 	profiles, total, err := h.profileService.ListProfiles(ctx, filter)
 	if err != nil {
-		h.logger.Error("failed to list statutory profiles", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -677,7 +680,7 @@ func (h *StatutoryProfileHandler) ListProfiles(w http.ResponseWriter, r *http.Re
 // ----------------------------------------------------------------------
 
 func (h *StatutoryProfileHandler) CreateRuleSet(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -707,7 +710,6 @@ func (h *StatutoryProfileHandler) CreateRuleSet(w http.ResponseWriter, r *http.R
 		ActorID:       actorID,
 	}
 	if err := h.engine.CreateRuleSet(ctx, input); err != nil {
-		h.logger.Error("failed to create rule set", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -718,7 +720,7 @@ func (h *StatutoryProfileHandler) CreateRuleSet(w http.ResponseWriter, r *http.R
 }
 
 func (h *StatutoryProfileHandler) UpdateRuleSet(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -759,7 +761,7 @@ func (h *StatutoryProfileHandler) UpdateRuleSet(w http.ResponseWriter, r *http.R
 }
 
 func (h *StatutoryProfileHandler) ActivateRuleSet(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	ruleSetID, err := parseUUIDParam(r, "ruleSetID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -781,7 +783,7 @@ func (h *StatutoryProfileHandler) ActivateRuleSet(w http.ResponseWriter, r *http
 }
 
 func (h *StatutoryProfileHandler) DeactivateRuleSet(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	ruleSetID, err := parseUUIDParam(r, "ruleSetID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -803,7 +805,7 @@ func (h *StatutoryProfileHandler) DeactivateRuleSet(w http.ResponseWriter, r *ht
 }
 
 func (h *StatutoryProfileHandler) ListRuleSets(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -825,7 +827,7 @@ func (h *StatutoryProfileHandler) ListRuleSets(w http.ResponseWriter, r *http.Re
 // ----------------------------------------------------------------------
 
 func (h *StatutoryProfileHandler) CreateComponentDefinition(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -868,7 +870,7 @@ func (h *StatutoryProfileHandler) CreateComponentDefinition(w http.ResponseWrite
 }
 
 func (h *StatutoryProfileHandler) UpdateComponentDefinition(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -885,12 +887,11 @@ func (h *StatutoryProfileHandler) UpdateComponentDefinition(w http.ResponseWrite
 		return
 	}
 
-	var req createComponentDefinitionRequest // reuse, but note that StatutoryCode is taken from URL
+	var req createComponentDefinitionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	// ignore req.StatutoryCode; use code from URL
 	req.StatutoryCode = code
 	if err := req.validate(); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -917,7 +918,7 @@ func (h *StatutoryProfileHandler) UpdateComponentDefinition(w http.ResponseWrite
 }
 
 func (h *StatutoryProfileHandler) DeleteComponentDefinition(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -944,7 +945,7 @@ func (h *StatutoryProfileHandler) DeleteComponentDefinition(w http.ResponseWrite
 }
 
 func (h *StatutoryProfileHandler) ListComponentDefinitions(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -966,7 +967,7 @@ func (h *StatutoryProfileHandler) ListComponentDefinitions(w http.ResponseWriter
 // ----------------------------------------------------------------------
 
 func (h *StatutoryProfileHandler) SetContributionRule(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -1015,9 +1016,8 @@ func (h *StatutoryProfileHandler) SetContributionRule(w http.ResponseWriter, r *
 	})
 }
 
-// BulkSetContributionRules – new handler
 func (h *StatutoryProfileHandler) BulkSetContributionRules(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -1074,7 +1074,7 @@ func (h *StatutoryProfileHandler) BulkSetContributionRules(w http.ResponseWriter
 }
 
 func (h *StatutoryProfileHandler) ListContributionRules(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -1097,7 +1097,7 @@ func (h *StatutoryProfileHandler) ListContributionRules(w http.ResponseWriter, r
 }
 
 func (h *StatutoryProfileHandler) DeactivateContributionRule(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	ruleID, err := parseUUIDParam(r, "ruleID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -1134,7 +1134,7 @@ func (h *StatutoryProfileHandler) DeleteContributionRule(w http.ResponseWriter, 
 // ----------------------------------------------------------------------
 
 func (h *StatutoryProfileHandler) CreateTaxSlab(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -1184,7 +1184,7 @@ func (h *StatutoryProfileHandler) CreateTaxSlab(w http.ResponseWriter, r *http.R
 }
 
 func (h *StatutoryProfileHandler) UpdateTaxSlab(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	slabID, err := parseUUIDParam(r, "slabID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -1223,7 +1223,7 @@ func (h *StatutoryProfileHandler) UpdateTaxSlab(w http.ResponseWriter, r *http.R
 }
 
 func (h *StatutoryProfileHandler) DeleteTaxSlab(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	slabID, err := parseUUIDParam(r, "slabID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -1245,7 +1245,7 @@ func (h *StatutoryProfileHandler) DeleteTaxSlab(w http.ResponseWriter, r *http.R
 }
 
 func (h *StatutoryProfileHandler) ListTaxSlabs(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -1272,7 +1272,7 @@ func (h *StatutoryProfileHandler) ListTaxSlabs(w http.ResponseWriter, r *http.Re
 // ----------------------------------------------------------------------
 
 func (h *StatutoryProfileHandler) CreateDeductionLimit(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -1318,7 +1318,7 @@ func (h *StatutoryProfileHandler) CreateDeductionLimit(w http.ResponseWriter, r 
 }
 
 func (h *StatutoryProfileHandler) UpdateDeductionLimit(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	limitID, err := parseUUIDParam(r, "limitID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -1353,7 +1353,7 @@ func (h *StatutoryProfileHandler) UpdateDeductionLimit(w http.ResponseWriter, r 
 }
 
 func (h *StatutoryProfileHandler) DeleteDeductionLimit(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	limitID, err := parseUUIDParam(r, "limitID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -1375,7 +1375,7 @@ func (h *StatutoryProfileHandler) DeleteDeductionLimit(w http.ResponseWriter, r 
 }
 
 func (h *StatutoryProfileHandler) ListDeductionLimits(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -1404,7 +1404,7 @@ func (h *StatutoryProfileHandler) ListDeductionLimits(w http.ResponseWriter, r *
 // ----------------------------------------------------------------------
 
 func (h *StatutoryProfileHandler) CreateComponentMapping(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -1450,7 +1450,7 @@ func (h *StatutoryProfileHandler) CreateComponentMapping(w http.ResponseWriter, 
 }
 
 func (h *StatutoryProfileHandler) UpdateComponentMapping(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	mappingID, err := parseUUIDParam(r, "mappingID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -1486,7 +1486,7 @@ func (h *StatutoryProfileHandler) UpdateComponentMapping(w http.ResponseWriter, 
 }
 
 func (h *StatutoryProfileHandler) DeleteComponentMapping(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	mappingID, err := parseUUIDParam(r, "mappingID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -1508,7 +1508,7 @@ func (h *StatutoryProfileHandler) DeleteComponentMapping(w http.ResponseWriter, 
 }
 
 func (h *StatutoryProfileHandler) ListComponentMappings(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -1526,6 +1526,81 @@ func (h *StatutoryProfileHandler) ListComponentMappings(w http.ResponseWriter, r
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    mappings,
+	})
+}
+
+// ----------------------------------------------------------------------
+// Bulk Create Component Mappings
+// ----------------------------------------------------------------------
+
+type bulkCreateComponentMappingRequest struct {
+	StatutoryCode  string    `json:"statutory_code"`
+	ComponentCodes []string  `json:"component_codes"`
+	EffectiveFrom  time.Time `json:"effective_from"`
+}
+
+func (r *bulkCreateComponentMappingRequest) validate() error {
+	if r.StatutoryCode == "" {
+		return errors.New("statutory_code is required")
+	}
+	if len(r.ComponentCodes) == 0 {
+		return errors.New("at least one component_code required")
+	}
+	if r.EffectiveFrom.IsZero() {
+		return errors.New("effective_from is required")
+	}
+	return nil
+}
+
+func (h *StatutoryProfileHandler) BulkCreateComponentMappings(w http.ResponseWriter, r *http.Request) {
+	ctx := injectCommonContext(r.Context(), r)
+
+	companyID, err := parseUUIDParam(r, "companyID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	ruleSetID, err := parseUUIDParam(r, "ruleSetID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	actorID, err := h.getAdminActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+
+	var req bulkCreateComponentMappingRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+
+	if err := req.validate(); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	input := &service.BulkCreateComponentMappingsInput{
+		CompanyID:      companyID,
+		StatutoryCode:  req.StatutoryCode,
+		ComponentCodes: req.ComponentCodes,
+		EffectiveFrom:  req.EffectiveFrom,
+		RuleSetID:      ruleSetID,
+		ActorID:        actorID,
+	}
+
+	if err := h.engine.BulkCreateComponentMappings(ctx, input); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("%d mappings processed", len(req.ComponentCodes)),
 	})
 }
 
@@ -1597,75 +1672,4 @@ func parseIntQuery(r *http.Request, key string, defaultValue int) int {
 		return defaultValue
 	}
 	return val
-}
-
-type bulkCreateComponentMappingRequest struct {
-	StatutoryCode  string    `json:"statutory_code"`
-	ComponentCodes []string  `json:"component_codes"`
-	EffectiveFrom  time.Time `json:"effective_from"`
-}
-
-func (r *bulkCreateComponentMappingRequest) validate() error {
-	if r.StatutoryCode == "" {
-		return errors.New("statutory_code is required")
-	}
-	if len(r.ComponentCodes) == 0 {
-		return errors.New("at least one component_code required")
-	}
-	if r.EffectiveFrom.IsZero() {
-		return errors.New("effective_from is required")
-	}
-	return nil
-}
-
-func (h *StatutoryProfileHandler) BulkCreateComponentMappings(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	companyID, err := parseUUIDParam(r, "companyID")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	ruleSetID, err := parseUUIDParam(r, "ruleSetID")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	actorID, err := h.getAdminActor(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err.Error())
-		return
-	}
-
-	var req bulkCreateComponentMappingRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid body")
-		return
-	}
-
-	if err := req.validate(); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	input := &service.BulkCreateComponentMappingsInput{
-		CompanyID:      companyID,
-		StatutoryCode:  req.StatutoryCode,
-		ComponentCodes: req.ComponentCodes,
-		EffectiveFrom:  req.EffectiveFrom,
-		RuleSetID:      ruleSetID,
-		ActorID:        actorID,
-	}
-
-	if err := h.engine.BulkCreateComponentMappings(ctx, input); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
-		"success": true,
-		"message": fmt.Sprintf("%d mappings processed", len(req.ComponentCodes)),
-	})
 }

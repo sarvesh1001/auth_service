@@ -9,32 +9,28 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/lib/pq"
-	"go.uber.org/zap"
 
 	"auth-service/internal/client"
+	hrErrors "auth-service/internal/hr/errors"
 	"auth-service/internal/hr/payroll/models"
-	"auth-service/internal/util"
 )
 
 type employeeFineRepository struct {
 	client *client.PostgresClient
-	logger *zap.Logger
 }
 
 // NewEmployeeFineRepository creates a new EmployeeFineRepository instance.
 func NewEmployeeFineRepository(
 	postgresClient *client.PostgresClient,
-	logger *zap.Logger,
 ) EmployeeFineRepository {
 	return &employeeFineRepository{
 		client: postgresClient,
-		logger: logger,
 	}
 }
 
-// ---------------------------------------------------------------------
-// Create & Update
-// ---------------------------------------------------------------------
+// ============================================================================
+// CREATE & UPDATE
+// ============================================================================
 
 func (r *employeeFineRepository) Create(ctx context.Context, fine *models.EmployeeFine) error {
 	if fine.FineID == uuid.Nil {
@@ -44,7 +40,6 @@ func (r *employeeFineRepository) Create(ctx context.Context, fine *models.Employ
 		fine.CreatedAt = time.Now().UTC()
 	}
 
-	// ADDED: component_code column and value
 	query := `
 		INSERT INTO payroll.employee_fine (
 			fine_id,
@@ -71,24 +66,15 @@ func (r *employeeFineRepository) Create(ctx context.Context, fine *models.Employ
 		fine.PayrollRunID,
 		fine.CreatedAt,
 		fine.CreatedBy,
-		fine.ComponentCode, // ADDED
+		fine.ComponentCode,
 	)
 	if err != nil {
-		r.logger.Error("Failed to create employee fine",
-			util.String("fine_id", fine.FineID.String()),
-			util.String("company_id", fine.CompanyID.String()),
-			util.String("user_id", fine.UserID.String()),
-			util.String("component_code", fine.ComponentCode), // ADDED
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to create employee fine: %w", err)
 	}
 	return nil
 }
 
 func (r *employeeFineRepository) Update(ctx context.Context, fine *models.EmployeeFine) error {
-	// Note: component_code is NOT updated because it is a fixed attribute of the fine.
-	// If you need to change the component, you should create a new fine or delete/unprocessed.
 	query := `
 		UPDATE payroll.employee_fine
 		SET
@@ -109,16 +95,11 @@ func (r *employeeFineRepository) Update(ctx context.Context, fine *models.Employ
 		fine.CompanyID,
 	)
 	if err != nil {
-		r.logger.Error("Failed to update employee fine",
-			util.String("fine_id", fine.FineID.String()),
-			util.String("company_id", fine.CompanyID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to update employee fine: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("employee fine not found for company")
+		return hrErrors.ErrEmployeeFineNotFound
 	}
 	return nil
 }
@@ -137,16 +118,11 @@ func (r *employeeFineRepository) MarkAsProcessed(
 	`
 	result, err := r.client.Exec(ctx, query, payrollRunID, fineID)
 	if err != nil {
-		r.logger.Error("Failed to mark fine as processed",
-			util.String("fine_id", fineID.String()),
-			util.String("payroll_run_id", payrollRunID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to mark fine as processed: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("fine not found or already processed")
+		return hrErrors.ErrEmployeeFineNotFound
 	}
 	return nil
 }
@@ -166,31 +142,21 @@ func (r *employeeFineRepository) BulkMarkAsProcessed(
 			payroll_run_id = $1
 		WHERE fine_id = ANY($2) AND is_processed = false
 	`
-	result, err := r.client.Exec(ctx, query, payrollRunID, pq.Array(fineIDs))
+	_, err := r.client.Exec(ctx, query, payrollRunID, pq.Array(fineIDs))
 	if err != nil {
-		r.logger.Error("Failed to bulk mark fines as processed",
-			util.String("payroll_run_id", payrollRunID.String()),
-			util.Int("count", len(fineIDs)),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to bulk mark fines as processed: %w", err)
 	}
-	rowsAffected, _ := result.RowsAffected()
-	r.logger.Info("Bulk marked fines as processed",
-		util.Int64("rows_affected", rowsAffected),
-	)
 	return nil
 }
 
-// ---------------------------------------------------------------------
-// Retrieval
-// ---------------------------------------------------------------------
+// ============================================================================
+// RETRIEVAL
+// ============================================================================
 
 func (r *employeeFineRepository) GetByID(
 	ctx context.Context,
 	companyID, fineID uuid.UUID,
 ) (*models.EmployeeFine, error) {
-	// ADDED: component_code in SELECT
 	query := `
 		SELECT
 			fine_id,
@@ -220,22 +186,22 @@ func (r *employeeFineRepository) GetByID(
 		&fine.PayrollRunID,
 		&fine.CreatedAt,
 		&fine.CreatedBy,
-		&fine.ComponentCode, // ADDED
+		&fine.ComponentCode,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, hrErrors.ErrEmployeeFineNotFound
 		}
-		r.logger.Error("Failed to get employee fine by ID",
-			util.String("fine_id", fineID.String()),
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get employee fine: %w", err)
 	}
 	return &fine, nil
 }
 
+// GetByFilter returns a page of fines.
+//
+// Location: filtered via filter.LocationID when non-nil. The filter is
+// expressed as a subquery against company_employees so the dynamic
+// WHERE-clause builder stays unchanged.
 func (r *employeeFineRepository) GetByFilter(
 	ctx context.Context,
 	filter models.EmployeeFineFilter,
@@ -269,23 +235,27 @@ func (r *employeeFineRepository) GetByFilter(
 		args = append(args, *filter.ToDate)
 		paramIdx++
 	}
+	// 👇 Location filter — via company_employees (current assignment)
+	if filter.LocationID != nil {
+		whereClause += fmt.Sprintf(
+			" AND user_id IN (SELECT user_id FROM company_employees WHERE company_id = $1 AND employment_location_id = $%d AND is_active = true)",
+			paramIdx)
+		args = append(args, *filter.LocationID)
+		paramIdx++
+	}
 
 	// Count total
 	countQuery := `SELECT COUNT(*) FROM payroll.employee_fine ` + whereClause
 	var total int
 	err := r.client.QueryRow(ctx, countQuery, args...).Scan(&total)
 	if err != nil {
-		r.logger.Error("Failed to count employee fines by filter",
-			util.String("company_id", filter.CompanyID.String()),
-			util.ErrorField(err),
-		)
 		return nil, 0, fmt.Errorf("failed to count employee fines: %w", err)
 	}
 	if total == 0 {
 		return []models.EmployeeFine{}, 0, nil
 	}
 
-	// Fetch data – ADDED component_code
+	// Fetch data
 	query := `
 		SELECT
 			fine_id,
@@ -307,17 +277,12 @@ func (r *employeeFineRepository) GetByFilter(
 		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", paramIdx, paramIdx+1)
 		args = append(args, filter.PageSize, offset)
 	} else {
-		// default limit
 		query += fmt.Sprintf(" LIMIT $%d", paramIdx)
 		args = append(args, 100)
 	}
 
 	rows, err := r.client.Query(ctx, query, args...)
 	if err != nil {
-		r.logger.Error("Failed to get employee fines by filter",
-			util.String("company_id", filter.CompanyID.String()),
-			util.ErrorField(err),
-		)
 		return nil, 0, fmt.Errorf("failed to get employee fines: %w", err)
 	}
 	defer rows.Close()
@@ -336,7 +301,7 @@ func (r *employeeFineRepository) GetByFilter(
 			&f.PayrollRunID,
 			&f.CreatedAt,
 			&f.CreatedBy,
-			&f.ComponentCode, // ADDED
+			&f.ComponentCode,
 		); err != nil {
 			return nil, 0, fmt.Errorf("failed to scan employee fine: %w", err)
 		}
@@ -354,7 +319,6 @@ func (r *employeeFineRepository) GetUnprocessedByUserAndPeriod(
 	userID uuid.UUID,
 	periodStart, periodEnd time.Time,
 ) ([]models.EmployeeFine, error) {
-	// ADDED component_code
 	query := `
 		SELECT
 			fine_id,
@@ -377,11 +341,6 @@ func (r *employeeFineRepository) GetUnprocessedByUserAndPeriod(
 	`
 	rows, err := r.client.Query(ctx, query, companyID, userID, periodStart, periodEnd)
 	if err != nil {
-		r.logger.Error("Failed to get unprocessed fines by user and period",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get unprocessed fines: %w", err)
 	}
 	defer rows.Close()
@@ -400,7 +359,7 @@ func (r *employeeFineRepository) GetUnprocessedByUserAndPeriod(
 			&f.PayrollRunID,
 			&f.CreatedAt,
 			&f.CreatedBy,
-			&f.ComponentCode, // ADDED
+			&f.ComponentCode,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan employee fine: %w", err)
 		}
@@ -412,12 +371,17 @@ func (r *employeeFineRepository) GetUnprocessedByUserAndPeriod(
 	return fines, nil
 }
 
+// GetUnprocessedByCompanyAndPeriod returns unprocessed fines for a company
+// whose fine_date is in the given period.
+//
+// Location: when locationID is non-nil, only fines for employees whose
+// current employment_location_id matches are returned.
 func (r *employeeFineRepository) GetUnprocessedByCompanyAndPeriod(
 	ctx context.Context,
 	companyID uuid.UUID,
 	periodStart, periodEnd time.Time,
+	locationID *uuid.UUID,
 ) ([]models.EmployeeFine, error) {
-	// ADDED component_code
 	query := `
 		SELECT
 			fine_id,
@@ -435,14 +399,14 @@ func (r *employeeFineRepository) GetUnprocessedByCompanyAndPeriod(
 		WHERE company_id = $1
 			AND is_processed = false
 			AND fine_date BETWEEN $2 AND $3
+			AND ($4::uuid IS NULL OR user_id IN (
+				SELECT user_id FROM company_employees
+				WHERE company_id = $1 AND employment_location_id = $4 AND is_active = true
+			))
 		ORDER BY user_id, fine_date
 	`
-	rows, err := r.client.Query(ctx, query, companyID, periodStart, periodEnd)
+	rows, err := r.client.Query(ctx, query, companyID, periodStart, periodEnd, locationID)
 	if err != nil {
-		r.logger.Error("Failed to get unprocessed fines by company and period",
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get unprocessed fines: %w", err)
 	}
 	defer rows.Close()
@@ -461,7 +425,7 @@ func (r *employeeFineRepository) GetUnprocessedByCompanyAndPeriod(
 			&f.PayrollRunID,
 			&f.CreatedAt,
 			&f.CreatedBy,
-			&f.ComponentCode, // ADDED
+			&f.ComponentCode,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan employee fine: %w", err)
 		}
@@ -473,19 +437,22 @@ func (r *employeeFineRepository) GetUnprocessedByCompanyAndPeriod(
 	return fines, nil
 }
 
-// ---------------------------------------------------------------------
-// Run Safety
-// ---------------------------------------------------------------------
+// ============================================================================
+// RUN SAFETY
+// ============================================================================
 
+// LockUnprocessedForPayrollRun atomically marks unprocessed fines as
+// processed and associates them with the payroll run.
+//
+// Location: when locationID is non-nil, only fines for employees whose
+// current employment_location_id matches are locked and returned.
 func (r *employeeFineRepository) LockUnprocessedForPayrollRun(
 	ctx context.Context,
 	companyID uuid.UUID,
 	periodStart, periodEnd time.Time,
 	payrollRunID uuid.UUID,
+	locationID *uuid.UUID,
 ) ([]models.EmployeeFine, error) {
-	// Atomically update and return the fines that become processed.
-	// This locks the rows and prevents double‑processing.
-	// ADDED component_code in RETURNING
 	query := `
 		UPDATE payroll.employee_fine
 		SET
@@ -494,6 +461,10 @@ func (r *employeeFineRepository) LockUnprocessedForPayrollRun(
 		WHERE company_id = $2
 			AND is_processed = false
 			AND fine_date BETWEEN $3 AND $4
+			AND ($5::uuid IS NULL OR user_id IN (
+				SELECT user_id FROM company_employees
+				WHERE company_id = $2 AND employment_location_id = $5 AND is_active = true
+			))
 		RETURNING
 			fine_id,
 			company_id,
@@ -507,14 +478,9 @@ func (r *employeeFineRepository) LockUnprocessedForPayrollRun(
 			created_by,
 			component_code
 	`
-	rows, err := r.client.Query(ctx, query, payrollRunID, companyID, periodStart, periodEnd)
+	rows, err := r.client.Query(ctx, query, payrollRunID, companyID, periodStart, periodEnd, locationID)
 	if err != nil {
-		r.logger.Error("Failed to lock and mark fines for payroll run",
-			util.String("company_id", companyID.String()),
-			util.String("payroll_run_id", payrollRunID.String()),
-			util.ErrorField(err),
-		)
-		return nil, fmt.Errorf("failed to lock unprocessed fines: %w", err)
+		return nil, fmt.Errorf("failed to lock and mark fines for payroll run: %w", err)
 	}
 	defer rows.Close()
 
@@ -532,7 +498,7 @@ func (r *employeeFineRepository) LockUnprocessedForPayrollRun(
 			&f.PayrollRunID,
 			&f.CreatedAt,
 			&f.CreatedBy,
-			&f.ComponentCode, // ADDED
+			&f.ComponentCode,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan employee fine: %w", err)
 		}
@@ -544,9 +510,9 @@ func (r *employeeFineRepository) LockUnprocessedForPayrollRun(
 	return fines, nil
 }
 
-// ---------------------------------------------------------------------
-// Audit / Integrity
-// ---------------------------------------------------------------------
+// ============================================================================
+// AUDIT / INTEGRITY
+// ============================================================================
 
 func (r *employeeFineRepository) DeleteIfUnprocessed(
 	ctx context.Context,
@@ -558,16 +524,11 @@ func (r *employeeFineRepository) DeleteIfUnprocessed(
 	`
 	result, err := r.client.Exec(ctx, query, fineID, companyID)
 	if err != nil {
-		r.logger.Error("Failed to delete unprocessed fine",
-			util.String("fine_id", fineID.String()),
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err),
-		)
 		return fmt.Errorf("failed to delete fine: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("fine not found or already processed")
+		return hrErrors.ErrEmployeeFineNotFound
 	}
 	return nil
 }

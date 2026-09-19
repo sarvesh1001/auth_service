@@ -1,6 +1,8 @@
 package inventory
 
 import (
+	"net/http"
+
 	"github.com/go-chi/chi/v5"
 
 	"auth-service/internal/inventory/handler"
@@ -39,13 +41,35 @@ type InventoryHandlers struct {
 	PurchaseOrderHandler           *handler.PurchaseOrderHandler // <-- NEW: vendors & purchase orders
 }
 
-// RegisterInventoryRoutes mounts all inventory routes under /api/v1/companies/{companyID}/inventory.
+// RegisterInventoryRoutes mounts all inventory routes under
+// /companies/{companyID}/inventory.
+//
+// Middleware chain applied inside this function (in order):
+//
+//	jwt → session → subscription → location → idempotency
+//
+// The caller must NOT wrap this call in a group that already applies
+// those middlewares, otherwise they will run twice.
 func RegisterInventoryRoutes(
 	r chi.Router,
 	handlers *InventoryHandlers,
 	jwtService *service.JWTService,
+
+	// 🆕 auth + platform middleware, provided by the main router
+	jwtAuthMiddleware func(http.Handler) http.Handler,
+	sessionValidationMiddleware func(http.Handler) http.Handler,
+	subscriptionEnforcementMiddleware func(http.Handler) http.Handler,
+	locationValidationMiddleware func(http.Handler) http.Handler,
+	idempotencyMiddleware func(http.Handler) http.Handler,
 ) {
-	r.Route("/inventory", func(r chi.Router) {
+	r.Route("/companies/{companyID}/inventory", func(r chi.Router) {
+		// ---- Mandatory chain ----
+		r.Use(jwtAuthMiddleware)
+		r.Use(sessionValidationMiddleware)
+		r.Use(subscriptionEnforcementMiddleware)
+		r.Use(locationValidationMiddleware)
+		r.Use(idempotencyMiddleware)
+
 		// -------------------------------
 		// 1. Items
 		// -------------------------------

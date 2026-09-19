@@ -56,12 +56,16 @@ func JWTAuthMiddlewareWithRedis(
 			}
 
 			ctx := r.Context()
+			ctx = context.WithValue(ctx, "jwt_claims", claims) // 🆕 store full claims
 			ctx = context.WithValue(ctx, "user_id", claims.UserID)
 			ctx = context.WithValue(ctx, "device_id", claims.DeviceID)
 			ctx = context.WithValue(ctx, "role", claims.Role)
 			ctx = context.WithValue(ctx, "session_type", claims.SessionType)
 			ctx = context.WithValue(ctx, "jti", claims.JTI)
 			ctx = context.WithValue(ctx, "permission_mask", claims.PermissionMask)
+			// 🆕 location claims for use by other middlewares
+			ctx = context.WithValue(ctx, "primary_location_id", claims.PrimaryLocationID)
+			ctx = context.WithValue(ctx, "location_scope", claims.LocationScope)
 
 			if claims.CompanyID != "" {
 				ctx = context.WithValue(ctx, "company_id", claims.CompanyID)
@@ -102,6 +106,7 @@ func AdminJWTAuthMiddleware(
 			}
 
 			ctx := r.Context()
+			ctx = context.WithValue(ctx, "jwt_claims", claims) // 🆕
 			ctx = context.WithValue(ctx, "admin_id", claims.UserID)
 			ctx = context.WithValue(ctx, "user_id", claims.UserID)
 			ctx = context.WithValue(ctx, "device_id", claims.DeviceID)
@@ -109,6 +114,8 @@ func AdminJWTAuthMiddleware(
 			ctx = context.WithValue(ctx, "session_type", claims.SessionType)
 			ctx = context.WithValue(ctx, "jti", claims.JTI)
 			ctx = context.WithValue(ctx, "permission_mask", claims.PermissionMask)
+			ctx = context.WithValue(ctx, "primary_location_id", claims.PrimaryLocationID)
+			ctx = context.WithValue(ctx, "location_scope", claims.LocationScope)
 
 			if claims.CompanyID != "" {
 				ctx = context.WithValue(ctx, "company_id", claims.CompanyID)
@@ -149,12 +156,15 @@ func UserAuthMiddleware(
 			}
 
 			ctx := r.Context()
+			ctx = context.WithValue(ctx, "jwt_claims", claims) // 🆕
 			ctx = context.WithValue(ctx, "user_id", claims.UserID)
 			ctx = context.WithValue(ctx, "device_id", claims.DeviceID)
 			ctx = context.WithValue(ctx, "role", claims.Role)
 			ctx = context.WithValue(ctx, "session_type", claims.SessionType)
 			ctx = context.WithValue(ctx, "jti", claims.JTI)
 			ctx = context.WithValue(ctx, "permission_mask", claims.PermissionMask)
+			ctx = context.WithValue(ctx, "primary_location_id", claims.PrimaryLocationID)
+			ctx = context.WithValue(ctx, "location_scope", claims.LocationScope)
 
 			if claims.CompanyID != "" {
 				ctx = context.WithValue(ctx, "company_id", claims.CompanyID)
@@ -314,6 +324,7 @@ func AdminRoleOrPermissionMiddleware(
 //
 
 func buildContext(ctx context.Context, claims *models.JWTClaims) context.Context {
+	ctx = context.WithValue(ctx, "jwt_claims", claims) // 🆕
 	ctx = context.WithValue(ctx, "admin_id", claims.UserID)
 	ctx = context.WithValue(ctx, "user_id", claims.UserID)
 	ctx = context.WithValue(ctx, "device_id", claims.DeviceID)
@@ -321,6 +332,8 @@ func buildContext(ctx context.Context, claims *models.JWTClaims) context.Context
 	ctx = context.WithValue(ctx, "session_type", claims.SessionType)
 	ctx = context.WithValue(ctx, "jti", claims.JTI)
 	ctx = context.WithValue(ctx, "permission_mask", claims.PermissionMask)
+	ctx = context.WithValue(ctx, "primary_location_id", claims.PrimaryLocationID)
+	ctx = context.WithValue(ctx, "location_scope", claims.LocationScope)
 
 	if claims.CompanyID != "" {
 		ctx = context.WithValue(ctx, "company_id", claims.CompanyID)

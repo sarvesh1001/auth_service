@@ -12,8 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"go.uber.org/zap"
-
 	"github.com/go-chi/chi/v5"
 	"github.com/go-playground/validator/v10"
 	"github.com/google/uuid"
@@ -328,14 +326,10 @@ type MPINForgotWithOTPPhoneRequest struct {
 // @Failure 403 {object} map[string]interface{} "User inactive"
 // @Router /api/v1/auth/login/initiate [post]
 func (h *AuthHandler) InitiateLogin(w http.ResponseWriter, r *http.Request) {
-	logger, _ := zap.NewDevelopment() // or zap.NewProduction()
-	defer logger.Sync()
-
 	ctx := h.injectClientIP(r.Context(), r)
 
 	var req LoginFlowRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		logger.Error("Invalid request body", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
@@ -345,69 +339,68 @@ func (h *AuthHandler) InitiateLogin(w http.ResponseWriter, r *http.Request) {
 	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
 	req.DataRegion = util.SanitizeInput(req.DataRegion)
 
-	logger.Debug("InitiateLogin request",
-		zap.String("phone_number", req.PhoneNumber),
-		zap.String("device_id", req.DeviceID),
-		zap.String("fingerprint", req.DeviceFingerprint),
-	)
-
 	user, err := h.userService.GetUserByPhone(ctx, req.PhoneNumber)
 	if err != nil {
 		status, msg := h.mapServiceError(err)
-		logger.Warn("GetUserByPhone failed", zap.Error(err))
 		h.respondWithError(w, status, err, msg)
 		return
 	}
 	if !user.IsActive {
-		logger.Warn("User inactive", zap.String("user_id", user.UserID.String()))
-		h.respondWithError(w, http.StatusForbidden, appErrors.ErrAdminInactive, "Account is inactive. Please contact support.")
+		h.respondWithError(w, http.StatusForbidden,
+			appErrors.ErrAdminInactive,
+			"Account is inactive. Please contact support.")
 		return
 	}
 
 	response := &UserLoginFlowResponse{
 		UserExists: true,
+		UserID:     user.UserID.String(),
 	}
 
-	// --- CHECK DEVICE TRUST FIRST (always set) ---
+	// --- Device trust ---
+	// NOT-FOUND is expected for a first-time device → device_trusted = false.
+	// Only genuine failures (DB down, timeout) fall through to the default branch.
 	deviceTrusted, err := h.deviceService.IsDeviceTrusted(ctx, user.UserID, req.DeviceID)
-	if err != nil {
-		logger.Error("IsDeviceTrusted failed",
-			zap.String("user_id", user.UserID.String()),
-			zap.String("device_id", req.DeviceID),
-			zap.Error(err),
-		)
-		deviceTrusted = false // safe fallback
+	switch {
+	case err == nil:
+		// use as-is
+	case errors.Is(err, appErrors.ErrNotFound):
+		deviceTrusted = false
+	default:
+		deviceTrusted = false
+		h.respondWithError(w, http.StatusInternalServerError, err,
+			"Unable to verify device trust")
+		return
 	}
-	response.DeviceTrusted = deviceTrusted // always set
+	response.DeviceTrusted = deviceTrusted
 
-	logger.Info("Device trust result",
-		zap.String("user_id", user.UserID.String()),
-		zap.String("device_id", req.DeviceID),
-		zap.Bool("device_trusted", deviceTrusted),
-	)
-
-	// --- MPIN status check ---
+	// --- MPIN status ---
 	mpinStatus, err := h.mpinService.GetMPINStatus(ctx, user.UserID)
-	if err != nil {
-		// MPIN not found – respond with OTP flow, but DeviceTrusted is already set
+	if errors.Is(err, appErrors.ErrNotFound) {
+		// No MPIN set — route to OTP flow. DeviceTrusted is already populated.
 		response.FlowState = "existing_user_otp"
 		response.Message = "Existing user - OTP verification required (no MPIN setup)"
 		h.respondWithJSON(w, http.StatusOK, successResponse(response, "Login flow determined"))
+		return
+	}
+	if err != nil {
+		// Real infra failure — do NOT silently downgrade to OTP.
+		h.respondWithError(w, http.StatusInternalServerError, err,
+			"Unable to determine login flow")
 		return
 	}
 
 	response.HasMPIN = true
 	response.MPINLocked = mpinStatus.IsLocked
 
-	// Determine flow based on MPIN lock and device trust
-	if response.MPINLocked {
+	switch {
+	case response.MPINLocked:
 		response.FlowState = "mpin_locked"
 		response.Message = "MPIN locked - OTP verification required"
-	} else if deviceTrusted {
+	case deviceTrusted:
 		response.FlowState = "existing_user_mpin"
 		response.Message = "Trusted device - MPIN login available"
-		response.UserID = user.UserID.String()
-	} else {
+	default:
 		response.FlowState = "existing_user_otp"
 		response.Message = "Untrusted device - OTP verification required"
 	}
@@ -2466,4 +2459,94 @@ func (h *AuthHandler) GetUserPhoneNumberInCompany(w http.ResponseWriter, r *http
 		"phone":      phone,
 	}
 	h.respondWithJSON(w, http.StatusOK, successResponse(responseData, "Phone number retrieved successfully"))
+}
+
+// UpdatePhoneRequest is the payload for updating a user's phone number.
+// UserID identifies the target user; it must match the {userID} path parameter.
+type UpdatePhoneRequest struct {
+	UserID      uuid.UUID `json:"user_id" validate:"required"`
+	PhoneNumber string    `json:"phone_number" validate:"required,min=10,max=15"`
+}
+
+// UpdateUserPhoneNumberInCompany updates the phone number of a user
+// within a specific company. The target user is identified by BOTH the
+// {userID} path parameter and the user_id field in the body; they must
+// match. Requires the appropriate permission via middleware.
+//
+// @Summary Update user phone number (company-scoped)
+// @Description Updates the plaintext phone number of a user in the company.
+// @Tags companies
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param userID path string true "User UUID (must match body.user_id)"
+// @Param request body UpdatePhoneRequest true "Target user and new phone number"
+// @Success 200 {object} map[string]interface{} "Phone number updated"
+// @Failure 400 {object} map[string]interface{} "Invalid ID, phone number, or mismatched user_id"
+// @Failure 403 {object} map[string]interface{} "Permission denied or user not in company"
+// @Failure 404 {object} map[string]interface{} "User not found"
+// @Failure 409 {object} map[string]interface{} "Phone number already in use"
+// @Failure 500 {object} map[string]interface{} "Internal error"
+// @Router /api/v1/companies/{companyID}/users/{userID}/phone [put]
+func (h *AuthHandler) UpdateUserPhoneNumberInCompany(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
+
+	// 1. Parse company ID from path
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	// 2. Parse user ID from path
+	pathUserID, err := uuid.Parse(chi.URLParam(r, "userID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
+		return
+	}
+
+	// 3. Decode & validate body
+	var req UpdatePhoneRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+	if err := validate.Struct(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request payload")
+		return
+	}
+
+	// 4. Path and body must agree
+	if req.UserID != pathUserID {
+		h.respondWithError(w, http.StatusBadRequest, appErrors.ErrInvalidInput,
+			"user_id in body does not match userID in path")
+		return
+	}
+	targetUserID := req.UserID
+
+	// 5. Ensure the target user is an active employee of this company
+	isEmployee, err := h.userService.IsUserEmployeeOfCompany(ctx, targetUserID, companyID)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to verify company membership")
+		return
+	}
+	if !isEmployee {
+		h.respondWithError(w, http.StatusForbidden, appErrors.ErrPermissionDenied,
+			"User does not belong to this company")
+		return
+	}
+
+	// 6. Perform the update
+	if err := h.userService.UpdatePhoneNumber(ctx, targetUserID, req.PhoneNumber); err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	responseData := map[string]interface{}{
+		"user_id":    targetUserID.String(),
+		"company_id": companyID.String(),
+	}
+	h.respondWithJSON(w, http.StatusOK,
+		successResponse(responseData, "Phone number updated successfully"))
 }

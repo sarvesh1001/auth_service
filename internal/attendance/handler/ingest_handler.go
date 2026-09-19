@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 
 	"auth-service/internal/attendance/models"
 	"auth-service/internal/attendance/service/ingest"
+	"auth-service/internal/attendance/service/resolver"
 )
 
 // AttendanceIngestHandler handles attendance punch ingestion.
@@ -33,7 +35,7 @@ func NewAttendanceIngestHandler(
 // PunchHTTPRequest is the common request for user/admin punches.
 type PunchHTTPRequest struct {
 	TargetUserID uuid.UUID  `json:"target_user_id"`
-	SubjectType  string     `json:"subject_type,omitempty"` // 👈 NEW: allows "student", "employee", etc.
+	SubjectType  string     `json:"subject_type,omitempty"`
 	EventType    string     `json:"event_type"`
 	EventTime    *time.Time `json:"event_time,omitempty"`
 	Source       struct {
@@ -63,6 +65,24 @@ func (h *AttendanceIngestHandler) handleDevicePunch(w http.ResponseWriter, r *ht
 		http.StatusBadRequest,
 		"use /attendance-device/events/punch for device attendance",
 	)
+}
+
+// mapIngestError converts subject-scope errors from the ingest service into
+// the appropriate HTTP status.
+//
+// Returns true if the error was recognised and written.
+func (h *AttendanceIngestHandler) mapIngestError(w http.ResponseWriter, err error) bool {
+	switch {
+	case errors.Is(err, resolver.ErrSubjectOutsideScope):
+		h.respondWithError(w, http.StatusForbidden,
+			"subject belongs to a different location than your current scope")
+		return true
+	case errors.Is(err, resolver.ErrSubjectHasNoLocation):
+		h.respondWithError(w, http.StatusBadRequest,
+			"target subject has no employment location assigned")
+		return true
+	}
+	return false
 }
 
 // handleUserPunch processes punches from authenticated users (including admins).
@@ -98,7 +118,6 @@ func (h *AttendanceIngestHandler) handleUserPunch(w http.ResponseWriter, r *http
 		return
 	}
 
-	// 👇 Determine subject type – default to "employee" if not provided
 	subjectType := req.SubjectType
 	if subjectType == "" {
 		subjectType = "employee"
@@ -113,7 +132,7 @@ func (h *AttendanceIngestHandler) handleUserPunch(w http.ResponseWriter, r *http
 	punchReq := &ingest.PunchRequest{
 		CompanyID:   companyID,
 		ActorID:     actorID,
-		SubjectType: subjectType, // 👈 dynamic
+		SubjectType: subjectType,
 		SubjectID:   req.TargetUserID,
 		EventType:   req.EventType,
 		EventTime:   req.EventTime,
@@ -128,6 +147,9 @@ func (h *AttendanceIngestHandler) handleUserPunch(w http.ResponseWriter, r *http
 
 	event, err := h.ingestService.IngestPunch(ctx, punchReq)
 	if err != nil {
+		if h.mapIngestError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -200,6 +222,9 @@ func (h *AttendanceIngestHandler) DevicePunchAttendance(w http.ResponseWriter, r
 
 	event, err := h.ingestService.IngestPunch(ctx, punchReq)
 	if err != nil {
+		if h.mapIngestError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -234,7 +259,7 @@ func (h *AttendanceIngestHandler) SelfPunchAttendance(w http.ResponseWriter, r *
 
 	var req struct {
 		EventType   string `json:"event_type"`
-		SubjectType string `json:"subject_type,omitempty"` // 👈 NEW
+		SubjectType string `json:"subject_type,omitempty"`
 		Source      struct {
 			SourceType string  `json:"source_type"`
 			DeviceID   *string `json:"device_id"`
@@ -258,7 +283,7 @@ func (h *AttendanceIngestHandler) SelfPunchAttendance(w http.ResponseWriter, r *
 
 	subjectType := req.SubjectType
 	if subjectType == "" {
-		subjectType = "employee" // default
+		subjectType = "employee"
 	}
 
 	ip := req.Source.IPAddress
@@ -284,6 +309,11 @@ func (h *AttendanceIngestHandler) SelfPunchAttendance(w http.ResponseWriter, r *
 
 	event, err := h.ingestService.IngestPunch(ctx, punchReq)
 	if err != nil {
+		// Self punches never hit ErrSubjectOutsideScope (actor == subject),
+		// but the mapping is harmless and keeps behavior uniform.
+		if h.mapIngestError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}

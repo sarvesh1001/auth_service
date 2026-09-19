@@ -11,9 +11,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"go.uber.org/zap"
 
 	"auth-service/internal/config"
+	"auth-service/internal/devicefp"
 	appErrors "auth-service/internal/errors"
 	"auth-service/internal/hashing"
 	"auth-service/internal/infrastructure/audit"
@@ -22,9 +25,6 @@ import (
 	"auth-service/internal/repository/scylla"
 	"auth-service/internal/service/security"
 	"auth-service/internal/sms"
-
-	"github.com/google/uuid"
-	lru "github.com/hashicorp/golang-lru/v2"
 )
 
 // ---- Constants ----
@@ -172,12 +172,17 @@ type OTPService struct {
 	lockoutCache         *lru.Cache[string, time.Time]
 	phoneValidator       PhoneValidator
 	adminDeviceTrustRepo scylla.AdminDeviceTrustRepository
-	botDetector          *security.BotDetector
-	ipReputation         *security.IPReputation
-	riskEngine           *security.RiskEngine
-	mu                   sync.RWMutex
+	// ★ Injected AdminDeviceService for atomic bind + trust
+	adminDeviceService *AdminDeviceService
+	botDetector        *security.BotDetector
+	ipReputation       *security.IPReputation
+	riskEngine         *security.RiskEngine
+	mu                 sync.RWMutex
 }
 
+// NewOTPService updates constructor to accept AdminDeviceService.
+// Fails fast if admin binding dependencies are nil — an OTP service
+// that cannot establish admin trust must never serve traffic.
 func NewOTPService(
 	otpRepo scylla.OTPRepository,
 	hasher *hashing.Hasher,
@@ -188,8 +193,18 @@ func NewOTPService(
 	idempotencyStore idempotency.Store,
 	phoneValidator PhoneValidator,
 	adminDeviceTrustRepo scylla.AdminDeviceTrustRepository,
+	adminDeviceService *AdminDeviceService,
 	smsManager *sms.SMSManager,
 ) *OTPService {
+
+	// ★ Fail-fast: these are required for the admin_login flow.
+	if adminDeviceService == nil {
+		panic("service.NewOTPService: adminDeviceService is required")
+	}
+	if adminDeviceTrustRepo == nil {
+		panic("service.NewOTPService: adminDeviceTrustRepo is required")
+	}
+
 	sendCache, _ := lru.New[string, *TokenBucket](100_000)
 	verifyCache, _ := lru.New[string, *TokenBucket](100_000)
 	lockoutCache, _ := lru.New[string, time.Time](50_000)
@@ -212,6 +227,7 @@ func NewOTPService(
 		lockoutCache:         lockoutCache,
 		phoneValidator:       phoneValidator,
 		adminDeviceTrustRepo: adminDeviceTrustRepo,
+		adminDeviceService:   adminDeviceService,
 		botDetector:          botDetector,
 		ipReputation:         ipReputation,
 		riskEngine:           riskEngine,
@@ -264,6 +280,7 @@ func (s *OTPService) performSecurityChecks(ctx context.Context, req *OTPSendRequ
 }
 
 // ---- Send OTP ----
+
 func (s *OTPService) SendOTP(ctx context.Context, req *OTPSendRequest) (*OTPResponse, error) {
 	startTime := time.Now()
 	logger := zap.L()
@@ -647,7 +664,10 @@ func (s *OTPService) SendOTP(ctx context.Context, req *OTPSendRequest) (*OTPResp
 }
 
 // ---- Verify OTP ----
-// This method now sets the device as Trusted for the admin upon successful OTP verification.
+
+// VerifyOTP verifies an OTP. For purpose=admin_login, it atomically binds
+// the device and establishes trust BEFORE consuming the OTP. If the bind
+// fails, the OTP is retained so the client can retry.
 func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTPResponse, error) {
 	startTime := time.Now()
 	logger := zap.L()
@@ -1032,32 +1052,34 @@ func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTP
 	// Store replay protection
 	_ = s.distCache.StoreOTPReplayProtection(ctx, replayKey, providedHash, OTPReplayProtectionWindow)
 
-	// Invalidate OTP
-	_ = s.otpRepo.InvalidateOTP(ctx, phoneHash, req.Purpose)
-	if s.distCache != nil {
-		cacheKey := fmt.Sprintf("otp:%s:%s", phoneHash, req.Purpose)
-		_ = s.distCache.DeleteOTPVerification(ctx, cacheKey)
-	}
-	s.clearFailedAttempts(phoneHash)
-
-	// -----------------------------------------------------------------
-	// ★ CRITICAL ADDITION: Establish device trust for admin on OTP login
-	// -----------------------------------------------------------------
-	// After successful OTP verification, this device becomes trusted for MPIN.
-	adminID, err := s.phoneValidator.GetAdminIDByPhone(ctx, req.PhoneNumber)
-	if err == nil && adminID != uuid.Nil && req.DeviceID != "" {
-		trustLevel := &models.DeviceTrustLevel{
-			UserID:            adminID,
-			DeviceID:          req.DeviceID,
-			TrustStatus:       models.TrustStatusTrusted, // OTP proves identity → device is trusted
-			DeviceFingerprint: s.hashFingerprint(req.DeviceFingerprint),
-			LastIPAddress:     req.IPAddress,
-			UserAgent:         req.UserAgent,
-			IsBlocked:         false,
-			RiskScore:         0,
+	// ---- ★ Admin bind runs BEFORE OTP invalidation. ----
+	// If the bind fails, the OTP stays valid so the client can retry
+	// without requesting a fresh code. This is the fail-closed rule.
+	if req.Purpose == "admin_login" {
+		if req.DeviceID == "" {
+			s.logOTPEvent(ctx, &models.OTPLogEvent{
+				LogEnvelope: models.LogEnvelope{
+					EventID:     uuid.New().String(),
+					EventType:   string(models.LogEventTypeOTP),
+					ServiceName: "auth-service",
+					Timestamp:   time.Now(),
+					Environment: s.config.Environment,
+					Version:     ServiceVersion,
+					Level:       string(models.LogLevelWarning),
+					Message:     "admin_login requires device_id",
+				},
+				PhoneNumber:  req.PhoneNumber,
+				Status:       "verification_failed",
+				Purpose:      req.Purpose,
+				IPAddress:    ip,
+				ErrorCode:    "DEVICE_ID_REQUIRED",
+				ErrorMessage: "device_id is required for admin_login",
+			})
+			return nil, fmt.Errorf("%w: device_id required for admin_login", appErrors.ErrInvalidInput)
 		}
-		if err := s.adminDeviceTrustRepo.SetAdminDeviceTrustLevel(ctx, adminID, req.DeviceID, trustLevel); err != nil {
-			// Log error but don't fail the login – trust is a secondary security measure
+
+		adminID, err := s.phoneValidator.GetAdminIDByPhone(ctx, req.PhoneNumber)
+		if err != nil || adminID == uuid.Nil {
 			s.logOTPEvent(ctx, &models.OTPLogEvent{
 				LogEnvelope: models.LogEnvelope{
 					EventID:     uuid.New().String(),
@@ -1067,19 +1089,33 @@ func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTP
 					Environment: s.config.Environment,
 					Version:     ServiceVersion,
 					Level:       string(models.LogLevelError),
-					Message:     "Failed to set device trust after OTP verification",
+					Message:     "admin lookup failed after OTP validation",
 				},
-				PhoneNumber:   req.PhoneNumber,
-				Status:        "trust_set_failed",
-				Purpose:       req.Purpose,
-				IPAddress:     ip,
-				UserAgent:     req.UserAgent,
-				DeviceID:      req.DeviceID,
-				ErrorCode:     "TRUST_SET_FAILED",
-				ErrorMessage:  err.Error(),
-				AttemptNumber: validatedOTP.Attempts,
+				PhoneNumber:  req.PhoneNumber,
+				Status:       "verification_failed",
+				Purpose:      req.Purpose,
+				IPAddress:    ip,
+				DeviceID:     req.DeviceID,
+				ErrorCode:    "ADMIN_LOOKUP_FAILED",
+				ErrorMessage: fmt.Sprintf("%v", err),
 			})
-		} else {
+			return nil, fmt.Errorf("%w: admin lookup failed", appErrors.ErrInternal)
+		}
+
+		// Distinct, namespaced key — cannot collide with the outer
+		// verify_otp: key that guards this very method.
+		bindCtx := context.WithValue(ctx, "idempotency_key",
+			fmt.Sprintf("admin_bind:%s:%s:%s", adminID, req.DeviceID, req.OTP))
+		bindCtx = context.WithValue(bindCtx, "ip_address", firstNonEmpty(req.IPAddress, ip))
+
+		if _, err := s.adminDeviceService.BindDevice(bindCtx, AdminBindDeviceRequest{
+			AdminID:           adminID,
+			DeviceID:          req.DeviceID,
+			DeviceFingerprint: req.DeviceFingerprint,
+			IPAddress:         firstNonEmpty(req.IPAddress, ip),
+			UserAgent:         req.UserAgent,
+		}); err != nil {
+			// FAIL-CLOSED. Do NOT invalidate the OTP.
 			s.logOTPEvent(ctx, &models.OTPLogEvent{
 				LogEnvelope: models.LogEnvelope{
 					EventID:     uuid.New().String(),
@@ -1088,18 +1124,49 @@ func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTP
 					Timestamp:   time.Now(),
 					Environment: s.config.Environment,
 					Version:     ServiceVersion,
-					Level:       string(models.LogLevelInfo),
-					Message:     "Device trust set to Trusted after successful OTP verification",
+					Level:       string(models.LogLevelError),
+					Message:     "admin device bind failed; OTP retained for retry",
 				},
-				PhoneNumber: req.PhoneNumber,
-				Status:      "trust_set_success",
-				Purpose:     req.Purpose,
-				IPAddress:   ip,
-				UserAgent:   req.UserAgent,
-				DeviceID:    req.DeviceID,
+				PhoneNumber:   req.PhoneNumber,
+				Status:        "bind_failed",
+				Purpose:       req.Purpose,
+				IPAddress:     ip,
+				UserAgent:     req.UserAgent,
+				DeviceID:      req.DeviceID,
+				ErrorCode:     "BIND_FAILED",
+				ErrorMessage:  err.Error(),
+				AttemptNumber: validatedOTP.Attempts,
 			})
+			return nil, fmt.Errorf("%w: device bind failed: %v", appErrors.ErrInternal, err)
 		}
+
+		s.logOTPEvent(ctx, &models.OTPLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeOTP),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelInfo),
+				Message:     "Admin device bound and trusted after OTP verification",
+			},
+			PhoneNumber: req.PhoneNumber,
+			Status:      "bind_success",
+			Purpose:     req.Purpose,
+			IPAddress:   ip,
+			UserAgent:   req.UserAgent,
+			DeviceID:    req.DeviceID,
+		})
 	}
+
+	// Invalidate OTP — now that any required trust writes are durable.
+	_ = s.otpRepo.InvalidateOTP(ctx, phoneHash, req.Purpose)
+	if s.distCache != nil {
+		cacheKey := fmt.Sprintf("otp:%s:%s", phoneHash, req.Purpose)
+		_ = s.distCache.DeleteOTPVerification(ctx, cacheKey)
+	}
+	s.clearFailedAttempts(phoneHash)
 
 	// Audit
 	if s.auditService != nil {
@@ -1419,9 +1486,24 @@ func (s *OTPService) generatePhoneHash(phoneNumber string) string {
 	return hex.EncodeToString(hash[:])
 }
 
-func (s *OTPService) hashFingerprint(fp string) string {
-	sum := sha256.Sum256([]byte(fp))
-	return hex.EncodeToString(sum[:])
+// extractSubnet24 returns a /24 (IPv4) or /64 (IPv6) subnet string, or "".
+func extractSubnet24(ipStr string) string {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return ""
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return fmt.Sprintf("%d.%d.%d.0/24", v4[0], v4[1], v4[2])
+	}
+	return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
+}
+
+// firstNonEmpty returns a if non-empty, else b.
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
 
 // ---- Device/IP trust checks ----
@@ -1460,7 +1542,6 @@ func (s *OTPService) isNewIP(ipAddress, phoneNumber, deviceID string) bool {
 			return false
 		}
 	}
-	// Fallback: check all devices
 	recs, err := s.adminDeviceTrustRepo.GetAdminDevices(ctx, adminID)
 	if err != nil {
 		return true
@@ -1473,28 +1554,67 @@ func (s *OTPService) isNewIP(ipAddress, phoneNumber, deviceID string) bool {
 	return true
 }
 
-func (s *OTPService) CheckFullDeviceTrust(ctx context.Context, adminID uuid.UUID, deviceID string, ip string, rawFingerprint string) (bool, string) {
+// CheckFullDeviceTrust returns whether an admin device can be treated as
+// trusted, along with a human-readable reason.
+//
+// IP and fingerprint are SOFT signals: a mismatch bumps an internal score
+// and only rejects when the score crosses the threshold. This is what keeps
+// admins trusted across docker restarts, NAT changes and NAT'd mobile
+// networks, while still flagging genuinely suspicious re-use.
+//
+// Signature is intentionally unchanged (bool, string) so existing callers
+// keep working.
+func (s *OTPService) CheckFullDeviceTrust(
+	ctx context.Context,
+	adminID uuid.UUID,
+	deviceID string,
+	ip string,
+	rawFingerprint string,
+) (bool, string) {
+
 	rec, err := s.adminDeviceTrustRepo.GetAdminDeviceTrustLevel(ctx, adminID, deviceID)
 	if err != nil || rec == nil {
-		return false, "device_not_trusted"
+		return false, "device_not_registered"
 	}
 	if rec.DeviceID != deviceID {
 		return false, "device_mismatch"
 	}
-	if rec.LastIPAddress == "" || rec.LastIPAddress != ip {
-		return false, "ip_mismatch"
-	}
-	incomingHash := s.hashFingerprint(rawFingerprint)
-	if rec.DeviceFingerprint != incomingHash {
-		return false, "fingerprint_mismatch"
-	}
-	if rec.TrustStatus != models.TrustStatusTrusted && rec.TrustStatus != models.TrustStatusPrimary {
-		return false, "device_not_trusted_status"
-	}
 	if rec.IsBlocked {
 		return false, "device_blocked"
 	}
-	return true, "trusted_3_of_3"
+	if rec.TrustStatus != models.TrustStatusTrusted &&
+		rec.TrustStatus != models.TrustStatusPrimary {
+		return false, "device_status_" + string(rec.TrustStatus)
+	}
+
+	score := 0
+
+	// ---- Fingerprint: hard when both sides non-empty and disagree ----
+	incoming := devicefp.Hash(rawFingerprint)
+	switch {
+	case rec.DeviceFingerprint == "" && incoming == "":
+		score += 10 // no fingerprint on either side — mild penalty
+	case rec.DeviceFingerprint != "" && incoming == "":
+		score += 40 // previously bound with a fingerprint, now missing
+	case rec.DeviceFingerprint == "" && incoming != "":
+		score += 5 // new fingerprint supplied opportunistically
+	case rec.DeviceFingerprint != incoming:
+		return false, "fingerprint_mismatch"
+	}
+
+	// ---- IP: soft, scored via /24 or /64 subnet ----
+	if rec.LastIPAddress == "" {
+		score += 20
+	} else if extractSubnet24(ip) != extractSubnet24(rec.LastIPAddress) {
+		score += 35
+	} else if rec.LastIPAddress != ip {
+		score += 10 // same subnet, different address (typical after restart)
+	}
+
+	if score >= 60 {
+		return false, fmt.Sprintf("risk_score_high:%d", score)
+	}
+	return true, "trusted"
 }
 
 // ---- Risk helpers ----

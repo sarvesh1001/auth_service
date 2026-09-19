@@ -20,4 +20,7 @@ var (
 	ErrCannotModifyPosted      = accErrors.ErrCannotModifyPosted
 	ErrInvalidStatusTransition = accErrors.ErrInvalidStatusTransition
 	ErrReversalAlreadyExists   = accErrors.ErrReversalAlreadyExists
+
+	// 👇 ADDED
+	ErrCostCenterCodeExists = accErrors.ErrCostCenterCodeExists
 )

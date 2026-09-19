@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
+
 	"auth-service/internal/hr/payroll/models"
 	"auth-service/internal/hr/payroll/repository"
-	a "auth-service/internal/infrastructure/audit"
-
-	"github.com/google/uuid"
-	"go.uber.org/zap"
+	hrRepo "auth-service/internal/hr/repository"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+	"auth-service/internal/locationctx"
 )
 
 // ---------------------------------------------------------------------
@@ -56,12 +58,13 @@ type SalaryStructureService interface {
 }
 
 type salaryStructureService struct {
-	repo            repository.CompensationRepository
-	lockService     PayrollLockService
-	compensationSvc CompensationService
-	arrearsSvc      ArrearsService
-	audit           *a.AuditService
-	logger          *zap.Logger
+	repo             repository.CompensationRepository
+	lockService      PayrollLockService
+	compensationSvc  CompensationService
+	arrearsSvc       ArrearsService
+	employeeRepo     hrRepo.EmployeeRepository // 👈 new — for location scope lookup
+	audit            *audit.AuditService
+	idempotencyStore idempotency.Store
 }
 
 func NewSalaryStructureService(
@@ -69,27 +72,78 @@ func NewSalaryStructureService(
 	lockService PayrollLockService,
 	compensationSvc CompensationService,
 	arrearsSvc ArrearsService,
-	audit *a.AuditService,
-	logger *zap.Logger,
+	employeeRepo hrRepo.EmployeeRepository, // 👈 new
+	audit *audit.AuditService,
+	idempotencyStore idempotency.Store,
 ) SalaryStructureService {
 	return &salaryStructureService{
-		repo:            repo,
-		lockService:     lockService,
-		compensationSvc: compensationSvc,
-		arrearsSvc:      arrearsSvc,
-		audit:           audit,
-		logger:          logger.Named("salary_structure_service"),
+		repo:             repo,
+		lockService:      lockService,
+		compensationSvc:  compensationSvc,
+		arrearsSvc:       arrearsSvc,
+		employeeRepo:     employeeRepo,
+		audit:            audit,
+		idempotencyStore: idempotencyStore,
 	}
 }
 
+// ensureEmployeeInScope verifies the target employee is within the caller's
+// current location scope.
+//
+//   - Self-action (actor == target) → always allowed
+//   - No location context           → allowed (system / worker call)
+//   - ScopeAll                      → allowed
+//   - ScopeLocation                 → target.employment_location_id must match
+func (s *salaryStructureService) ensureEmployeeInScope(
+	ctx context.Context,
+	companyID, targetUserID uuid.UUID,
+) error {
+	// Self-action shortcut
+	if actorStr, ok := ctx.Value("user_id").(string); ok {
+		if actorID, err := uuid.Parse(actorStr); err == nil && actorID == targetUserID {
+			return nil
+		}
+	}
+
+	locCtx, err := locationctx.FromContext(ctx)
+	if err != nil {
+		// No location context → system call, allow.
+		return nil
+	}
+	if locCtx.Mode == locationctx.ScopeAll {
+		return nil
+	}
+
+	empLoc, err := s.employeeRepo.GetEmploymentLocationID(ctx, companyID, targetUserID)
+	if err != nil {
+		return err
+	}
+	if empLoc == nil {
+		return ErrEmployeeHasNoLocation
+	}
+	if *empLoc != *locCtx.LocationID {
+		return ErrEmployeeOutsideScope
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------
-// STRUCTURE LIFECYCLE
+// STRUCTURE LIFECYCLE (with idempotency & IP audit)
 // ---------------------------------------------------------------------
 
 func (s *salaryStructureService) CreateStructure(
 	ctx context.Context,
 	input *models.CreateSalaryStructureInput,
 ) (*models.SalaryStructure, error) {
+	// Idempotency
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("salary_struct_create-%s-%s", input.CompanyID.String(), input.StructureName)
+	}
+	var cached *models.SalaryStructure
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
 
 	if input.CompanyID == uuid.Nil {
 		return nil, errors.New("invalid company id")
@@ -114,14 +168,16 @@ func (s *salaryStructureService) CreateStructure(
 		CreatedBy:         &input.CreatedBy,
 	}
 
+	beforeJSON, _ := json.Marshal(structure)
 	if err := s.repo.CreateSalaryStructure(ctx, structure); err != nil {
 		return nil, err
 	}
+	afterJSON, _ := json.Marshal(structure)
 
-	afterState, _ := json.Marshal(structure)
+	ip, _ := ctx.Value("ip_address").(string)
 	_ = s.audit.LogAction(
 		ctx,
-		nil, // ✅ added transaction argument
+		nil,
 		&structure.CompanyID,
 		"payroll",
 		"salary_structure_created",
@@ -129,14 +185,16 @@ func (s *salaryStructureService) CreateStructure(
 		&structure.SalaryStructureID,
 		"admin",
 		&input.CreatedBy,
-		nil,
-		afterState,
+		beforeJSON,
+		afterJSON,
 		map[string]interface{}{
 			"structure_name": structure.StructureName,
 			"currency_code":  structure.CurrencyCode,
+			"ip":             ip,
 		},
 	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, structure)
 	return structure, nil
 }
 
@@ -144,6 +202,15 @@ func (s *salaryStructureService) UpdateStructure(
 	ctx context.Context,
 	input *models.UpdateSalaryStructureInput,
 ) (*models.SalaryStructure, error) {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("salary_struct_update-%s", input.StructureID.String())
+	}
+	var cached *models.SalaryStructure
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
+
 	structure, err := s.repo.GetSalaryStructure(ctx, input.StructureID, input.CompanyID)
 	if err != nil || structure == nil {
 		return nil, fmt.Errorf("structure not found")
@@ -152,7 +219,7 @@ func (s *salaryStructureService) UpdateStructure(
 		return nil, fmt.Errorf("cannot update active structure")
 	}
 
-	beforeState, _ := json.Marshal(structure)
+	beforeJSON, _ := json.Marshal(structure)
 
 	structure.StructureName = input.StructureName
 	structure.CurrencyCode = input.CurrencyCode
@@ -161,11 +228,12 @@ func (s *salaryStructureService) UpdateStructure(
 	if err := s.repo.UpdateSalaryStructure(ctx, structure); err != nil {
 		return nil, err
 	}
+	afterJSON, _ := json.Marshal(structure)
 
-	afterState, _ := json.Marshal(structure)
+	ip, _ := ctx.Value("ip_address").(string)
 	_ = s.audit.LogAction(
 		ctx,
-		nil, // ✅ added transaction argument
+		nil,
 		&structure.CompanyID,
 		"payroll",
 		"salary_structure_updated",
@@ -173,11 +241,12 @@ func (s *salaryStructureService) UpdateStructure(
 		&structure.SalaryStructureID,
 		"admin",
 		&input.UpdatedBy,
-		beforeState,
-		afterState,
-		nil,
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{"ip": ip},
 	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, structure)
 	return structure, nil
 }
 
@@ -188,6 +257,15 @@ func (s *salaryStructureService) CloneStructure(
 	effectiveFrom time.Time,
 	createdBy uuid.UUID,
 ) (*models.SalaryStructure, error) {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("salary_struct_clone-%s", structureID.String())
+	}
+	var cached *models.SalaryStructure
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
+
 	orig, err := s.repo.GetSalaryStructure(ctx, structureID, companyID)
 	if err != nil || orig == nil {
 		return nil, fmt.Errorf("original structure not found")
@@ -202,14 +280,16 @@ func (s *salaryStructureService) CloneStructure(
 		CreatedBy:         &createdBy,
 	}
 
+	beforeJSON, _ := json.Marshal(newStructure)
 	if err := s.repo.CreateSalaryStructure(ctx, newStructure); err != nil {
 		return nil, err
 	}
+	afterJSON, _ := json.Marshal(newStructure)
 
-	afterState, _ := json.Marshal(newStructure)
+	ip, _ := ctx.Value("ip_address").(string)
 	_ = s.audit.LogAction(
 		ctx,
-		nil, // ✅ added transaction argument
+		nil,
 		&newStructure.CompanyID,
 		"payroll",
 		"salary_structure_cloned",
@@ -217,13 +297,15 @@ func (s *salaryStructureService) CloneStructure(
 		&newStructure.SalaryStructureID,
 		"admin",
 		&createdBy,
-		nil,
-		afterState,
+		beforeJSON,
+		afterJSON,
 		map[string]interface{}{
 			"source_structure_id": structureID.String(),
+			"ip":                  ip,
 		},
 	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, newStructure)
 	return newStructure, nil
 }
 
@@ -233,6 +315,15 @@ func (s *salaryStructureService) PublishStructure(
 	structureID uuid.UUID,
 	actorID uuid.UUID,
 ) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("salary_struct_publish-%s", structureID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
 	structure, err := s.repo.GetSalaryStructure(ctx, structureID, companyID)
 	if err != nil || structure == nil {
 		return fmt.Errorf("structure not found")
@@ -241,7 +332,6 @@ func (s *salaryStructureService) PublishStructure(
 		return fmt.Errorf("already active")
 	}
 
-	// Check that the structure has at least one component.
 	comps, err := s.repo.GetStructureComponents(ctx, structureID, companyID)
 	if err != nil {
 		return fmt.Errorf("failed to check structure components: %w", err)
@@ -250,11 +340,7 @@ func (s *salaryStructureService) PublishStructure(
 		return fmt.Errorf("cannot publish structure without components")
 	}
 
-	// No "in use" check – we allow activation even if assigned to employees.
-	// This is a deliberate change for payroll compatibility: an inactive structure
-	// that is already assigned to employees should still be publishable.
-
-	beforeState, _ := json.Marshal(structure)
+	beforeJSON, _ := json.Marshal(structure)
 
 	structure.IsActive = true
 	structure.UpdatedBy = &actorID
@@ -263,8 +349,9 @@ func (s *salaryStructureService) PublishStructure(
 	if err := s.repo.UpdateSalaryStructure(ctx, structure); err != nil {
 		return err
 	}
+	afterJSON, _ := json.Marshal(structure)
 
-	afterState, _ := json.Marshal(structure)
+	ip, _ := ctx.Value("ip_address").(string)
 	_ = s.audit.LogAction(
 		ctx,
 		nil,
@@ -275,11 +362,12 @@ func (s *salaryStructureService) PublishStructure(
 		&structure.SalaryStructureID,
 		"admin",
 		&actorID,
-		beforeState,
-		afterState,
-		nil,
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{"ip": ip},
 	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
@@ -289,6 +377,15 @@ func (s *salaryStructureService) DeactivateStructure(
 	structureID uuid.UUID,
 	actorID uuid.UUID,
 ) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("salary_struct_deactivate-%s", structureID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
 	inUse, err := s.repo.IsSalaryStructureInUse(ctx, structureID)
 	if err != nil {
 		return err
@@ -302,15 +399,17 @@ func (s *salaryStructureService) DeactivateStructure(
 		return fmt.Errorf("structure not found")
 	}
 
-	beforeState, _ := json.Marshal(structure)
+	beforeJSON, _ := json.Marshal(structure)
 
 	if err := s.repo.DeactivateSalaryStructure(ctx, structureID, actorID); err != nil {
 		return err
 	}
+	afterJSON, _ := json.Marshal(structure)
 
+	ip, _ := ctx.Value("ip_address").(string)
 	_ = s.audit.LogAction(
 		ctx,
-		nil, // ✅ added transaction argument
+		nil,
 		&structure.CompanyID,
 		"payroll",
 		"salary_structure_deactivated",
@@ -318,13 +417,18 @@ func (s *salaryStructureService) DeactivateStructure(
 		&structure.SalaryStructureID,
 		"admin",
 		&actorID,
-		beforeState,
-		nil,
-		nil,
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{"ip": ip},
 	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
+
+// ---------------------------------------------------------------------
+// READ METHODS (no idempotency, but we add IP to audit if needed)
+// ---------------------------------------------------------------------
 
 func (s *salaryStructureService) GetStructure(
 	ctx context.Context,
@@ -335,12 +439,10 @@ func (s *salaryStructureService) GetStructure(
 	if err != nil || structure == nil {
 		return nil, fmt.Errorf("structure not found")
 	}
-
 	comps, err := s.repo.GetStructureComponentsOrdered(ctx, structureID, companyID)
 	if err != nil {
 		return nil, err
 	}
-
 	return &models.SalaryStructureDetail{
 		SalaryStructure: *structure,
 		Components:      comps,
@@ -363,7 +465,7 @@ func (s *salaryStructureService) ListStructures(
 }
 
 // ---------------------------------------------------------------------
-// COMPONENT MANAGEMENT
+// COMPONENT MANAGEMENT (with idempotency)
 // ---------------------------------------------------------------------
 
 func (s *salaryStructureService) AddComponent(
@@ -371,6 +473,15 @@ func (s *salaryStructureService) AddComponent(
 	input *models.AddSalaryStructureComponentInput,
 	actorID uuid.UUID,
 ) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("salary_comp_add-%s-%s", input.StructureID.String(), input.ComponentCode)
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
 	component := &models.SalaryStructureComponent{
 		MappingID:         uuid.New(),
 		SalaryStructureID: input.StructureID,
@@ -382,14 +493,16 @@ func (s *salaryStructureService) AddComponent(
 		SequenceOrder:     input.SequenceOrder,
 	}
 
+	beforeJSON, _ := json.Marshal(component)
 	if err := s.repo.AddStructureComponent(ctx, component); err != nil {
 		return err
 	}
+	afterJSON, _ := json.Marshal(component)
 
-	afterState, _ := json.Marshal(component)
+	ip, _ := ctx.Value("ip_address").(string)
 	_ = s.audit.LogAction(
 		ctx,
-		nil, // ✅ added transaction argument
+		nil,
 		&input.CompanyID,
 		"payroll",
 		"salary_structure_component_added",
@@ -397,14 +510,16 @@ func (s *salaryStructureService) AddComponent(
 		&component.MappingID,
 		"admin",
 		&actorID,
-		nil,
-		afterState,
+		beforeJSON,
+		afterJSON,
 		map[string]interface{}{
 			"structure_id":   input.StructureID.String(),
 			"component_code": input.ComponentCode,
+			"ip":             ip,
 		},
 	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
@@ -413,12 +528,21 @@ func (s *salaryStructureService) UpdateComponent(
 	input *models.UpdateSalaryStructureComponentInput,
 	actorID uuid.UUID,
 ) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("salary_comp_update-%s", input.MappingID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
 	component, err := s.repo.GetStructureComponentByID(ctx, input.MappingID)
 	if err != nil || component == nil {
 		return fmt.Errorf("component not found")
 	}
 
-	beforeState, _ := json.Marshal(component)
+	beforeJSON, _ := json.Marshal(component)
 
 	component.Value = input.Value
 	component.SequenceOrder = input.SequenceOrder
@@ -426,11 +550,12 @@ func (s *salaryStructureService) UpdateComponent(
 	if err := s.repo.UpdateStructureComponent(ctx, component); err != nil {
 		return err
 	}
+	afterJSON, _ := json.Marshal(component)
 
-	afterState, _ := json.Marshal(component)
+	ip, _ := ctx.Value("ip_address").(string)
 	_ = s.audit.LogAction(
 		ctx,
-		nil, // ✅ added transaction argument
+		nil,
 		&component.CompanyID,
 		"payroll",
 		"salary_structure_component_updated",
@@ -438,11 +563,12 @@ func (s *salaryStructureService) UpdateComponent(
 		&component.MappingID,
 		"admin",
 		&actorID,
-		beforeState,
-		afterState,
-		nil,
+		beforeJSON,
+		afterJSON,
+		map[string]interface{}{"ip": ip},
 	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
@@ -453,6 +579,15 @@ func (s *salaryStructureService) RemoveComponent(
 	componentCode string,
 	actorID uuid.UUID,
 ) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("salary_comp_remove-%s-%s", structureID.String(), componentCode)
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
 	comps, err := s.repo.GetStructureComponents(ctx, structureID, companyID)
 	if err != nil {
 		return err
@@ -473,15 +608,16 @@ func (s *salaryStructureService) RemoveComponent(
 		return fmt.Errorf("component not found")
 	}
 
-	beforeState, _ := json.Marshal(component)
+	beforeJSON, _ := json.Marshal(component)
 
 	if err := s.repo.RemoveStructureComponent(ctx, targetMappingID); err != nil {
 		return err
 	}
 
+	ip, _ := ctx.Value("ip_address").(string)
 	_ = s.audit.LogAction(
 		ctx,
-		nil, // ✅ added transaction argument
+		nil,
 		&companyID,
 		"payroll",
 		"salary_structure_component_removed",
@@ -489,14 +625,16 @@ func (s *salaryStructureService) RemoveComponent(
 		&targetMappingID,
 		"admin",
 		&actorID,
-		beforeState,
+		beforeJSON,
 		nil,
 		map[string]interface{}{
 			"structure_id":   structureID.String(),
 			"component_code": componentCode,
+			"ip":             ip,
 		},
 	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
@@ -507,6 +645,15 @@ func (s *salaryStructureService) ReorderComponents(
 	componentCodes []string,
 	actorID uuid.UUID,
 ) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("salary_comp_reorder-%s", structureID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
 	comps, err := s.repo.GetStructureComponents(ctx, structureID, companyID)
 	if err != nil {
 		return err
@@ -520,7 +667,7 @@ func (s *salaryStructureService) ReorderComponents(
 		orderMap[code] = i + 1
 	}
 
-	beforeState, _ := json.Marshal(comps)
+	beforeJSON, _ := json.Marshal(comps)
 
 	for _, c := range comps {
 		if newOrder, ok := orderMap[c.ComponentCode]; ok {
@@ -531,10 +678,11 @@ func (s *salaryStructureService) ReorderComponents(
 		}
 	}
 
-	afterState, _ := json.Marshal(comps)
+	afterJSON, _ := json.Marshal(comps)
+	ip, _ := ctx.Value("ip_address").(string)
 	_ = s.audit.LogAction(
 		ctx,
-		nil, // ✅ added transaction argument
+		nil,
 		&companyID,
 		"payroll",
 		"salary_structure_components_reordered",
@@ -542,13 +690,15 @@ func (s *salaryStructureService) ReorderComponents(
 		&structureID,
 		"admin",
 		&actorID,
-		beforeState,
-		afterState,
+		beforeJSON,
+		afterJSON,
 		map[string]interface{}{
 			"new_order": componentCodes,
+			"ip":        ip,
 		},
 	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
@@ -569,13 +719,27 @@ func (s *salaryStructureService) GetStructureComponents(
 }
 
 // ---------------------------------------------------------------------
-// EMPLOYEE ASSIGNMENT
+// EMPLOYEE ASSIGNMENT (with idempotency + location scope)
 // ---------------------------------------------------------------------
 
 func (s *salaryStructureService) AssignToEmployee(
 	ctx context.Context,
 	input *models.AssignSalaryStructureInput,
 ) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("salary_assign-%s-%s", input.UserID.String(), input.EffectiveFrom.Format("2006-01-02"))
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	// 👇 Location scope check
+	if err := s.ensureEmployeeInScope(ctx, input.CompanyID, input.UserID); err != nil {
+		return err
+	}
+
 	if err := s.ValidateAssignmentAllowed(ctx, input.CompanyID, input.EffectiveFrom); err != nil {
 		return err
 	}
@@ -607,38 +771,32 @@ func (s *salaryStructureService) AssignToEmployee(
 		UpdatedBy:         &input.ActorID,
 	}
 
+	beforeJSON, _ := json.Marshal(salary)
 	if err := s.repo.CreateEmployeeSalary(ctx, salary); err != nil {
 		return err
 	}
+	afterJSON, _ := json.Marshal(salary)
 
+	// Arrears generation (best effort)
 	today := time.Now().Truncate(24 * time.Hour)
 	if input.EffectiveFrom.Before(today) {
-		prev, err := s.repo.GetActiveEmployeeSalary(ctx, input.CompanyID, input.UserID, input.EffectiveFrom.Add(-time.Nanosecond))
-		if err != nil {
-			s.logger.Error("Failed to fetch previous salary for arrears calculation",
-				zap.String("company_id", input.CompanyID.String()),
-				zap.String("user_id", input.UserID.String()),
-				zap.Error(err))
-		} else if prev != nil {
-			if err := s.arrearsSvc.GenerateArrearsForSalaryChange(
+		prev, _ := s.repo.GetActiveEmployeeSalary(ctx, input.CompanyID, input.UserID, input.EffectiveFrom.Add(-time.Nanosecond))
+		if prev != nil {
+			_ = s.arrearsSvc.GenerateArrearsForSalaryChange(
 				ctx,
 				input.CompanyID,
 				input.UserID,
 				prev.EmployeeSalaryID,
 				salary.EmployeeSalaryID,
 				input.EffectiveFrom,
-			); err != nil {
-				s.logger.Error("Failed to generate arrears for salary change",
-					zap.String("salary_id", salary.EmployeeSalaryID.String()),
-					zap.Error(err))
-			}
+			)
 		}
 	}
 
-	afterState, _ := json.Marshal(salary)
+	ip, _ := ctx.Value("ip_address").(string)
 	_ = s.audit.LogAction(
 		ctx,
-		nil, // ✅ added transaction argument
+		nil,
 		&input.CompanyID,
 		"payroll",
 		"salary_structure_assigned",
@@ -646,14 +804,16 @@ func (s *salaryStructureService) AssignToEmployee(
 		&salary.EmployeeSalaryID,
 		"admin",
 		&input.ActorID,
-		nil,
-		afterState,
+		beforeJSON,
+		afterJSON,
 		map[string]interface{}{
 			"user_id":      input.UserID.String(),
 			"structure_id": input.StructureID.String(),
+			"ip":           ip,
 		},
 	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
@@ -661,6 +821,22 @@ func (s *salaryStructureService) BulkAssignToEmployees(
 	ctx context.Context,
 	input *models.BulkAssignSalaryStructureInput,
 ) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("salary_bulk_assign-%s", input.StructureID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	// 👇 Location scope check for every target user (fail fast before any write)
+	for _, userID := range input.UserIDs {
+		if err := s.ensureEmployeeInScope(ctx, input.CompanyID, userID); err != nil {
+			return fmt.Errorf("user %s: %w", userID.String(), err)
+		}
+	}
+
 	for _, userID := range input.UserIDs {
 		err := s.AssignToEmployee(ctx, &models.AssignSalaryStructureInput{
 			CompanyID:     input.CompanyID,
@@ -675,6 +851,8 @@ func (s *salaryStructureService) BulkAssignToEmployees(
 			return err
 		}
 	}
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
@@ -682,17 +860,26 @@ func (s *salaryStructureService) ChangeEmployeeStructure(
 	ctx context.Context,
 	input *models.ChangeSalaryStructureInput,
 ) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("salary_change-%s-%s", input.UserID.String(), input.EffectiveFrom.Format("2006-01-02"))
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	// 👇 Location scope check
+	if err := s.ensureEmployeeInScope(ctx, input.CompanyID, input.UserID); err != nil {
+		return err
+	}
+
 	if err := s.ValidateAssignmentAllowed(ctx, input.CompanyID, input.EffectiveFrom); err != nil {
 		return err
 	}
 
 	endDate := input.EffectiveFrom.AddDate(0, 0, -1)
-	if err := s.EndEmployeeStructure(ctx, input.CompanyID, input.UserID, endDate, input.ActorID); err != nil {
-		s.logger.Warn("Could not end previous salary during change; continuing with new assignment",
-			zap.String("company_id", input.CompanyID.String()),
-			zap.String("user_id", input.UserID.String()),
-			zap.Error(err))
-	}
+	_ = s.EndEmployeeStructure(ctx, input.CompanyID, input.UserID, endDate, input.ActorID)
 
 	if err := s.AssignToEmployee(ctx, &models.AssignSalaryStructureInput{
 		CompanyID:     input.CompanyID,
@@ -706,6 +893,7 @@ func (s *salaryStructureService) ChangeEmployeeStructure(
 		return err
 	}
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
 
@@ -716,12 +904,26 @@ func (s *salaryStructureService) EndEmployeeStructure(
 	endDate time.Time,
 	actorID uuid.UUID,
 ) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("salary_end-%s", userID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	// 👇 Location scope check
+	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
+		return err
+	}
+
 	active, err := s.repo.GetActiveEmployeeSalary(ctx, companyID, userID, endDate)
 	if err != nil || active == nil {
 		return fmt.Errorf("no active salary found on %s", endDate.Format("2006-01-02"))
 	}
 
-	beforeState, _ := json.Marshal(active)
+	beforeJSON, _ := json.Marshal(active)
 
 	active.EffectiveTo = &endDate
 	active.IsActive = false
@@ -730,26 +932,23 @@ func (s *salaryStructureService) EndEmployeeStructure(
 	if err := s.repo.UpdateEmployeeSalary(ctx, active); err != nil {
 		return err
 	}
+	afterJSON, _ := json.Marshal(active)
 
 	today := time.Now().Truncate(24 * time.Hour)
 	if endDate.Before(today) {
-		if err := s.arrearsSvc.GenerateArrearsForSalaryEnd(
+		_ = s.arrearsSvc.GenerateArrearsForSalaryEnd(
 			ctx,
 			companyID,
 			userID,
 			active.EmployeeSalaryID,
 			endDate,
-		); err != nil {
-			s.logger.Error("Failed to generate arrears for salary end",
-				zap.String("salary_id", active.EmployeeSalaryID.String()),
-				zap.Error(err))
-		}
+		)
 	}
 
-	afterState, _ := json.Marshal(active)
+	ip, _ := ctx.Value("ip_address").(string)
 	_ = s.audit.LogAction(
 		ctx,
-		nil, // ✅ added transaction argument
+		nil,
 		&companyID,
 		"payroll",
 		"salary_structure_ended",
@@ -757,17 +956,23 @@ func (s *salaryStructureService) EndEmployeeStructure(
 		&active.EmployeeSalaryID,
 		"admin",
 		&actorID,
-		beforeState,
-		afterState,
+		beforeJSON,
+		afterJSON,
 		map[string]interface{}{
 			"user_id":      userID.String(),
 			"structure_id": active.SalaryStructureID.String(),
 			"end_date":     endDate,
+			"ip":           ip,
 		},
 	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 	return nil
 }
+
+// ---------------------------------------------------------------------
+// QUERY METHODS (with location scope where target is an employee)
+// ---------------------------------------------------------------------
 
 func (s *salaryStructureService) GetActiveStructureForEmployee(
 	ctx context.Context,
@@ -775,6 +980,11 @@ func (s *salaryStructureService) GetActiveStructureForEmployee(
 	userID uuid.UUID,
 	asOf time.Time,
 ) (*models.EmployeeSalaryStructure, error) {
+	// 👇 Location scope check
+	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
+		return nil, err
+	}
+
 	salary, err := s.repo.GetActiveEmployeeSalary(ctx, companyID, userID, asOf)
 	if err != nil || salary == nil {
 		return nil, err
@@ -789,6 +999,11 @@ func (s *salaryStructureService) GetEmployeeStructureHistory(
 	companyID uuid.UUID,
 	userID uuid.UUID,
 ) ([]*models.EmployeeSalaryStructure, error) {
+	// 👇 Location scope check
+	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
+		return nil, err
+	}
+
 	history, err := s.repo.GetEmployeeSalaryHistory(ctx, companyID, userID, 1, 1000)
 	if err != nil {
 		return nil, err
@@ -839,5 +1054,9 @@ func (s *salaryStructureService) BuildStructureSnapshot(
 	userID uuid.UUID,
 	asOf time.Time,
 ) (*models.SalaryStructureSnapshot, error) {
+	// 👇 Location scope check
+	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
+		return nil, err
+	}
 	return s.compensationSvc.ResolveSalaryStructure(ctx, companyID, userID, asOf)
 }

@@ -2,60 +2,32 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
+
 	"auth-service/internal/hr/leave/models"
 	"auth-service/internal/hr/leave/repository"
-	"auth-service/internal/util"
-
-	"github.com/google/uuid"
-	"go.uber.org/zap"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
 )
 
-// =====================================================
-// SERVICE INTERFACE
-// =====================================================
-
 type LeavePolicyResolutionService interface {
-	ResolveUserLeaveEntitlements(
-		ctx context.Context,
-		companyID uuid.UUID,
-		userID uuid.UUID,
-		asOf time.Time,
-		reason string,
-	) error
+	ResolveUserLeaveEntitlements(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, asOf time.Time, reason string, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
+	ResolveBatchLeaveEntitlements(ctx context.Context, companyID uuid.UUID, userIDs []uuid.UUID, asOf time.Time, reason string, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*LeavePolicyResolutionResult, error)
 
-	ResolveBatchLeaveEntitlements(
-		ctx context.Context,
-		companyID uuid.UUID,
-		userIDs []uuid.UUID,
-		asOf time.Time,
-		reason string,
-	) (*LeavePolicyResolutionResult, error)
-
+	// GetLeaveEntitlements — location filter applies when locationID != nil.
 	GetLeaveEntitlements(
 		ctx context.Context,
 		companyID uuid.UUID,
 		userID *uuid.UUID,
+		locationID *uuid.UUID,
 		page, pageSize int,
 	) ([]*models.LeaveEntitlement, int64, error)
 
-	GetUserEffectivePolicies(
-		ctx context.Context,
-		companyID uuid.UUID,
-		userID uuid.UUID,
-		asOf time.Time,
-	) ([]*models.LeavePolicyRuleResolution, error)
-}
-
-// =====================================================
-// IMPLEMENTATION
-// =====================================================
-
-type leavePolicyResolutionService struct {
-	repo   repository.LeaveRepository
-	logger *zap.Logger
+	GetUserEffectivePolicies(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, asOf time.Time) ([]*models.LeavePolicyRuleResolution, error)
 }
 
 type LeavePolicyResolutionResult struct {
@@ -65,113 +37,73 @@ type LeavePolicyResolutionResult struct {
 	Errors         []string
 }
 
+type leavePolicyResolutionService struct {
+	repo             repository.LeaveRepository
+	idempotencyStore idempotency.Store
+	auditService     *audit.AuditService
+}
+
 func NewLeavePolicyResolutionService(
 	repo repository.LeaveRepository,
-	logger *zap.Logger,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
 ) LeavePolicyResolutionService {
 	return &leavePolicyResolutionService{
-		repo:   repo,
-		logger: logger.Named("leave_policy_resolution_service"),
+		repo:             repo,
+		idempotencyStore: idempotencyStore,
+		auditService:     auditService,
 	}
 }
 
-// =====================================================
-// CORE LOGIC
-// =====================================================
 func (s *leavePolicyResolutionService) ResolveUserLeaveEntitlements(
 	ctx context.Context,
 	companyID uuid.UUID,
 	userID uuid.UUID,
 	asOf time.Time,
 	reason string,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
 ) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("resolve_user-%s-%s", userID.String(), asOf.Format("2006-01-02"))
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
 
-	s.logger.Info("Resolving leave entitlements",
-		util.String("company_id", companyID.String()),
-		util.String("user_id", userID.String()),
-		util.Time("as_of", asOf),
-	)
-
-	// 🔥 Snapshot user position context ONCE
-	positionID, workCenterCode, err := s.repo.GetUserPositionContext(
-		ctx,
-		companyID,
-		userID,
-	)
+	positionID, workCenterCode, err := s.repo.GetUserPositionContext(ctx, companyID, userID)
 	if err != nil {
 		return fmt.Errorf("failed to get user position context: %w", err)
 	}
 
-	// 1. Resolve effective policy rules
 	rules, err := s.repo.ResolveUserPolicyRules(ctx, companyID, userID, asOf)
 	if err != nil {
 		return fmt.Errorf("resolve policy rules failed: %w", err)
 	}
-
 	if len(rules) == 0 {
-		s.logger.Debug("No applicable policy rules",
-			util.String("user_id", userID.String()),
-		)
+		_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 		return nil
 	}
 
 	processedLeaveTypes := make(map[uuid.UUID]bool)
-	processedPolicies := make(map[uuid.UUID]bool)
-
-	// 2. Apply rules PER LEAVE TYPE (IDEMPOTENT)
 	for _, rule := range rules {
 		if processedLeaveTypes[rule.LeaveTypeID] {
 			continue
 		}
-
-		// 🔒 Check existing active policy entitlement (position-aware)
-		existing, err := s.repo.GetActivePolicyEntitlement(
-			ctx,
-			companyID,
-			userID,
-			rule.LeaveTypeID,
-			positionID,
-		)
+		existing, err := s.repo.GetActivePolicyEntitlement(ctx, companyID, userID, rule.LeaveTypeID, positionID)
 		if err != nil {
-			return fmt.Errorf(
-				"failed to check existing entitlement (leave_type=%s): %w",
-				rule.LeaveTypeID, err,
-			)
+			return fmt.Errorf("failed to check existing entitlement: %w", err)
 		}
-
-		// ✅ Idempotency: same policy + same days → skip
-		if existing != nil &&
-			existing.PolicyID != nil &&
-			*existing.PolicyID == rule.PolicyID &&
-			existing.TotalDays == rule.TotalDays {
-
-			s.logger.Debug("Skipping unchanged entitlement",
-				util.String("user_id", userID.String()),
-				util.String("leave_type_id", rule.LeaveTypeID.String()),
-				util.String("policy_id", rule.PolicyID.String()),
-			)
-
+		if existing != nil && existing.PolicyID != nil && *existing.PolicyID == rule.PolicyID && existing.TotalDays == rule.TotalDays {
 			processedLeaveTypes[rule.LeaveTypeID] = true
-			processedPolicies[rule.PolicyID] = true
 			continue
 		}
-
-		// 🔥 End old entitlement if exists / changed
-		if err := s.repo.EndActivePolicyEntitlementsByLeaveType(
-			ctx,
-			companyID,
-			userID,
-			rule.LeaveTypeID,
-			asOf,
-			positionID,
-		); err != nil {
-			return fmt.Errorf(
-				"end entitlement failed (leave_type=%s): %w",
-				rule.LeaveTypeID, err,
-			)
+		if err := s.repo.EndActivePolicyEntitlementsByLeaveType(ctx, companyID, userID, rule.LeaveTypeID, asOf, positionID); err != nil {
+			return fmt.Errorf("failed to end entitlement: %w", err)
 		}
-
-		// ✅ Create new entitlement snapshot
 		entitlement := &models.LeaveEntitlement{
 			EntitlementID:  uuid.New(),
 			CompanyID:      companyID,
@@ -185,52 +117,29 @@ func (s *leavePolicyResolutionService) ResolveUserLeaveEntitlements(
 			PositionID:     positionID,
 			WorkCenterCode: workCenterCode,
 		}
-
 		if err := s.repo.CreatePolicyLeaveEntitlement(ctx, entitlement); err != nil {
-			return fmt.Errorf(
-				"create entitlement failed (leave_type=%s): %w",
-				rule.LeaveTypeID, err,
-			)
+			return fmt.Errorf("failed to create entitlement: %w", err)
 		}
-
 		processedLeaveTypes[rule.LeaveTypeID] = true
-		processedPolicies[rule.PolicyID] = true
 	}
 
-	// 3. Audit (multi-policy resolution)
-	metadata := map[string]interface{}{
-		"company_id":     companyID.String(),
-		"user_id":        userID.String(),
-		"resolved_at":    asOf,
-		"reason":         reason,
-		"leave_type_ids": keysUUID(processedLeaveTypes),
-		"policy_ids":     keysUUID(processedPolicies),
-		"rule_count":     len(rules),
-	}
-
-	if err := s.repo.CreateLeavePolicyResolution(
-		ctx,
-		companyID,
-		userID,
-		nil, // multi-policy resolution
-		reason,
-		metadata,
-	); err != nil {
-		return fmt.Errorf("policy resolution audit failed: %w", err)
-	}
-
-	s.logger.Info("Leave entitlement resolution completed",
-		util.String("user_id", userID.String()),
-		util.Int("leave_types", len(processedLeaveTypes)),
-		util.Int("policies", len(processedPolicies)),
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"company_id": companyID.String(),
+		"user_id":    userID.String(),
+		"as_of":      asOf,
+		"reason":     reason,
+		"ip":         ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx, nil, &companyID, "leave", "resolution.user", "leave_entitlement",
+		nil, actorType, &actorID, nil, nil, auditMeta,
 	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 
 	return nil
 }
-
-// =====================================================
-// BATCH
-// =====================================================
 
 func (s *leavePolicyResolutionService) ResolveBatchLeaveEntitlements(
 	ctx context.Context,
@@ -238,16 +147,26 @@ func (s *leavePolicyResolutionService) ResolveBatchLeaveEntitlements(
 	userIDs []uuid.UUID,
 	asOf time.Time,
 	reason string,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
 ) (*LeavePolicyResolutionResult, error) {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("resolve_batch-%s", uuid.New().String())
+	}
+	var cached *LeavePolicyResolutionResult
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
 
 	result := &LeavePolicyResolutionResult{
 		TotalUsers:  len(userIDs),
 		FailedUsers: []uuid.UUID{},
 		Errors:      []string{},
 	}
-
 	for _, userID := range userIDs {
-		if err := s.ResolveUserLeaveEntitlements(ctx, companyID, userID, asOf, reason); err != nil {
+		if err := s.ResolveUserLeaveEntitlements(ctx, companyID, userID, asOf, reason, actorType, actorID, metadata); err != nil {
 			result.FailedUsers = append(result.FailedUsers, userID)
 			result.Errors = append(result.Errors, err.Error())
 		} else {
@@ -255,64 +174,36 @@ func (s *leavePolicyResolutionService) ResolveBatchLeaveEntitlements(
 		}
 	}
 
+	ip, _ := ctx.Value("ip_address").(string)
+	afterJSON, _ := json.Marshal(result)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"company_id": companyID.String(),
+		"total":      result.TotalUsers,
+		"processed":  result.ProcessedUsers,
+		"failed":     len(result.FailedUsers),
+		"ip":         ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx, nil, &companyID, "leave", "resolution.batch", "leave_entitlement",
+		nil, actorType, &actorID, nil, afterJSON, auditMeta,
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, result)
+
 	return result, nil
 }
 
-// =====================================================
-// READ
-// =====================================================
-
-func (s *leavePolicyResolutionService) GetUserEffectivePolicies(
-	ctx context.Context,
-	companyID uuid.UUID,
-	userID uuid.UUID,
-	asOf time.Time,
-) ([]*models.LeavePolicyRuleResolution, error) {
-	return s.repo.ResolveUserPolicyRules(ctx, companyID, userID, asOf)
-}
-
-// =====================================================
-// HELPERS
-// =====================================================
-
-func keysUUID(m map[uuid.UUID]bool) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k.String())
-	}
-	return out
-}
-
+// GetLeaveEntitlements — location filter applies when locationID != nil.
 func (s *leavePolicyResolutionService) GetLeaveEntitlements(
 	ctx context.Context,
 	companyID uuid.UUID,
 	userID *uuid.UUID,
+	locationID *uuid.UUID,
 	page, pageSize int,
 ) ([]*models.LeaveEntitlement, int64, error) {
+	return s.repo.GetLeaveEntitlementsByCompanyAndUser(ctx, companyID, userID, locationID, page, pageSize)
+}
 
-	if page < 1 {
-		page = 1
-	}
-	if pageSize < 1 || pageSize > 100 {
-		pageSize = 50
-	}
-
-	entitlements, total, err := s.repo.GetLeaveEntitlementsByCompanyAndUser(
-		ctx,
-		companyID,
-		userID,
-		page,
-		pageSize,
-	)
-	if err != nil {
-		s.logger.Error("Failed to get leave entitlements",
-			util.String("company_id", companyID.String()),
-			util.Int("page", page),
-			util.Int("page_size", pageSize),
-			util.ErrorField(err),
-		)
-		return nil, 0, fmt.Errorf("failed to get leave entitlements: %w", err)
-	}
-
-	return entitlements, total, nil
+func (s *leavePolicyResolutionService) GetUserEffectivePolicies(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, asOf time.Time) ([]*models.LeavePolicyRuleResolution, error) {
+	return s.repo.ResolveUserPolicyRules(ctx, companyID, userID, asOf)
 }

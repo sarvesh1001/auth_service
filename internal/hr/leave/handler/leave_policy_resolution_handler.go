@@ -1,42 +1,82 @@
 package handler
 
 import (
-	"auth-service/internal/hr/leave/service"
-	"auth-service/internal/util"
+	"context"
 	"encoding/json"
-	"math" // ✅ ADD THIS
+	"math"
 	"net/http"
-	"strconv" // ✅ ADD THIS
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
-	"go.uber.org/zap"
+
+	"auth-service/internal/hr/leave/service"
+	"auth-service/internal/locationctx"
 )
 
 type LeavePolicyResolutionHandler struct {
 	policyResolutionService service.LeavePolicyResolutionService
-	logger                  *zap.Logger
 }
 
 func NewLeavePolicyResolutionHandler(
 	policyResolutionService service.LeavePolicyResolutionService,
-	logger *zap.Logger,
 ) *LeavePolicyResolutionHandler {
 	return &LeavePolicyResolutionHandler{
 		policyResolutionService: policyResolutionService,
-		logger:                  logger.Named("leave_policy_resolution_handler"),
 	}
 }
 
-// ResolveSingleUser - POST /companies/{companyID}/leave/admin/policies/resolve/user/{userID}
+// ----- helpers -----
+
+func (h *LeavePolicyResolutionHandler) getActor(ctx context.Context) (actorType string, actorID uuid.UUID, err error) {
+	actorID, err = getUserIDFromContext(ctx)
+	if err != nil {
+		return "", uuid.Nil, err
+	}
+	actorType = "admin"
+	return actorType, actorID, nil
+}
+
+func (h *LeavePolicyResolutionHandler) getMetadata(ctx context.Context) map[string]interface{} {
+	meta := make(map[string]interface{})
+	if ip, ok := ctx.Value("ip_address").(string); ok {
+		meta["ip_address"] = ip
+	}
+	return meta
+}
+
+// ----- request types -----
+
 type ResolveSingleUserRequest struct {
 	AsOf   *time.Time `json:"as_of,omitempty"`
 	Reason string     `json:"reason"`
 }
 
+type ResolveBatchRequest struct {
+	UserIDs []uuid.UUID `json:"user_ids"`
+	AsOf    *time.Time  `json:"as_of,omitempty"`
+	Reason  string      `json:"reason"`
+}
+
+type OnboardingRequest struct {
+	CompanyID uuid.UUID `json:"company_id"`
+	UserID    uuid.UUID `json:"user_id"`
+	JoinedAt  time.Time `json:"joined_at"`
+}
+
+type PositionChangeRequest struct {
+	CompanyID uuid.UUID `json:"company_id"`
+	UserID    uuid.UUID `json:"user_id"`
+	ChangedAt time.Time `json:"changed_at"`
+}
+
+// ----- handlers -----
+
+// ResolveSingleUser - POST /companies/{companyID}/leave/admin/policies/resolve/user/{userID}
 func (h *LeavePolicyResolutionHandler) ResolveSingleUser(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -51,6 +91,13 @@ func (h *LeavePolicyResolutionHandler) ResolveSingleUser(w http.ResponseWriter, 
 		return
 	}
 
+	actorType, actorID, err := h.getActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	metadata := h.getMetadata(ctx)
+
 	var req ResolveSingleUserRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
@@ -61,31 +108,14 @@ func (h *LeavePolicyResolutionHandler) ResolveSingleUser(w http.ResponseWriter, 
 	if req.AsOf != nil {
 		asOf = *req.AsOf
 	}
-
 	reason := req.Reason
 	if reason == "" {
 		reason = "manual resolution triggered by admin"
 	}
 
-	h.logger.Info("Resolving leave entitlements for single user",
-		util.String("company_id", companyID.String()),
-		util.String("user_id", userID.String()),
-		util.Time("as_of", asOf),
-		util.String("reason", reason),
-	)
-
 	if err := h.policyResolutionService.ResolveUserLeaveEntitlements(
-		ctx,
-		companyID,
-		userID,
-		asOf,
-		reason,
+		ctx, companyID, userID, asOf, reason, actorType, actorID, metadata,
 	); err != nil {
-		h.logger.Error("Failed to resolve leave entitlements for user",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.ErrorField(err),
-		)
 		h.respondWithError(w, http.StatusInternalServerError, "failed to resolve leave entitlements")
 		return
 	}
@@ -103,20 +133,22 @@ func (h *LeavePolicyResolutionHandler) ResolveSingleUser(w http.ResponseWriter, 
 }
 
 // ResolveBatchUsers - POST /companies/{companyID}/leave/admin/policies/resolve/batch
-type ResolveBatchRequest struct {
-	UserIDs []uuid.UUID `json:"user_ids"`
-	AsOf    *time.Time  `json:"as_of,omitempty"`
-	Reason  string      `json:"reason"`
-}
-
 func (h *LeavePolicyResolutionHandler) ResolveBatchUsers(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
 		return
 	}
+
+	actorType, actorID, err := h.getActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	metadata := h.getMetadata(ctx)
 
 	var req ResolveBatchRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -133,31 +165,15 @@ func (h *LeavePolicyResolutionHandler) ResolveBatchUsers(w http.ResponseWriter, 
 	if req.AsOf != nil {
 		asOf = *req.AsOf
 	}
-
 	reason := req.Reason
 	if reason == "" {
 		reason = "batch resolution triggered by admin"
 	}
 
-	h.logger.Info("Resolving leave entitlements for batch users",
-		util.String("company_id", companyID.String()),
-		util.Int("user_count", len(req.UserIDs)),
-		util.Time("as_of", asOf),
-		util.String("reason", reason),
-	)
-
 	result, err := h.policyResolutionService.ResolveBatchLeaveEntitlements(
-		ctx,
-		companyID,
-		req.UserIDs,
-		asOf,
-		reason,
+		ctx, companyID, req.UserIDs, asOf, reason, actorType, actorID, metadata,
 	)
 	if err != nil {
-		h.logger.Error("Failed to resolve batch leave entitlements",
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err),
-		)
 		h.respondWithError(w, http.StatusInternalServerError, "failed to resolve batch leave entitlements")
 		return
 	}
@@ -171,7 +187,8 @@ func (h *LeavePolicyResolutionHandler) ResolveBatchUsers(w http.ResponseWriter, 
 
 // GetEffectivePolicies - GET /companies/{companyID}/leave/admin/policies/effective/{userID}
 func (h *LeavePolicyResolutionHandler) GetEffectivePolicies(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -186,36 +203,19 @@ func (h *LeavePolicyResolutionHandler) GetEffectivePolicies(w http.ResponseWrite
 		return
 	}
 
-	// Parse optional as_of parameter
 	asOfStr := r.URL.Query().Get("as_of")
 	asOf := time.Now().UTC()
 	if asOfStr != "" {
-		parsedAsOf, err := time.Parse("2006-01-02", asOfStr)
+		parsed, err := time.Parse("2006-01-02", asOfStr)
 		if err != nil {
 			h.respondWithError(w, http.StatusBadRequest, "invalid as_of format, use YYYY-MM-DD")
 			return
 		}
-		asOf = parsedAsOf
+		asOf = parsed
 	}
 
-	h.logger.Debug("Getting effective policies for user",
-		util.String("company_id", companyID.String()),
-		util.String("user_id", userID.String()),
-		util.Time("as_of", asOf),
-	)
-
-	policies, err := h.policyResolutionService.GetUserEffectivePolicies(
-		ctx,
-		companyID,
-		userID,
-		asOf,
-	)
+	policies, err := h.policyResolutionService.GetUserEffectivePolicies(ctx, companyID, userID, asOf)
 	if err != nil {
-		h.logger.Error("Failed to get effective policies",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.ErrorField(err),
-		)
 		h.respondWithError(w, http.StatusInternalServerError, "failed to get effective policies")
 		return
 	}
@@ -232,17 +232,9 @@ func (h *LeavePolicyResolutionHandler) GetEffectivePolicies(w http.ResponseWrite
 	})
 }
 
-// Internal handler for automation events
-
 // ResolveOnboarding - POST /internal/leave/resolve/onboarding
-type OnboardingRequest struct {
-	CompanyID uuid.UUID `json:"company_id"`
-	UserID    uuid.UUID `json:"user_id"`
-	JoinedAt  time.Time `json:"joined_at"`
-}
-
 func (h *LeavePolicyResolutionHandler) ResolveOnboarding(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	var req OnboardingRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -254,29 +246,17 @@ func (h *LeavePolicyResolutionHandler) ResolveOnboarding(w http.ResponseWriter, 
 		h.respondWithError(w, http.StatusBadRequest, "company_id and user_id are required")
 		return
 	}
-
 	if req.JoinedAt.IsZero() {
 		req.JoinedAt = time.Now().UTC()
 	}
 
-	h.logger.Info("Resolving leave entitlements for onboarding",
-		util.String("company_id", req.CompanyID.String()),
-		util.String("user_id", req.UserID.String()),
-		util.Time("joined_at", req.JoinedAt),
-	)
+	actorType := "system"
+	actorID := uuid.Nil
+	metadata := h.getMetadata(ctx)
 
 	if err := h.policyResolutionService.ResolveUserLeaveEntitlements(
-		ctx,
-		req.CompanyID,
-		req.UserID,
-		req.JoinedAt,
-		"employee onboarding",
+		ctx, req.CompanyID, req.UserID, req.JoinedAt, "employee onboarding", actorType, actorID, metadata,
 	); err != nil {
-		h.logger.Error("Failed to resolve leave entitlements for onboarding",
-			util.String("company_id", req.CompanyID.String()),
-			util.String("user_id", req.UserID.String()),
-			util.ErrorField(err),
-		)
 		h.respondWithError(w, http.StatusInternalServerError, "failed to resolve leave entitlements for onboarding")
 		return
 	}
@@ -288,14 +268,8 @@ func (h *LeavePolicyResolutionHandler) ResolveOnboarding(w http.ResponseWriter, 
 }
 
 // ResolvePositionChange - POST /internal/leave/resolve/position-change
-type PositionChangeRequest struct {
-	CompanyID uuid.UUID `json:"company_id"`
-	UserID    uuid.UUID `json:"user_id"`
-	ChangedAt time.Time `json:"changed_at"`
-}
-
 func (h *LeavePolicyResolutionHandler) ResolvePositionChange(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
 
 	var req PositionChangeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -307,29 +281,17 @@ func (h *LeavePolicyResolutionHandler) ResolvePositionChange(w http.ResponseWrit
 		h.respondWithError(w, http.StatusBadRequest, "company_id and user_id are required")
 		return
 	}
-
 	if req.ChangedAt.IsZero() {
 		req.ChangedAt = time.Now().UTC()
 	}
 
-	h.logger.Info("Resolving leave entitlements for position change",
-		util.String("company_id", req.CompanyID.String()),
-		util.String("user_id", req.UserID.String()),
-		util.Time("changed_at", req.ChangedAt),
-	)
+	actorType := "system"
+	actorID := uuid.Nil
+	metadata := h.getMetadata(ctx)
 
 	if err := h.policyResolutionService.ResolveUserLeaveEntitlements(
-		ctx,
-		req.CompanyID,
-		req.UserID,
-		req.ChangedAt,
-		"position change",
+		ctx, req.CompanyID, req.UserID, req.ChangedAt, "position change", actorType, actorID, metadata,
 	); err != nil {
-		h.logger.Error("Failed to resolve leave entitlements for position change",
-			util.String("company_id", req.CompanyID.String()),
-			util.String("user_id", req.UserID.String()),
-			util.ErrorField(err),
-		)
 		h.respondWithError(w, http.StatusInternalServerError, "failed to resolve leave entitlements for position change")
 		return
 	}
@@ -341,9 +303,12 @@ func (h *LeavePolicyResolutionHandler) ResolvePositionChange(w http.ResponseWrit
 }
 
 // ListEntitlements - GET /companies/{companyID}/leave/admin/entitlements
-// Update ListEntitlements in handler/leave_policy_resolution.go
+//
+// Reads the request's location scope and passes it to the service.
+// nil = company-wide (X-Location-ID: ALL).
 func (h *LeavePolicyResolutionHandler) ListEntitlements(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := injectCommonContext(r.Context(), r)
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -351,11 +316,9 @@ func (h *LeavePolicyResolutionHandler) ListEntitlements(w http.ResponseWriter, r
 		return
 	}
 
-	// Parse query parameters
 	var userID *uuid.UUID
-	userIDStr := r.URL.Query().Get("user_id")
-	if userIDStr != "" {
-		uid, err := uuid.Parse(userIDStr)
+	if v := r.URL.Query().Get("user_id"); v != "" {
+		uid, err := uuid.Parse(v)
 		if err != nil {
 			h.respondWithError(w, http.StatusBadRequest, "invalid user ID format")
 			return
@@ -363,50 +326,46 @@ func (h *LeavePolicyResolutionHandler) ListEntitlements(w http.ResponseWriter, r
 		userID = &uid
 	}
 
-	page, err := strconv.Atoi(r.URL.Query().Get("page"))
-	if err != nil || page < 1 {
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if page < 1 {
 		page = 1
 	}
-
-	pageSize, err := strconv.Atoi(r.URL.Query().Get("page_size"))
-	if err != nil || pageSize < 1 || pageSize > 100 {
+	pageSize, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
+	if pageSize < 1 || pageSize > 100 {
 		pageSize = 50
 	}
 
+	// 👇 Location scope filter.
+	locFilter := locationctx.Filter(ctx)
+
 	entitlements, total, err := h.policyResolutionService.GetLeaveEntitlements(
-		ctx, companyID, userID, page, pageSize,
-	)
+		ctx, companyID, userID, locFilter, page, pageSize)
 	if err != nil {
-		h.logger.Error("Failed to list leave entitlements",
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to list leave entitlements")
 		return
 	}
 
-	// Enrich with leave type info if needed
-	enrichedEntitlements := make([]map[string]interface{}, len(entitlements))
-	for i, entitlement := range entitlements {
-		enriched := map[string]interface{}{
-			"entitlement_id": entitlement.EntitlementID,
-			"company_id":     entitlement.CompanyID,
-			"user_id":        entitlement.UserID,
-			"leave_type_id":  entitlement.LeaveTypeID,
-			"total_days":     entitlement.TotalDays,
-			"effective_from": entitlement.EffectiveFrom,
-			"effective_to":   entitlement.EffectiveTo,
-			"source":         entitlement.Source,
-			"policy_id":      entitlement.PolicyID,
-			"created_at":     entitlement.CreatedAt,
-			"updated_at":     entitlement.UpdatedAt,
+	enriched := make([]map[string]interface{}, len(entitlements))
+	for i, e := range entitlements {
+		enriched[i] = map[string]interface{}{
+			"entitlement_id": e.EntitlementID,
+			"company_id":     e.CompanyID,
+			"user_id":        e.UserID,
+			"leave_type_id":  e.LeaveTypeID,
+			"total_days":     e.TotalDays,
+			"effective_from": e.EffectiveFrom,
+			"effective_to":   e.EffectiveTo,
+			"source":         e.Source,
+			"policy_id":      e.PolicyID,
+			"created_at":     e.CreatedAt,
+			"updated_at":     e.UpdatedAt,
 		}
-		enrichedEntitlements[i] = enriched
 	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data": map[string]interface{}{
-			"entitlements": enrichedEntitlements,
+			"entitlements": enriched,
 			"pagination": map[string]interface{}{
 				"page":        page,
 				"page_size":   pageSize,
@@ -419,10 +378,12 @@ func (h *LeavePolicyResolutionHandler) ListEntitlements(w http.ResponseWriter, r
 	})
 }
 
+// ----- response helpers -----
+
 func (h *LeavePolicyResolutionHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
+	_ = json.NewEncoder(w).Encode(data)
 }
 
 func (h *LeavePolicyResolutionHandler) respondWithError(w http.ResponseWriter, status int, message string) {

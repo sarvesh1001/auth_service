@@ -1,6 +1,8 @@
 package accounting
 
 import (
+	"net/http"
+
 	"github.com/go-chi/chi/v5"
 
 	"auth-service/internal/accounting/handler"
@@ -19,150 +21,162 @@ type AccountingHandlers struct {
 	TaxHandler                *handler.TaxHandler
 	AccountingSettingsHandler *handler.AccountingSettingsHandler
 	AnalyticsHandler          *handler.AnalyticsHandler
-	PeriodLockHandler         *handler.PeriodLockHandler // 👈 NEW
+	PeriodLockHandler         *handler.PeriodLockHandler
+
+	// 👇 ADDED
+	CostCenterHandler *handler.CostCenterHandler
 }
 
-// RegisterAccountingRoutes registers all accounting routes under /companies/{companyID}/accounting.
+// RegisterAccountingRoutes registers all accounting routes under
+// /companies/{companyID}/accounting.
+//
+// Middleware chain applied inside this function (in order):
+//
+//	jwt → session → subscription → location → idempotency
+//
+// The caller must NOT wrap this call in a group that already applies
+// those middlewares, otherwise they will run twice.
 func RegisterAccountingRoutes(
 	r chi.Router,
 	handlers *AccountingHandlers,
 	jwtService *service.JWTService,
+
+	// auth + platform middleware, provided by the main router
+	jwtAuthMiddleware func(http.Handler) http.Handler,
+	sessionValidationMiddleware func(http.Handler) http.Handler,
+	subscriptionEnforcementMiddleware func(http.Handler) http.Handler,
+	locationValidationMiddleware func(http.Handler) http.Handler,
+	idempotencyMiddleware func(http.Handler) http.Handler,
 ) {
-	r.Route("/accounting", func(r chi.Router) {
+	r.Route("/companies/{companyID}/accounting", func(r chi.Router) {
+		// ---- Mandatory chain ----
+		r.Use(jwtAuthMiddleware)
+		r.Use(sessionValidationMiddleware)
+		r.Use(subscriptionEnforcementMiddleware)
+		r.Use(locationValidationMiddleware)
+		r.Use(idempotencyMiddleware)
 
 		// ========== Chart of Accounts ==========
 		r.Route("/accounts", func(r chi.Router) {
 
-			// Create a single account
 			r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.journal.create")).
 				Post("/", handlers.AccountHandler.CreateAccount)
 
-			// Bulk create accounts
 			r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.journal.create")).
 				Post("/bulk", handlers.AccountHandler.BulkCreateAccounts)
 
-			// Get account tree
 			r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.ledger.view")).
 				Get("/tree", handlers.AccountHandler.GetAccountTree)
 
-			// Get account by code
 			r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.ledger.view")).
 				Get("/by-code", handlers.AccountHandler.GetAccountByCode)
 
-			// List accounts
 			r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.ledger.view")).
 				Get("/", handlers.AccountHandler.ListAccounts)
 
 			r.Route("/{accountID}", func(r chi.Router) {
-
-				// Get account details
 				r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.ledger.view")).
 					Get("/", handlers.AccountHandler.GetAccount)
 
-				// Full update
 				r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.journal.update")).
 					Put("/", handlers.AccountHandler.UpdateAccount)
 
-				// Update status
 				r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.journal.update")).
 					Patch("/status", handlers.AccountHandler.UpdateAccountStatus)
 
-				// Move account
 				r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.journal.update")).
 					Patch("/move", handlers.AccountHandler.MoveAccount)
 
-				// Delete
 				r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.journal.delete")).
 					Delete("/", handlers.AccountHandler.DeleteAccount)
 
-				// Children
 				r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.ledger.view")).
 					Get("/children", handlers.AccountHandler.GetChildren)
 
-				// Has children
 				r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.ledger.view")).
 					Get("/has-children", handlers.AccountHandler.HasChildren)
 
-				// Usage
 				r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.ledger.view")).
 					Get("/usage", handlers.AccountHandler.CheckUsage)
 
-				// Circular check
 				r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.ledger.view")).
 					Get("/circular", handlers.AccountHandler.CheckCircularReference)
 			})
 		})
 
+		// ========== Cost Centers (👇 ADDED) ==========
+		r.Route("/cost-centers", func(r chi.Router) {
+			r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.ledger.view")).
+				Get("/", handlers.CostCenterHandler.List) // ?include_inactive=true&tree=true&limit=&offset=
+
+			r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.journal.create")).
+				Post("/", handlers.CostCenterHandler.Create)
+
+			r.Route("/{costCenterID}", func(r chi.Router) {
+				r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.ledger.view")).
+					Get("/", handlers.CostCenterHandler.GetByID)
+
+				r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.journal.update")).
+					Put("/", handlers.CostCenterHandler.Update)
+
+				r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.journal.delete")).
+					Delete("/", handlers.CostCenterHandler.Deactivate)
+			})
+		})
+
 		// ========== Accounting Settings ==========
 		r.Route("/settings", func(r chi.Router) {
-			// GET /companies/{companyID}/accounting/settings
 			r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.view")).
 				Get("/", handlers.AccountingSettingsHandler.GetSettings)
 
-			// POST /companies/{companyID}/accounting/settings
 			r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.update")).
 				Post("/", handlers.AccountingSettingsHandler.CreateSettings)
 
-			// PUT /companies/{companyID}/accounting/settings
 			r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.update")).
 				Put("/", handlers.AccountingSettingsHandler.UpdateSettings)
 
-			// PUT /companies/{companyID}/accounting/settings/upsert
 			r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.update")).
 				Put("/upsert", handlers.AccountingSettingsHandler.UpsertSettings)
 
-			// PUT /companies/{companyID}/accounting/settings/fiscal-year
 			r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.update")).
 				Put("/fiscal-year", handlers.AccountingSettingsHandler.UpdateFiscalYear)
 
-			// PUT /companies/{companyID}/accounting/settings/currency
 			r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.update")).
 				Put("/currency", handlers.AccountingSettingsHandler.UpdateCurrency)
 
-			// PUT /companies/{companyID}/accounting/settings/tax-scheme
 			r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.update")).
 				Put("/tax-scheme", handlers.AccountingSettingsHandler.UpdateTaxScheme)
 
-			// ===== NEW ROUTES =====
-			// GET /companies/{companyID}/accounting/settings/exists
 			r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.view")).
 				Get("/exists", handlers.AccountingSettingsHandler.ExistsSettings)
 
-			// GET /companies/{companyID}/accounting/settings/fiscal-period
 			r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.view")).
 				Get("/fiscal-period", handlers.AccountingSettingsHandler.GetFiscalPeriod)
 
-			// PUT /companies/{companyID}/accounting/settings/flags
 			r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.update")).
 				Put("/flags", handlers.AccountingSettingsHandler.UpdateFlags)
 		})
 
 		// ========== Ledger ==========
 		r.Route("/ledger", func(r chi.Router) {
-			// GET /companies/{companyID}/accounting/ledger/balance
 			r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.ledger.view")).
 				Get("/balance", handlers.LedgerHandler.GetAccountBalance)
 
-			// POST /companies/{companyID}/accounting/ledger/recompute
 			r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.reconcile")).
 				Post("/recompute", handlers.LedgerHandler.RecomputeBalances)
 
-			// NEW: Trial Balance
 			r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.ledger.view")).
 				Get("/trial-balance", handlers.LedgerHandler.TrialBalance)
 
-			// NEW: Profit & Loss
 			r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.pl.view")).
 				Get("/profit-and-loss", handlers.LedgerHandler.ProfitAndLoss)
 
-			// NEW: Balance Sheet
 			r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.balance_sheet.view")).
 				Get("/balance-sheet", handlers.LedgerHandler.BalanceSheet)
 		})
 
 		// ========== Reconciliation ==========
 		r.Route("/reconciliation", func(r chi.Router) {
-			// Batches
 			r.Route("/batches", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.reconcile")).
 					Post("/", handlers.ReconciliationHandler.CreateBatch)
@@ -180,7 +194,6 @@ func RegisterAccountingRoutes(
 				})
 			})
 
-			// Items
 			r.Route("/batches/{batchID}/items", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.reconcile")).
 					Post("/", handlers.ReconciliationHandler.AddItems)
@@ -190,7 +203,6 @@ func RegisterAccountingRoutes(
 					Get("/unmatched", handlers.ReconciliationHandler.GetUnmatchedItems)
 			})
 
-			// Matching
 			r.Route("/batches/{batchID}/match", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.reconcile")).
 					Post("/auto", handlers.ReconciliationHandler.AutoMatch)
@@ -204,7 +216,6 @@ func RegisterAccountingRoutes(
 					Delete("/", handlers.ReconciliationHandler.UnmatchItem)
 			})
 
-			// Differences
 			r.Route("/batches/{batchID}/differences", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.reconcile")).
 					Post("/", handlers.ReconciliationHandler.CreateDifference)
@@ -216,7 +227,6 @@ func RegisterAccountingRoutes(
 					Post("/resolve", handlers.ReconciliationHandler.ResolveDifference)
 			})
 
-			// Adjustments
 			r.Route("/batches/{batchID}/adjustments", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.reconcile")).
 					Post("/", handlers.ReconciliationHandler.CreateAdjustment)
@@ -231,35 +241,27 @@ func RegisterAccountingRoutes(
 
 		// ========== Reports ==========
 		r.Route("/reports", func(r chi.Router) {
-			// Trial Balance (now GET with query params)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.pl.view")).
 				Get("/trial-balance", handlers.ReportHandler.GetTrialBalance)
 
-			// General Ledger
 			r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.ledger.view")).
 				Get("/general-ledger", handlers.ReportHandler.GetGeneralLedger)
 
-			// Balance Sheet
 			r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.balance_sheet.view")).
 				Get("/balance-sheet", handlers.ReportHandler.GetBalanceSheet)
 
-			// Income Statement (now GET with query params)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.pl.view")).
 				Get("/income-statement", handlers.ReportHandler.GetIncomeStatement)
 
-			// Cash Flow Statement
 			r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.cashflow.view")).
 				Get("/cash-flow", handlers.ReportHandler.GetCashFlowStatement)
 
-			// Tax Summary
 			r.With(authMiddleware.BitmaskPermissionMiddleware("finance.tax.view")).
 				Get("/tax-summary", handlers.ReportHandler.GetTaxSummary)
 
-			// Compliance Returns (list)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("finance.tax.view")).
 				Get("/compliance-returns", handlers.ReportHandler.ListComplianceReturns)
 
-			// NEW: Account Balance (report-style)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.ledger.view")).
 				Get("/account-balance", handlers.ReportHandler.GetAccountBalance)
 		})
@@ -301,7 +303,6 @@ func RegisterAccountingRoutes(
 			r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.journal.view")).
 				Get("/", handlers.JournalHandler.List)
 			r.Route("/{id}", func(r chi.Router) {
-				// UPDATED: Use ReportHandler.GetJournal to return journal with lines
 				r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.journal.view")).
 					Get("/", handlers.ReportHandler.GetJournal)
 				r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.journal.update")).
@@ -317,7 +318,6 @@ func RegisterAccountingRoutes(
 
 		// ========== Tax Engine ==========
 		r.Route("/tax", func(r chi.Router) {
-			// Tax Rates
 			r.Route("/rates", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("finance.tax.create")).
 					Post("/", handlers.TaxHandler.CreateTaxRate)
@@ -333,7 +333,6 @@ func RegisterAccountingRoutes(
 					Post("/close-open", handlers.TaxHandler.CloseOpenRates)
 			})
 
-			// Tax Rules
 			r.Route("/rules", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("finance.tax.create")).
 					Post("/", handlers.TaxHandler.CreateTaxRule)
@@ -347,7 +346,6 @@ func RegisterAccountingRoutes(
 				})
 			})
 
-			// Tax Profiles
 			r.Route("/profiles", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("finance.tax.create")).
 					Post("/", handlers.TaxHandler.CreateTaxProfile)
@@ -363,7 +361,6 @@ func RegisterAccountingRoutes(
 					Post("/{profileID}/set-default", handlers.TaxHandler.SetDefaultTaxProfile)
 			})
 
-			// Tax Transactions
 			r.Route("/transactions", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("finance.tax.create")).
 					Post("/", handlers.TaxHandler.CreateTaxTransaction)
@@ -375,13 +372,11 @@ func RegisterAccountingRoutes(
 				})
 			})
 
-			// Tax Computation
 			r.With(authMiddleware.BitmaskPermissionMiddleware("finance.tax.view")).
 				Post("/compute", handlers.TaxHandler.ComputeTax)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("finance.tax.view")).
 				Post("/evaluate-rules", handlers.TaxHandler.EvaluateRules)
 
-			// Tax Returns / Summaries
 			r.With(authMiddleware.BitmaskPermissionMiddleware("finance.tax.view")).
 				Get("/return", handlers.TaxHandler.GenerateTaxReturn)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("finance.tax.view")).
@@ -390,64 +385,52 @@ func RegisterAccountingRoutes(
 
 		// ========== Analytics ==========
 		r.Route("/analytics", func(r chi.Router) {
-			// Daily Account Summaries
 			r.With(authMiddleware.BitmaskPermissionMiddleware("analytics.read")).
 				Get("/daily-summaries", handlers.AnalyticsHandler.ListDailySummaries)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("analytics.read")).
 				Get("/daily-summaries/{summaryID}", handlers.AnalyticsHandler.GetDailySummary)
 
-			// Account Snapshots (balances)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("analytics.read")).
 				Get("/snapshots", handlers.AnalyticsHandler.ListSnapshots)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("analytics.read")).
 				Get("/snapshots/{snapshotID}", handlers.AnalyticsHandler.GetSnapshot)
 
-			// Journal Metrics
 			r.With(authMiddleware.BitmaskPermissionMiddleware("analytics.read")).
 				Get("/journal-metrics", handlers.AnalyticsHandler.ListJournalMetrics)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("analytics.read")).
 				Get("/journal-metrics/{metricID}", handlers.AnalyticsHandler.GetJournalMetric)
 
-			// Cashflow
 			r.With(authMiddleware.BitmaskPermissionMiddleware("analytics.read")).
 				Get("/cashflow", handlers.AnalyticsHandler.ListCashflows)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("analytics.read")).
 				Get("/cashflow/{cashflowID}", handlers.AnalyticsHandler.GetCashflow)
 
-			// Tax Summaries (uses separate permission)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("analytics.tax.read")).
 				Get("/tax-summaries", handlers.AnalyticsHandler.ListTaxSummaries)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("analytics.tax.read")).
 				Get("/tax-summaries/{summaryID}", handlers.AnalyticsHandler.GetTaxSummary)
 
-			// Reconciliation Daily Stats
 			r.With(authMiddleware.BitmaskPermissionMiddleware("analytics.reconciliation.read")).
 				Get("/reconciliation/daily-stats", handlers.AnalyticsHandler.ListReconciliationDailyStats)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("analytics.reconciliation.read")).
 				Get("/reconciliation/daily-stats/{reconciliationType}/{date}", handlers.AnalyticsHandler.GetReconciliationDailyStats)
 
-			// Reconciliation Difference Trends
 			r.With(authMiddleware.BitmaskPermissionMiddleware("analytics.reconciliation.read")).
 				Get("/reconciliation/diff-trends", handlers.AnalyticsHandler.ListReconciliationDiffTrends)
 		})
 
-		// ========== PERIOD LOCKS (NEW) ==========
+		// ========== PERIOD LOCKS ==========
 		r.Route("/periods", func(r chi.Router) {
-			// List all period locks for the company
 			r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.ledger.view")).
 				Get("/locks", handlers.PeriodLockHandler.ListPeriodLocks)
 
-			// Operations on a specific period
 			r.Route("/{fiscalYear}/{period}/lock", func(r chi.Router) {
-				// Get lock status
 				r.With(authMiddleware.BitmaskPermissionMiddleware("accounting.ledger.view")).
 					Get("/", handlers.PeriodLockHandler.GetPeriodLock)
 
-				// Lock a period (admin action – use company update permission)
 				r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.update")).
 					Post("/", handlers.PeriodLockHandler.LockPeriod)
 
-				// Unlock a period (admin action)
 				r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.update")).
 					Delete("/", handlers.PeriodLockHandler.UnlockPeriod)
 			})

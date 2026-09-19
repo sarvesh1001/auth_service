@@ -23,4 +23,7 @@ var (
 	ErrCannotModifyPosted      = errors.New("cannot modify lines of a posted entry")
 	ErrInvalidStatusTransition = errors.New("invalid journal status transition")
 	ErrReversalAlreadyExists   = errors.New("reversal already exists for this journal entry")
+
+	// 👇 ADDED — cost center specific
+	ErrCostCenterCodeExists = errors.New("cost center code already exists for this company")
 )

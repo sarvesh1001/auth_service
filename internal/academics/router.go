@@ -1,6 +1,8 @@
 package academics
 
 import (
+	"net/http"
+
 	"auth-service/internal/academics/handler"
 	authMiddleware "auth-service/internal/middleware"
 
@@ -9,8 +11,14 @@ import (
 
 // RegisterAcademicRoutes registers all academic‑domain routes (excluding attendance,
 // which is handled by the generic attendance module).
+//
+// Callers MUST apply JWT + session middleware BEFORE these routes so that
+// subscriptionEnforcementMiddleware and locationValidationMiddleware find
+// jwt_claims / session_type in the request context.
 func RegisterAcademicRoutes(
 	r chi.Router,
+
+	// ----- Handlers -----
 	academicYearHandler *handler.AcademicYearHandler,
 	admissionHandler *handler.AdmissionHandler,
 	analyticsHandler *handler.AnalyticsHandler,
@@ -34,8 +42,26 @@ func RegisterAcademicRoutes(
 	timetableHandler *handler.TimetableHandler,
 	transportHandler *handler.TransportHandler,
 	sessionGenerationHandler *handler.SessionGenerationHandler,
+
+	// ----- Middleware chain (applied once, at the /academics root) -----
+	subscriptionEnforcementMiddleware func(http.Handler) http.Handler, // 🆕
+	locationValidationMiddleware func(http.Handler) http.Handler, // 🆕
+	idempotencyMiddleware func(http.Handler) http.Handler, // 🆕
 ) {
 	r.Route("/academics", func(r chi.Router) {
+		// ============================================================
+		// Cross-cutting middleware applied once for the whole module.
+		//
+		// ORDER MATTERS:
+		//   jwt + session MUST already be in context (applied by caller).
+		//   subscription → blocks expired/cancelled companies; admin bypass built in.
+		//   location     → requires X-Location-ID for non-admin writes; admin bypass built in.
+		//   idempotency  → reads Idempotency-Key header into context.
+		// ============================================================
+		r.Use(subscriptionEnforcementMiddleware)
+		r.Use(locationValidationMiddleware)
+		r.Use(idempotencyMiddleware)
+
 		// ========== Academic Years ==========
 		r.Route("/academic-years", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.academic_year.read")).
@@ -1021,7 +1047,6 @@ func RegisterAcademicRoutes(
 		})
 
 		// ========== Session Generation ==========
-		// Fail-fast check: ensure the handler is not nil before registering the route.
 		r.Route("/sessions", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.recalculate")).
 				Post("/generate", sessionGenerationHandler.GenerateSession)

@@ -57,12 +57,15 @@ func (r CreateJournalRequest) TotalCredit() decimal.Decimal {
 	return total
 }
 
-// JournalLineRequest
 type JournalLineRequest struct {
-	AccountID    uuid.UUID
-	DebitAmount  decimal.Decimal
-	CreditAmount decimal.Decimal
-	Description  *string
+	AccountID    uuid.UUID       `json:"account_id" validate:"required"`
+	DebitAmount  decimal.Decimal `json:"debit_amount"`
+	CreditAmount decimal.Decimal `json:"credit_amount"`
+	Description  *string         `json:"description,omitempty"`
+
+	// 👇 ADDED — accounting dimensions, snapshotted onto ledger_entries on post
+	CostCenterID *uuid.UUID `json:"cost_center_id,omitempty"`
+	DepartmentID *uuid.UUID `json:"department_id,omitempty"`
 }
 
 // UpdateJournalRequest

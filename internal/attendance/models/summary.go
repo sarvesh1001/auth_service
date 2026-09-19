@@ -36,26 +36,34 @@ type SummaryMetadata struct {
 	IsLeavePaid     *bool         `json:"is_leave_paid,omitempty"`
 }
 
+// AttendanceDailySummary represents one day of attendance for one subject.
+//
+// EmploymentLocationID is a snapshot at generation time, sourced from
+// SubjectLocationResolver. It lets location-scoped list queries filter
+// without joining company_employees or academics.students.
 type AttendanceDailySummary struct {
-	AttendanceSummaryID uuid.UUID       `json:"attendance_summary_id" db:"attendance_summary_id"`
-	CompanyID           uuid.UUID       `json:"company_id" db:"company_id"`
-	SubjectType         string          `json:"subject_type" db:"subject_type"`
-	SubjectID           uuid.UUID       `json:"subject_id" db:"subject_id"`
-	AttendanceDate      time.Time       `json:"attendance_date" db:"attendance_date"`
-	Status              string          `json:"status" db:"status"`
-	WorkedMinutes       *int            `json:"worked_minutes" db:"worked_minutes"`
-	ExpectedMinutes     *int            `json:"expected_minutes" db:"expected_minutes"`
-	OvertimeMinutes     *int            `json:"overtime_minutes" db:"overtime_minutes"`
-	LateMinutes         *int            `json:"late_minutes" db:"late_minutes"`
-	IsFinalized         bool            `json:"is_finalized" db:"is_finalized"`
-	IsPayable           bool            `json:"is_payable" db:"is_payable"`
-	IsPayrollLocked     bool            `json:"is_payroll_locked" db:"is_payroll_locked"`
-	Metadata            SummaryMetadata `json:"metadata" db:"metadata"`
-	GeneratedAt         time.Time       `json:"generated_at" db:"generated_at"`
-	GeneratedBy         string          `json:"generated_by" db:"generated_by"`
+	AttendanceSummaryID uuid.UUID `json:"attendance_summary_id" db:"attendance_summary_id"`
+	CompanyID           uuid.UUID `json:"company_id" db:"company_id"`
+	SubjectType         string    `json:"subject_type" db:"subject_type"`
+	SubjectID           uuid.UUID `json:"subject_id" db:"subject_id"`
+
+	// Snapshot at generation time.
+	EmploymentLocationID *uuid.UUID `json:"employment_location_id,omitempty" db:"employment_location_id"`
+
+	AttendanceDate  time.Time       `json:"attendance_date" db:"attendance_date"`
+	Status          string          `json:"status" db:"status"`
+	WorkedMinutes   *int            `json:"worked_minutes" db:"worked_minutes"`
+	ExpectedMinutes *int            `json:"expected_minutes" db:"expected_minutes"`
+	OvertimeMinutes *int            `json:"overtime_minutes" db:"overtime_minutes"`
+	LateMinutes     *int            `json:"late_minutes" db:"late_minutes"`
+	IsFinalized     bool            `json:"is_finalized" db:"is_finalized"`
+	IsPayable       bool            `json:"is_payable" db:"is_payable"`
+	IsPayrollLocked bool            `json:"is_payroll_locked" db:"is_payroll_locked"`
+	Metadata        SummaryMetadata `json:"metadata" db:"metadata"`
+	GeneratedAt     time.Time       `json:"generated_at" db:"generated_at"`
+	GeneratedBy     string          `json:"generated_by" db:"generated_by"`
 }
 
-// AttendanceStats represents aggregated attendance statistics for a company.
 type AttendanceStats struct {
 	CompanyID          uuid.UUID `json:"company_id"`
 	StartDate          time.Time `json:"start_date"`
@@ -72,7 +80,6 @@ type AttendanceStats struct {
 	AverageAttendance  float64   `json:"average_attendance"`
 }
 
-// UserAttendanceStats represents attendance statistics for a single subject.
 type UserAttendanceStats struct {
 	UserID             uuid.UUID `json:"user_id"`
 	StartDate          time.Time `json:"start_date"`

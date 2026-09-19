@@ -1,35 +1,38 @@
 package service
 
 import (
-	"auth-service/internal/hr/models/orgunit"
-	"auth-service/internal/hr/repository"
-	a "auth-service/internal/infrastructure/audit"
-	"auth-service/internal/util"
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
-	"go.uber.org/zap"
+
+	"auth-service/internal/hr/models/orgunit"
+	"auth-service/internal/hr/repository"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
 )
 
 type OrgUnitService struct {
-	orgUnitRepo  repository.OrgUnitRepository
-	auditService *a.AuditService
-	logger       *zap.Logger
+	orgUnitRepo      repository.OrgUnitRepository
+	auditService     *audit.AuditService
+	idempotencyStore idempotency.Store
 }
 
 func NewOrgUnitService(
 	orgUnitRepo repository.OrgUnitRepository,
-	auditService *a.AuditService,
-	logger *zap.Logger,
+	auditService *audit.AuditService,
+	idempotencyStore idempotency.Store,
 ) *OrgUnitService {
 	return &OrgUnitService{
-		orgUnitRepo:  orgUnitRepo,
-		auditService: auditService,
-		logger:       logger,
+		orgUnitRepo:      orgUnitRepo,
+		auditService:     auditService,
+		idempotencyStore: idempotencyStore,
 	}
 }
+
+// ---------- WRITE OPERATIONS WITH IDEMPOTENCY ----------
 
 func (s *OrgUnitService) CreateOrgUnit(
 	ctx context.Context,
@@ -39,9 +42,18 @@ func (s *OrgUnitService) CreateOrgUnit(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) (*orgunit.OrgUnit, error) {
-	startTime := time.Now()
 
-	// Check if org unit already exists
+	// Idempotency
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("create_ou-%s-%s", companyID.String(), req.Name)
+	}
+	var cached *orgunit.OrgUnit
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
+
+	// Check existence
 	exists, err := s.orgUnitRepo.CheckOrgUnitExists(ctx, companyID, req.Name, req.OrgUnitType)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check org unit existence: %w", err)
@@ -65,23 +77,17 @@ func (s *OrgUnitService) CreateOrgUnit(
 
 	err = s.orgUnitRepo.CreateOrgUnit(ctx, orgUnit)
 	if err != nil {
-		s.logger.Error("Failed to create org unit",
-			util.String("company_id", companyID.String()),
-			util.String("name", req.Name),
-			util.String("type", req.OrgUnitType),
-			util.ErrorField(err))
 		return nil, fmt.Errorf("failed to create org unit: %w", err)
 	}
 
-	// Audit log
-	afterState, _ := util.ToJSON(orgUnit)
-	auditMetadata := make(map[string]interface{})
-	for k, v := range metadata {
-		auditMetadata[k] = v
-	}
-	auditMetadata["org_unit_id"] = orgUnit.OrgUnitID.String()
-	auditMetadata["org_unit_type"] = req.OrgUnitType
-
+	afterJSON, _ := json.Marshal(orgUnit)
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMetadata(metadata, map[string]interface{}{
+		"ip":            ip,
+		"org_unit_id":   orgUnit.OrgUnitID.String(),
+		"org_unit_type": req.OrgUnitType,
+		"name":          req.Name,
+	})
 	_ = s.auditService.LogAction(
 		ctx,
 		nil,
@@ -93,32 +99,13 @@ func (s *OrgUnitService) CreateOrgUnit(
 		actorType,
 		&actorID,
 		[]byte("{}"),
-		afterState,
-		auditMetadata,
+		afterJSON,
+		auditMeta,
 	)
 
-	s.logger.Info("Org unit created",
-		util.String("org_unit_id", orgUnit.OrgUnitID.String()),
-		util.String("company_id", companyID.String()),
-		util.String("name", req.Name),
-		util.String("type", req.OrgUnitType),
-		util.String("actor_type", actorType),
-		util.String("actor_id", actorID.String()),
-		util.Duration("duration", time.Since(startTime)))
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, orgUnit)
 
 	return orgUnit, nil
-}
-
-func (s *OrgUnitService) GetOrgUnit(
-	ctx context.Context,
-	companyID uuid.UUID,
-	orgUnitID uuid.UUID,
-	withDetails bool,
-) (interface{}, error) {
-	if withDetails {
-		return s.orgUnitRepo.GetOrgUnitWithDetails(ctx, companyID, orgUnitID)
-	}
-	return s.orgUnitRepo.GetOrgUnitByID(ctx, companyID, orgUnitID)
 }
 
 func (s *OrgUnitService) UpdateOrgUnit(
@@ -130,18 +117,25 @@ func (s *OrgUnitService) UpdateOrgUnit(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) (*orgunit.OrgUnit, error) {
-	startTime := time.Now()
+
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("update_ou-%s", orgUnitID.String())
+	}
+	var cached *orgunit.OrgUnit
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
 
 	existing, err := s.orgUnitRepo.GetOrgUnitByID(ctx, companyID, orgUnitID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get existing org unit: %w", err)
 	}
 
-	beforeState, _ := util.ToJSON(existing)
+	beforeJSON, _ := json.Marshal(existing)
 	updated := *existing
 
 	if req.Name != nil && *req.Name != existing.Name {
-		// Check if new name conflicts
 		exists, err := s.orgUnitRepo.CheckOrgUnitExists(ctx, companyID, *req.Name, existing.OrgUnitType)
 		if err != nil {
 			return nil, fmt.Errorf("failed to check org unit existence: %w", err)
@@ -151,7 +145,6 @@ func (s *OrgUnitService) UpdateOrgUnit(
 		}
 		updated.Name = *req.Name
 	}
-
 	if req.Description != nil {
 		updated.Description = req.Description
 	}
@@ -161,7 +154,6 @@ func (s *OrgUnitService) UpdateOrgUnit(
 	if req.IsActive != nil {
 		updated.IsActive = *req.IsActive
 	}
-
 	updated.UpdatedAt = time.Now().UTC()
 
 	err = s.orgUnitRepo.UpdateOrgUnit(ctx, &updated)
@@ -169,14 +161,12 @@ func (s *OrgUnitService) UpdateOrgUnit(
 		return nil, fmt.Errorf("failed to update org unit: %w", err)
 	}
 
-	// Audit log
-	afterState, _ := util.ToJSON(&updated)
-	auditMetadata := make(map[string]interface{})
-	for k, v := range metadata {
-		auditMetadata[k] = v
-	}
-	auditMetadata["org_unit_id"] = orgUnitID.String()
-
+	afterJSON, _ := json.Marshal(&updated)
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMetadata(metadata, map[string]interface{}{
+		"ip":          ip,
+		"org_unit_id": orgUnitID.String(),
+	})
 	_ = s.auditService.LogAction(
 		ctx,
 		nil,
@@ -187,17 +177,12 @@ func (s *OrgUnitService) UpdateOrgUnit(
 		nil,
 		actorType,
 		&actorID,
-		beforeState,
-		afterState,
-		auditMetadata,
+		beforeJSON,
+		afterJSON,
+		auditMeta,
 	)
 
-	s.logger.Info("Org unit updated",
-		util.String("org_unit_id", orgUnitID.String()),
-		util.String("company_id", companyID.String()),
-		util.String("actor_type", actorType),
-		util.String("actor_id", actorID.String()),
-		util.Duration("duration", time.Since(startTime)))
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, &updated)
 
 	return &updated, nil
 }
@@ -210,27 +195,33 @@ func (s *OrgUnitService) DeleteOrgUnit(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) error {
-	startTime := time.Now()
+
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("delete_ou-%s", orgUnitID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
 
 	orgUnit, err := s.orgUnitRepo.GetOrgUnitByID(ctx, companyID, orgUnitID)
 	if err != nil {
 		return fmt.Errorf("failed to get org unit for deletion: %w", err)
 	}
 
-	beforeState, _ := util.ToJSON(orgUnit)
+	beforeJSON, _ := json.Marshal(orgUnit)
 
 	err = s.orgUnitRepo.SoftDeleteOrgUnit(ctx, companyID, orgUnitID)
 	if err != nil {
 		return fmt.Errorf("failed to delete org unit: %w", err)
 	}
 
-	// Audit log
-	auditMetadata := make(map[string]interface{})
-	for k, v := range metadata {
-		auditMetadata[k] = v
-	}
-	auditMetadata["org_unit_id"] = orgUnitID.String()
-
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMetadata(metadata, map[string]interface{}{
+		"ip":          ip,
+		"org_unit_id": orgUnitID.String(),
+	})
 	_ = s.auditService.LogAction(
 		ctx,
 		nil,
@@ -241,17 +232,12 @@ func (s *OrgUnitService) DeleteOrgUnit(
 		nil,
 		actorType,
 		&actorID,
-		beforeState,
+		beforeJSON,
 		[]byte("{}"),
-		auditMetadata,
+		auditMeta,
 	)
 
-	s.logger.Info("Org unit deleted",
-		util.String("org_unit_id", orgUnitID.String()),
-		util.String("company_id", companyID.String()),
-		util.String("actor_type", actorType),
-		util.String("actor_id", actorID.String()),
-		util.Duration("duration", time.Since(startTime)))
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 
 	return nil
 }
@@ -265,21 +251,25 @@ func (s *OrgUnitService) AddMember(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) error {
-	startTime := time.Now()
 
-	// 1️⃣ Verify org unit exists and belongs to company
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("add_member-%s-%s", orgUnitID.String(), req.UserID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
 	_, err := s.orgUnitRepo.GetOrgUnitByID(ctx, companyID, orgUnitID)
 	if err != nil {
 		return fmt.Errorf("org unit not found")
 	}
 
-	// 2️⃣ Parse effective_from
 	effectiveFrom, err := time.Parse("2006-01-02", req.EffectiveFrom)
 	if err != nil {
 		return fmt.Errorf("invalid effective_from date")
 	}
-
-	// 3️⃣ Parse effective_to (optional)
 	var effectiveTo *time.Time
 	if req.EffectiveTo != nil {
 		to, err := time.Parse("2006-01-02", *req.EffectiveTo)
@@ -289,13 +279,7 @@ func (s *OrgUnitService) AddMember(
 		effectiveTo = &to
 	}
 
-	// 4️⃣ 🔥 BUSINESS RULE CHECK (prevent duplicates)
-	exists, err := s.orgUnitRepo.MemberExists(
-		ctx,
-		orgUnitID,
-		req.UserID,
-		effectiveFrom,
-	)
+	exists, err := s.orgUnitRepo.MemberExists(ctx, orgUnitID, req.UserID, effectiveFrom)
 	if err != nil {
 		return err
 	}
@@ -303,30 +287,24 @@ func (s *OrgUnitService) AddMember(
 		return fmt.Errorf("member already exists for this effective_from date")
 	}
 
-	// 5️⃣ Create member
 	member := &orgunit.OrgUnitMember{
 		OrgUnitID:     orgUnitID,
 		UserID:        req.UserID,
 		EffectiveFrom: effectiveFrom,
 		EffectiveTo:   effectiveTo,
 	}
-
 	if err := s.orgUnitRepo.AddMember(ctx, member); err != nil {
 		return fmt.Errorf("failed to add member: %w", err)
 	}
 
-	// 6️⃣ Audit log
-	auditMetadata := make(map[string]interface{})
-	for k, v := range metadata {
-		auditMetadata[k] = v
-	}
-	auditMetadata["org_unit_id"] = orgUnitID.String()
-	auditMetadata["user_id"] = req.UserID.String()
-	auditMetadata["effective_from"] = req.EffectiveFrom
-	if req.EffectiveTo != nil {
-		auditMetadata["effective_to"] = *req.EffectiveTo
-	}
-
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMetadata(metadata, map[string]interface{}{
+		"ip":             ip,
+		"org_unit_id":    orgUnitID.String(),
+		"user_id":        req.UserID.String(),
+		"effective_from": req.EffectiveFrom,
+		"effective_to":   req.EffectiveTo,
+	})
 	_ = s.auditService.LogAction(
 		ctx,
 		nil,
@@ -338,22 +316,11 @@ func (s *OrgUnitService) AddMember(
 		actorType,
 		&actorID,
 		[]byte("{}"),
-		[]byte(fmt.Sprintf(
-			`{"user_id":"%s","org_unit_id":"%s"}`,
-			req.UserID, orgUnitID,
-		)),
-		auditMetadata,
+		[]byte(fmt.Sprintf(`{"user_id":"%s","org_unit_id":"%s"}`, req.UserID, orgUnitID)),
+		auditMeta,
 	)
 
-	// 7️⃣ Log success
-	s.logger.Info("Member added to org unit",
-		util.String("org_unit_id", orgUnitID.String()),
-		util.String("user_id", req.UserID.String()),
-		util.String("company_id", companyID.String()),
-		util.String("actor_type", actorType),
-		util.String("actor_id", actorID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 
 	return nil
 }
@@ -367,29 +334,33 @@ func (s *OrgUnitService) RemoveMember(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) error {
-	startTime := time.Now()
 
-	// Verify org unit exists and belongs to company
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("remove_member-%s-%s", orgUnitID.String(), userID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
 	_, err := s.orgUnitRepo.GetOrgUnitByID(ctx, companyID, orgUnitID)
 	if err != nil {
 		return fmt.Errorf("failed to get org unit: %w", err)
 	}
 
 	effectiveTo := time.Now().UTC()
-
 	err = s.orgUnitRepo.RemoveMember(ctx, orgUnitID, userID, effectiveTo)
 	if err != nil {
 		return fmt.Errorf("failed to remove member: %w", err)
 	}
 
-	// Audit log
-	auditMetadata := make(map[string]interface{})
-	for k, v := range metadata {
-		auditMetadata[k] = v
-	}
-	auditMetadata["org_unit_id"] = orgUnitID.String()
-	auditMetadata["user_id"] = userID.String()
-
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMetadata(metadata, map[string]interface{}{
+		"ip":          ip,
+		"org_unit_id": orgUnitID.String(),
+		"user_id":     userID.String(),
+	})
 	_ = s.auditService.LogAction(
 		ctx,
 		nil,
@@ -402,16 +373,10 @@ func (s *OrgUnitService) RemoveMember(
 		&actorID,
 		[]byte(fmt.Sprintf(`{"user_id": "%s", "org_unit_id": "%s"}`, userID, orgUnitID)),
 		[]byte("{}"),
-		auditMetadata,
+		auditMeta,
 	)
 
-	s.logger.Info("Member removed from org unit",
-		util.String("org_unit_id", orgUnitID.String()),
-		util.String("user_id", userID.String()),
-		util.String("company_id", companyID.String()),
-		util.String("actor_type", actorType),
-		util.String("actor_id", actorID.String()),
-		util.Duration("duration", time.Since(startTime)))
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 
 	return nil
 }
@@ -425,9 +390,16 @@ func (s *OrgUnitService) AssignRole(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) error {
-	startTime := time.Now()
 
-	// Verify org unit exists and belongs to company
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("assign_role-%s-%s", orgUnitID.String(), req.UserID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
 	_, err := s.orgUnitRepo.GetOrgUnitByID(ctx, companyID, orgUnitID)
 	if err != nil {
 		return fmt.Errorf("failed to get org unit: %w", err)
@@ -437,7 +409,6 @@ func (s *OrgUnitService) AssignRole(
 	if err != nil {
 		return fmt.Errorf("invalid effective_from date: %w", err)
 	}
-
 	var effectiveTo *time.Time
 	if req.EffectiveTo != nil {
 		to, err := time.Parse("2006-01-02", *req.EffectiveTo)
@@ -455,22 +426,19 @@ func (s *OrgUnitService) AssignRole(
 		EffectiveFrom: effectiveFrom,
 		EffectiveTo:   effectiveTo,
 	}
-
 	err = s.orgUnitRepo.AssignRole(ctx, role)
 	if err != nil {
 		return fmt.Errorf("failed to assign role: %w", err)
 	}
 
-	// Audit log
-	auditMetadata := make(map[string]interface{})
-	for k, v := range metadata {
-		auditMetadata[k] = v
-	}
-	auditMetadata["org_unit_id"] = orgUnitID.String()
-	auditMetadata["user_id"] = req.UserID.String()
-	auditMetadata["role"] = req.Role
-	auditMetadata["effective_from"] = req.EffectiveFrom
-
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMetadata(metadata, map[string]interface{}{
+		"ip":             ip,
+		"org_unit_id":    orgUnitID.String(),
+		"user_id":        req.UserID.String(),
+		"role":           req.Role,
+		"effective_from": req.EffectiveFrom,
+	})
 	_ = s.auditService.LogAction(
 		ctx,
 		nil,
@@ -484,17 +452,10 @@ func (s *OrgUnitService) AssignRole(
 		[]byte("{}"),
 		[]byte(fmt.Sprintf(`{"user_id": "%s", "org_unit_id": "%s", "role": "%s"}`,
 			req.UserID, orgUnitID, req.Role)),
-		auditMetadata,
+		auditMeta,
 	)
 
-	s.logger.Info("Role assigned in org unit",
-		util.String("org_unit_id", orgUnitID.String()),
-		util.String("user_id", req.UserID.String()),
-		util.String("role", req.Role),
-		util.String("company_id", companyID.String()),
-		util.String("actor_type", actorType),
-		util.String("actor_id", actorID.String()),
-		util.Duration("duration", time.Since(startTime)))
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 
 	return nil
 }
@@ -509,30 +470,34 @@ func (s *OrgUnitService) RemoveRole(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) error {
-	startTime := time.Now()
 
-	// Verify org unit exists and belongs to company
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("remove_role-%s-%s", orgUnitID.String(), userID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
 	_, err := s.orgUnitRepo.GetOrgUnitByID(ctx, companyID, orgUnitID)
 	if err != nil {
 		return fmt.Errorf("failed to get org unit: %w", err)
 	}
 
 	effectiveTo := time.Now().UTC()
-
 	err = s.orgUnitRepo.RemoveRole(ctx, orgUnitID, userID, role, effectiveTo)
 	if err != nil {
 		return fmt.Errorf("failed to remove role: %w", err)
 	}
 
-	// Audit log
-	auditMetadata := make(map[string]interface{})
-	for k, v := range metadata {
-		auditMetadata[k] = v
-	}
-	auditMetadata["org_unit_id"] = orgUnitID.String()
-	auditMetadata["user_id"] = userID.String()
-	auditMetadata["role"] = role
-
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMetadata(metadata, map[string]interface{}{
+		"ip":          ip,
+		"org_unit_id": orgUnitID.String(),
+		"user_id":     userID.String(),
+		"role":        role,
+	})
 	_ = s.auditService.LogAction(
 		ctx,
 		nil,
@@ -546,89 +511,12 @@ func (s *OrgUnitService) RemoveRole(
 		[]byte(fmt.Sprintf(`{"user_id": "%s", "org_unit_id": "%s", "role": "%s"}`,
 			userID, orgUnitID, role)),
 		[]byte("{}"),
-		auditMetadata,
+		auditMeta,
 	)
 
-	s.logger.Info("Role removed from org unit",
-		util.String("org_unit_id", orgUnitID.String()),
-		util.String("user_id", userID.String()),
-		util.String("role", role),
-		util.String("company_id", companyID.String()),
-		util.String("actor_type", actorType),
-		util.String("actor_id", actorID.String()),
-		util.Duration("duration", time.Since(startTime)))
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 
 	return nil
-}
-
-func (s *OrgUnitService) ListOrgUnits(
-	ctx context.Context,
-	companyID uuid.UUID,
-	page, pageSize int,
-	orgUnitType *string,
-	isActive *bool,
-) ([]*orgunit.OrgUnit, int, error) {
-	if page < 1 {
-		page = 1
-	}
-	if pageSize < 1 || pageSize > 100 {
-		pageSize = 50
-	}
-
-	offset := (page - 1) * pageSize
-	return s.orgUnitRepo.ListOrgUnits(ctx, companyID, orgUnitType, isActive, pageSize, offset)
-}
-
-func (s *OrgUnitService) SearchOrgUnits(
-	ctx context.Context,
-	companyID uuid.UUID,
-	filters map[string]interface{},
-	page, pageSize int,
-) ([]*orgunit.OrgUnit, int, error) {
-	if page < 1 {
-		page = 1
-	}
-	if pageSize < 1 || pageSize > 100 {
-		pageSize = 50
-	}
-
-	offset := (page - 1) * pageSize
-	return s.orgUnitRepo.SearchOrgUnits(ctx, companyID, filters, pageSize, offset)
-}
-
-func (s *OrgUnitService) GetActiveOrgUnits(
-	ctx context.Context,
-	companyID uuid.UUID,
-) ([]*orgunit.OrgUnit, error) {
-	return s.orgUnitRepo.GetActiveOrgUnits(ctx, companyID)
-}
-
-func (s *OrgUnitService) GetUserMemberships(
-	ctx context.Context,
-	userID uuid.UUID,
-	onlyActive bool,
-) ([]*orgunit.UserOrgUnitMembership, error) {
-	return s.orgUnitRepo.GetUserMemberships(ctx, userID, onlyActive)
-}
-
-func (s *OrgUnitService) GetOrgUnitMembers(
-	ctx context.Context,
-	orgUnitID uuid.UUID,
-	onlyActive bool,
-) ([]*orgunit.OrgUnitMember, error) {
-	return s.orgUnitRepo.GetOrgUnitMembers(ctx, orgUnitID, onlyActive)
-}
-
-func (s *OrgUnitService) GetOrgUnitRoles(
-	ctx context.Context,
-	orgUnitID uuid.UUID,
-	onlyActive bool,
-) ([]*orgunit.OrgUnitRole, error) {
-	return s.orgUnitRepo.GetOrgUnitRoles(ctx, orgUnitID, onlyActive)
-}
-
-func (s *OrgUnitService) HealthCheck(ctx context.Context) error {
-	return s.orgUnitRepo.HealthCheck(ctx)
 }
 
 func (s *OrgUnitService) UpdateMember(
@@ -642,13 +530,20 @@ func (s *OrgUnitService) UpdateMember(
 	metadata map[string]interface{},
 ) error {
 
-	// 1️⃣ Validate org unit
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("update_member-%s-%s", orgUnitID.String(), userID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
 	_, err := s.orgUnitRepo.GetOrgUnitByID(ctx, companyID, orgUnitID)
 	if err != nil {
 		return fmt.Errorf("org unit not found")
 	}
 
-	// 2️⃣ Get current membership
 	existing, err := s.orgUnitRepo.GetMember(ctx, orgUnitID, userID)
 	if err != nil || existing == nil {
 		return fmt.Errorf("membership not found")
@@ -658,7 +553,6 @@ func (s *OrgUnitService) UpdateMember(
 	if err != nil {
 		return fmt.Errorf("invalid effective_from")
 	}
-
 	if !newFrom.After(existing.EffectiveFrom) {
 		return fmt.Errorf("effective_from must be after current membership start")
 	}
@@ -672,25 +566,29 @@ func (s *OrgUnitService) UpdateMember(
 		newTo = &t
 	}
 
-	// 3️⃣ End existing membership
 	endDate := newFrom.AddDate(0, 0, -1)
 	if err := s.orgUnitRepo.EndActiveMembership(ctx, orgUnitID, userID, endDate); err != nil {
 		return fmt.Errorf("failed to end existing membership")
 	}
 
-	// 4️⃣ Insert new membership
 	newMember := &orgunit.OrgUnitMember{
 		OrgUnitID:     orgUnitID,
 		UserID:        userID,
 		EffectiveFrom: newFrom,
 		EffectiveTo:   newTo,
 	}
-
 	if err := s.orgUnitRepo.AddMember(ctx, newMember); err != nil {
 		return fmt.Errorf("failed to create new membership")
 	}
 
-	// 5️⃣ Audit
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMetadata(metadata, map[string]interface{}{
+		"ip":          ip,
+		"org_unit_id": orgUnitID.String(),
+		"user_id":     userID.String(),
+		"new_from":    req.EffectiveFrom,
+		"new_to":      req.EffectiveTo,
+	})
 	_ = s.auditService.LogAction(
 		ctx,
 		nil,
@@ -703,8 +601,308 @@ func (s *OrgUnitService) UpdateMember(
 		&actorID,
 		[]byte("{}"),
 		[]byte(fmt.Sprintf(`{"user_id":"%s","org_unit_id":"%s"}`, userID, orgUnitID)),
-		metadata,
+		auditMeta,
 	)
 
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+
 	return nil
+}
+
+// ---------- READ OPERATIONS (WITH AUDIT, NO IDEMPOTENCY) ----------
+// These are kept here for convenience but should ideally be delegated to query service.
+// We'll add audit logging with IP.
+
+func (s *OrgUnitService) GetOrgUnit(
+	ctx context.Context,
+	companyID uuid.UUID,
+	orgUnitID uuid.UUID,
+	withDetails bool,
+) (interface{}, error) {
+	startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
+
+	var result interface{}
+	var err error
+	if withDetails {
+		result, err = s.orgUnitRepo.GetOrgUnitWithDetails(ctx, companyID, orgUnitID)
+	} else {
+		result, err = s.orgUnitRepo.GetOrgUnitByID(ctx, companyID, orgUnitID)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	afterJSON, _ := json.Marshal(result)
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&companyID,
+		"hr",
+		"org_unit.read",
+		"org_units",
+		&orgUnitID,
+		"system",
+		nil,
+		nil,
+		afterJSON,
+		map[string]interface{}{
+			"ip":           ip,
+			"company_id":   companyID.String(),
+			"with_details": withDetails,
+			"duration_ms":  time.Since(startTime).Milliseconds(),
+		},
+	)
+
+	return result, nil
+}
+
+func (s *OrgUnitService) ListOrgUnits(
+	ctx context.Context,
+	companyID uuid.UUID,
+	page, pageSize int,
+	orgUnitType *string,
+	isActive *bool,
+) ([]*orgunit.OrgUnit, int, error) {
+	startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
+
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 50
+	}
+	offset := (page - 1) * pageSize
+
+	orgUnits, total, err := s.orgUnitRepo.ListOrgUnits(ctx, companyID, orgUnitType, isActive, pageSize, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&companyID,
+		"hr",
+		"org_unit.list",
+		"org_units",
+		nil,
+		"system",
+		nil,
+		nil,
+		nil,
+		map[string]interface{}{
+			"ip":          ip,
+			"company_id":  companyID.String(),
+			"page":        page,
+			"page_size":   pageSize,
+			"type":        orgUnitType,
+			"is_active":   isActive,
+			"total":       total,
+			"returned":    len(orgUnits),
+			"duration_ms": time.Since(startTime).Milliseconds(),
+		},
+	)
+
+	return orgUnits, total, nil
+}
+
+func (s *OrgUnitService) SearchOrgUnits(
+	ctx context.Context,
+	companyID uuid.UUID,
+	filters map[string]interface{},
+	page, pageSize int,
+) ([]*orgunit.OrgUnit, int, error) {
+	startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
+
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 50
+	}
+	offset := (page - 1) * pageSize
+
+	orgUnits, total, err := s.orgUnitRepo.SearchOrgUnits(ctx, companyID, filters, pageSize, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&companyID,
+		"hr",
+		"org_unit.search",
+		"org_units",
+		nil,
+		"system",
+		nil,
+		nil,
+		nil,
+		map[string]interface{}{
+			"ip":          ip,
+			"company_id":  companyID.String(),
+			"filters":     filters,
+			"page":        page,
+			"page_size":   pageSize,
+			"total":       total,
+			"returned":    len(orgUnits),
+			"duration_ms": time.Since(startTime).Milliseconds(),
+		},
+	)
+
+	return orgUnits, total, nil
+}
+
+func (s *OrgUnitService) GetActiveOrgUnits(
+	ctx context.Context,
+	companyID uuid.UUID,
+) ([]*orgunit.OrgUnit, error) {
+	startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
+
+	orgUnits, err := s.orgUnitRepo.GetActiveOrgUnits(ctx, companyID)
+	if err != nil {
+		return nil, err
+	}
+
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&companyID,
+		"hr",
+		"org_unit.active_list",
+		"org_units",
+		nil,
+		"system",
+		nil,
+		nil,
+		nil,
+		map[string]interface{}{
+			"ip":          ip,
+			"company_id":  companyID.String(),
+			"count":       len(orgUnits),
+			"duration_ms": time.Since(startTime).Milliseconds(),
+		},
+	)
+
+	return orgUnits, nil
+}
+
+func (s *OrgUnitService) GetUserMemberships(
+	ctx context.Context,
+	userID uuid.UUID,
+	onlyActive bool,
+) ([]*orgunit.UserOrgUnitMembership, error) {
+	startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
+
+	memberships, err := s.orgUnitRepo.GetUserMemberships(ctx, userID, onlyActive)
+	if err != nil {
+		return nil, err
+	}
+
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		nil,
+		"hr",
+		"org_unit.user_memberships",
+		"org_unit_members",
+		nil,
+		"system",
+		nil,
+		nil,
+		nil,
+		map[string]interface{}{
+			"ip":          ip,
+			"user_id":     userID.String(),
+			"only_active": onlyActive,
+			"count":       len(memberships),
+			"duration_ms": time.Since(startTime).Milliseconds(),
+		},
+	)
+
+	return memberships, nil
+}
+
+func (s *OrgUnitService) GetOrgUnitMembers(
+	ctx context.Context,
+	orgUnitID uuid.UUID,
+	onlyActive bool,
+) ([]*orgunit.OrgUnitMember, error) {
+	startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
+
+	members, err := s.orgUnitRepo.GetOrgUnitMembers(ctx, orgUnitID, onlyActive)
+	if err != nil {
+		return nil, err
+	}
+
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		nil,
+		"hr",
+		"org_unit.members_list",
+		"org_unit_members",
+		&orgUnitID,
+		"system",
+		nil,
+		nil,
+		nil,
+		map[string]interface{}{
+			"ip":          ip,
+			"org_unit_id": orgUnitID.String(),
+			"only_active": onlyActive,
+			"count":       len(members),
+			"duration_ms": time.Since(startTime).Milliseconds(),
+		},
+	)
+
+	return members, nil
+}
+
+func (s *OrgUnitService) GetOrgUnitRoles(
+	ctx context.Context,
+	orgUnitID uuid.UUID,
+	onlyActive bool,
+) ([]*orgunit.OrgUnitRole, error) {
+	startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
+
+	roles, err := s.orgUnitRepo.GetOrgUnitRoles(ctx, orgUnitID, onlyActive)
+	if err != nil {
+		return nil, err
+	}
+
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		nil,
+		"hr",
+		"org_unit.roles_list",
+		"org_unit_roles",
+		&orgUnitID,
+		"system",
+		nil,
+		nil,
+		nil,
+		map[string]interface{}{
+			"ip":          ip,
+			"org_unit_id": orgUnitID.String(),
+			"only_active": onlyActive,
+			"count":       len(roles),
+			"duration_ms": time.Since(startTime).Milliseconds(),
+		},
+	)
+
+	return roles, nil
+}
+
+func (s *OrgUnitService) HealthCheck(ctx context.Context) error {
+	return s.orgUnitRepo.HealthCheck(ctx)
 }
