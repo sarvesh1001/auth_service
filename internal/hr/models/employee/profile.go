@@ -76,3 +76,94 @@ type EmployeeProfile struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
+type EmployeeFullDetails struct {
+	// ---- Identity (users) ----
+	UserID    uuid.UUID
+	CompanyID uuid.UUID
+	Username  string
+	FullName  *string
+
+	// ---- Phone (encrypted, from users) ----
+	PhoneHash         string
+	PhoneEncrypted    []byte
+	PhoneEncryptedDEK string
+	PhoneKeyID        uuid.UUID
+
+	// ---- Roster (company_employees) ----
+	EmployeeID          string
+	RoleID              uuid.UUID
+	RoleName            string
+	PositionID          *uuid.UUID
+	PositionTitle       *string
+	DepartmentID        *uuid.UUID
+	DepartmentName      *string
+	PrimaryLocationID   *uuid.UUID
+	PrimaryLocationName *string
+	LocationAccessScope string
+	ReportsTo           *uuid.UUID
+	HireDate            time.Time
+	IsActive            bool
+
+	// ---- Profile (employee_profiles) — non-PII ----
+	EmployeeProfileID *uuid.UUID
+	Gender            *string
+	EmploymentType    *string
+	EmploymentStatus  *string
+	JobTitle          *string
+	Grade             *string
+	CostCenter        *string
+
+	// ---- Profile — encrypted PII (opaque to this layer) ----
+	EmailHash         *string
+	EmailEncrypted    []byte
+	EmailEncryptedDEK *string
+	EmailKeyID        *uuid.UUID
+
+	TaxIDEncrypted    []byte
+	TaxIDEncryptedDEK *string
+	TaxIDKeyID        *uuid.UUID
+
+	SocialSecurityIDEncrypted    []byte
+	SocialSecurityIDEncryptedDEK *string
+	SocialSecurityIDKeyID        *uuid.UUID
+
+	DateOfBirthEncrypted    []byte
+	DateOfBirthEncryptedDEK *string
+	DateOfBirthKeyID        *uuid.UUID
+
+	NationalityEncrypted    []byte
+	NationalityEncryptedDEK *string
+	NationalityKeyID        *uuid.UUID
+
+	MaritalStatusEncrypted    []byte
+	MaritalStatusEncryptedDEK *string
+	MaritalStatusKeyID        *uuid.UUID
+
+	// ---- Timestamps ----
+	ProfileCreatedAt *time.Time
+	ProfileUpdatedAt *time.Time
+	UserCreatedAt    time.Time
+	UserLastLogin    *time.Time
+}
+
+// EmployeeFullDetailsExt extends EmployeeFullDetails with columns that are
+// only populated by the enriched GetEmployeeFullDetailsByIDs query — namely
+// the resolved cost-center join columns and the probation/confirmation
+// dates from employee_profiles.
+//
+// The base EmployeeFullDetails is intentionally left unchanged so existing
+// callers that don't SELECT these columns keep compiling.
+//
+// Field promotion: `ext.CostCenter`, `ext.Gender`, `ext.EmailEncrypted`,
+// etc. continue to resolve through the embedded struct — every existing
+// reference keeps working without modification.
+type EmployeeFullDetailsExt struct {
+	EmployeeFullDetails
+
+	// ---- Extra columns (only populated by the enriched query) ----
+	CostCenterID     *uuid.UUID `json:"cost_center_id,omitempty"`
+	CostCenterName   *string    `json:"cost_center_name,omitempty"`
+	CostCenterCode   *string    `json:"cost_center_code,omitempty"`
+	ProbationEndDate *time.Time `json:"probation_end_date,omitempty"`
+	ConfirmationDate *time.Time `json:"confirmation_date,omitempty"`
+}

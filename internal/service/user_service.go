@@ -1776,3 +1776,163 @@ func (s *UserService) GetUserByPhoneTx(ctx context.Context, db client.DBTX, phon
 	s.cachePhoneMapping(ctx, phoneHash, user.UserID)
 	return user, nil
 }
+
+// ============================================================================
+// UpdateMyProfile — user self-service. Only touches the users table.
+//
+// Deliberately narrow:
+//   - username, full_name only
+//   - phone changes require OTP (separate flow)
+//   - everything else lives on employee_profiles and is HR-only
+//
+// Caller is responsible for extracting userID from the JWT.
+// ============================================================================
+type UpdateMyProfileRequest struct {
+	Username *string `json:"username,omitempty"`
+	FullName *string `json:"full_name,omitempty"`
+}
+
+func (s *UserService) UpdateMyProfile(
+	ctx context.Context,
+	userID uuid.UUID,
+	req *UpdateMyProfileRequest,
+) (*models.User, error) {
+	if userID == uuid.Nil {
+		return nil, fmt.Errorf("%w: user_id is required", appErrors.ErrInvalidInput)
+	}
+	if req == nil || (req.Username == nil && req.FullName == nil) {
+		return nil, fmt.Errorf("%w: no update fields provided", appErrors.ErrInvalidInput)
+	}
+
+	ip, _ := ctx.Value("ip_address").(string)
+
+	user, err := s.GetUserByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	beforeJSON, _ := json.Marshal(user)
+
+	changed := false
+
+	if req.Username != nil {
+		u := strings.TrimSpace(*req.Username)
+		if len(u) < 3 || len(u) > 100 {
+			return nil, fmt.Errorf("%w: username must be 3–100 characters", appErrors.ErrInvalidInput)
+		}
+		for _, r := range u {
+			if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {
+				return nil, fmt.Errorf("%w: username must be alphanumeric", appErrors.ErrInvalidInput)
+			}
+		}
+		if u != user.Username {
+			existing, err := s.userRepo.GetUserByUsername(ctx, s.db(), u)
+			if err == nil && existing != nil && existing.UserID != userID {
+				return nil, fmt.Errorf("%w: username already taken", appErrors.ErrDuplicate)
+			}
+			if err != nil && !errors.Is(err, appErrors.ErrNotFound) {
+				return nil, fmt.Errorf("%w: failed to check username uniqueness", appErrors.ErrInternal)
+			}
+			user.Username = u
+			changed = true
+		}
+	}
+
+	if req.FullName != nil {
+		f := strings.TrimSpace(*req.FullName)
+		if f == "" || len(f) > 255 {
+			return nil, fmt.Errorf("%w: full_name must be 1–255 characters", appErrors.ErrInvalidInput)
+		}
+		if f != user.FullName {
+			user.FullName = f
+			changed = true
+		}
+	}
+
+	if !changed {
+		return user, nil
+	}
+
+	user.UpdatedAt = time.Now().UTC()
+
+	if err := s.userRepo.UpdateUser(ctx, s.db(), user); err != nil {
+		return nil, fmt.Errorf("%w: failed to update user: %v", appErrors.ErrInternal, err)
+	}
+	afterJSON, _ := json.Marshal(user)
+
+	s.invalidateUserCache(ctx, userID)
+	s.cacheUser(ctx, user)
+
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "user", "self_update_profile", "user",
+			&userID, "user", &userID, beforeJSON, afterJSON, map[string]interface{}{
+				"ip": ip,
+			})
+	}
+	return user, nil
+}
+
+// ============================================================================
+// UpdateUserTx — tx-aware variant of UpdateUser.
+//
+// Used by CompanyService.UpdateMember (via the UserService held by the
+// CompanyService) so the users row update commits atomically with the
+// company_employees + employee_profiles + employee_location_access updates.
+//
+// Semantics:
+//   - Only username / full_name are writable here. Same whitelist as
+//     UpdateMyProfile — anything else belongs on employee_profiles.
+//   - Username uniqueness is re-checked inside the tx (best-effort; the
+//     DB unique constraint is the final guard).
+//   - Audit + cache invalidation happen outside the tx (caller's job).
+//
+// Caller passes the DBTX (typically *sql.Tx) obtained from its own
+// transaction. This method never touches s.db().
+// ============================================================================
+func (s *UserService) UpdateUserTx(
+	ctx context.Context,
+	db client.DBTX,
+	user *models.User,
+) error {
+	if user == nil || user.UserID == uuid.Nil {
+		return fmt.Errorf("%w: user is required", appErrors.ErrInvalidInput)
+	}
+
+	// Validate username shape if it changed. We don't have the "before" here;
+	// the caller is expected to have already applied the merge against the
+	// current row. This is a shape-only check.
+	if user.Username != "" {
+		u := strings.TrimSpace(user.Username)
+		if len(u) < 3 || len(u) > 100 {
+			return fmt.Errorf("%w: username must be 3–100 characters", appErrors.ErrInvalidInput)
+		}
+		for _, r := range u {
+			if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {
+				return fmt.Errorf("%w: username must be alphanumeric", appErrors.ErrInvalidInput)
+			}
+		}
+		user.Username = u
+	}
+	if user.FullName != "" && len(user.FullName) > 255 {
+		return fmt.Errorf("%w: full_name must be ≤255 characters", appErrors.ErrInvalidInput)
+	}
+
+	user.UpdatedAt = time.Now().UTC()
+
+	if err := s.userRepo.UpdateUser(ctx, db, user); err != nil {
+		return fmt.Errorf("%w: failed to update user: %v", appErrors.ErrInternal, err)
+	}
+	return nil
+}
+
+// GetUserDisplayName returns only {username, full_name} for a user.
+// Cheap, cache-free, no encryption, no audit — use it for "who is this"
+// lookups (comments, mentions, headers, notifications).
+func (s *UserService) GetUserDisplayName(
+	ctx context.Context,
+	userID uuid.UUID,
+) (*models.UserDisplayName, error) {
+	if userID == uuid.Nil {
+		return nil, fmt.Errorf("%w: user_id is required", appErrors.ErrInvalidInput)
+	}
+	return s.userRepo.GetUserDisplayName(ctx, s.db(), userID)
+}

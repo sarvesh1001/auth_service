@@ -3,11 +3,13 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 
+	hrErrors "auth-service/internal/hr/errors"
 	"auth-service/internal/hr/leave/models"
 	"auth-service/internal/hr/leave/repository"
 	"auth-service/internal/infrastructure/audit"
@@ -57,28 +59,24 @@ func (s *leavePolicyService) CreateLeaveType(
 		return cached, nil
 	}
 
+	// GetLeaveTypeByCode returns ErrLeaveTypeNotFound when the code does
+	// not exist yet — that's the SUCCESS path for a duplicate check.
 	existing, err := s.repo.GetLeaveTypeByCode(ctx, companyID, req.Code)
-	if err != nil {
+	if err != nil && !errors.Is(err, hrErrors.ErrLeaveTypeNotFound) {
 		return nil, fmt.Errorf("failed to check leave type: %w", err)
 	}
 	if existing != nil {
 		return nil, fmt.Errorf("leave type with code %s already exists", req.Code)
 	}
-	validAccrual := map[string]bool{"none": true, "monthly": true, "yearly": true, "quarterly": true}
-	if !validAccrual[req.AccrualMethod] {
-		return nil, fmt.Errorf("invalid accrual method: %s", req.AccrualMethod)
-	}
 
 	leaveType := &models.LeaveType{
-		LeaveTypeID:       uuid.New(),
-		CompanyID:         companyID,
-		Code:              req.Code,
-		Name:              req.Name,
-		IsPaid:            req.IsPaid,
-		RequiresApproval:  req.RequiresApproval,
-		AccrualMethod:     req.AccrualMethod,
-		CarryForwardLimit: req.CarryForwardLimit,
-		CreatedAt:         time.Now().UTC(),
+		LeaveTypeID:      uuid.New(),
+		CompanyID:        companyID,
+		Code:             req.Code,
+		Name:             req.Name,
+		IsPaid:           req.IsPaid,
+		RequiresApproval: req.RequiresApproval,
+		CreatedAt:        time.Now().UTC(),
 	}
 
 	if err := s.repo.CreateLeaveType(ctx, leaveType); err != nil {
@@ -139,12 +137,6 @@ func (s *leavePolicyService) UpdateLeaveType(
 	}
 	beforeJSON, _ := json.Marshal(existing)
 
-	if update.AccrualMethod != nil {
-		valid := map[string]bool{"none": true, "monthly": true, "yearly": true, "quarterly": true}
-		if !valid[*update.AccrualMethod] {
-			return fmt.Errorf("invalid accrual method")
-		}
-	}
 	if err := s.repo.UpdateLeaveType(ctx, leaveTypeID, update); err != nil {
 		return err
 	}

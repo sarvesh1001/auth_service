@@ -137,6 +137,22 @@ func (s *leaveAccrualService) RecalculateEntitlement(
 		return nil, fmt.Errorf("leave type not found")
 	}
 
+	// Carry-forward limit comes from the effective policy rule, not the
+	// leave type. If the entitlement is policy-sourced we look up the
+	// rule; for manual entitlements there is no rule so the limit is nil.
+	var carryForward *int
+	if entitlement.PolicyID != nil {
+		rules, err := s.repo.GetPolicyRules(ctx, *entitlement.PolicyID)
+		if err == nil {
+			for _, r := range rules {
+				if r.LeaveTypeID == entitlement.LeaveTypeID {
+					carryForward = r.CarryForwardLimit
+					break
+				}
+			}
+		}
+	}
+
 	balance := &models.LeaveBalance{
 		UserID:        entitlement.UserID,
 		LeaveTypeID:   entitlement.LeaveTypeID,
@@ -146,7 +162,7 @@ func (s *leaveAccrualService) RecalculateEntitlement(
 		Accrued:       totalAccrued,
 		Consumed:      totalConsumed,
 		Balance:       totalAccrued - totalConsumed,
-		CarryForward:  leaveType.CarryForwardLimit,
+		CarryForward:  carryForward,
 	}
 
 	// Audit

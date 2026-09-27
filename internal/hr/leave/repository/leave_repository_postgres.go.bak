@@ -1018,7 +1018,7 @@ func (r *leaveRepository) GetLeaveEntitlementsByUser(
 // GetLeaveEntitlementsByCompany returns a page of entitlements for a company.
 //
 // Location: when locationID is non-nil, only entitlements for employees whose
-// company_employees.primary_location_id matches are returned.
+// company_employees.employment_location_id matches are returned.
 func (r *leaveRepository) GetLeaveEntitlementsByCompany(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1034,7 +1034,7 @@ func (r *leaveRepository) GetLeaveEntitlementsByCompany(
 		locationClause = ` AND le.user_id IN (
 			SELECT user_id FROM company_employees
 			WHERE company_id = $1
-			  AND primary_location_id = $2
+			  AND employment_location_id = $2
 			  AND is_active = true
 		)`
 		args = append(args, *locationID)
@@ -1161,7 +1161,7 @@ func (r *leaveRepository) GetLeaveEntitlementsByCompanyAndUser(
 
 	if locationID != nil {
 		conditions = append(conditions, fmt.Sprintf(
-			"le.user_id IN (SELECT user_id FROM company_employees WHERE company_id = $1 AND primary_location_id = $%d AND is_active = true)",
+			"le.user_id IN (SELECT user_id FROM company_employees WHERE company_id = $1 AND employment_location_id = $%d AND is_active = true)",
 			len(args)+1))
 		args = append(args, *locationID)
 	}
@@ -1354,14 +1354,6 @@ func (r *leaveRepository) GetActiveLeaveEntitlement(
 	return &entitlement, nil
 }
 
-// GetActivePolicyEntitlement returns the currently-open policy entitlement for
-// (company, user, leave_type), regardless of which position it was created for.
-//
-// Position is intentionally NOT filtered. When a user moves between positions,
-// the resolver wants to see the existing entitlement so it can decide "does
-// this need to change?" — filtering by the new position would hide the old
-// row and cause a fresh insert, leaking the previous entitlement as
-// permanently-open.
 func (r *leaveRepository) GetActivePolicyEntitlement(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1369,8 +1361,6 @@ func (r *leaveRepository) GetActivePolicyEntitlement(
 	leaveTypeID uuid.UUID,
 	positionID *uuid.UUID,
 ) (*models.LeaveEntitlement, error) {
-	_ = positionID // ignored on purpose — see comment above
-
 	query := `
 		SELECT
 			entitlement_id,
@@ -1392,12 +1382,12 @@ func (r *leaveRepository) GetActivePolicyEntitlement(
 		  AND leave_type_id = $3
 		  AND source = 'policy'
 		  AND effective_to IS NULL
+		  AND (position_id IS NOT DISTINCT FROM $4)
 		ORDER BY effective_from DESC
 		LIMIT 1
 	`
 
-	row := r.client.QueryRow(ctx, query, companyID, userID, leaveTypeID)
-
+	row := r.client.QueryRow(ctx, query, companyID, userID, leaveTypeID, positionID)
 	var entitlement models.LeaveEntitlement
 	var effectiveTo sql.NullTime
 	var policyID sql.NullString
@@ -1423,11 +1413,7 @@ func (r *leaveRepository) GetActivePolicyEntitlement(
 
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			// No matching row is a valid outcome — the caller treats
-			// (nil, nil) as "no existing entitlement" and proceeds to
-			// create one. Returning ErrLeaveEntitlementNotFound here
-			// breaks the very first resolve for any new hire.
-			return nil, nil
+			return nil, hrErrors.ErrLeaveEntitlementNotFound
 		}
 		return nil, fmt.Errorf("failed to get active policy entitlement: %w", err)
 	}
@@ -1455,17 +1441,7 @@ func (r *leaveRepository) GetActivePolicyEntitlement(
 	}
 	return &entitlement, nil
 }
-// CreatePolicyLeaveEntitlement writes a policy-sourced entitlement. If an open
-// row already exists for (company, user, leave_type), the row is reused and
-// its fields are refreshed in place — including position_id and
-// work_center_code, which get moved to the new position atomically with the
-// policy/total_days update.
-//
-// The existence check no longer filters by position. Position is metadata on
-// the row (for audit and for the service-layer "is this still applicable?"
-// check), not part of the entitlement's uniqueness key. Filtering by position
-// caused old-position rows to leak as permanently-open duplicates whenever a
-// user moved between seats.
+
 func (r *leaveRepository) CreatePolicyLeaveEntitlement(
 	ctx context.Context,
 	entitlement *models.LeaveEntitlement,
@@ -1492,6 +1468,7 @@ func (r *leaveRepository) CreatePolicyLeaveEntitlement(
 		  AND leave_type_id = $3
 		  AND effective_to IS NULL
 		  AND source = 'policy'
+		  AND (position_id IS NOT DISTINCT FROM $4)
 		LIMIT 1
 	`
 
@@ -1499,6 +1476,7 @@ func (r *leaveRepository) CreatePolicyLeaveEntitlement(
 		entitlement.CompanyID,
 		entitlement.UserID,
 		entitlement.LeaveTypeID,
+		entitlement.PositionID,
 	)
 
 	var existingID uuid.UUID
@@ -1574,6 +1552,7 @@ func (r *leaveRepository) CreatePolicyLeaveEntitlement(
 	}
 	return nil
 }
+
 func (r *leaveRepository) EndActivePolicyEntitlements(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1598,18 +1577,6 @@ func (r *leaveRepository) EndActivePolicyEntitlements(
 	return nil
 }
 
-// EndActivePolicyEntitlementsByLeaveType closes every open policy entitlement
-// for this (company, user, leave_type), regardless of position.
-//
-// The position filter was removed because the resolver calls this before
-// writing a new entitlement, and the caller's position is the NEW one — the
-// entitlements being replaced carry the OLD position_id. Keeping the filter
-// meant old-position rows were never closed and leaked as permanently-open
-// duplicates whenever a user moved between seats.
-//
-// positionID is kept in the signature for interface compatibility but is
-// no longer used. Position is metadata on the row (for audit and for the
-// service-layer dedup check), not part of the entitlement's uniqueness key.
 func (r *leaveRepository) EndActivePolicyEntitlementsByLeaveType(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1618,8 +1585,6 @@ func (r *leaveRepository) EndActivePolicyEntitlementsByLeaveType(
 	endDate time.Time,
 	positionID *uuid.UUID,
 ) error {
-	_ = positionID // ignored on purpose — see comment above
-
 	query := `
 		UPDATE leave.leave_entitlement
 		SET effective_to = $4, updated_at = NOW()
@@ -1628,14 +1593,16 @@ func (r *leaveRepository) EndActivePolicyEntitlementsByLeaveType(
 		AND leave_type_id = $3
 		AND source = 'policy'
 		AND (effective_to IS NULL OR effective_to > $4)
+		AND (position_id IS NOT DISTINCT FROM $5 OR $5 IS NULL)
 	`
 
-	_, err := r.client.Exec(ctx, query, companyID, userID, leaveTypeID, endDate)
+	_, err := r.client.Exec(ctx, query, companyID, userID, leaveTypeID, endDate, positionID)
 	if err != nil {
 		return fmt.Errorf("failed to end active policy entitlements by leave type: %w", err)
 	}
 	return nil
 }
+
 // ============================================================================
 // LEAVE REQUEST
 // ============================================================================
@@ -2127,7 +2094,7 @@ func (r *leaveRepository) GetLeaveRequestsByCompany(ctx context.Context, filter 
 	// 👇 Location filter
 	if filter.LocationID != nil {
 		conditions = append(conditions, fmt.Sprintf(
-			"lr.user_id IN (SELECT user_id FROM company_employees WHERE company_id = $1 AND primary_location_id = $%d AND is_active = true)",
+			"lr.user_id IN (SELECT user_id FROM company_employees WHERE company_id = $1 AND employment_location_id = $%d AND is_active = true)",
 			argIdx))
 		args = append(args, *filter.LocationID)
 		argIdx++
@@ -2218,7 +2185,7 @@ func (r *leaveRepository) GetLeaveRequestsByCompany(ctx context.Context, filter 
 // GetPendingLeaveRequests returns pending leave requests for approval.
 //
 // Location: when locationID is non-nil, only requests for employees whose
-// primary_location_id matches are returned.
+// employment_location_id matches are returned.
 func (r *leaveRepository) GetPendingLeaveRequests(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -2232,7 +2199,7 @@ func (r *leaveRepository) GetPendingLeaveRequests(
 		locationClause = ` AND lr.user_id IN (
 			SELECT user_id FROM company_employees
 			WHERE company_id = $1
-			  AND primary_location_id = $3
+			  AND employment_location_id = $3
 			  AND is_active = true
 		)`
 		args = append(args, *locationID)
@@ -3517,7 +3484,7 @@ func (r *leaveRepository) ProcessLeaveAccruals(
 // GetLeaveUtilizationReport returns leave utilization across a company.
 //
 // Location: when locationID is non-nil, only employees whose
-// primary_location_id matches are included.
+// employment_location_id matches are included.
 func (r *leaveRepository) GetLeaveUtilizationReport(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -3531,7 +3498,7 @@ func (r *leaveRepository) GetLeaveUtilizationReport(
 		locationClause = ` AND le.user_id IN (
 			SELECT user_id FROM company_employees
 			WHERE company_id = $1
-			  AND primary_location_id = $4
+			  AND employment_location_id = $4
 			  AND is_active = true
 		)`
 		args = append(args, *locationID)
@@ -3879,76 +3846,4 @@ func (r *leaveRepository) HealthCheck(ctx context.Context) error {
 		return fmt.Errorf("leave repository health check failed: %w", err)
 	}
 	return nil
-}
-
-// ============================================================================
-// RESOLVER WORKER HELPERS
-// ============================================================================
-
-// ListActiveEmployeeUserIDs returns every active employee's user_id for a
-// company. Used by the resolver worker for company-wide fan-out jobs.
-func (r *leaveRepository) ListActiveEmployeeUserIDs(
-	ctx context.Context,
-	companyID uuid.UUID,
-) ([]uuid.UUID, error) {
-	query := `
-		SELECT user_id
-		FROM company_employees
-		WHERE company_id = $1
-		  AND is_active = true
-	`
-
-	rows, err := r.client.Query(ctx, query, companyID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list active employee user ids: %w", err)
-	}
-	defer rows.Close()
-
-	var userIDs []uuid.UUID
-	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("failed to scan user id: %w", err)
-		}
-		userIDs = append(userIDs, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("rows iteration error: %w", err)
-	}
-	return userIDs, nil
-}
-
-// ListActiveEmployeeUserIDsByPosition returns active employees' user_ids
-// currently sitting at a given position. Used by the resolver worker for
-// position-scoped fan-out jobs (work-center change, position edit, etc.).
-func (r *leaveRepository) ListActiveEmployeeUserIDsByPosition(
-	ctx context.Context,
-	companyID, positionID uuid.UUID,
-) ([]uuid.UUID, error) {
-	query := `
-		SELECT user_id
-		FROM company_employees
-		WHERE company_id = $1
-		  AND position_id = $2
-		  AND is_active = true
-	`
-
-	rows, err := r.client.Query(ctx, query, companyID, positionID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list active employees by position: %w", err)
-	}
-	defer rows.Close()
-
-	var userIDs []uuid.UUID
-	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("failed to scan user id: %w", err)
-		}
-		userIDs = append(userIDs, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("rows iteration error: %w", err)
-	}
-	return userIDs, nil
 }

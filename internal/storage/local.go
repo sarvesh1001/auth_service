@@ -36,7 +36,7 @@ func (s *LocalStorage) GenerateUploadURL(ctx context.Context, key string, expiry
 	case strings.HasPrefix(key, "kyc/"):
 		uploadPath = "/admin/kyc/documents/upload"
 	case strings.HasPrefix(key, "avatars/"):
-		uploadPath = "/avatars/upload"
+		uploadPath = "/avatars/me/upload"
 	default:
 		return "", fmt.Errorf("unknown key prefix for upload: %s", key)
 	}

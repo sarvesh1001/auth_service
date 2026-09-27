@@ -97,7 +97,7 @@ type employeeFineService struct {
 	payrollRepo      repository.PayrollRepository
 	componentRepo    repository.ComponentRepository
 	settingsRepo     repository.CompanySettingsRepository
-	employeeRepo     hrRepo.EmployeeRepository // 👈 new
+	employeeRepo     hrRepo.EmployeeRepository
 	audit            *audit.AuditService
 	idempotencyStore idempotency.Store
 }
@@ -107,7 +107,7 @@ func NewEmployeeFineService(
 	payrollRepo repository.PayrollRepository,
 	componentRepo repository.ComponentRepository,
 	settingsRepo repository.CompanySettingsRepository,
-	employeeRepo hrRepo.EmployeeRepository, // 👈 new
+	employeeRepo hrRepo.EmployeeRepository,
 	audit *audit.AuditService,
 	idempotencyStore idempotency.Store,
 ) EmployeeFineService {
@@ -122,8 +122,7 @@ func NewEmployeeFineService(
 	}
 }
 
-// ensureEmployeeInScope — see HR for the shared pattern.
-// Missing location context is allowed (system/worker calls).
+// ensureEmployeeInScope — same pattern as other payroll services.
 func (s *employeeFineService) ensureEmployeeInScope(
 	ctx context.Context,
 	companyID, targetUserID uuid.UUID,
@@ -135,7 +134,7 @@ func (s *employeeFineService) ensureEmployeeInScope(
 	}
 	locCtx, err := locationctx.FromContext(ctx)
 	if err != nil {
-		return nil // system call
+		return nil
 	}
 	if locCtx.Mode == locationctx.ScopeAll {
 		return nil
@@ -154,38 +153,41 @@ func (s *employeeFineService) ensureEmployeeInScope(
 }
 
 // ----------------------------------------------------------------------
-// Helper: resolve component code
+// Helper: resolve component.
+//
+// Returns the full component struct so the caller can set both ComponentID
+// (the surrogate FK written to the DB) and ComponentCode (display / API).
 // ----------------------------------------------------------------------
 
-func (s *employeeFineService) resolveComponentCode(
+func (s *employeeFineService) resolveComponent(
 	ctx context.Context,
 	companyID uuid.UUID,
 	inputCode *string,
-) (string, error) {
+) (*models.PayrollComponent, error) {
 	var code string
 	if inputCode != nil && *inputCode != "" {
 		code = *inputCode
 	} else {
 		settings, err := s.settingsRepo.GetPayrollSettings(ctx, companyID)
 		if err != nil {
-			return "", fmt.Errorf("failed to get company payroll settings: %w", err)
+			return nil, fmt.Errorf("failed to get company payroll settings: %w", err)
 		}
-		if settings == nil || settings.DefaultFineComponent == nil {
-			return "", errors.New("no component code provided and no default fine component configured for company")
+		if settings == nil || settings.DefaultFineComponentCode == nil || *settings.DefaultFineComponentCode == "" {
+			return nil, errors.New("no component code provided and no default fine component configured for company")
 		}
-		code = *settings.DefaultFineComponent
+		code = *settings.DefaultFineComponentCode
 	}
 	comp, err := s.componentRepo.GetComponent(ctx, companyID, code)
 	if err != nil {
-		return "", fmt.Errorf("failed to validate component %s: %w", code, err)
+		return nil, fmt.Errorf("failed to validate component %s: %w", code, err)
 	}
 	if comp == nil {
-		return "", fmt.Errorf("component %s not found or inactive", code)
+		return nil, fmt.Errorf("component %s not found or inactive", code)
 	}
 	if comp.ComponentType != models.ComponentTypeDeduction {
-		return "", fmt.Errorf("component %s is of type %s, but fine requires deduction type", code, comp.ComponentType)
+		return nil, fmt.Errorf("component %s is of type %s, but fine requires deduction type", code, comp.ComponentType)
 	}
-	return code, nil
+	return comp, nil
 }
 
 // ----------------------------------------------------------------------
@@ -193,7 +195,6 @@ func (s *employeeFineService) resolveComponentCode(
 // ----------------------------------------------------------------------
 
 func (s *employeeFineService) CreateFine(ctx context.Context, input CreateEmployeeFineInput) (*models.EmployeeFine, error) {
-	// 👇 Location scope check
 	if err := s.ensureEmployeeInScope(ctx, input.CompanyID, input.UserID); err != nil {
 		return nil, err
 	}
@@ -215,7 +216,7 @@ func (s *employeeFineService) CreateFine(ctx context.Context, input CreateEmploy
 		return nil, fmt.Errorf("cannot create fine in a locked payroll period")
 	}
 
-	componentCode, err := s.resolveComponentCode(ctx, input.CompanyID, input.ComponentCode)
+	comp, err := s.resolveComponent(ctx, input.CompanyID, input.ComponentCode)
 	if err != nil {
 		return nil, err
 	}
@@ -224,7 +225,8 @@ func (s *employeeFineService) CreateFine(ctx context.Context, input CreateEmploy
 		FineID:        uuid.New(),
 		CompanyID:     input.CompanyID,
 		UserID:        input.UserID,
-		ComponentCode: componentCode,
+		ComponentID:   comp.ComponentID,
+		ComponentCode: comp.ComponentCode,
 		FineAmount:    input.FineAmount,
 		Reason:        input.Reason,
 		FineDate:      input.FineDate,
@@ -248,7 +250,7 @@ func (s *employeeFineService) CreateFine(ctx context.Context, input CreateEmploy
 			"user_id":        input.UserID.String(),
 			"fine_amount":    input.FineAmount,
 			"fine_date":      input.FineDate,
-			"component_code": componentCode,
+			"component_code": comp.ComponentCode,
 		},
 	)
 
@@ -265,7 +267,6 @@ func (s *employeeFineService) UpdateFine(ctx context.Context, input UpdateEmploy
 		return nil, fmt.Errorf("fine not found")
 	}
 
-	// 👇 Location scope check
 	if err := s.ensureEmployeeInScope(ctx, input.CompanyID, fine.UserID); err != nil {
 		return nil, err
 	}
@@ -298,11 +299,12 @@ func (s *employeeFineService) UpdateFine(ctx context.Context, input UpdateEmploy
 	beforeJSON, _ := json.Marshal(fine)
 
 	if input.ComponentCode != nil && *input.ComponentCode != fine.ComponentCode {
-		newCode, err := s.resolveComponentCode(ctx, input.CompanyID, input.ComponentCode)
+		comp, err := s.resolveComponent(ctx, input.CompanyID, input.ComponentCode)
 		if err != nil {
 			return nil, err
 		}
-		fine.ComponentCode = newCode
+		fine.ComponentID = comp.ComponentID
+		fine.ComponentCode = comp.ComponentCode
 	}
 	if input.FineAmount != nil {
 		fine.FineAmount = *input.FineAmount
@@ -345,7 +347,6 @@ func (s *employeeFineService) DeleteFine(ctx context.Context, companyID, fineID,
 		return fmt.Errorf("fine not found")
 	}
 
-	// 👇 Location scope check
 	if err := s.ensureEmployeeInScope(ctx, companyID, fine.UserID); err != nil {
 		return err
 	}
@@ -406,7 +407,6 @@ func (s *employeeFineService) BulkCreateFines(ctx context.Context, input BulkCre
 		return cached, nil
 	}
 
-	// 👇 Location scope check for every target user
 	for _, userID := range input.UserIDs {
 		if err := s.ensureEmployeeInScope(ctx, input.CompanyID, userID); err != nil {
 			return nil, fmt.Errorf("user %s: %w", userID.String(), err)
@@ -421,7 +421,7 @@ func (s *employeeFineService) BulkCreateFines(ctx context.Context, input BulkCre
 		return nil, fmt.Errorf("cannot create fines in a locked payroll period")
 	}
 
-	componentCode, err := s.resolveComponentCode(ctx, input.CompanyID, input.ComponentCode)
+	comp, err := s.resolveComponent(ctx, input.CompanyID, input.ComponentCode)
 	if err != nil {
 		return nil, err
 	}
@@ -432,7 +432,8 @@ func (s *employeeFineService) BulkCreateFines(ctx context.Context, input BulkCre
 			FineID:        uuid.New(),
 			CompanyID:     input.CompanyID,
 			UserID:        userID,
-			ComponentCode: componentCode,
+			ComponentID:   comp.ComponentID,
+			ComponentCode: comp.ComponentCode,
 			FineAmount:    input.FineAmount,
 			Reason:        input.Reason,
 			FineDate:      input.FineDate,
@@ -456,7 +457,7 @@ func (s *employeeFineService) BulkCreateFines(ctx context.Context, input BulkCre
 			"user_count":     len(input.UserIDs),
 			"fine_amount":    input.FineAmount,
 			"fine_date":      input.FineDate,
-			"component_code": componentCode,
+			"component_code": comp.ComponentCode,
 		},
 	)
 
@@ -483,12 +484,9 @@ func (s *employeeFineService) BulkDeleteUnprocessed(ctx context.Context, company
 		if fine == nil {
 			return fmt.Errorf("fine %s not found", fid)
 		}
-
-		// 👇 Location scope check per fine
 		if err := s.ensureEmployeeInScope(ctx, companyID, fine.UserID); err != nil {
 			return err
 		}
-
 		if fine.IsProcessed {
 			return fmt.Errorf("fine %s is already processed", fid)
 		}
@@ -537,7 +535,6 @@ func (s *employeeFineService) MarkFineAsProcessed(ctx context.Context, fineID uu
 		return fmt.Errorf("fine not found")
 	}
 
-	// 👇 Location scope check
 	if err := s.ensureEmployeeInScope(ctx, fine.CompanyID, fine.UserID); err != nil {
 		return err
 	}
@@ -588,7 +585,6 @@ func (s *employeeFineService) LockFinesForPayrollRun(
 		return cached, nil
 	}
 
-	// System call → nil location filter
 	lockedFines, err := s.fineRepo.LockUnprocessedForPayrollRun(ctx, companyID, periodStart, periodEnd, payrollRunID, nil)
 	if err != nil {
 		return nil, err
@@ -620,7 +616,6 @@ func (s *employeeFineService) GetFineByID(ctx context.Context, companyID, fineID
 	return s.fineRepo.GetByID(ctx, companyID, fineID)
 }
 
-// ListFines — filter carries LocationID; caller (handler) populates it from ctx.
 func (s *employeeFineService) ListFines(ctx context.Context, filter models.EmployeeFineFilter) ([]models.EmployeeFine, int, error) {
 	return s.fineRepo.GetByFilter(ctx, filter)
 }
@@ -680,7 +675,6 @@ func (s *employeeFineService) GetFineSummaryByEmployee(
 	}, nil
 }
 
-// GetCompanyFineSummary — admin read; scoped to the caller's location when set.
 func (s *employeeFineService) GetCompanyFineSummary(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -694,7 +688,6 @@ func (s *employeeFineService) GetCompanyFineSummary(
 		PageSize:  10000,
 	}
 
-	// 👇 Populate LocationID from request scope when set
 	if locCtx, err := locationctx.FromContext(ctx); err == nil {
 		if locCtx.Mode == locationctx.ScopeLocation {
 			filter.LocationID = locCtx.LocationID

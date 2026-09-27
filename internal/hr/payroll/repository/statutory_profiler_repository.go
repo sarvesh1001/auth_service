@@ -310,10 +310,11 @@ func (r *statutoryProfileRepository) ListProfiles(ctx context.Context, filter *m
 		argIdx++
 		conditions = append(conditions, "is_active = true")
 	}
-	// 👇 Location filter — via company_employees (current assignment)
+	// Location filter — via company_employees (current assignment).
+	// Column is `primary_location_id` (renamed from `employment_location_id`).
 	if filter.LocationID != nil {
 		conditions = append(conditions, fmt.Sprintf(
-			"user_id IN (SELECT user_id FROM company_employees WHERE company_id = $1 AND employment_location_id = $%d AND is_active = true)",
+			"user_id IN (SELECT user_id FROM company_employees WHERE company_id = $1 AND primary_location_id = $%d AND is_active = true)",
 			argIdx))
 		args = append(args, *filter.LocationID)
 		argIdx++
@@ -324,7 +325,6 @@ func (r *statutoryProfileRepository) ListProfiles(ctx context.Context, filter *m
 		whereClause = "WHERE " + strings.Join(conditions, " AND ")
 	}
 
-	// Count total
 	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM payroll.employee_statutory_profile %s", whereClause)
 	var total int
 	err := r.db.QueryRow(ctx, countQuery, args...).Scan(&total)
@@ -332,7 +332,6 @@ func (r *statutoryProfileRepository) ListProfiles(ctx context.Context, filter *m
 		return nil, 0, fmt.Errorf("count profiles: %w", err)
 	}
 
-	// Pagination
 	if filter.Page < 1 {
 		filter.Page = 1
 	}

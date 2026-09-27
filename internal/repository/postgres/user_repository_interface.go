@@ -176,6 +176,11 @@ type UserRepository interface {
 		db client.DBTX,
 		userID uuid.UUID,
 	) error
+	GetUserDisplayName(
+		ctx context.Context,
+		db client.DBTX,
+		userID uuid.UUID,
+	) (*models.UserDisplayName, error)
 
 	Close() error
 }

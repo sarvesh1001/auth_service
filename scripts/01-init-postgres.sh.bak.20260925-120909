@@ -244,18 +244,14 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION sync_employee_role_history()
 RETURNS TRIGGER AS $$
 BEGIN
-    UPDATE employee_role_history
-       SET end_date = CURRENT_DATE
-     WHERE user_id    = NEW.user_id
-       AND company_id = NEW.company_id
-       AND end_date IS NULL;
-
-    INSERT INTO employee_role_history (user_id, company_id, role_id, start_date, reason)
-    VALUES (NEW.user_id, NEW.company_id, NEW.role_id, CURRENT_DATE,
+    UPDATE employee_role_history SET end_date = CURRENT_DATE WHERE user_id = NEW.user_id AND end_date IS NULL;
+    INSERT INTO employee_role_history (user_id, role_id, start_date, reason)
+    VALUES (NEW.user_id, NEW.role_id, CURRENT_DATE,
             CASE WHEN TG_OP = 'INSERT' THEN 'initial role assignment' ELSE 'role change' END);
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION enforce_scheduled_employee_exits(
     p_effective_date DATE DEFAULT CURRENT_DATE,
     p_enforced_by UUID DEFAULT NULL
@@ -2115,10 +2111,8 @@ CREATE TABLE IF NOT EXISTS employee_location_history (
     FOREIGN KEY (location_id) REFERENCES locations(location_id)
 );
 
-DROP INDEX IF EXISTS uq_employee_location_active;
-CREATE UNIQUE INDEX uq_employee_location_active
-    ON employee_location_history (user_id, company_id)
-    WHERE end_date IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_employee_location_active ON employee_location_history (user_id) WHERE end_date IS NULL;
+
 CREATE INDEX IF NOT EXISTS idx_employee_location_history_user ON employee_location_history (user_id);
 CREATE INDEX IF NOT EXISTS idx_employee_location_history_dates ON employee_location_history (start_date, end_date);
 
@@ -2254,13 +2248,21 @@ CREATE TABLE IF NOT EXISTS employee_documents (
 
 -- ============================================================
 -- JOBS (generic role catalog — one row per distinct role)
+--
+-- A "job" is a DEFINITION: "Cashier", "Line Operator". It has NO
+-- location and NO work center — those live on `positions`.
+--
+-- Opening a 2nd store does NOT require duplicating "Cashier": you
+-- create one job row, N position rows.
+--
+-- SAP parallel: this is the "Job catalog" / "Tätigkeit" object.
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS jobs (
     job_id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id          UUID NOT NULL,
-    job_code            VARCHAR(50)  NOT NULL,
-    job_title           VARCHAR(255) NOT NULL,
+    job_code            VARCHAR(50)  NOT NULL,   -- 'CASHIER'
+    job_title           VARCHAR(255) NOT NULL,   -- 'Cashier'
     description         TEXT,
     is_schedulable      BOOLEAN NOT NULL DEFAULT true,
     attendance_required BOOLEAN NOT NULL DEFAULT true,
@@ -2281,7 +2283,19 @@ CREATE INDEX IF NOT EXISTS idx_jobs_code
     ON jobs (company_id, job_code);
 
 -- ============================================================
--- POSITIONS (headcount seats)
+-- POSITIONS (headcount seats — one row per physical seat)
+--
+-- A "position" is a SEAT: "the Cashier seat at Mumbai Store #42
+-- that punches at Register-3". 100 stores × 1 cashier = 100 positions,
+-- all pointing at the SAME job_id.
+--
+-- Key changes vs. old design:
+--   • job_id           → links to the job catalog (the definition)
+--   • location_id      → the site this seat belongs to
+--   • work_center_code → sub-area inside that site (attendance)
+--   • title_override   → nullable; NULL = use jobs.job_title
+--   • UNIQUE (company_id, department_id, title) → REMOVED
+--     (it forced one "Cashier" per department per location)
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS positions (
@@ -2289,10 +2303,10 @@ CREATE TABLE IF NOT EXISTS positions (
     company_id           UUID NOT NULL,
     department_id        UUID NOT NULL,
     job_id               UUID NOT NULL,
-    location_id          UUID,
-    title_override       VARCHAR(255),
+    location_id          UUID,                             -- NULL = company-wide seat
+    title_override       VARCHAR(255),                     -- NULL → use jobs.job_title
     is_open              BOOLEAN NOT NULL DEFAULT true,
-    work_center_code     VARCHAR(100),
+    work_center_code     VARCHAR(100),                     -- sub-area, per seat
     created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
@@ -2306,6 +2320,8 @@ CREATE TABLE IF NOT EXISTS positions (
         REFERENCES locations(location_id) ON DELETE SET NULL
 );
 
+-- Old constraint is gone. New unique index includes location so the
+-- same title can exist at many stores without collision.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_positions_dept_title_loc
     ON positions (
         company_id,
@@ -2330,15 +2346,14 @@ CREATE INDEX IF NOT EXISTS idx_positions_work_center  ON positions (company_id, 
 CREATE TABLE IF NOT EXISTS employee_role_history (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id    UUID NOT NULL,
-    company_id UUID NOT NULL,
     role_id    UUID NOT NULL,
     start_date DATE,
     end_date   DATE,
     reason     TEXT,
-    FOREIGN KEY (user_id)    REFERENCES users(user_id),
-    FOREIGN KEY (role_id)    REFERENCES roles(role_id),
-    FOREIGN KEY (company_id) REFERENCES companies(company_id)
+    FOREIGN KEY (user_id) REFERENCES users(user_id),
+    FOREIGN KEY (role_id) REFERENCES roles(role_id)
 );
+
 -- ============================================================
 -- EMPLOYEE EXIT
 -- ============================================================
@@ -2494,12 +2509,11 @@ CREATE TABLE IF NOT EXISTS leave.leave_policy_resolution (
 );
 
 -- ============================================================
--- PAYROLL SCHEMA — COMPONENT CATALOG (per-company)
+-- PAYROLL SCHEMA
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS payroll.payroll_component (
-    component_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id        UUID NOT NULL,
+    company_id        UUID,
     component_code    VARCHAR(50) NOT NULL,
     component_type    VARCHAR(40) NOT NULL
         CHECK (component_type IN ('earning','deduction')),
@@ -2507,25 +2521,9 @@ CREATE TABLE IF NOT EXISTS payroll.payroll_component (
     is_taxable        BOOLEAN NOT NULL DEFAULT false,
     is_system         BOOLEAN NOT NULL DEFAULT false,
     is_active         BOOLEAN NOT NULL DEFAULT true,
-    contribution_side VARCHAR(20) NOT NULL DEFAULT 'none'
-        CHECK (contribution_side IN ('employee','employer','none')),
-    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by        UUID,
-    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_by        UUID,
-    deactivated_at    TIMESTAMPTZ,
-    deactivated_by    UUID,
-    version           INT NOT NULL DEFAULT 1,
-    CONSTRAINT fk_component_company
-        FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE
+    contribution_side VARCHAR(20) DEFAULT 'none'
+        CHECK (contribution_side IN ('employee','employer','none'))
 );
-
-CREATE UNIQUE INDEX uq_component_company_code_active
-    ON payroll.payroll_component (company_id, component_code)
-    WHERE is_active = true;
-
-CREATE INDEX idx_component_company_active
-    ON payroll.payroll_component (company_id, is_active);
 
 CREATE TABLE IF NOT EXISTS payroll.payroll_tax_profile (
     profile_name   VARCHAR(100) NOT NULL,
@@ -2547,10 +2545,10 @@ CREATE TABLE IF NOT EXISTS payroll.attendance_rule (
     created_by UUID,
     updated_at TIMESTAMP WITHOUT TIME ZONE,
     updated_by UUID,
-    component_id UUID,
+    component_code VARCHAR(50),
     CONSTRAINT attendance_rule_pkey PRIMARY KEY (rule_id),
     CONSTRAINT fk_attendance_rule_company FOREIGN KEY (company_id) REFERENCES public.companies(company_id) ON DELETE CASCADE,
-    CONSTRAINT fk_attendance_rule_component FOREIGN KEY (component_id) REFERENCES payroll.payroll_component(component_id),
+    CONSTRAINT fk_attendance_rule_component FOREIGN KEY (component_code) REFERENCES payroll.payroll_component(component_code),
     CONSTRAINT fk_attendance_rule_created_by FOREIGN KEY (created_by) REFERENCES public.users(user_id),
     CONSTRAINT fk_attendance_rule_updated_by FOREIGN KEY (updated_by) REFERENCES public.users(user_id)
 );
@@ -2585,13 +2583,13 @@ CREATE TABLE IF NOT EXISTS payroll.employee_fine (
     payroll_run_id UUID,
     created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now() NOT NULL,
     created_by UUID NOT NULL,
-    component_id UUID,
+    component_code VARCHAR(50),
     CONSTRAINT employee_fine_pkey PRIMARY KEY (fine_id),
     CONSTRAINT fk_employee_fine_company FOREIGN KEY (company_id) REFERENCES public.companies(company_id),
     CONSTRAINT fk_employee_fine_user FOREIGN KEY (user_id) REFERENCES public.users(user_id),
     CONSTRAINT fk_employee_fine_created_by FOREIGN KEY (created_by) REFERENCES public.users(user_id),
     CONSTRAINT fk_employee_fine_payroll_run FOREIGN KEY (payroll_run_id) REFERENCES payroll.payroll_run(payroll_run_id),
-    CONSTRAINT fk_employee_fine_component FOREIGN KEY (component_id) REFERENCES payroll.payroll_component(component_id)
+    CONSTRAINT fk_employee_fine_component FOREIGN KEY (component_code) REFERENCES payroll.payroll_component(component_code)
 );
 
 CREATE INDEX IF NOT EXISTS idx_employee_fine_user ON payroll.employee_fine(company_id, user_id, is_processed);
@@ -2644,7 +2642,7 @@ CREATE TABLE IF NOT EXISTS payroll.statutory_component_mapping (
     mapping_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id       UUID NOT NULL,
     statutory_code   VARCHAR(50) NOT NULL,
-    component_id     UUID NOT NULL,
+    component_code   VARCHAR(50) NOT NULL,
     effective_from   DATE NOT NULL,
     effective_to     DATE,
     is_active        BOOLEAN NOT NULL DEFAULT true,
@@ -2655,10 +2653,10 @@ CREATE TABLE IF NOT EXISTS payroll.statutory_component_mapping (
     version          INT NOT NULL DEFAULT 1,
     rule_set_id      UUID,
     CONSTRAINT fk_scm_company FOREIGN KEY (company_id) REFERENCES public.companies(company_id),
-    CONSTRAINT fk_scm_component FOREIGN KEY (component_id) REFERENCES payroll.payroll_component(component_id),
+    CONSTRAINT fk_scm_component FOREIGN KEY (component_code) REFERENCES payroll.payroll_component(component_code),
     CONSTRAINT fk_scm_ruleset FOREIGN KEY (rule_set_id) REFERENCES payroll.statutory_rule_set(rule_set_id) ON DELETE CASCADE,
     CONSTRAINT fk_scm_definition FOREIGN KEY (company_id, statutory_code) REFERENCES payroll.statutory_component_definition(company_id, statutory_code) ON DELETE CASCADE,
-    UNIQUE (company_id, statutory_code, component_id, effective_from)
+    UNIQUE (company_id, statutory_code, component_code, effective_from)
 );
 
 CREATE TABLE IF NOT EXISTS payroll.statutory_contribution_rule (
@@ -2781,16 +2779,16 @@ CREATE TABLE IF NOT EXISTS payroll.salary_structure_component (
     mapping_id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     salary_structure_id  UUID NOT NULL,
     company_id           UUID NOT NULL,
-    component_id         UUID NOT NULL,
+    component_code       VARCHAR(50) NOT NULL,
     calculation_type     VARCHAR(20) NOT NULL CHECK (calculation_type IN ('fixed','percentage')),
     value                NUMERIC(12,4) NOT NULL,
-    based_on_component_id UUID,
+    based_on_component   VARCHAR(50),
     sequence_order       INTEGER DEFAULT 1,
     created_at           TIMESTAMPTZ DEFAULT NOW(),
-    CONSTRAINT uq_structure_component UNIQUE (salary_structure_id, component_id),
+    CONSTRAINT uq_structure_component UNIQUE (salary_structure_id, component_code),
     CONSTRAINT fk_ssc_structure FOREIGN KEY (salary_structure_id) REFERENCES payroll.salary_structure(salary_structure_id) ON DELETE CASCADE,
-    CONSTRAINT fk_ssc_component FOREIGN KEY (component_id) REFERENCES payroll.payroll_component(component_id),
-    CONSTRAINT fk_ssc_based_on_component FOREIGN KEY (based_on_component_id) REFERENCES payroll.payroll_component(component_id)
+    CONSTRAINT fk_ssc_component FOREIGN KEY (component_code) REFERENCES payroll.payroll_component(component_code),
+    CONSTRAINT fk_ssc_based_on_component FOREIGN KEY (based_on_component) REFERENCES payroll.payroll_component(component_code)
 );
 
 CREATE TABLE IF NOT EXISTS payroll.employee_salary (
@@ -2851,12 +2849,12 @@ CREATE TABLE IF NOT EXISTS payroll.payroll_ledger (
     ledger_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     payroll_item_id UUID NOT NULL,
     company_id      UUID NOT NULL,
-    component_id    UUID NOT NULL,
+    component_code  VARCHAR(50) NOT NULL,
     amount          NUMERIC(12,2) NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT fk_ledger_item FOREIGN KEY (payroll_item_id) REFERENCES payroll.payroll_item(payroll_item_id) ON DELETE CASCADE,
-    CONSTRAINT fk_ledger_component FOREIGN KEY (component_id) REFERENCES payroll.payroll_component(component_id),
-    CONSTRAINT uq_payroll_ledger_item_component UNIQUE (payroll_item_id, component_id)
+    CONSTRAINT fk_ledger_component FOREIGN KEY (component_code) REFERENCES payroll.payroll_component(component_code),
+    CONSTRAINT uq_payroll_ledger_item_component UNIQUE (payroll_item_id, component_code)
 );
 
 CREATE TABLE IF NOT EXISTS payroll.payroll_snapshot (
@@ -2892,7 +2890,7 @@ CREATE TABLE IF NOT EXISTS payroll.payroll_adjustment (
     adjustment_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id      UUID NOT NULL,
     user_id         UUID NOT NULL,
-    component_id    UUID NOT NULL,
+    component_code  VARCHAR(50) NOT NULL,
     amount          NUMERIC(12,2) NOT NULL,
     adjustment_type VARCHAR(20) CHECK (adjustment_type IN ('addition','deduction')),
     reason          TEXT,
@@ -2900,7 +2898,7 @@ CREATE TABLE IF NOT EXISTS payroll.payroll_adjustment (
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     created_by      UUID,
     CONSTRAINT fk_adjust_company FOREIGN KEY (company_id) REFERENCES public.companies(company_id),
-    CONSTRAINT fk_adjust_component FOREIGN KEY (component_id) REFERENCES payroll.payroll_component(component_id)
+    CONSTRAINT fk_adjust_component FOREIGN KEY (component_code) REFERENCES payroll.payroll_component(component_code)
 );
 
 CREATE TABLE IF NOT EXISTS payroll.payslip_template (
@@ -3128,13 +3126,13 @@ CREATE TABLE IF NOT EXISTS payroll.employee_loan (
     status           VARCHAR(20) NOT NULL DEFAULT 'active',
     created_at       TIMESTAMPTZ DEFAULT NOW(),
     created_by       UUID REFERENCES users(user_id),
-    component_id     UUID,
+    component_code   VARCHAR(50),
     interest_type    VARCHAR(20) DEFAULT 'flat',
     tenure_months    INT,
     outstanding_balance NUMERIC(14,2),
     penalty_rate     NUMERIC(5,2) DEFAULT 0,
     allow_partial_payment BOOLEAN DEFAULT true,
-    CONSTRAINT fk_employee_loan_component FOREIGN KEY (component_id) REFERENCES payroll.payroll_component(component_id)
+    CONSTRAINT fk_employee_loan_component FOREIGN KEY (component_code) REFERENCES payroll.payroll_component(component_code)
 );
 
 CREATE TABLE IF NOT EXISTS payroll.emi_transaction (
@@ -3162,8 +3160,8 @@ CREATE TABLE IF NOT EXISTS payroll.arrears (
     reason           TEXT,
     processed        BOOLEAN DEFAULT false,
     created_at       TIMESTAMPTZ DEFAULT NOW(),
-    component_id     UUID,
-    CONSTRAINT fk_arrears_component FOREIGN KEY (component_id) REFERENCES payroll.payroll_component(component_id)
+    component_code   VARCHAR(50),
+    CONSTRAINT fk_arrears_component FOREIGN KEY (component_code) REFERENCES payroll.payroll_component(component_code)
 );
 
 CREATE TABLE IF NOT EXISTS payroll.tax_declaration_type (
@@ -3195,17 +3193,17 @@ CREATE TABLE IF NOT EXISTS payroll.tax_declaration (
 );
 
 CREATE TABLE IF NOT EXISTS payroll.company_payroll_settings (
-    company_id                   UUID PRIMARY KEY REFERENCES companies(company_id) ON DELETE CASCADE,
-    default_fine_component_id    UUID,
-    default_arrears_component_id UUID,
-    default_loan_component_id    UUID,
-    default_basic_component_id   UUID,
-    created_at                   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at                   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT fk_default_fine_component    FOREIGN KEY (default_fine_component_id)    REFERENCES payroll.payroll_component(component_id),
-    CONSTRAINT fk_default_arrears_component FOREIGN KEY (default_arrears_component_id) REFERENCES payroll.payroll_component(component_id),
-    CONSTRAINT fk_default_loan_component    FOREIGN KEY (default_loan_component_id)    REFERENCES payroll.payroll_component(component_id),
-    CONSTRAINT fk_default_basic_component   FOREIGN KEY (default_basic_component_id)   REFERENCES payroll.payroll_component(component_id)
+    company_id                UUID PRIMARY KEY REFERENCES companies(company_id) ON DELETE CASCADE,
+    default_fine_component    VARCHAR(50),
+    default_arrears_component VARCHAR(50),
+    default_loan_component    VARCHAR(50),
+    default_basic_component   VARCHAR(50),
+    created_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_default_fine_component FOREIGN KEY (default_fine_component) REFERENCES payroll.payroll_component(component_code),
+    CONSTRAINT fk_default_arrears_component FOREIGN KEY (default_arrears_component) REFERENCES payroll.payroll_component(component_code),
+    CONSTRAINT fk_default_loan_component FOREIGN KEY (default_loan_component) REFERENCES payroll.payroll_component(component_code),
+    CONSTRAINT fk_default_basic_component FOREIGN KEY (default_basic_component) REFERENCES payroll.payroll_component(component_code)
 );
 
 CREATE TABLE IF NOT EXISTS payroll.payroll_job (
@@ -3377,9 +3375,9 @@ CREATE INDEX IF NOT EXISTS idx_payroll_item_created_at ON payroll.payroll_item (
 CREATE INDEX IF NOT EXISTS idx_payroll_component_type ON payroll.payroll_component (component_type);
 CREATE INDEX IF NOT EXISTS idx_payroll_component_taxable ON payroll.payroll_component (is_taxable) WHERE is_taxable = true;
 CREATE INDEX IF NOT EXISTS idx_payroll_component_system ON payroll.payroll_component (is_system) WHERE is_system = true;
-CREATE INDEX IF NOT EXISTS idx_payroll_ledger_component ON payroll.payroll_ledger (component_id);
+CREATE INDEX IF NOT EXISTS idx_payroll_ledger_component ON payroll.payroll_ledger (component_code);
 CREATE INDEX IF NOT EXISTS idx_payroll_ledger_created_at ON payroll.payroll_ledger (created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_payroll_ledger_item_component ON payroll.payroll_ledger (payroll_item_id, component_id);
+CREATE INDEX IF NOT EXISTS idx_payroll_ledger_item_component ON payroll.payroll_ledger (payroll_item_id, component_code);
 CREATE INDEX IF NOT EXISTS idx_payroll_tax_profile_country ON payroll.payroll_tax_profile (country_code);
 CREATE INDEX IF NOT EXISTS idx_payroll_tax_profile_active ON payroll.payroll_tax_profile (is_active) WHERE is_active = true;
 CREATE INDEX IF NOT EXISTS idx_payroll_tax_profile_created_at ON payroll.payroll_tax_profile (created_at DESC);
@@ -3392,22 +3390,10 @@ CREATE INDEX IF NOT EXISTS idx_audit_logs_company_time ON audit.audit_logs (comp
 CREATE INDEX IF NOT EXISTS idx_audit_logs_module_action ON audit.audit_logs (module, action);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit.audit_logs (entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_outbox_unprocessed ON audit.audit_logs_outbox (created_at) WHERE processed_at IS NULL;
--- was: unique per user_id only → broke multi-company employees
-DROP INDEX IF EXISTS uq_employee_active_department;
-CREATE UNIQUE INDEX uq_employee_active_department
-    ON employee_department_history (user_id, company_id)
-    WHERE end_date IS NULL;
-
--- was: unique per user_id only → broke multi-company employees
-DROP INDEX IF EXISTS uq_employee_role_active;
-CREATE UNIQUE INDEX uq_employee_role_active
-    ON employee_role_history (user_id, company_id)
-    WHERE end_date IS NULL;
-
--- already correct, no change
-CREATE UNIQUE INDEX IF NOT EXISTS uq_employee_exit_active
-    ON employee_exit (company_id, user_id)
-    WHERE exit_state IN ('scheduled','effective');CREATE INDEX IF NOT EXISTS idx_user_avatars_user_active ON user_avatars (user_id) WHERE is_active = true AND is_primary = true;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_employee_active_department ON employee_department_history (user_id) WHERE end_date IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_employee_role_active ON employee_role_history (user_id) WHERE end_date IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_employee_exit_active ON employee_exit (company_id, user_id) WHERE exit_state IN ('scheduled','effective');
+CREATE INDEX IF NOT EXISTS idx_user_avatars_user_active ON user_avatars (user_id) WHERE is_active = true AND is_primary = true;
 CREATE INDEX IF NOT EXISTS idx_user_avatars_hash ON user_avatars (avatar_hash);
 CREATE INDEX IF NOT EXISTS idx_admin_avatars_admin_active ON admin_avatars (admin_id) WHERE is_active = true AND is_primary = true;
 CREATE INDEX IF NOT EXISTS idx_admin_avatars_hash ON admin_avatars (avatar_hash);
@@ -3456,6 +3442,8 @@ CREATE INDEX IF NOT EXISTS idx_subscription_invoice_items_invoice ON subscriptio
 CREATE INDEX IF NOT EXISTS idx_subscription_reminders_company ON subscription_reminders(company_id);
 CREATE INDEX IF NOT EXISTS idx_subscription_reminders_sent_at ON subscription_reminders(sent_at) WHERE sent_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_employee_bank_details_active ON payroll.employee_bank_details (company_id, user_id) WHERE is_active = true;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payroll_component_global ON payroll.payroll_component(component_code) WHERE company_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payroll_component_company ON payroll.payroll_component(company_id, component_code) WHERE company_id IS NOT NULL;
 
 -- ============================================================
 -- TRIGGERS
@@ -3595,6 +3583,42 @@ CREATE TRIGGER update_kyc_documents_updated_at
 -- ============================================================
 -- DATA INSERTS
 -- ============================================================
+
+INSERT INTO payroll.payroll_component (
+    company_id, component_code, component_type, description,
+    is_taxable, is_system, is_active, contribution_side
+) VALUES
+(NULL,'BASIC','earning','Basic Salary',true,true,true,'employee'),
+(NULL,'HRA','earning','House Rent Allowance',true,false,true,'employee'),
+(NULL,'CONVEYANCE','earning','Conveyance Allowance',true,false,true,'employee'),
+(NULL,'SPECIAL_ALLOWANCE','earning','Special Allowance',true,false,true,'employee'),
+(NULL,'MEDICAL_ALLOWANCE','earning','Medical Allowance',true,false,true,'employee'),
+(NULL,'LTA','earning','Leave Travel Allowance',true,false,true,'employee'),
+(NULL,'BONUS','earning','Performance Bonus',true,false,true,'employee'),
+(NULL,'COMMISSION','earning','Sales Commission',true,false,true,'employee'),
+(NULL,'OVERTIME','earning','Overtime Pay',true,false,true,'employee'),
+(NULL,'ARREARS','earning','Salary Arrears',true,false,true,'employee'),
+(NULL,'SHIFT_ALLOWANCE','earning','Shift Allowance',true,false,true,'employee'),
+(NULL,'FOOD_ALLOWANCE','earning','Meal / Food Allowance',true,false,true,'employee'),
+(NULL,'OVERTIME_PAY','earning','Overtime Pay',true,true,true,'employee'),
+(NULL,'LOAN_EMI','deduction','Loan EMI',false,false,true,'employee'),
+(NULL,'ABSENT_DEDUCTION','deduction','Absent Deduction',false,true,true,'employee'),
+(NULL,'MANUAL_FINE','deduction','Manual Fine',false,false,true,'employee'),
+(NULL,'PF','deduction','Provident Fund (Employee)',false,false,true,'employee'),
+(NULL,'ESI','deduction','Employee State Insurance',false,false,true,'employee'),
+(NULL,'PT','deduction','Professional Tax',false,false,true,'employee'),
+(NULL,'TDS','deduction','Income Tax (TDS)',false,false,true,'employee'),
+(NULL,'LOP','deduction','Loss of Pay',false,true,true,'employee'),
+(NULL,'ADVANCE','deduction','Salary Advance Recovery',false,false,true,'employee'),
+(NULL,'LOAN_DEDUCTION','deduction','Loan Repayment Deduction',false,false,true,'employee'),
+(NULL,'INSURANCE','deduction','Insurance Deduction',false,false,true,'employee'),
+(NULL,'OTHER_DEDUCTION','deduction','Other Deduction',false,false,true,'employee'),
+(NULL,'LATE_DEDUCTION','deduction','Late Attendance Deduction',false,true,true,'employee'),
+(NULL,'PF_EMPLOYER','deduction','Employer Provident Fund',false,true,true,'employer'),
+(NULL,'ESI_EMPLOYER','deduction','Employer ESI Contribution',false,true,true,'employer'),
+(NULL,'GRATUITY','deduction','Gratuity Provision',false,true,true,'employer'),
+(NULL,'BONUS_PROVISION','deduction','Bonus Provision',false,true,true,'employer')
+ON CONFLICT DO NOTHING;
 
 INSERT INTO system_departments (name, module_code, description, bitmask) VALUES
     ('HR', 'hr', 'Human resource management', 1 << 0),
@@ -4273,44 +4297,6 @@ BEGIN
         gateway_response = p_gateway_response,
         updated_at = v_now
     WHERE payment_id = p_payment_id;
-END;
-$$ LANGUAGE plpgsql;
-
--- ============================================================
--- PAYROLL COMPONENT PROVISIONING (per company)
--- ============================================================
-CREATE OR REPLACE FUNCTION provision_default_payroll_components(
-    p_company_id UUID,
-    p_created_by UUID
-) RETURNS INT AS $$
-DECLARE v_count INT;
-BEGIN
-    INSERT INTO payroll.payroll_component (
-        company_id, component_code, component_type, description,
-        is_taxable, is_system, contribution_side, created_by
-    ) VALUES
-        (p_company_id, 'BASIC',              'earning',  'Basic Salary',              true,  true, 'employee', p_created_by),
-        (p_company_id, 'HRA',                'earning',  'House Rent Allowance',      true,  true, 'employee', p_created_by),
-        (p_company_id, 'CONVEYANCE',         'earning',  'Conveyance Allowance',      true,  true, 'employee', p_created_by),
-        (p_company_id, 'SPECIAL_ALLOWANCE',  'earning',  'Special Allowance',         true,  true, 'employee', p_created_by),
-        (p_company_id, 'MEDICAL_ALLOWANCE',  'earning',  'Medical Allowance',         true,  true, 'employee', p_created_by),
-        (p_company_id, 'BONUS',              'earning',  'Bonus',                     true,  false,'employee', p_created_by),
-        (p_company_id, 'OVERTIME',           'earning',  'Overtime Pay',              true,  false,'employee', p_created_by),
-        (p_company_id, 'ARREARS',            'earning',  'Salary Arrears',            true,  false,'employee', p_created_by),
-        (p_company_id, 'PF',                 'deduction','Provident Fund (Employee)', false, true, 'employee', p_created_by),
-        (p_company_id, 'ESI',                'deduction','ESI (Employee)',            false, true, 'employee', p_created_by),
-        (p_company_id, 'PT',                 'deduction','Professional Tax',          false, true, 'employee', p_created_by),
-        (p_company_id, 'TDS',                'deduction','Income Tax (TDS)',          false, true, 'employee', p_created_by),
-        (p_company_id, 'LOP',                'deduction','Loss of Pay',               false, true, 'employee', p_created_by),
-        (p_company_id, 'LOAN_EMI',           'deduction','Loan EMI',                  false, false,'employee', p_created_by),
-        (p_company_id, 'ABSENT_DEDUCTION',   'deduction','Absent Deduction',          false, true, 'employee', p_created_by),
-        (p_company_id, 'MANUAL_FINE',        'deduction','Manual Fine',               false, false,'employee', p_created_by),
-        (p_company_id, 'PF_EMPLOYER',        'deduction','Employer PF',               false, true, 'employer', p_created_by),
-        (p_company_id, 'ESI_EMPLOYER',       'deduction','Employer ESI',              false, true, 'employer', p_created_by),
-        (p_company_id, 'GRATUITY',           'deduction','Gratuity Provision',        false, true, 'employer', p_created_by)
-    ON CONFLICT DO NOTHING;
-    GET DIAGNOSTICS v_count = ROW_COUNT;
-    RETURN v_count;
 END;
 $$ LANGUAGE plpgsql;
 

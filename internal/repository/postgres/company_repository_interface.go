@@ -9,7 +9,7 @@ import (
 )
 
 // CompanyRepository defines the persistence contract for companies,
-// departments, roles, employees, permissions, and positions.
+// departments, roles, employees, permissions, positions, and jobs.
 //
 // Convention:
 //   - Methods that take `db client.DBTX` can be called with either
@@ -213,6 +213,7 @@ type CompanyRepository interface {
 	CreateCompanyDepartment(ctx context.Context, db client.DBTX, companyID uuid.UUID, departmentName string, systemDepartmentID uuid.UUID) (*models.Department, error)
 	SoftDeleteDepartment(ctx context.Context, companyID, departmentID uuid.UUID) error
 	ActivateDepartment(ctx context.Context, companyID uuid.UUID, departmentID uuid.UUID) error
+	UpdateEmployeeTx(ctx context.Context, db client.DBTX, emp *models.CompanyEmployee) error
 
 	// ============================================================
 	// Department Quotas
@@ -223,23 +224,77 @@ type CompanyRepository interface {
 	GetCompanyDepartmentInfo(ctx context.Context, db client.DBTX, companyID uuid.UUID) (*models.CompanyDepartmentInfo, error)
 
 	// ============================================================
-	// Position Operations
+	// Job Operations  👈 NEW
+	//
+	// A job is a *definition*: "Cashier", "Line Operator". It carries
+	// no location and no work center — those live on the seat
+	// (positions). One job can back N positions across N sites.
+	// ============================================================
+	//
+	// FindOrCreateJob is idempotent on (company_id, job_code). It
+	// returns the existing job if one exists with the same code —
+	// otherwise it inserts a new row. Used by CreateCompany and by
+	// service-layer code that creates positions from a title.
+	FindOrCreateJob(
+		ctx context.Context,
+		db client.DBTX,
+		companyID uuid.UUID,
+		jobCode, jobTitle string,
+		isSchedulable, attendanceRequired, overtimeAllowed bool,
+	) (*models.Job, error)
+
+	GetJobByID(ctx context.Context, jobID uuid.UUID) (*models.Job, error)
+	ListJobsByCompany(ctx context.Context, companyID uuid.UUID) ([]*models.Job, error)
+	UpdateJob(ctx context.Context, job *models.Job) error
+
+	// DeactivateJob sets is_active = false. It does NOT delete the row —
+	// existing positions keep referencing it. New positions cannot be
+	// created against an inactive job.
+	DeactivateJob(ctx context.Context, jobID uuid.UUID) error
+
+	// ============================================================
+	// Position Operations  👈 CHANGED
+	//
+	// Reads now return *models.PositionView, which carries the joined
+	// job_title, job_code, is_schedulable, attendance_required,
+	// overtime_allowed, department_name, location_name, and
+	// work_center_name alongside the seat's own fields.
+	//
+	// Writes take a *models.Position — the view is read-only.
 	// ============================================================
 	CreatePosition(ctx context.Context, db client.DBTX, position *models.Position) error
 	UpdatePosition(ctx context.Context, db client.DBTX, position *models.Position) error
 	UpdatePositionStatus(ctx context.Context, db client.DBTX, positionID uuid.UUID, isOpen bool) error
 	DeletePosition(ctx context.Context, db client.DBTX, positionID uuid.UUID) error
-	GetPosition(ctx context.Context, db client.DBTX, positionID uuid.UUID) (*models.Position, error)
-	GetPositionsByCompany(ctx context.Context, db client.DBTX, companyID uuid.UUID, limit int, offset int, onlyOpen bool) ([]*models.Position, int, error)
-	GetPositionsByDepartment(ctx context.Context, db client.DBTX, departmentID uuid.UUID, limit int, offset int, onlyOpen bool) ([]*models.Position, int, error)
-	GetOpenPositions(ctx context.Context, db client.DBTX, companyID uuid.UUID, isOpen *bool, limit, offset int) ([]*models.Position, int, error)
-	PositionExists(ctx context.Context, db client.DBTX, companyID, departmentID uuid.UUID, title string) (bool, error)
+
+	GetPosition(ctx context.Context, db client.DBTX, positionID uuid.UUID) (*models.PositionView, error)
+	GetPositionsByCompany(ctx context.Context, db client.DBTX, companyID uuid.UUID, limit int, offset int, onlyOpen bool) ([]*models.PositionView, int, error)
+	GetPositionsByDepartment(ctx context.Context, db client.DBTX, departmentID uuid.UUID, limit int, offset int, onlyOpen bool) ([]*models.PositionView, int, error)
+	GetOpenPositions(ctx context.Context, db client.DBTX, companyID uuid.UUID, isOpen *bool, limit, offset int) ([]*models.PositionView, int, error)
+
+	// PositionExists now checks the seat's uniqueness using title_override
+	// (which may be NULL → falls back to jobs.job_title) plus location_id.
+	// NULL title_override and NULL location_id are treated as equal via
+	// COALESCE in the SQL, matching the uq_positions_dept_title_loc index.
+	PositionExists(
+		ctx context.Context,
+		db client.DBTX,
+		companyID, departmentID uuid.UUID,
+		titleOverride *string,
+		locationID *uuid.UUID,
+	) (bool, error)
+
 	WorkCenterExists(ctx context.Context, db client.DBTX, companyID uuid.UUID, workCenterCode string) (bool, error)
 
 	// ============================================================
 	// Employee Location Settings
 	// ============================================================
 	UpdateEmployeeLocationSettings(ctx context.Context, db client.DBTX, companyID, userID uuid.UUID, primaryLocationID *uuid.UUID, accessScope string) error
+
+	// SetWorkCenterLocation links a work center to a location AND
+	// backfills positions.location_id for any seat that uses this work
+	// center and still has NULL location_id. Both writes happen so the
+	// enforce_position_location_matches_work_center trigger stays happy.
 	SetWorkCenterLocation(ctx context.Context, db client.DBTX, companyID uuid.UUID, workCenterCode string, locationID uuid.UUID) error
 
 	// ============================================================

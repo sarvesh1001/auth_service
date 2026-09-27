@@ -226,25 +226,41 @@ func (r *salaryStructureRepository) Deactivate(ctx context.Context, structureID 
 }
 
 // ---------------------------------------------------------------------
-// Component management
+// Component resolution helpers (NEW: return full component, not bool)
 // ---------------------------------------------------------------------
 
-func (r *salaryStructureRepository) componentExistsForCompany(ctx context.Context, companyID uuid.UUID, componentCode string) (bool, error) {
+// resolveComponent returns the active component for (companyID, code), or
+// ErrPayrollComponentNotFound if none. Callers use .ComponentID for writes.
+func (r *salaryStructureRepository) resolveComponent(ctx context.Context, companyID uuid.UUID, code string) (*models.PayrollComponent, error) {
 	const query = `
-		SELECT EXISTS (
-			SELECT 1
-			FROM payroll.payroll_component
-			WHERE component_code = $2
-			  AND is_active = true
-			  AND (company_id = $1 OR company_id IS NULL)
-		)
+		SELECT
+			component_id, company_id, component_code, component_type,
+			description, is_taxable, is_system, is_active, contribution_side
+		FROM payroll.payroll_component
+		WHERE company_id = $1
+		  AND component_code = $2
+		  AND is_active = true
+		LIMIT 1
 	`
-	var exists bool
-	err := r.client.QueryRow(ctx, query, companyID, componentCode).Scan(&exists)
+	var comp models.PayrollComponent
+	err := r.client.QueryRow(ctx, query, companyID, code).Scan(
+		&comp.ComponentID,
+		&comp.CompanyID,
+		&comp.ComponentCode,
+		&comp.ComponentType,
+		&comp.Description,
+		&comp.IsTaxable,
+		&comp.IsSystem,
+		&comp.IsActive,
+		&comp.ContributionSide,
+	)
 	if err != nil {
-		return false, fmt.Errorf("check component existence: %w", err)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("component %s is not active for company %s: %w", code, companyID, hrErrors.ErrPayrollComponentNotFound)
+		}
+		return nil, fmt.Errorf("resolve component %s: %w", code, err)
 	}
-	return exists, nil
+	return &comp, nil
 }
 
 func (r *salaryStructureRepository) getStructureCompanyID(ctx context.Context, structureID uuid.UUID) (uuid.UUID, error) {
@@ -260,8 +276,11 @@ func (r *salaryStructureRepository) getStructureCompanyID(ctx context.Context, s
 	return companyID, nil
 }
 
+// ---------------------------------------------------------------------
+// Component management
+// ---------------------------------------------------------------------
+
 func (r *salaryStructureRepository) AddComponent(ctx context.Context, comp *models.SalaryStructureComponent) error {
-	// Ensure company ID is set
 	if comp.CompanyID == uuid.Nil {
 		companyID, err := r.getStructureCompanyID(ctx, comp.SalaryStructureID)
 		if err != nil {
@@ -270,16 +289,24 @@ func (r *salaryStructureRepository) AddComponent(ctx context.Context, comp *mode
 		comp.CompanyID = companyID
 	}
 
-	// Validate component exists and is active
-	exists, err := r.componentExistsForCompany(ctx, comp.CompanyID, comp.ComponentCode)
+	// Resolve component_code -> component_id
+	resolved, err := r.resolveComponent(ctx, comp.CompanyID, comp.ComponentCode)
 	if err != nil {
 		return err
 	}
-	if !exists {
-		return fmt.Errorf("component %s is not active for company %s", comp.ComponentCode, comp.CompanyID)
+	comp.ComponentID = resolved.ComponentID
+
+	// Resolve based_on_component (optional self-reference) to id
+	var basedOnID *uuid.UUID
+	if comp.BasedOnComponent != nil && *comp.BasedOnComponent != "" {
+		basedOnResolved, err := r.resolveComponent(ctx, comp.CompanyID, *comp.BasedOnComponent)
+		if err != nil {
+			return fmt.Errorf("resolve based_on_component: %w", err)
+		}
+		basedOnID = &basedOnResolved.ComponentID
+		comp.BasedOnComponentID = basedOnID
 	}
 
-	// Prepare
 	if comp.MappingID == uuid.Nil {
 		comp.MappingID = uuid.New()
 	}
@@ -289,18 +316,18 @@ func (r *salaryStructureRepository) AddComponent(ctx context.Context, comp *mode
 
 	query := `
         INSERT INTO payroll.salary_structure_component (
-            mapping_id, salary_structure_id, company_id, component_code,
-            calculation_type, value, based_on_component, sequence_order, created_at
+            mapping_id, salary_structure_id, company_id, component_id,
+            calculation_type, value, based_on_component_id, sequence_order, created_at
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
     `
 	_, err = r.client.Exec(ctx, query,
 		comp.MappingID,
 		comp.SalaryStructureID,
 		comp.CompanyID,
-		comp.ComponentCode,
+		comp.ComponentID,
 		comp.CalculationType,
 		comp.Value,
-		comp.BasedOnComponent,
+		comp.BasedOnComponentID,
 		comp.SequenceOrder,
 		comp.CreatedAt,
 	)
@@ -311,14 +338,14 @@ func (r *salaryStructureRepository) AddComponent(ctx context.Context, comp *mode
 }
 
 func (r *salaryStructureRepository) UpdateComponent(ctx context.Context, comp *models.SalaryStructureComponent) error {
-	// Fetch current component to check code change and existence
-	var currentCode string
+	// Fetch current component_id to detect change
+	var currentComponentID uuid.UUID
 	const getCurrentQuery = `
-		SELECT component_code
+		SELECT component_id
 		FROM payroll.salary_structure_component
 		WHERE mapping_id = $1
 	`
-	err := r.client.QueryRow(ctx, getCurrentQuery, comp.MappingID).Scan(&currentCode)
+	err := r.client.QueryRow(ctx, getCurrentQuery, comp.MappingID).Scan(&currentComponentID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return hrErrors.ErrSalaryStructureComponentNotFound
@@ -326,39 +353,46 @@ func (r *salaryStructureRepository) UpdateComponent(ctx context.Context, comp *m
 		return fmt.Errorf("fetch current component: %w", err)
 	}
 
-	// If component code changed, validate new code
-	if currentCode != comp.ComponentCode {
-		if comp.CompanyID == uuid.Nil {
-			companyID, err := r.getStructureCompanyID(ctx, comp.SalaryStructureID)
-			if err != nil {
-				return err
-			}
-			comp.CompanyID = companyID
-		}
-		exists, err := r.componentExistsForCompany(ctx, comp.CompanyID, comp.ComponentCode)
+	// Resolve incoming component_code -> component_id
+	if comp.CompanyID == uuid.Nil {
+		companyID, err := r.getStructureCompanyID(ctx, comp.SalaryStructureID)
 		if err != nil {
 			return err
 		}
-		if !exists {
-			return fmt.Errorf("component %s is not active for company %s", comp.ComponentCode, comp.CompanyID)
+		comp.CompanyID = companyID
+	}
+	resolved, err := r.resolveComponent(ctx, comp.CompanyID, comp.ComponentCode)
+	if err != nil {
+		return err
+	}
+	comp.ComponentID = resolved.ComponentID
+
+	// Resolve based_on_component if provided
+	if comp.BasedOnComponent != nil && *comp.BasedOnComponent != "" {
+		basedOnResolved, err := r.resolveComponent(ctx, comp.CompanyID, *comp.BasedOnComponent)
+		if err != nil {
+			return fmt.Errorf("resolve based_on_component: %w", err)
 		}
+		comp.BasedOnComponentID = &basedOnResolved.ComponentID
+	} else {
+		comp.BasedOnComponentID = nil
 	}
 
 	query := `
 		UPDATE payroll.salary_structure_component
 		SET
-			component_code = $1,
+			component_id = $1,
 			calculation_type = $2,
 			value = $3,
-			based_on_component = $4,
+			based_on_component_id = $4,
 			sequence_order = $5
 		WHERE mapping_id = $6
 	`
 	result, err := r.client.Exec(ctx, query,
-		comp.ComponentCode,
+		comp.ComponentID,
 		comp.CalculationType,
 		comp.Value,
-		comp.BasedOnComponent,
+		comp.BasedOnComponentID,
 		comp.SequenceOrder,
 		comp.MappingID,
 	)
@@ -396,13 +430,26 @@ func (r *salaryStructureRepository) GetComponentsOrdered(ctx context.Context, st
 func (r *salaryStructureRepository) getComponents(ctx context.Context, structureID uuid.UUID, ordered bool) ([]models.SalaryStructureComponent, error) {
 	query := `
 		SELECT
-			mapping_id, salary_structure_id, component_code,
-			calculation_type, value, based_on_component, sequence_order, created_at
-		FROM payroll.salary_structure_component
-		WHERE salary_structure_id = $1
+			ssc.mapping_id,
+			ssc.salary_structure_id,
+			ssc.company_id,
+			ssc.component_id,
+			pc.component_code,
+			ssc.calculation_type,
+			ssc.value,
+			ssc.based_on_component_id,
+			bopc.component_code AS based_on_component,
+			ssc.sequence_order,
+			ssc.created_at
+		FROM payroll.salary_structure_component ssc
+		JOIN payroll.payroll_component pc
+		    ON pc.component_id = ssc.component_id
+		LEFT JOIN payroll.payroll_component bopc
+		    ON bopc.component_id = ssc.based_on_component_id
+		WHERE ssc.salary_structure_id = $1
 	`
 	if ordered {
-		query += " ORDER BY sequence_order"
+		query += " ORDER BY ssc.sequence_order"
 	}
 	rows, err := r.client.Query(ctx, query, structureID)
 	if err != nil {
@@ -416,9 +463,12 @@ func (r *salaryStructureRepository) getComponents(ctx context.Context, structure
 		if err := rows.Scan(
 			&c.MappingID,
 			&c.SalaryStructureID,
+			&c.CompanyID,
+			&c.ComponentID,
 			&c.ComponentCode,
 			&c.CalculationType,
 			&c.Value,
+			&c.BasedOnComponentID,
 			&c.BasedOnComponent,
 			&c.SequenceOrder,
 			&c.CreatedAt,
@@ -434,20 +484,26 @@ func (r *salaryStructureRepository) getComponents(ctx context.Context, structure
 }
 
 func (r *salaryStructureRepository) ReplaceComponents(ctx context.Context, structureID uuid.UUID, comps []models.SalaryStructureComponent) error {
-	// Get company ID for validation
 	companyID, err := r.getStructureCompanyID(ctx, structureID)
 	if err != nil {
 		return err
 	}
 
-	// Validate all components before changes
-	for _, comp := range comps {
-		exists, err := r.componentExistsForCompany(ctx, companyID, comp.ComponentCode)
+	// Resolve every component before touching the DB
+	for i := range comps {
+		resolved, err := r.resolveComponent(ctx, companyID, comps[i].ComponentCode)
 		if err != nil {
 			return err
 		}
-		if !exists {
-			return fmt.Errorf("component %s is not active for company %s", comp.ComponentCode, companyID)
+		comps[i].CompanyID = companyID
+		comps[i].ComponentID = resolved.ComponentID
+
+		if comps[i].BasedOnComponent != nil && *comps[i].BasedOnComponent != "" {
+			basedOnResolved, err := r.resolveComponent(ctx, companyID, *comps[i].BasedOnComponent)
+			if err != nil {
+				return fmt.Errorf("resolve based_on_component for %s: %w", comps[i].ComponentCode, err)
+			}
+			comps[i].BasedOnComponentID = &basedOnResolved.ComponentID
 		}
 	}
 
@@ -461,7 +517,6 @@ func (r *salaryStructureRepository) ReplaceComponents(ctx context.Context, struc
 		}
 	}()
 
-	// Delete existing
 	if _, err = tx.ExecContext(ctx, `DELETE FROM payroll.salary_structure_component WHERE salary_structure_id = $1`, structureID); err != nil {
 		return fmt.Errorf("delete existing components: %w", err)
 	}
@@ -470,12 +525,11 @@ func (r *salaryStructureRepository) ReplaceComponents(ctx context.Context, struc
 		return tx.Commit()
 	}
 
-	// Insert new
 	insertQuery := `
 		INSERT INTO payroll.salary_structure_component (
-			mapping_id, salary_structure_id, component_code,
-			calculation_type, value, based_on_component, sequence_order, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			mapping_id, salary_structure_id, company_id, component_id,
+			calculation_type, value, based_on_component_id, sequence_order, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 	`
 	stmt, err := tx.PrepareContext(ctx, insertQuery)
 	if err != nil {
@@ -483,7 +537,8 @@ func (r *salaryStructureRepository) ReplaceComponents(ctx context.Context, struc
 	}
 	defer stmt.Close()
 
-	for _, comp := range comps {
+	for i := range comps {
+		comp := &comps[i]
 		if comp.MappingID == uuid.Nil {
 			comp.MappingID = uuid.New()
 		}
@@ -493,10 +548,11 @@ func (r *salaryStructureRepository) ReplaceComponents(ctx context.Context, struc
 		if _, err = stmt.ExecContext(ctx,
 			comp.MappingID,
 			structureID,
-			comp.ComponentCode,
+			comp.CompanyID,
+			comp.ComponentID,
 			comp.CalculationType,
 			comp.Value,
-			comp.BasedOnComponent,
+			comp.BasedOnComponentID,
 			comp.SequenceOrder,
 			comp.CreatedAt,
 		); err != nil {

@@ -6,37 +6,32 @@ import (
 	"github.com/google/uuid"
 )
 
-// LeaveType represents a leave policy definition
+// LeaveType — pure classification. Accrual schedule and carry-forward live
+// on the policy rule (leave.leave_policy_rule), not here.
 type LeaveType struct {
-	LeaveTypeID       uuid.UUID `json:"leave_type_id" db:"leave_type_id"`
-	CompanyID         uuid.UUID `json:"company_id" db:"company_id"`
-	Code              string    `json:"code" db:"code"`
-	Name              string    `json:"name" db:"name"`
-	IsPaid            bool      `json:"is_paid" db:"is_paid"`
-	RequiresApproval  bool      `json:"requires_approval" db:"requires_approval"`
-	AccrualMethod     string    `json:"accrual_method" db:"accrual_method"`
-	CarryForwardLimit *int      `json:"carry_forward_limit,omitempty" db:"carry_forward_limit"`
-	CreatedAt         time.Time `json:"created_at" db:"created_at"`
+	LeaveTypeID      uuid.UUID `json:"leave_type_id" db:"leave_type_id"`
+	CompanyID        uuid.UUID `json:"company_id" db:"company_id"`
+	Code             string    `json:"code" db:"code"`
+	Name             string    `json:"name" db:"name"`
+	IsPaid           bool      `json:"is_paid" db:"is_paid"`
+	RequiresApproval bool      `json:"requires_approval" db:"requires_approval"`
+	CreatedAt        time.Time `json:"created_at" db:"created_at"`
 }
 
-// LeaveTypeCreate represents data needed to create a new leave type
+// LeaveTypeCreate — no accrual fields.
 type LeaveTypeCreate struct {
-	CompanyID         uuid.UUID `json:"company_id"`
-	Code              string    `json:"code"`
-	Name              string    `json:"name"`
-	IsPaid            bool      `json:"is_paid"`
-	RequiresApproval  bool      `json:"requires_approval"`
-	AccrualMethod     string    `json:"accrual_method"`
-	CarryForwardLimit *int      `json:"carry_forward_limit,omitempty"`
+	CompanyID        uuid.UUID `json:"company_id"`
+	Code             string    `json:"code"`
+	Name             string    `json:"name"`
+	IsPaid           bool      `json:"is_paid"`
+	RequiresApproval bool      `json:"requires_approval"`
 }
 
-// LeaveTypeUpdate represents data needed to update a leave type
+// LeaveTypeUpdate — no accrual fields.
 type LeaveTypeUpdate struct {
-	Name              *string `json:"name,omitempty"`
-	IsPaid            *bool   `json:"is_paid,omitempty"`
-	RequiresApproval  *bool   `json:"requires_approval,omitempty"`
-	AccrualMethod     *string `json:"accrual_method,omitempty"`
-	CarryForwardLimit *int    `json:"carry_forward_limit,omitempty"`
+	Name             *string `json:"name,omitempty"`
+	IsPaid           *bool   `json:"is_paid,omitempty"`
+	RequiresApproval *bool   `json:"requires_approval,omitempty"`
 }
 
 type ScheduleOverride struct {
@@ -57,6 +52,9 @@ type LeaveBalanceSnapshot struct {
 	CalculatedAt  time.Time  `json:"calculated_at" db:"calculated_at"`
 	UpdatedAt     *time.Time `json:"updated_at,omitempty" db:"updated_at"`
 }
+
+// LeavePolicyRuleResolution — accrual_method comes from the resolved
+// policy rule (the SAP-aligned source of truth).
 type LeavePolicyRuleResolution struct {
 	PolicyID          uuid.UUID
 	LeaveTypeID       uuid.UUID

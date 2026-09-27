@@ -240,20 +240,11 @@ func (r *payrollRepository) GetPayrollRunSummary(ctx context.Context, runID uuid
 }
 
 // ---------------------------------------------------------------------
-// Payroll Run Population Snapshot (P1)
+// Payroll Run Population Snapshot
 // ---------------------------------------------------------------------
 
-// SnapshotRunPopulationTx freezes the employee population for a payroll run
-// at creation time. Writes one row per employee to payroll_run_employees,
-// capturing their employment_location_id, salary_structure_id, and
-// monthly_ctc at that moment.
-//
-// Returns the user IDs that were snapshotted, so the caller can enqueue
-// per-employee jobs in the same transaction.
-//
-// Runs are always company-wide. The snapshot carries the employee's
-// employment_location_id as a data attribute, not a filter — it is what
-// makes payroll historically correct across mid-period transfers.
+// NOTE: employment_location_id has been renamed to primary_location_id
+// on company_employees. This query was updated accordingly.
 func (r *payrollRepository) SnapshotRunPopulationTx(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -270,7 +261,7 @@ func (r *payrollRepository) SnapshotRunPopulationTx(
 		SELECT
 			$1,
 			ce.user_id,
-			ce.employment_location_id,
+			ce.primary_location_id,
 			es.salary_structure_id,
 			es.monthly_ctc
 		FROM company_employees ce
@@ -403,11 +394,6 @@ func (r *payrollRepository) GetPayrollItemByID(ctx context.Context, itemID uuid.
 	return &item, nil
 }
 
-// GetPayrollItemsByRun returns the payroll items for a run.
-//
-// Location: when locationID is non-nil, only items for employees whose
-// snapshotted employment_location_id at run time matches are returned.
-// nil = no filter (worker path, company-wide view).
 func (r *payrollRepository) GetPayrollItemsByRun(
 	ctx context.Context,
 	runID uuid.UUID,
@@ -478,7 +464,7 @@ func (r *payrollRepository) GetPayrollItemDetail(ctx context.Context, itemID uui
             u.username,
             u.full_name,
             ce.employee_id,
-            p.title as position_title,
+            COALESCE(p.title_override, j.job_title) AS position_title,
             d.department_name,
             pr.company_id
         FROM payroll.payroll_item pi
@@ -486,6 +472,7 @@ func (r *payrollRepository) GetPayrollItemDetail(ctx context.Context, itemID uui
         JOIN users u ON pi.user_id = u.user_id
         JOIN company_employees ce ON pi.user_id = ce.user_id AND ce.company_id = pr.company_id
         LEFT JOIN positions p ON ce.position_id = p.position_id
+        LEFT JOIN jobs j ON j.job_id = p.job_id
         LEFT JOIN departments d ON p.department_id = d.department_id
         WHERE pi.payroll_item_id = $1
     `
@@ -518,20 +505,20 @@ func (r *payrollRepository) GetPayrollItemDetail(ctx context.Context, itemID uui
 		}
 		return nil, fmt.Errorf("failed to get payroll item detail: %w", err)
 	}
+
+	// Ledger rows — JOIN on component_id (single match, PK)
 	ledgerQuery := `
         SELECT
-            pl.component_code,
+            pc.component_code,
             pc.component_type,
             pc.description,
             pl.amount,
             pc.is_taxable
         FROM payroll.payroll_ledger pl
-        JOIN payroll.payroll_item pi ON pl.payroll_item_id = pi.payroll_item_id
-        JOIN payroll.payroll_run pr ON pi.payroll_run_id = pr.payroll_run_id
-        JOIN payroll.payroll_component pc 
-            ON pl.component_code = pc.component_code 
-            AND (pc.company_id = pr.company_id OR pc.company_id IS NULL)
+        JOIN payroll.payroll_component pc
+            ON pc.component_id = pl.component_id
         WHERE pl.payroll_item_id = $1
+        ORDER BY pc.component_type, pc.component_code
     `
 	rows, err := r.client.Query(ctx, ledgerQuery, itemID)
 	if err != nil {
@@ -688,24 +675,42 @@ func (r *payrollRepository) PayrollItemExists(ctx context.Context, runID uuid.UU
 }
 
 // ---------------------------------------------------------------------
-// Payroll Component
+// Payroll Component catalog
+//
+// NOTE: company_id is now NOT NULL, no more NULL globals. The unique
+// index on (company_id, component_code) is PARTIAL (WHERE is_active=true),
+// so ON CONFLICT must include the same predicate.
 // ---------------------------------------------------------------------
 
 func (r *payrollRepository) CreateComponent(ctx context.Context, component *models.PayrollComponent) error {
 	query := `
         INSERT INTO payroll.payroll_component (
-            company_id, component_code, component_type, description,
-            is_taxable, is_system, is_active, contribution_side
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        ON CONFLICT (company_id, component_code) DO UPDATE SET
+            component_id, company_id, component_code, component_type, description,
+            is_taxable, is_system, is_active, contribution_side,
+            created_at, created_by, updated_at, updated_by, version
+        ) VALUES (
+            COALESCE($1, gen_random_uuid()), $2, $3, $4, $5,
+            $6, $7, $8, $9,
+            NOW(), $10, NOW(), $10, 1
+        )
+        ON CONFLICT (company_id, component_code) WHERE is_active = true
+        DO UPDATE SET
             component_type = EXCLUDED.component_type,
             description = EXCLUDED.description,
             is_taxable = EXCLUDED.is_taxable,
-            is_active = EXCLUDED.is_active,
-            contribution_side = EXCLUDED.contribution_side
+            contribution_side = EXCLUDED.contribution_side,
+            updated_at = NOW(),
+            updated_by = EXCLUDED.updated_by
         WHERE payroll.payroll_component.is_system = FALSE
+        RETURNING component_id
     `
-	_, err := r.client.Exec(ctx, query,
+	var componentID *uuid.UUID
+	if component.ComponentID != uuid.Nil {
+		componentID = &component.ComponentID
+	}
+	var newID uuid.UUID
+	err := r.client.QueryRow(ctx, query,
+		componentID,
 		component.CompanyID,
 		component.ComponentCode,
 		component.ComponentType,
@@ -714,34 +719,38 @@ func (r *payrollRepository) CreateComponent(ctx context.Context, component *mode
 		component.IsSystem,
 		component.IsActive,
 		component.ContributionSide,
-	)
+		component.CreatedBy,
+	).Scan(&newID)
 	if err != nil {
-		return fmt.Errorf("failed to create payroll component: %w", err)
+		return fmt.Errorf("failed to upsert payroll component: %w", err)
 	}
+	component.ComponentID = newID
 	return nil
 }
 
 func (r *payrollRepository) GetComponent(ctx context.Context, companyID uuid.UUID, code string) (*models.PayrollComponent, error) {
 	query := `
 		SELECT
+			component_id,
+			company_id,
 			component_code,
 			component_type,
 			description,
 			is_taxable,
 			is_system,
 			is_active,
-			contribution_side,
-			company_id
+			contribution_side
 		FROM payroll.payroll_component
-		WHERE component_code = $2
-		  AND (company_id = $1 OR company_id IS NULL)
-		ORDER BY company_id DESC
+		WHERE company_id = $1
+		  AND component_code = $2
+		  AND is_active = true
 		LIMIT 1
 	`
 	row := r.client.QueryRow(ctx, query, companyID, code)
 	var component models.PayrollComponent
-	var dbCompanyID *uuid.UUID
 	err := row.Scan(
+		&component.ComponentID,
+		&component.CompanyID,
 		&component.ComponentCode,
 		&component.ComponentType,
 		&component.Description,
@@ -749,18 +758,12 @@ func (r *payrollRepository) GetComponent(ctx context.Context, companyID uuid.UUI
 		&component.IsSystem,
 		&component.IsActive,
 		&component.ContributionSide,
-		&dbCompanyID,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, hrErrors.ErrPayrollComponentNotFound
 		}
 		return nil, fmt.Errorf("failed to get payroll component: %w", err)
-	}
-	if dbCompanyID != nil {
-		component.CompanyID = *dbCompanyID
-	} else {
-		component.CompanyID = companyID
 	}
 	return &component, nil
 }
@@ -769,7 +772,7 @@ func (r *payrollRepository) GetComponents(ctx context.Context, companyID uuid.UU
 	var conditions []string
 	var args []interface{}
 	argIdx := 1
-	conditions = append(conditions, fmt.Sprintf("(company_id = $%d OR company_id IS NULL)", argIdx))
+	conditions = append(conditions, fmt.Sprintf("company_id = $%d", argIdx))
 	args = append(args, companyID)
 	argIdx++
 	if filter.ComponentType != nil {
@@ -794,7 +797,7 @@ func (r *payrollRepository) GetComponents(ctx context.Context, companyID uuid.UU
 	}
 	whereClause := "WHERE " + strings.Join(conditions, " AND ")
 	query := fmt.Sprintf(`
-        SELECT component_code, component_type, description,
+        SELECT component_id, company_id, component_code, component_type, description,
                is_taxable, is_system, is_active, contribution_side
         FROM payroll.payroll_component
         %s
@@ -808,8 +811,9 @@ func (r *payrollRepository) GetComponents(ctx context.Context, companyID uuid.UU
 	var components []*models.PayrollComponent
 	for rows.Next() {
 		var component models.PayrollComponent
-		component.CompanyID = companyID
 		if err := rows.Scan(
+			&component.ComponentID,
+			&component.CompanyID,
 			&component.ComponentCode,
 			&component.ComponentType,
 			&component.Description,
@@ -835,7 +839,9 @@ func (r *payrollRepository) UpdateComponent(ctx context.Context, component *mode
             description = $2,
             is_taxable = $3,
             is_active = $4,
-            contribution_side = $5
+            contribution_side = $5,
+            updated_at = NOW(),
+            version = version + 1
         WHERE company_id = $6 AND component_code = $7
           AND is_system = FALSE
     `
@@ -861,7 +867,10 @@ func (r *payrollRepository) UpdateComponent(ctx context.Context, component *mode
 func (r *payrollRepository) DeactivateComponent(ctx context.Context, companyID uuid.UUID, code string) error {
 	query := `
         UPDATE payroll.payroll_component
-        SET is_active = false
+        SET is_active = false,
+            deactivated_at = NOW(),
+            updated_at = NOW(),
+            version = version + 1
         WHERE company_id = $1 AND component_code = $2
           AND is_system = FALSE
     `
@@ -878,14 +887,17 @@ func (r *payrollRepository) DeactivateComponent(ctx context.Context, companyID u
 
 // ---------------------------------------------------------------------
 // Payroll Ledger
+//
+// DB column is now component_id. ComponentCode is JOIN-populated for
+// callers that need the human-readable code.
 // ---------------------------------------------------------------------
 
 func (r *payrollRepository) CreateLedgerEntry(ctx context.Context, entry *models.PayrollLedger) error {
 	query := `
         INSERT INTO payroll.payroll_ledger (
-            ledger_id, payroll_item_id, company_id, component_code, amount, created_at
+            ledger_id, payroll_item_id, company_id, component_id, amount, created_at
         ) VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT (payroll_item_id, component_code)
+        ON CONFLICT (payroll_item_id, component_id)
         DO UPDATE SET
             amount = EXCLUDED.amount
     `
@@ -899,7 +911,7 @@ func (r *payrollRepository) CreateLedgerEntry(ctx context.Context, entry *models
 		entry.LedgerID,
 		entry.PayrollItemID,
 		entry.CompanyID,
-		entry.ComponentCode,
+		entry.ComponentID,
 		entry.Amount,
 		entry.CreatedAt,
 	)
@@ -911,10 +923,18 @@ func (r *payrollRepository) CreateLedgerEntry(ctx context.Context, entry *models
 
 func (r *payrollRepository) GetLedgerEntriesByItem(ctx context.Context, itemID uuid.UUID) ([]*models.PayrollLedger, error) {
 	query := `
-        SELECT ledger_id, payroll_item_id, component_code, amount, created_at
-        FROM payroll.payroll_ledger
-        WHERE payroll_item_id = $1
-        ORDER BY created_at
+        SELECT
+            pl.ledger_id,
+            pl.payroll_item_id,
+            pl.company_id,
+            pl.component_id,
+            pc.component_code,
+            pl.amount,
+            pl.created_at
+        FROM payroll.payroll_ledger pl
+        JOIN payroll.payroll_component pc ON pc.component_id = pl.component_id
+        WHERE pl.payroll_item_id = $1
+        ORDER BY pl.created_at
     `
 	rows, err := r.client.Query(ctx, query, itemID)
 	if err != nil {
@@ -927,6 +947,8 @@ func (r *payrollRepository) GetLedgerEntriesByItem(ctx context.Context, itemID u
 		if err := rows.Scan(
 			&entry.LedgerID,
 			&entry.PayrollItemID,
+			&entry.CompanyID,
+			&entry.ComponentID,
 			&entry.ComponentCode,
 			&entry.Amount,
 			&entry.CreatedAt,
@@ -941,10 +963,6 @@ func (r *payrollRepository) GetLedgerEntriesByItem(ctx context.Context, itemID u
 	return entries, nil
 }
 
-// GetLedgerSummaryByRun returns the ledger component rollup for a run.
-//
-// Location: when locationID is non-nil, only entries for employees whose
-// snapshotted employment_location_id at run time matches are included.
 func (r *payrollRepository) GetLedgerSummaryByRun(
 	ctx context.Context,
 	runID uuid.UUID,
@@ -952,7 +970,7 @@ func (r *payrollRepository) GetLedgerSummaryByRun(
 ) ([]*models.LedgerSummary, error) {
 	query := `
         SELECT
-            pl.component_code,
+            pc.component_code,
             pc.component_type,
             pc.description,
             SUM(pl.amount) as total_amount,
@@ -960,18 +978,15 @@ func (r *payrollRepository) GetLedgerSummaryByRun(
             pc.contribution_side
         FROM payroll.payroll_ledger pl
         JOIN payroll.payroll_item pi ON pl.payroll_item_id = pi.payroll_item_id
-        JOIN payroll.payroll_run pr ON pi.payroll_run_id = pr.payroll_run_id
-        JOIN payroll.payroll_component pc 
-            ON pl.component_code = pc.component_code 
-            AND (pc.company_id = pr.company_id OR pc.company_id IS NULL)
+        JOIN payroll.payroll_component pc ON pc.component_id = pl.component_id
         WHERE pi.payroll_run_id = $1
           AND pi.is_superseded = FALSE
           AND ($2::uuid IS NULL OR pi.user_id IN (
               SELECT user_id FROM payroll.payroll_run_employees
               WHERE payroll_run_id = $1 AND employment_location_id = $2
           ))
-        GROUP BY pl.component_code, pc.component_type, pc.description, pc.is_taxable, pc.contribution_side
-        ORDER BY pc.component_type, pl.component_code
+        GROUP BY pc.component_code, pc.component_type, pc.description, pc.is_taxable, pc.contribution_side
+        ORDER BY pc.component_type, pc.component_code
     `
 	rows, err := r.client.Query(ctx, query, runID, locationID)
 	if err != nil {
@@ -1011,9 +1026,9 @@ func (r *payrollRepository) BulkCreateLedgerEntries(ctx context.Context, entries
 	}()
 	query := `
         INSERT INTO payroll.payroll_ledger (
-            ledger_id, payroll_item_id, company_id, component_code, amount, created_at
+            ledger_id, payroll_item_id, company_id, component_id, amount, created_at
         ) VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT (payroll_item_id, component_code)
+        ON CONFLICT (payroll_item_id, component_id)
         DO UPDATE SET
             amount = EXCLUDED.amount
     `
@@ -1033,7 +1048,7 @@ func (r *payrollRepository) BulkCreateLedgerEntries(ctx context.Context, entries
 			entry.LedgerID,
 			entry.PayrollItemID,
 			entry.CompanyID,
-			entry.ComponentCode,
+			entry.ComponentID,
 			entry.Amount,
 			entry.CreatedAt,
 		)
@@ -1048,7 +1063,7 @@ func (r *payrollRepository) BulkCreateLedgerEntries(ctx context.Context, entries
 }
 
 // ---------------------------------------------------------------------
-// Payroll Snapshot
+// Payroll Snapshot (unchanged — no component references)
 // ---------------------------------------------------------------------
 
 func (r *payrollRepository) CreateSnapshot(ctx context.Context, snapshot *models.PayrollSnapshot) error {
@@ -1142,7 +1157,7 @@ func (r *payrollRepository) GetSnapshotsByRun(ctx context.Context, runID uuid.UU
 }
 
 // ---------------------------------------------------------------------
-// Payroll Period Lock
+// Payroll Period Lock (unchanged — no component references)
 // ---------------------------------------------------------------------
 
 func (r *payrollRepository) CreatePayrollPeriodLock(ctx context.Context, lock *models.PayrollPeriodLock) error {
@@ -1274,7 +1289,7 @@ func (r *payrollRepository) ListPayrollLocks(ctx context.Context, companyID uuid
 }
 
 // ---------------------------------------------------------------------
-// Attendance related
+// Attendance related (unchanged — no component references)
 // ---------------------------------------------------------------------
 
 func (r *payrollRepository) GetEmployeeIDsForPayroll(ctx context.Context, companyID uuid.UUID, periodStart, periodEnd time.Time) ([]uuid.UUID, error) {
@@ -1465,9 +1480,9 @@ func (r *payrollRepository) CreatePayrollItemTx(ctx context.Context, tx *sql.Tx,
 func (r *payrollRepository) BulkCreateLedgerEntriesTx(ctx context.Context, tx *sql.Tx, entries []*models.PayrollLedger) error {
 	query := `
         INSERT INTO payroll.payroll_ledger (
-            ledger_id, payroll_item_id, company_id, component_code, amount, created_at
+            ledger_id, payroll_item_id, company_id, component_id, amount, created_at
         ) VALUES ($1,$2,$3,$4,$5,$6)
-        ON CONFLICT (payroll_item_id, component_code)
+        ON CONFLICT (payroll_item_id, component_id)
         DO UPDATE SET
             amount = EXCLUDED.amount
     `
@@ -1487,7 +1502,7 @@ func (r *payrollRepository) BulkCreateLedgerEntriesTx(ctx context.Context, tx *s
 			entry.LedgerID,
 			entry.PayrollItemID,
 			entry.CompanyID,
-			entry.ComponentCode,
+			entry.ComponentID,
 			entry.Amount,
 			entry.CreatedAt,
 		)
@@ -1667,7 +1682,12 @@ func (r *payrollRepository) DeletePayrollPeriodLockTx(ctx context.Context, tx *s
 // Employee Payroll History
 // ---------------------------------------------------------------------
 
-func (r *payrollRepository) GetEmployeePayrollHistory(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, from, to time.Time) ([]*models.PayrollItemDetail, error) {
+func (r *payrollRepository) GetEmployeePayrollHistory(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+	from, to time.Time,
+) ([]*models.PayrollItemDetail, error) {
 	query := `
         SELECT
             pi.payroll_item_id,
@@ -1685,7 +1705,7 @@ func (r *payrollRepository) GetEmployeePayrollHistory(ctx context.Context, compa
             u.username,
             u.full_name,
             ce.employee_id,
-            p.title,
+            COALESCE(p.title_override, j.job_title) AS position_title,
             d.department_name
         FROM payroll.payroll_item pi
         JOIN payroll.payroll_run pr ON pr.payroll_run_id = pi.payroll_run_id
@@ -1693,6 +1713,7 @@ func (r *payrollRepository) GetEmployeePayrollHistory(ctx context.Context, compa
         JOIN company_employees ce
             ON ce.user_id = pi.user_id AND ce.company_id = pr.company_id
         LEFT JOIN positions p ON ce.position_id = p.position_id
+        LEFT JOIN jobs j ON j.job_id = p.job_id
         LEFT JOIN departments d ON p.department_id = d.department_id
         WHERE pr.company_id = $1
           AND pi.user_id = $2
@@ -1705,6 +1726,7 @@ func (r *payrollRepository) GetEmployeePayrollHistory(ctx context.Context, compa
 		return nil, fmt.Errorf("failed to get payroll history: %w", err)
 	}
 	defer rows.Close()
+
 	itemMap := make(map[uuid.UUID]*models.PayrollItemDetail)
 	var itemIDs []uuid.UUID
 	for rows.Next() {
@@ -1740,22 +1762,19 @@ func (r *payrollRepository) GetEmployeePayrollHistory(ctx context.Context, compa
 	if len(itemIDs) == 0 {
 		return []*models.PayrollItemDetail{}, nil
 	}
+
 	ledgerQuery := `
         SELECT
             pl.payroll_item_id,
-            pl.component_code,
+            pc.component_code,
             pl.amount,
             pc.component_type,
             pc.description,
             pc.is_taxable
         FROM payroll.payroll_ledger pl
-        JOIN payroll.payroll_item pi ON pl.payroll_item_id = pi.payroll_item_id
-        JOIN payroll.payroll_run pr ON pi.payroll_run_id = pr.payroll_run_id
-        JOIN payroll.payroll_component pc 
-            ON pl.component_code = pc.component_code 
-            AND (pc.company_id = pr.company_id OR pc.company_id IS NULL)
+        JOIN payroll.payroll_component pc ON pc.component_id = pl.component_id
         WHERE pl.payroll_item_id = ANY($1)
-        ORDER BY pl.payroll_item_id
+        ORDER BY pl.payroll_item_id, pc.component_type, pc.component_code
     `
 	ledgerRows, err := r.client.Query(ctx, ledgerQuery, itemIDs)
 	if err != nil {
@@ -1782,6 +1801,7 @@ func (r *payrollRepository) GetEmployeePayrollHistory(ctx context.Context, compa
 	if err = ledgerRows.Err(); err != nil {
 		return nil, err
 	}
+
 	result := make([]*models.PayrollItemDetail, 0, len(itemIDs))
 	for _, id := range itemIDs {
 		result = append(result, itemMap[id])
@@ -1816,7 +1836,7 @@ func (r *payrollRepository) GetEmployeeYTDSummary(ctx context.Context, companyID
 	}
 	componentQuery := `
         SELECT
-            pl.component_code,
+            pc.component_code,
             pc.component_type,
             pc.description,
             COALESCE(SUM(pl.amount),0),
@@ -1825,15 +1845,13 @@ func (r *payrollRepository) GetEmployeeYTDSummary(ctx context.Context, companyID
         FROM payroll.payroll_ledger pl
         JOIN payroll.payroll_item pi ON pl.payroll_item_id = pi.payroll_item_id
         JOIN payroll.payroll_run pr ON pi.payroll_run_id = pr.payroll_run_id
-        JOIN payroll.payroll_component pc 
-            ON pl.component_code = pc.component_code 
-            AND (pc.company_id = pr.company_id OR pc.company_id IS NULL)
+        JOIN payroll.payroll_component pc ON pc.component_id = pl.component_id
         WHERE pr.company_id = $1
           AND pi.user_id = $2
           AND pr.period_start >= $3
           AND pr.period_end <= $4
           AND pi.is_superseded = FALSE
-        GROUP BY pl.component_code, pc.component_type, pc.description, pc.is_taxable, pc.contribution_side
+        GROUP BY pc.component_code, pc.component_type, pc.description, pc.is_taxable, pc.contribution_side
     `
 	rows, err := r.client.Query(ctx, componentQuery,
 		companyID, userID, financialYearStart, asOf,
@@ -1919,20 +1937,18 @@ func (r *payrollRepository) GetComponentTrend(ctx context.Context, companyID uui
 	query := `
 		SELECT
 			pr.period_start,
-			pl.component_code,
+			pc.component_code,
 			COALESCE(SUM(pl.amount),0)
 		FROM payroll.payroll_ledger pl
 		JOIN payroll.payroll_item pi ON pl.payroll_item_id = pi.payroll_item_id
 		JOIN payroll.payroll_run pr ON pi.payroll_run_id = pr.payroll_run_id
-		JOIN payroll.payroll_component pc 
-			ON pl.component_code = pc.component_code 
-			AND (pc.company_id = pr.company_id OR pc.company_id IS NULL)
+		JOIN payroll.payroll_component pc ON pc.component_id = pl.component_id
 		WHERE pr.company_id = $1
-		  AND pl.component_code = $2
+		  AND pc.component_code = $2
 		  AND pr.period_start >= $3
 		  AND pr.period_end <= $4
 		  AND pi.is_superseded = FALSE
-		GROUP BY pr.period_start, pl.component_code
+		GROUP BY pr.period_start, pc.component_code
 		ORDER BY pr.period_start
 	`
 	rows, err := r.client.Query(ctx, query,
@@ -1958,10 +1974,6 @@ func (r *payrollRepository) GetComponentTrend(ctx context.Context, companyID uui
 	return result, nil
 }
 
-// GetRunStatutorySummary returns the statutory aggregates for a run.
-//
-// Location: when locationID is non-nil, only contributions for employees
-// whose snapshotted employment_location_id at run time matches are included.
 func (r *payrollRepository) GetRunStatutorySummary(
 	ctx context.Context,
 	runID uuid.UUID,
@@ -2008,6 +2020,8 @@ func (r *payrollRepository) GetRunStatutorySummary(
 
 // ---------------------------------------------------------------------
 // Payroll Adjustments
+//
+// DB column is now component_id. Filter by code JOINs the catalog.
 // ---------------------------------------------------------------------
 
 func (r *payrollRepository) CreatePayrollAdjustment(ctx context.Context, adjustment *models.PayrollAdjustment) error {
@@ -2016,7 +2030,7 @@ func (r *payrollRepository) CreatePayrollAdjustment(ctx context.Context, adjustm
 			adjustment_id,
 			company_id,
 			user_id,
-			component_code,
+			component_id,
 			amount,
 			adjustment_type,
 			reason,
@@ -2036,7 +2050,7 @@ func (r *payrollRepository) CreatePayrollAdjustment(ctx context.Context, adjustm
 		adjustment.AdjustmentID,
 		adjustment.CompanyID,
 		adjustment.UserID,
-		adjustment.ComponentCode,
+		adjustment.ComponentID,
 		adjustment.Amount,
 		adjustment.AdjustmentType,
 		adjustment.Reason,
@@ -2091,18 +2105,20 @@ func (r *payrollRepository) DeletePayrollAdjustment(ctx context.Context, adjustm
 func (r *payrollRepository) GetPayrollAdjustmentByID(ctx context.Context, adjustmentID uuid.UUID) (*models.PayrollAdjustment, error) {
 	query := `
 		SELECT
-			adjustment_id,
-			company_id,
-			user_id,
-			component_code,
-			amount,
-			adjustment_type,
-			reason,
-			applicable_month,
-			created_at,
-			created_by
-		FROM payroll.payroll_adjustment
-		WHERE adjustment_id = $1
+			pa.adjustment_id,
+			pa.company_id,
+			pa.user_id,
+			pa.component_id,
+			pc.component_code,
+			pa.amount,
+			pa.adjustment_type,
+			pa.reason,
+			pa.applicable_month,
+			pa.created_at,
+			pa.created_by
+		FROM payroll.payroll_adjustment pa
+		JOIN payroll.payroll_component pc ON pc.component_id = pa.component_id
+		WHERE pa.adjustment_id = $1
 	`
 	row := r.client.QueryRow(ctx, query, adjustmentID)
 	var a models.PayrollAdjustment
@@ -2110,6 +2126,7 @@ func (r *payrollRepository) GetPayrollAdjustmentByID(ctx context.Context, adjust
 		&a.AdjustmentID,
 		&a.CompanyID,
 		&a.UserID,
+		&a.ComponentID,
 		&a.ComponentCode,
 		&a.Amount,
 		&a.AdjustmentType,
@@ -2127,54 +2144,51 @@ func (r *payrollRepository) GetPayrollAdjustmentByID(ctx context.Context, adjust
 	return &a, nil
 }
 
-// ListPayrollAdjustments returns a page of payroll adjustments.
-//
-// Location: when filter.LocationID is non-nil, only adjustments for employees
-// whose current employment_location_id matches are returned.
 func (r *payrollRepository) ListPayrollAdjustments(ctx context.Context, filter models.PayrollAdjustmentFilter) ([]*models.PayrollAdjustment, int64, error) {
 	var conditions []string
 	var args []interface{}
 	argIdx := 1
-	conditions = append(conditions, fmt.Sprintf("company_id = $%d", argIdx))
+	conditions = append(conditions, fmt.Sprintf("pa.company_id = $%d", argIdx))
 	args = append(args, filter.CompanyID)
 	argIdx++
 	if filter.UserID != nil {
-		conditions = append(conditions, fmt.Sprintf("user_id = $%d", argIdx))
+		conditions = append(conditions, fmt.Sprintf("pa.user_id = $%d", argIdx))
 		args = append(args, *filter.UserID)
 		argIdx++
 	}
 	if filter.ComponentCode != nil {
-		conditions = append(conditions, fmt.Sprintf("component_code = $%d", argIdx))
+		conditions = append(conditions, fmt.Sprintf("pc.component_code = $%d", argIdx))
 		args = append(args, *filter.ComponentCode)
 		argIdx++
 	}
 	if filter.AdjustmentType != nil {
-		conditions = append(conditions, fmt.Sprintf("adjustment_type = $%d", argIdx))
+		conditions = append(conditions, fmt.Sprintf("pa.adjustment_type = $%d", argIdx))
 		args = append(args, *filter.AdjustmentType)
 		argIdx++
 	}
 	if filter.FromMonth != nil {
-		conditions = append(conditions, fmt.Sprintf("applicable_month >= $%d", argIdx))
+		conditions = append(conditions, fmt.Sprintf("pa.applicable_month >= $%d", argIdx))
 		args = append(args, *filter.FromMonth)
 		argIdx++
 	}
 	if filter.ToMonth != nil {
-		conditions = append(conditions, fmt.Sprintf("applicable_month <= $%d", argIdx))
+		conditions = append(conditions, fmt.Sprintf("pa.applicable_month <= $%d", argIdx))
 		args = append(args, *filter.ToMonth)
 		argIdx++
 	}
-	// 👇 Location filter — via company_employees (current assignment)
 	if filter.LocationID != nil {
 		conditions = append(conditions, fmt.Sprintf(
-			"user_id IN (SELECT user_id FROM company_employees WHERE company_id = $1 AND employment_location_id = $%d AND is_active = true)",
+			"pa.user_id IN (SELECT user_id FROM company_employees WHERE company_id = $1 AND primary_location_id = $%d AND is_active = true)",
 			argIdx))
 		args = append(args, *filter.LocationID)
 		argIdx++
 	}
 	whereClause := "WHERE " + strings.Join(conditions, " AND ")
+
 	countQuery := fmt.Sprintf(`
 		SELECT COUNT(*)
-		FROM payroll.payroll_adjustment
+		FROM payroll.payroll_adjustment pa
+		JOIN payroll.payroll_component pc ON pc.component_id = pa.component_id
 		%s
 	`, whereClause)
 	var total int64
@@ -2185,19 +2199,21 @@ func (r *payrollRepository) ListPayrollAdjustments(ctx context.Context, filter m
 	offset := (filter.Page - 1) * filter.PageSize
 	query := fmt.Sprintf(`
 		SELECT
-			adjustment_id,
-			company_id,
-			user_id,
-			component_code,
-			amount,
-			adjustment_type,
-			reason,
-			applicable_month,
-			created_at,
-			created_by
-		FROM payroll.payroll_adjustment
+			pa.adjustment_id,
+			pa.company_id,
+			pa.user_id,
+			pa.component_id,
+			pc.component_code,
+			pa.amount,
+			pa.adjustment_type,
+			pa.reason,
+			pa.applicable_month,
+			pa.created_at,
+			pa.created_by
+		FROM payroll.payroll_adjustment pa
+		JOIN payroll.payroll_component pc ON pc.component_id = pa.component_id
 		%s
-		ORDER BY applicable_month DESC
+		ORDER BY pa.applicable_month DESC
 		LIMIT $%d OFFSET $%d
 	`, whereClause, argIdx, argIdx+1)
 	args = append(args, filter.PageSize, offset)
@@ -2213,6 +2229,7 @@ func (r *payrollRepository) ListPayrollAdjustments(ctx context.Context, filter m
 			&a.AdjustmentID,
 			&a.CompanyID,
 			&a.UserID,
+			&a.ComponentID,
 			&a.ComponentCode,
 			&a.Amount,
 			&a.AdjustmentType,
@@ -2232,7 +2249,7 @@ func (r *payrollRepository) ListPayrollAdjustments(ctx context.Context, filter m
 }
 
 // ---------------------------------------------------------------------
-// Payroll Run State Transitions
+// Payroll Run State Transitions (unchanged)
 // ---------------------------------------------------------------------
 
 func (r *payrollRepository) GetPayrollRunForUpdate(ctx context.Context, runID uuid.UUID) (*models.PayrollRun, error) {
@@ -2359,15 +2376,17 @@ func (r *payrollRepository) TransitionRunToProcessing(ctx context.Context, runID
 
 func (r *payrollRepository) GetAdjustmentsForEmployee(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, startDate, endDate time.Time) ([]*models.PayrollAdjustment, error) {
 	query := `
-        SELECT adjustment_id, company_id, user_id,
-               component_code, amount, adjustment_type,
-               reason, applicable_month, created_at, created_by
-        FROM payroll.payroll_adjustment
-        WHERE company_id = $1
-          AND user_id = $2
-          AND applicable_month >= $3
-          AND applicable_month <= $4
-        ORDER BY applicable_month
+        SELECT pa.adjustment_id, pa.company_id, pa.user_id,
+               pa.component_id, pc.component_code,
+               pa.amount, pa.adjustment_type,
+               pa.reason, pa.applicable_month, pa.created_at, pa.created_by
+        FROM payroll.payroll_adjustment pa
+        JOIN payroll.payroll_component pc ON pc.component_id = pa.component_id
+        WHERE pa.company_id = $1
+          AND pa.user_id = $2
+          AND pa.applicable_month >= $3
+          AND pa.applicable_month <= $4
+        ORDER BY pa.applicable_month
     `
 	rows, err := r.client.Query(ctx, query, companyID, userID, startDate, endDate)
 	if err != nil {
@@ -2381,6 +2400,7 @@ func (r *payrollRepository) GetAdjustmentsForEmployee(ctx context.Context, compa
 			&a.AdjustmentID,
 			&a.CompanyID,
 			&a.UserID,
+			&a.ComponentID,
 			&a.ComponentCode,
 			&a.Amount,
 			&a.AdjustmentType,
@@ -2606,7 +2626,7 @@ func (r *payrollRepository) RecalculatePayrollItemNet(ctx context.Context, itemI
 			SELECT SUM(pl.amount)
 			FROM payroll.payroll_ledger pl
 			JOIN payroll.payroll_component pc
-				ON pc.component_code = pl.component_code
+				ON pc.component_id = pl.component_id
 			WHERE pl.payroll_item_id = pi.payroll_item_id
 			  AND pc.component_type = 'deduction'
 		), 0)
@@ -2698,10 +2718,6 @@ func (r *payrollRepository) ResetPayrollRunDataTx(ctx context.Context, tx *sql.T
 // Employee IDs by Run
 // ---------------------------------------------------------------------
 
-// GetEmployeeIDsByRun returns the distinct employees with items in the run.
-//
-// Location: when locationID is non-nil, only employees whose snapshotted
-// employment_location_id at run time matches are returned.
 func (r *payrollRepository) GetEmployeeIDsByRun(
 	ctx context.Context,
 	runID uuid.UUID,
@@ -2734,7 +2750,7 @@ func (r *payrollRepository) GetEmployeeIDsByRun(
 }
 
 // ---------------------------------------------------------------------
-// Attendance Days
+// Attendance Days (unchanged)
 // ---------------------------------------------------------------------
 
 func (r *payrollRepository) GetPayrollAttendanceDays(
@@ -2779,7 +2795,7 @@ func (r *payrollRepository) GetPayrollAttendanceDays(
 }
 
 // ---------------------------------------------------------------------
-// Finalize Attendance for Period
+// Finalize Attendance for Period (unchanged)
 // ---------------------------------------------------------------------
 
 func (r *payrollRepository) FinalizeAttendanceForPeriod(
@@ -2802,6 +2818,7 @@ func (r *payrollRepository) FinalizeAttendanceForPeriod(
 	}
 	return nil
 }
+
 func (r *payrollRepository) CreatePayrollRunTx(ctx context.Context, tx *sql.Tx, run *models.PayrollRun) error {
 	if run.PayrollRunID == uuid.Nil {
 		run.PayrollRunID = uuid.New()

@@ -21,8 +21,7 @@ type LeaveRepository interface {
 	GetLeaveEntitlementByID(ctx context.Context, entitlementID uuid.UUID) (*models.LeaveEntitlement, error)
 	GetLeaveEntitlementsByUser(ctx context.Context, userID uuid.UUID, positionID *uuid.UUID,
 	) ([]*models.LeaveEntitlement, error)
-	ListActiveEmployeeUserIDs(ctx context.Context, companyID uuid.UUID) ([]uuid.UUID, error)
-	ListActiveEmployeeUserIDsByPosition(ctx context.Context, companyID, positionID uuid.UUID) ([]uuid.UUID, error)
+
 	// GetLeaveEntitlementsByCompany — location filter applies when non-nil.
 	GetLeaveEntitlementsByCompany(
 		ctx context.Context,

@@ -40,14 +40,14 @@ type PayrollAdjustmentService interface {
 
 type payrollAdjustmentService struct {
 	repo             repository.PayrollRepository
-	employeeRepo     hrRepo.EmployeeRepository // 👈 new
+	employeeRepo     hrRepo.EmployeeRepository
 	audit            *audit.AuditService
 	idempotencyStore idempotency.Store
 }
 
 func NewPayrollAdjustmentService(
 	repo repository.PayrollRepository,
-	employeeRepo hrRepo.EmployeeRepository, // 👈 new
+	employeeRepo hrRepo.EmployeeRepository,
 	audit *audit.AuditService,
 	idempotencyStore idempotency.Store,
 ) PayrollAdjustmentService {
@@ -59,7 +59,6 @@ func NewPayrollAdjustmentService(
 	}
 }
 
-// ensureEmployeeInScope — same pattern.
 func (s *payrollAdjustmentService) ensureEmployeeInScope(
 	ctx context.Context,
 	companyID, targetUserID uuid.UUID,
@@ -135,7 +134,6 @@ func (s *payrollAdjustmentService) Create(
 		return nil, errors.New("nil input")
 	}
 
-	// 👇 Location scope check
 	if err := s.ensureEmployeeInScope(ctx, input.CompanyID, input.UserID); err != nil {
 		return nil, err
 	}
@@ -172,7 +170,8 @@ func (s *payrollAdjustmentService) Create(
 		AdjustmentID:    uuid.New(),
 		CompanyID:       input.CompanyID,
 		UserID:          input.UserID,
-		ComponentCode:   input.ComponentCode,
+		ComponentID:     component.ComponentID,   // ← resolved FK
+		ComponentCode:   component.ComponentCode, // ← display / API
 		Amount:          input.Amount,
 		AdjustmentType:  input.AdjustmentType,
 		Reason:          reason,
@@ -212,7 +211,6 @@ func (s *payrollAdjustmentService) BulkCreate(
 		return nil
 	}
 
-	// 👇 Location scope check for every input
 	for _, input := range inputs {
 		if input == nil {
 			return errors.New("nil input in bulk")
@@ -271,7 +269,8 @@ func (s *payrollAdjustmentService) BulkCreate(
 			AdjustmentID:    uuid.New(),
 			CompanyID:       input.CompanyID,
 			UserID:          input.UserID,
-			ComponentCode:   input.ComponentCode,
+			ComponentID:     component.ComponentID,   // ← resolved FK
+			ComponentCode:   component.ComponentCode, // ← display / API
 			Amount:          input.Amount,
 			AdjustmentType:  input.AdjustmentType,
 			Reason:          reason,
@@ -279,15 +278,18 @@ func (s *payrollAdjustmentService) BulkCreate(
 			CreatedAt:       time.Now().UTC(),
 			CreatedBy:       &input.CreatedBy,
 		}
+
+		// DB column is component_id (FK). The repo path is bypassed here (raw
+		// insert inside our tx), so we bind the resolved UUID directly.
 		_, err = tx.ExecContext(ctx, `
 			INSERT INTO payroll.payroll_adjustment (
-				adjustment_id, company_id, user_id, component_code,
+				adjustment_id, company_id, user_id, component_id,
 				amount, adjustment_type, reason, applicable_month,
 				created_at, created_by
 			)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 		`,
-			adj.AdjustmentID, adj.CompanyID, adj.UserID, adj.ComponentCode,
+			adj.AdjustmentID, adj.CompanyID, adj.UserID, adj.ComponentID,
 			adj.Amount, adj.AdjustmentType, adj.Reason, adj.ApplicableMonth,
 			adj.CreatedAt, adj.CreatedBy,
 		)
@@ -325,6 +327,10 @@ func (s *payrollAdjustmentService) BulkCreate(
 }
 
 // Update — location scope + idempotency + audit.
+//
+// Component is not editable here; if the adjustment's component needs to
+// change, delete and re-create. That keeps the ID stable across the
+// adjustment's lifetime, which matters for the ledger FK.
 func (s *payrollAdjustmentService) Update(
 	ctx context.Context,
 	input *models.UpdatePayrollAdjustmentInput,
@@ -341,7 +347,6 @@ func (s *payrollAdjustmentService) Update(
 		return nil, errors.New("adjustment not found")
 	}
 
-	// 👇 Location scope check
 	if err := s.ensureEmployeeInScope(ctx, existing.CompanyID, existing.UserID); err != nil {
 		return nil, err
 	}
@@ -402,7 +407,6 @@ func (s *payrollAdjustmentService) Delete(
 		return errors.New("adjustment not found")
 	}
 
-	// 👇 Location scope check
 	if err := s.ensureEmployeeInScope(ctx, existing.CompanyID, existing.UserID); err != nil {
 		return err
 	}
@@ -460,7 +464,6 @@ func (s *payrollAdjustmentService) GetEmployeeAdjustmentsForPeriod(
 	userID uuid.UUID,
 	periodStart, periodEnd time.Time,
 ) ([]*models.PayrollAdjustment, error) {
-	// 👇 Location scope check
 	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
 		return nil, err
 	}

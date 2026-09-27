@@ -59,6 +59,11 @@ type ResolveBatchRequest struct {
 	Reason  string      `json:"reason"`
 }
 
+type ResolveAllUsersRequest struct {
+	AsOf   *time.Time `json:"as_of,omitempty"`
+	Reason string     `json:"reason"`
+}
+
 type OnboardingRequest struct {
 	CompanyID uuid.UUID `json:"company_id"`
 	UserID    uuid.UUID `json:"user_id"`
@@ -73,7 +78,7 @@ type PositionChangeRequest struct {
 
 // ----- handlers -----
 
-// ResolveSingleUser - POST /companies/{companyID}/leave/admin/policies/resolve/user/{userID}
+// ResolveSingleUser — unchanged. Synchronous, one user, small blast radius.
 func (h *LeavePolicyResolutionHandler) ResolveSingleUser(w http.ResponseWriter, r *http.Request) {
 	ctx := injectCommonContext(r.Context(), r)
 
@@ -132,7 +137,11 @@ func (h *LeavePolicyResolutionHandler) ResolveSingleUser(w http.ResponseWriter, 
 	})
 }
 
-// ResolveBatchUsers - POST /companies/{companyID}/leave/admin/policies/resolve/batch
+// ResolveBatchUsers — ASYNC. Enqueues one resolve_user job per user and
+// returns 202 Accepted immediately. The resolver worker does the work.
+//
+// Batch size is capped at 1000 — anything larger is an ops problem, not a
+// UI action. Over-cap returns 400.
 func (h *LeavePolicyResolutionHandler) ResolveBatchUsers(w http.ResponseWriter, r *http.Request) {
 	ctx := injectCommonContext(r.Context(), r)
 
@@ -143,49 +152,51 @@ func (h *LeavePolicyResolutionHandler) ResolveBatchUsers(w http.ResponseWriter, 
 		return
 	}
 
-	actorType, actorID, err := h.getActor(ctx)
-	if err != nil {
+	// Auth check still runs — the audit log should record who queued it.
+	if _, _, err := h.getActor(ctx); err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	metadata := h.getMetadata(ctx)
 
 	var req ResolveBatchRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
 	if len(req.UserIDs) == 0 {
 		h.respondWithError(w, http.StatusBadRequest, "at least one user ID is required")
 		return
 	}
-
-	asOf := time.Now().UTC()
-	if req.AsOf != nil {
-		asOf = *req.AsOf
+	const maxBatch = 1000
+	if len(req.UserIDs) > maxBatch {
+		h.respondWithError(w, http.StatusBadRequest, "batch size exceeds limit")
+		return
 	}
+
 	reason := req.Reason
 	if reason == "" {
 		reason = "batch resolution triggered by admin"
 	}
 
-	result, err := h.policyResolutionService.ResolveBatchLeaveEntitlements(
-		ctx, companyID, req.UserIDs, asOf, reason, actorType, actorID, metadata,
-	)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, "failed to resolve batch leave entitlements")
+	if err := h.policyResolutionService.EnqueueUserResolutionJobs(
+		ctx, companyID, req.UserIDs, reason,
+	); err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, "failed to enqueue resolution jobs")
 		return
 	}
 
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+	h.respondWithJSON(w, http.StatusAccepted, map[string]interface{}{
 		"success": true,
-		"message": "Batch leave entitlements resolved successfully",
-		"data":    result,
+		"message": "Resolution queued",
+		"data": map[string]interface{}{
+			"company_id": companyID,
+			"enqueued":   len(req.UserIDs),
+			"reason":     reason,
+		},
 	})
 }
 
-// GetEffectivePolicies - GET /companies/{companyID}/leave/admin/policies/effective/{userID}
+// GetEffectivePolicies — unchanged.
 func (h *LeavePolicyResolutionHandler) GetEffectivePolicies(w http.ResponseWriter, r *http.Request) {
 	ctx := injectCommonContext(r.Context(), r)
 
@@ -232,7 +243,7 @@ func (h *LeavePolicyResolutionHandler) GetEffectivePolicies(w http.ResponseWrite
 	})
 }
 
-// ResolveOnboarding - POST /internal/leave/resolve/onboarding
+// ResolveOnboarding — unchanged. One user, called on hire event.
 func (h *LeavePolicyResolutionHandler) ResolveOnboarding(w http.ResponseWriter, r *http.Request) {
 	ctx := injectCommonContext(r.Context(), r)
 
@@ -267,7 +278,7 @@ func (h *LeavePolicyResolutionHandler) ResolveOnboarding(w http.ResponseWriter, 
 	})
 }
 
-// ResolvePositionChange - POST /internal/leave/resolve/position-change
+// ResolvePositionChange — unchanged. One user, called on position edit.
 func (h *LeavePolicyResolutionHandler) ResolvePositionChange(w http.ResponseWriter, r *http.Request) {
 	ctx := injectCommonContext(r.Context(), r)
 
@@ -302,10 +313,7 @@ func (h *LeavePolicyResolutionHandler) ResolvePositionChange(w http.ResponseWrit
 	})
 }
 
-// ListEntitlements - GET /companies/{companyID}/leave/admin/entitlements
-//
-// Reads the request's location scope and passes it to the service.
-// nil = company-wide (X-Location-ID: ALL).
+// ListEntitlements — unchanged.
 func (h *LeavePolicyResolutionHandler) ListEntitlements(w http.ResponseWriter, r *http.Request) {
 	ctx := injectCommonContext(r.Context(), r)
 
@@ -335,7 +343,6 @@ func (h *LeavePolicyResolutionHandler) ListEntitlements(w http.ResponseWriter, r
 		pageSize = 50
 	}
 
-	// 👇 Location scope filter.
 	locFilter := locationctx.Filter(ctx)
 
 	entitlements, total, err := h.policyResolutionService.GetLeaveEntitlements(
@@ -374,6 +381,50 @@ func (h *LeavePolicyResolutionHandler) ListEntitlements(w http.ResponseWriter, r
 			},
 			"company_id": companyID,
 			"user_id":    userID,
+		},
+	})
+}
+
+// ResolveAllUsers — ASYNC. Enqueues a single resolve_company job. The
+// worker fans out in chunks of 100 internally.
+func (h *LeavePolicyResolutionHandler) ResolveAllUsers(w http.ResponseWriter, r *http.Request) {
+	ctx := injectCommonContext(r.Context(), r)
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	if _, _, err := h.getActor(ctx); err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	var req ResolveAllUsersRequest
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+
+	reason := req.Reason
+	if reason == "" {
+		reason = "initial backfill"
+	}
+
+	if err := h.policyResolutionService.EnqueueCompanyResolution(
+		ctx, companyID, reason,
+	); err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, "failed to enqueue company resolution")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusAccepted, map[string]interface{}{
+		"success": true,
+		"message": "Company-wide resolution queued",
+		"data": map[string]interface{}{
+			"company_id": companyID,
+			"reason":     reason,
 		},
 	})
 }

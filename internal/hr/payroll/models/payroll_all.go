@@ -83,18 +83,37 @@ const (
 )
 
 // ============================================================================
-// payroll_component (company‑specific)
+// payroll_component (company‑specific catalog)
+//
+// Schema change: this table now has a surrogate PK (component_id). The code
+// remains a per-company business label — unique only within (company_id,
+// component_code) while is_active.
+//
+// All child tables (payroll_ledger, employee_loan, arrears, attendance_rule,
+// employee_fine, salary_structure_component, statutory_component_mapping,
+// payroll_adjustment, company_payroll_settings) now reference component_id.
+//
+// The API still speaks in component_code. Services resolve code -> id and set
+// ComponentID on the child struct before insert.
 // ============================================================================
 
 type PayrollComponent struct {
-	CompanyID        uuid.UUID `json:"company_id" db:"company_id"`
-	ComponentCode    string    `json:"component_code" db:"component_code"`
-	ComponentType    string    `json:"component_type" db:"component_type"`
-	Description      string    `json:"description,omitempty" db:"description"`
-	IsTaxable        bool      `json:"is_taxable" db:"is_taxable"`
-	IsSystem         bool      `json:"is_system" db:"is_system"`
-	IsActive         bool      `json:"is_active" db:"is_active"`
-	ContributionSide string    `json:"contribution_side" db:"contribution_side"`
+	ComponentID      uuid.UUID  `json:"component_id" db:"component_id"`
+	CompanyID        uuid.UUID  `json:"company_id" db:"company_id"`
+	ComponentCode    string     `json:"component_code" db:"component_code"`
+	ComponentType    string     `json:"component_type" db:"component_type"`
+	Description      string     `json:"description,omitempty" db:"description"`
+	IsTaxable        bool       `json:"is_taxable" db:"is_taxable"`
+	IsSystem         bool       `json:"is_system" db:"is_system"`
+	IsActive         bool       `json:"is_active" db:"is_active"`
+	ContributionSide string     `json:"contribution_side" db:"contribution_side"`
+	CreatedAt        time.Time  `json:"created_at" db:"created_at"`
+	CreatedBy        *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
+	UpdatedAt        time.Time  `json:"updated_at" db:"updated_at"`
+	UpdatedBy        *uuid.UUID `json:"updated_by,omitempty" db:"updated_by"`
+	DeactivatedAt    *time.Time `json:"deactivated_at,omitempty" db:"deactivated_at"`
+	DeactivatedBy    *uuid.UUID `json:"deactivated_by,omitempty" db:"deactivated_by"`
+	Version          int        `json:"version" db:"version"`
 }
 
 type ComponentFilter struct {
@@ -123,16 +142,20 @@ type SalaryStructure struct {
 	DeactivatedBy     *uuid.UUID `json:"deactivated_by,omitempty" db:"deactivated_by"`
 }
 
+// SalaryStructureComponent: DB stores component_id + based_on_component_id.
+// ComponentCode / BasedOnComponent are populated by JOIN and used by callers.
 type SalaryStructureComponent struct {
-	MappingID         uuid.UUID `json:"mapping_id" db:"mapping_id"`
-	SalaryStructureID uuid.UUID `json:"salary_structure_id" db:"salary_structure_id"`
-	CompanyID         uuid.UUID `json:"company_id,omitempty"` // for ownership validation
-	ComponentCode     string    `json:"component_code" db:"component_code"`
-	CalculationType   string    `json:"calculation_type" db:"calculation_type"`
-	Value             float64   `json:"value" db:"value"`
-	BasedOnComponent  *string   `json:"based_on_component,omitempty" db:"based_on_component"`
-	SequenceOrder     int       `json:"sequence_order" db:"sequence_order"`
-	CreatedAt         time.Time `json:"created_at" db:"created_at"`
+	MappingID          uuid.UUID  `json:"mapping_id" db:"mapping_id"`
+	SalaryStructureID  uuid.UUID  `json:"salary_structure_id" db:"salary_structure_id"`
+	CompanyID          uuid.UUID  `json:"company_id,omitempty" db:"-"`
+	ComponentID        uuid.UUID  `json:"component_id" db:"component_id"`
+	ComponentCode      string     `json:"component_code" db:"component_code"` // JOIN-populated
+	CalculationType    string     `json:"calculation_type" db:"calculation_type"`
+	Value              float64    `json:"value" db:"value"`
+	BasedOnComponentID *uuid.UUID `json:"based_on_component_id,omitempty" db:"based_on_component_id"`
+	BasedOnComponent   *string    `json:"based_on_component,omitempty" db:"based_on_component"` // JOIN-populated
+	SequenceOrder      int        `json:"sequence_order" db:"sequence_order"`
+	CreatedAt          time.Time  `json:"created_at" db:"created_at"`
 }
 
 type SalaryStructureSnapshot struct {
@@ -147,7 +170,7 @@ type SalaryStructureSnapshot struct {
 }
 
 // ============================================================================
-// employee_salary
+// employee_salary  (unchanged — no component FK)
 // ============================================================================
 
 type EmployeeSalary struct {
@@ -242,16 +265,21 @@ type PayrollItemDetail struct {
 	Components     []PayrollLedgerItem `json:"components"`
 }
 
+// PayrollLedger — child of payroll_item. DB column is component_id.
+// ComponentCode is JOIN-populated for display.
 type PayrollLedger struct {
 	LedgerID      uuid.UUID `json:"ledger_id" db:"ledger_id"`
 	PayrollItemID uuid.UUID `json:"payroll_item_id" db:"payroll_item_id"`
-	CompanyID     uuid.UUID `json:"company_id"` // new field
+	CompanyID     uuid.UUID `json:"company_id" db:"company_id"`
 
-	ComponentCode string    `json:"component_code" db:"component_code"`
-	Amount        float64   `json:"amount" db:"amount"`
-	CreatedAt     time.Time `json:"created_at" db:"created_at"`
+	ComponentID   uuid.UUID `json:"component_id" db:"component_id"`
+	ComponentCode string    `json:"component_code" db:"component_code"` // JOIN-populated
+
+	Amount    float64   `json:"amount" db:"amount"`
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
 }
 
+// PayrollLedgerItem is a pure DTO used in API responses — code only.
 type PayrollLedgerItem struct {
 	ComponentCode string  `json:"component_code"`
 	ComponentType string  `json:"component_type"`
@@ -277,15 +305,14 @@ type PayrollSnapshot struct {
 	SnapshotID   uuid.UUID  `json:"snapshot_id" db:"snapshot_id"`
 	PayrollRunID uuid.UUID  `json:"payroll_run_id" db:"payroll_run_id"`
 	CompanyID    uuid.UUID  `json:"company_id" db:"company_id"`
-	SnapshotType string     `json:"snapshot_type" db:"snapshot_type"` // run, item, salary, tax, statutory
-	SnapshotData []byte     `json:"snapshot_data" db:"snapshot_data"` // JSONB
+	SnapshotType string     `json:"snapshot_type" db:"snapshot_type"`
+	SnapshotData []byte     `json:"snapshot_data" db:"snapshot_data"`
 	CreatedAt    time.Time  `json:"created_at" db:"created_at"`
 	CreatedBy    uuid.UUID  `json:"created_by" db:"created_by"`
 	RuleSetID    *uuid.UUID `json:"rule_set_id,omitempty" db:"rule_set_id"`
 	RuleHash     *string    `json:"rule_hash,omitempty" db:"rule_hash"`
 }
 
-// Payslip is used for API responses (enriched with computed data).
 type Payslip struct {
 	PayslipID    uuid.UUID          `json:"payslip_id"`
 	CompanyID    uuid.UUID          `json:"company_id"`
@@ -301,7 +328,6 @@ type Payslip struct {
 	GeneratedAt  time.Time          `json:"generated_at"`
 }
 
-// PayslipRecord corresponds to the database table payroll.payslip.
 // ============================================================================
 // statutory rule set
 // ============================================================================
@@ -323,10 +349,13 @@ type StatutoryRuleSet struct {
 // ============================================================================
 
 type StatutoryComponentMapping struct {
-	MappingID     uuid.UUID  `json:"mapping_id" db:"mapping_id"`
-	CompanyID     uuid.UUID  `json:"company_id" db:"company_id"`
-	StatutoryCode string     `json:"statutory_code" db:"statutory_code"`
-	ComponentCode string     `json:"component_code" db:"component_code"`
+	MappingID     uuid.UUID `json:"mapping_id" db:"mapping_id"`
+	CompanyID     uuid.UUID `json:"company_id" db:"company_id"`
+	StatutoryCode string    `json:"statutory_code" db:"statutory_code"`
+
+	ComponentID   uuid.UUID `json:"component_id" db:"component_id"`
+	ComponentCode string    `json:"component_code" db:"component_code"` // JOIN-populated
+
 	EffectiveFrom time.Time  `json:"effective_from" db:"effective_from"`
 	EffectiveTo   *time.Time `json:"effective_to,omitempty" db:"effective_to"`
 	IsActive      bool       `json:"is_active" db:"is_active"`
@@ -363,7 +392,7 @@ type StatutoryTaxSlab struct {
 }
 
 // ============================================================================
-// statutory deduction limit (exactly as per SQL)
+// statutory deduction limit
 // ============================================================================
 
 type StatutoryDeductionLimit struct {
@@ -449,7 +478,7 @@ type YTDStatutorySummary struct {
 
 type StatutoryBreakdownItem struct {
 	StatutoryCode    string  `json:"statutory_code"`
-	ContributionSide string  `json:"contribution_side"` // employee | employer
+	ContributionSide string  `json:"contribution_side"`
 	Amount           float64 `json:"amount"`
 }
 
@@ -481,13 +510,17 @@ type PayrollPeriodLock struct {
 	Reason      *string    `json:"reason,omitempty" db:"reason"`
 }
 
+// PayrollAdjustment — child of payroll_component. DB column is component_id.
 type PayrollAdjustment struct {
-	AdjustmentID    uuid.UUID  `json:"adjustment_id" db:"adjustment_id"`
-	CompanyID       uuid.UUID  `json:"company_id" db:"company_id"`
-	UserID          uuid.UUID  `json:"user_id" db:"user_id"`
-	ComponentCode   string     `json:"component_code" db:"component_code"`
+	AdjustmentID uuid.UUID `json:"adjustment_id" db:"adjustment_id"`
+	CompanyID    uuid.UUID `json:"company_id" db:"company_id"`
+	UserID       uuid.UUID `json:"user_id" db:"user_id"`
+
+	ComponentID   uuid.UUID `json:"component_id" db:"component_id"`
+	ComponentCode string    `json:"component_code" db:"component_code"` // JOIN-populated
+
 	Amount          float64    `json:"amount" db:"amount"`
-	AdjustmentType  string     `json:"adjustment_type" db:"adjustment_type"` // addition / deduction
+	AdjustmentType  string     `json:"adjustment_type" db:"adjustment_type"`
 	Reason          *string    `json:"reason,omitempty" db:"reason"`
 	ApplicableMonth time.Time  `json:"applicable_month" db:"applicable_month"`
 	CreatedAt       time.Time  `json:"created_at" db:"created_at"`
@@ -495,7 +528,7 @@ type PayrollAdjustment struct {
 }
 
 // ============================================================================
-// (Deleted models: CompanyStatutoryConfig, CompanyTaxSlab, TaxProfile, TaxRule, CalculatedTax)
+// Statutory YTD context
 // ============================================================================
 
 type StatutoryYTDContext struct {
@@ -505,7 +538,7 @@ type StatutoryYTDContext struct {
 }
 
 // ============================================================================
-// Statutory Profile Input / Output Types (used by the service interface)
+// Statutory Profile Input / Output
 // ============================================================================
 
 type CreateStatutoryProfileInput struct {
@@ -532,16 +565,16 @@ type ChangeTaxRegimeInput struct {
 	ChangedBy     uuid.UUID
 }
 
-// In models package:
 type StatutoryProfileFilter struct {
 	CompanyID     uuid.UUID
 	UserID        *uuid.UUID
 	StatutoryCode *string
 	ActiveOn      *time.Time
-	LocationID    *uuid.UUID // 👈 NEW — nil = no filter
+	LocationID    *uuid.UUID
 	Page          int
 	PageSize      int
 }
+
 type StatutoryProfileVersion struct {
 	ProfileID     uuid.UUID
 	CompanyID     uuid.UUID
@@ -652,13 +685,13 @@ type PayrollAdjustmentFilter struct {
 	AdjustmentType *string
 	FromMonth      *time.Time
 	ToMonth        *time.Time
-	LocationID     *uuid.UUID // 👈 new — nil = no filter
+	LocationID     *uuid.UUID
 	Page           int
 	PageSize       int
 }
 
 // ============================================================================
-// Salary Structure Input / Output Types
+// Salary Structure Input / Output
 // ============================================================================
 
 type CreateSalaryStructureInput struct {
@@ -688,7 +721,7 @@ type SalaryStructureFilter struct {
 
 type AddSalaryStructureComponentInput struct {
 	StructureID      uuid.UUID
-	CompanyID        uuid.UUID // needed for ownership validation
+	CompanyID        uuid.UUID
 	ComponentCode    string
 	CalculationType  string
 	Value            float64
@@ -765,37 +798,45 @@ type UpdateStatutoryRuleSetInput struct {
 }
 
 // ============================================================================
-// Attendance Rule & Employee Fine (updated with ComponentCode)
+// Attendance Rule & Employee Fine
 // ============================================================================
 
+// AttendanceRule — DB now has component_id; ComponentCode JOIN-populated.
 type AttendanceRule struct {
-	RuleID           uuid.UUID  `json:"rule_id" db:"rule_id"`
-	CompanyID        uuid.UUID  `json:"company_id" db:"company_id"`
-	RuleType         string     `json:"rule_type" db:"rule_type"`                 // overtime | late | absent
-	CalculationType  string     `json:"calculation_type" db:"calculation_type"`   // percentage | flat | multiplier
-	Value            float64    `json:"value" db:"value"`                         // numeric(10,4)
-	BasedOn          *string    `json:"based_on,omitempty" db:"based_on"`         // daily | hourly (nullable)
-	ThresholdMinutes int        `json:"threshold_minutes" db:"threshold_minutes"` // default 0
-	ComponentCode    string     `json:"component_code" db:"component_code"`       // NEW: link to payroll_component
-	IsActive         bool       `json:"is_active" db:"is_active"`                 // default true
-	CreatedAt        time.Time  `json:"created_at" db:"created_at"`               // default now()
-	CreatedBy        *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
-	UpdatedAt        *time.Time `json:"updated_at,omitempty" db:"updated_at"`
-	UpdatedBy        *uuid.UUID `json:"updated_by,omitempty" db:"updated_by"`
+	RuleID           uuid.UUID `json:"rule_id" db:"rule_id"`
+	CompanyID        uuid.UUID `json:"company_id" db:"company_id"`
+	RuleType         string    `json:"rule_type" db:"rule_type"`
+	CalculationType  string    `json:"calculation_type" db:"calculation_type"`
+	Value            float64   `json:"value" db:"value"`
+	BasedOn          *string   `json:"based_on,omitempty" db:"based_on"`
+	ThresholdMinutes int       `json:"threshold_minutes" db:"threshold_minutes"`
+
+	ComponentID   uuid.UUID `json:"component_id" db:"component_id"`
+	ComponentCode string    `json:"component_code" db:"component_code"` // JOIN-populated
+
+	IsActive  bool       `json:"is_active" db:"is_active"`
+	CreatedAt time.Time  `json:"created_at" db:"created_at"`
+	CreatedBy *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
+	UpdatedAt *time.Time `json:"updated_at,omitempty" db:"updated_at"`
+	UpdatedBy *uuid.UUID `json:"updated_by,omitempty" db:"updated_by"`
 }
 
+// EmployeeFine — DB now has component_id; ComponentCode JOIN-populated.
 type EmployeeFine struct {
-	FineID        uuid.UUID  `json:"fine_id" db:"fine_id"`
-	CompanyID     uuid.UUID  `json:"company_id" db:"company_id"`
-	UserID        uuid.UUID  `json:"user_id" db:"user_id"`
-	ComponentCode string     `json:"component_code" db:"component_code"` // NEW
-	FineAmount    float64    `json:"fine_amount" db:"fine_amount"`       // numeric(12,2)
-	Reason        string     `json:"reason" db:"reason"`
-	FineDate      time.Time  `json:"fine_date" db:"fine_date"`       // date
-	IsProcessed   bool       `json:"is_processed" db:"is_processed"` // default false
-	PayrollRunID  *uuid.UUID `json:"payroll_run_id,omitempty" db:"payroll_run_id"`
-	CreatedAt     time.Time  `json:"created_at" db:"created_at"` // default now()
-	CreatedBy     uuid.UUID  `json:"created_by" db:"created_by"` // NOT NULL
+	FineID    uuid.UUID `json:"fine_id" db:"fine_id"`
+	CompanyID uuid.UUID `json:"company_id" db:"company_id"`
+	UserID    uuid.UUID `json:"user_id" db:"user_id"`
+
+	ComponentID   uuid.UUID `json:"component_id" db:"component_id"`
+	ComponentCode string    `json:"component_code" db:"component_code"` // JOIN-populated
+
+	FineAmount   float64    `json:"fine_amount" db:"fine_amount"`
+	Reason       string     `json:"reason" db:"reason"`
+	FineDate     time.Time  `json:"fine_date" db:"fine_date"`
+	IsProcessed  bool       `json:"is_processed" db:"is_processed"`
+	PayrollRunID *uuid.UUID `json:"payroll_run_id,omitempty" db:"payroll_run_id"`
+	CreatedAt    time.Time  `json:"created_at" db:"created_at"`
+	CreatedBy    uuid.UUID  `json:"created_by" db:"created_by"`
 }
 
 type AttendanceRuleFilter struct {
@@ -808,7 +849,6 @@ type AttendanceRuleFilter struct {
 	PageSize     int
 }
 
-// In models package:
 type EmployeeFineFilter struct {
 	CompanyID    uuid.UUID
 	UserID       *uuid.UUID
@@ -816,7 +856,7 @@ type EmployeeFineFilter struct {
 	PayrollRunID *uuid.UUID
 	FromDate     *time.Time
 	ToDate       *time.Time
-	LocationID   *uuid.UUID `json:"location_id,omitempty"` // 👈 NEW — nil = no filter
+	LocationID   *uuid.UUID `json:"location_id,omitempty"`
 	Page         int
 	PageSize     int
 }
@@ -831,7 +871,7 @@ type SetStatutoryContributionInput struct {
 	StatutoryCode   string
 	EmployeeRate    *float64
 	EmployerRate    *float64
-	CalculationType string // percentage | fixed
+	CalculationType string
 	WageCeiling     *float64
 	MinThreshold    *float64
 	EffectiveFrom   time.Time
@@ -856,7 +896,7 @@ type UpdateRuleSetInput struct {
 }
 
 // ============================================================================
-// statutory_component_definition (with soft‑delete)
+// statutory_component_definition
 // ============================================================================
 
 type StatutoryComponentDefinition struct {
@@ -973,7 +1013,7 @@ type CreateDeductionLimitInput struct {
 type UpdateDeductionLimitInput struct {
 	LimitID    uuid.UUID
 	LimitValue *float64
-	Metadata   map[string]interface{} // if nil, metadata is not updated; if non-nil, replaces existing
+	Metadata   map[string]interface{}
 }
 
 // ============================================================================
@@ -993,25 +1033,24 @@ type UpdateComponentMappingInput struct {
 	MappingID     uuid.UUID
 	ComponentCode *string
 	EffectiveFrom *time.Time
-	Version       int // current version for optimistic locking
+	Version       int
 	UpdatedBy     uuid.UUID
 }
 
 // ============================================================================
-// New tables from SQL (already present above, but listed here for completeness)
+// Employee Bank Details
 // ============================================================================
 
-// EmployeeBankDetails (payroll.employee_bank_details)
 type EmployeeBankDetails struct {
 	BankDetailID  uuid.UUID  `json:"bank_detail_id" db:"bank_detail_id"`
 	CompanyID     uuid.UUID  `json:"company_id" db:"company_id"`
 	UserID        uuid.UUID  `json:"user_id" db:"user_id"`
 	AccountHolder string     `json:"account_holder" db:"account_holder"`
-	AccountNumber string     `json:"account_number" db:"account_number"` // encrypted
+	AccountNumber string     `json:"account_number" db:"account_number"`
 	IFSCCode      string     `json:"ifsc_code" db:"ifsc_code"`
 	BankName      string     `json:"bank_name,omitempty" db:"bank_name"`
 	Branch        string     `json:"branch,omitempty" db:"branch"`
-	AccountType   string     `json:"account_type,omitempty" db:"account_type"` // savings, current
+	AccountType   string     `json:"account_type,omitempty" db:"account_type"`
 	IsActive      bool       `json:"is_active" db:"is_active"`
 	EffectiveFrom time.Time  `json:"effective_from" db:"effective_from"`
 	EffectiveTo   *time.Time `json:"effective_to,omitempty" db:"effective_to"`
@@ -1019,22 +1058,25 @@ type EmployeeBankDetails struct {
 	UpdatedAt     time.Time  `json:"updated_at" db:"updated_at"`
 }
 
-// EmployeeLoan (payroll.employee_loan) – updated with ComponentCode
-// EmployeeLoan (payroll.employee_loan)
+// ============================================================================
+// EmployeeLoan — DB now has component_id; ComponentCode JOIN-populated.
+// ============================================================================
+
 type EmployeeLoan struct {
 	LoanID    uuid.UUID `json:"loan_id" db:"loan_id"`
 	CompanyID uuid.UUID `json:"company_id" db:"company_id"`
 	UserID    uuid.UUID `json:"user_id" db:"user_id"`
 
-	ComponentCode string `json:"component_code" db:"component_code"`
+	ComponentID   *uuid.UUID `json:"component_id,omitempty" db:"component_id"`
+	ComponentCode string     `json:"component_code" db:"component_code"` // JOIN-populated
 
-	LoanType string `json:"loan_type" db:"loan_type"` // loan | advance
+	LoanType string `json:"loan_type" db:"loan_type"`
 
 	PrincipalAmount float64 `json:"principal_amount" db:"principal_amount"`
 
 	InterestRate *float64 `json:"interest_rate,omitempty" db:"interest_rate"`
 
-	InterestType *string `json:"interest_type,omitempty" db:"interest_type"` // flat | compound
+	InterestType *string `json:"interest_type,omitempty" db:"interest_type"`
 
 	TotalEmis int `json:"total_emis" db:"total_emis"`
 
@@ -1050,13 +1092,16 @@ type EmployeeLoan struct {
 
 	ClosureDate *time.Time `json:"closure_date,omitempty" db:"closure_date"`
 
-	Status string `json:"status" db:"status"` // active | closed | defaulted
+	Status string `json:"status" db:"status"`
 
 	CreatedAt time.Time  `json:"created_at" db:"created_at"`
 	CreatedBy *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
 }
 
-// EmiTransaction (payroll.emi_transaction)
+// ============================================================================
+// EmiTransaction
+// ============================================================================
+
 type EmiTransaction struct {
 	EmiID  uuid.UUID `json:"emi_id" db:"emi_id"`
 	LoanID uuid.UUID `json:"loan_id" db:"loan_id"`
@@ -1073,23 +1118,27 @@ type EmiTransaction struct {
 
 	OutstandingAmount float64 `json:"outstanding_amount" db:"outstanding_amount"`
 
-	PaymentStatus string `json:"payment_status" db:"payment_status"` // on_time | late
+	PaymentStatus string `json:"payment_status" db:"payment_status"`
 
-	Status string `json:"status" db:"status"` // pending | paid | missed | partial | waived
+	Status string `json:"status" db:"status"`
 
 	PayrollRunID *uuid.UUID `json:"payroll_run_id,omitempty" db:"payroll_run_id"`
 
 	CreatedAt time.Time `json:"created_at" db:"created_at"`
 }
 
-// EmiTransaction (payroll.emi_transaction)
+// ============================================================================
+// Arrears — DB now has component_id; ComponentCode JOIN-populated.
+// ============================================================================
 
-// Arrears (payroll.arrears) – updated with ComponentCode
 type Arrears struct {
-	ArrearsID     uuid.UUID  `json:"arrears_id" db:"arrears_id"`
-	CompanyID     uuid.UUID  `json:"company_id" db:"company_id"`
-	UserID        uuid.UUID  `json:"user_id" db:"user_id"`
-	ComponentCode string     `json:"component_code" db:"component_code"` // NEW
+	ArrearsID uuid.UUID `json:"arrears_id" db:"arrears_id"`
+	CompanyID uuid.UUID `json:"company_id" db:"company_id"`
+	UserID    uuid.UUID `json:"user_id" db:"user_id"`
+
+	ComponentID   *uuid.UUID `json:"component_id,omitempty" db:"component_id"`
+	ComponentCode string     `json:"component_code" db:"component_code"` // JOIN-populated
+
 	PayrollRunID  *uuid.UUID `json:"payroll_run_id,omitempty" db:"payroll_run_id"`
 	EffectiveFrom time.Time  `json:"effective_from" db:"effective_from"`
 	EffectiveTo   time.Time  `json:"effective_to" db:"effective_to"`
@@ -1099,7 +1148,10 @@ type Arrears struct {
 	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
 }
 
-// TaxDeclarationType (payroll.tax_declaration_type)
+// ============================================================================
+// TaxDeclarationType
+// ============================================================================
+
 type TaxDeclarationType struct {
 	CompanyID   uuid.UUID `json:"company_id" db:"company_id"`
 	TypeCode    string    `json:"type_code" db:"type_code"`
@@ -1110,16 +1162,19 @@ type TaxDeclarationType struct {
 	UpdatedAt   time.Time `json:"updated_at" db:"updated_at"`
 }
 
-// TaxDeclaration (payroll.tax_declaration)
+// ============================================================================
+// TaxDeclaration
+// ============================================================================
+
 type TaxDeclaration struct {
 	DeclarationID   uuid.UUID  `json:"declaration_id" db:"declaration_id"`
 	CompanyID       uuid.UUID  `json:"company_id" db:"company_id"`
 	UserID          uuid.UUID  `json:"user_id" db:"user_id"`
-	FinancialYear   string     `json:"financial_year" db:"financial_year"` // e.g., "2024-25"
+	FinancialYear   string     `json:"financial_year" db:"financial_year"`
 	DeclarationType string     `json:"declaration_type" db:"declaration_type"`
 	Amount          float64    `json:"amount" db:"amount"`
-	SupportingDocs  []string   `json:"supporting_docs,omitempty" db:"supporting_docs"` // array of object keys
-	Status          string     `json:"status" db:"status"`                             // pending, verified, rejected
+	SupportingDocs  []string   `json:"supporting_docs,omitempty" db:"supporting_docs"`
+	Status          string     `json:"status" db:"status"`
 	SubmittedAt     time.Time  `json:"submitted_at" db:"submitted_at"`
 	VerifiedAt      *time.Time `json:"verified_at,omitempty" db:"verified_at"`
 	VerifiedBy      *uuid.UUID `json:"verified_by,omitempty" db:"verified_by"`
@@ -1128,17 +1183,27 @@ type TaxDeclaration struct {
 }
 
 // ============================================================================
-// NEW: CompanyPayrollSettings – company‑level default component codes
+// CompanyPayrollSettings
+//
+// DB now stores *_component_id (UUID FKs). The code strings are JOIN-populated
+// so the API can keep returning the human-readable names.
 // ============================================================================
 
 type CompanyPayrollSettings struct {
-	CompanyID               uuid.UUID `json:"company_id" db:"company_id"`
-	DefaultFineComponent    *string   `json:"default_fine_component" db:"default_fine_component"`
-	DefaultArrearsComponent *string   `json:"default_arrears_component" db:"default_arrears_component"`
-	DefaultLoanComponent    *string   `json:"default_loan_component" db:"default_loan_component"`
-	DefaultBasicComponent   *string   `json:"default_basic_component" db:"default_basic_component"`
-	CreatedAt               time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt               time.Time `json:"updated_at" db:"updated_at"`
+	CompanyID uuid.UUID `json:"company_id" db:"company_id"`
+
+	DefaultFineComponentID    *uuid.UUID `json:"default_fine_component_id,omitempty"    db:"default_fine_component_id"`
+	DefaultArrearsComponentID *uuid.UUID `json:"default_arrears_component_id,omitempty" db:"default_arrears_component_id"`
+	DefaultLoanComponentID    *uuid.UUID `json:"default_loan_component_id,omitempty"    db:"default_loan_component_id"`
+	DefaultBasicComponentID   *uuid.UUID `json:"default_basic_component_id,omitempty"   db:"default_basic_component_id"`
+
+	DefaultFineComponentCode    *string `json:"default_fine_component,omitempty"    db:"default_fine_component"`    // JOIN-populated
+	DefaultArrearsComponentCode *string `json:"default_arrears_component,omitempty" db:"default_arrears_component"` // JOIN-populated
+	DefaultLoanComponentCode    *string `json:"default_loan_component,omitempty"    db:"default_loan_component"`    // JOIN-populated
+	DefaultBasicComponentCode   *string `json:"default_basic_component,omitempty"   db:"default_basic_component"`   // JOIN-populated
+
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
 }
 
 // Payroll Job statuses
@@ -1150,7 +1215,7 @@ const (
 )
 
 // ============================================================================
-// payroll_job (background payroll execution)
+// payroll_job
 // ============================================================================
 
 type PayrollJob struct {
@@ -1158,10 +1223,10 @@ type PayrollJob struct {
 	CompanyID    uuid.UUID `json:"company_id" db:"company_id"`
 	PayrollRunID uuid.UUID `json:"payroll_run_id" db:"payroll_run_id"`
 
-	Status       string  `json:"status" db:"status"` // queued | processing | completed | failed
+	Status       string  `json:"status" db:"status"`
 	Attempts     int     `json:"attempts" db:"attempts"`
 	MaxAttempts  int     `json:"max_attempts" db:"max_attempts"`
-	Priority     int     `json:"priority" db:"priority"` // lower = higher priority
+	Priority     int     `json:"priority" db:"priority"`
 	RetryCount   int     `json:"retry_count" db:"retry_count"`
 	MaxRetries   int     `json:"max_retries" db:"max_retries"`
 	ErrorMessage *string `json:"error_message,omitempty" db:"error_message"`
@@ -1185,7 +1250,7 @@ type CreatePayrollJobInput struct {
 }
 
 // ============================================================================
-// Payroll Component Inputs (for service methods)
+// Payroll Component Inputs (service-facing — still code-based)
 // ============================================================================
 
 type CreateComponentInput struct {
@@ -1194,7 +1259,7 @@ type CreateComponentInput struct {
 	ComponentType    string
 	Description      string
 	IsTaxable        bool
-	IsSystem         bool // will be rejected in service – system components cannot be created via API
+	IsSystem         bool
 	ContributionSide string
 }
 
@@ -1238,7 +1303,7 @@ type LoanPayment struct {
 
 	PaidAt time.Time `json:"paid_at" db:"paid_at"`
 
-	Source string `json:"source" db:"source"` // payroll | manual
+	Source string `json:"source" db:"source"`
 
 	PayrollRunID *uuid.UUID `json:"payroll_run_id,omitempty" db:"payroll_run_id"`
 
@@ -1280,29 +1345,24 @@ type PayslipComponent struct {
 }
 
 type PayslipData struct {
-	// Company
 	CompanyID   uuid.UUID
 	CompanyName string
 
-	// Employee
 	UserID       uuid.UUID
 	EmployeeName string
 	EmployeeID   string
 	Department   string
 	Position     string
 
-	// Payroll Run
 	PayrollRunID uuid.UUID
 	PeriodStart  time.Time
 	PeriodEnd    time.Time
 
-	// Financials
 	GrossAmount float64
 	NetAmount   float64
 	Earnings    []PayslipComponent
 	Deductions  []PayslipComponent
 
-	// Bank Details (optional)
 	BankDetails *struct {
 		AccountHolder string
 		AccountNumber string
@@ -1310,7 +1370,6 @@ type PayslipData struct {
 		BankName      string
 	}
 
-	// Template
 	FooterDeclaration   string
 	AuthorizedSignatory string
 	GeneratedAt         time.Time

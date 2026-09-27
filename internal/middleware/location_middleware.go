@@ -30,6 +30,33 @@ const (
 	CtxLocationAccessLevel = locationctx.CtxAccessLevel
 )
 
+// readOnlyPOSTSuffixes lists URL path suffixes for POST endpoints that are
+// semantically reads — they use POST only because they accept a request body
+// (e.g. batch-fetch by ID list). These are exempt from the "ALL location
+// scope is read-only" guard, because there is no state mutation.
+//
+// Match against the path suffix so the rule works regardless of the
+// /api/v1/companies/{companyID} prefix in front of the route.
+var readOnlyPOSTSuffixes = []string{
+	"/hr/employees/details",
+	// add more here as batch-read endpoints are introduced
+}
+
+// isReadOnlyPost reports whether r is a POST that should be treated as a read
+// for the purposes of the ALL-location guard.
+func isReadOnlyPost(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	p := r.URL.Path
+	for _, suffix := range readOnlyPOSTSuffixes {
+		if strings.HasSuffix(p, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 // LocationValidationMiddleware normalizes X-Location-ID into a well-defined
 // organizational context and enforces access control.
 //
@@ -103,10 +130,13 @@ func LocationValidationMiddleware(locationService *service.LocationService) func
 
 			// ---------------------------------------------------------------
 			// 4. Classify the HTTP method. GET/HEAD/OPTIONS are reads.
+			//    A small allow-list of POST endpoints are also reads — they
+			//    accept a body (batch fetch by IDs) but do not mutate state.
 			// ---------------------------------------------------------------
 			isWrite := r.Method != http.MethodGet &&
 				r.Method != http.MethodHead &&
-				r.Method != http.MethodOptions
+				r.Method != http.MethodOptions &&
+				!isReadOnlyPost(r)
 
 			// ---------------------------------------------------------------
 			// 5. Company-wide ("ALL") context.

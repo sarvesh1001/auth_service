@@ -478,3 +478,18 @@ func (r *LocationRepositoryImpl) GetLocationAccessLevel(
 	}
 	return level, nil
 }
+
+func (r *LocationRepositoryImpl) DeleteAllLocationAccessForUser(
+	ctx context.Context,
+	db client.DBTX,
+	companyID, userID uuid.UUID,
+) error {
+	const query = `
+		DELETE FROM employee_location_access
+		WHERE company_id = $1 AND user_id = $2`
+	_, err := db.ExecContext(ctx, query, companyID, userID)
+	if err != nil {
+		return fmt.Errorf("failed to delete employee location access: %w", err)
+	}
+	return nil
+}

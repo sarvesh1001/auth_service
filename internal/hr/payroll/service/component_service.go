@@ -62,6 +62,10 @@ func NewComponentService(
 }
 
 // GetComponents returns all active components for a company, using a cached copy if available.
+//
+// The returned map is keyed by component_code; each value carries both
+// ComponentID (the surrogate PK) and ComponentCode. Callers that need to
+// write a child row must use comp.ComponentID.
 func (s *componentService) GetComponents(ctx context.Context, companyID uuid.UUID) (map[string]*models.PayrollComponent, error) {
 	s.mu.RLock()
 	cached, ok := s.cache[companyID]
@@ -108,7 +112,6 @@ func (s *componentService) ValidateComponentExists(ctx context.Context, companyI
 		return fmt.Errorf("component %s is inactive", code)
 	}
 
-	// Audit: record component validation (for compliance/security)
 	ip, _ := ctx.Value("ip_address").(string)
 	compJSON, _ := json.Marshal(comp)
 	_ = s.auditService.LogAction(
@@ -118,7 +121,7 @@ func (s *componentService) ValidateComponentExists(ctx context.Context, companyI
 		"payroll",
 		"component.validate",
 		"payroll_component",
-		nil,
+		&comp.ComponentID,
 		"system",
 		nil,
 		nil,
@@ -133,8 +136,14 @@ func (s *componentService) ValidateComponentExists(ctx context.Context, companyI
 	return nil
 }
 
-// GetDefaultComponent returns the default component code for a given purpose.
-// Purpose: "fine", "arrears", "loan", "basic".
+// GetDefaultComponent returns the default component *code* for a given purpose.
+//
+// Purposes: "fine", "arrears", "loan", "basic".
+//
+// The underlying company_payroll_settings table now stores a UUID FK; the
+// repository JOINs the catalog and populates the *_component_code fields on
+// the returned struct. This method reads those display codes — callers that
+// need the ID should fetch the component separately via GetComponent.
 func (s *componentService) GetDefaultComponent(ctx context.Context, companyID uuid.UUID, purpose string) (string, error) {
 	settings, err := s.settingsRepo.GetPayrollSettings(ctx, companyID)
 	if err != nil {
@@ -146,20 +155,20 @@ func (s *componentService) GetDefaultComponent(ctx context.Context, companyID uu
 
 	switch purpose {
 	case "fine":
-		if settings.DefaultFineComponent != nil {
-			return *settings.DefaultFineComponent, nil
+		if settings.DefaultFineComponentCode != nil {
+			return *settings.DefaultFineComponentCode, nil
 		}
 	case "arrears":
-		if settings.DefaultArrearsComponent != nil {
-			return *settings.DefaultArrearsComponent, nil
+		if settings.DefaultArrearsComponentCode != nil {
+			return *settings.DefaultArrearsComponentCode, nil
 		}
 	case "loan":
-		if settings.DefaultLoanComponent != nil {
-			return *settings.DefaultLoanComponent, nil
+		if settings.DefaultLoanComponentCode != nil {
+			return *settings.DefaultLoanComponentCode, nil
 		}
 	case "basic":
-		if settings.DefaultBasicComponent != nil {
-			return *settings.DefaultBasicComponent, nil
+		if settings.DefaultBasicComponentCode != nil {
+			return *settings.DefaultBasicComponentCode, nil
 		}
 	default:
 		return "", errors.New("invalid default component purpose")

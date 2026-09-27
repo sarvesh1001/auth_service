@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
 	"auth-service/internal/encryption"
 	"auth-service/internal/hr/models/employee"
@@ -26,6 +27,7 @@ type EmployeeQueryService struct {
 	documentStorage DocumentStorage
 	auditService    *audit.AuditService
 	encryptionMgr   *encryption.EncryptionManager
+	logger          *zap.Logger
 }
 
 func NewEmployeeQueryService(
@@ -48,6 +50,7 @@ func NewEmployeeQueryService(
 		documentStorage: documentStorage,
 		auditService:    auditService,
 		encryptionMgr:   encryptionMgr,
+		logger:          zap.L(),
 	}
 }
 
@@ -84,7 +87,7 @@ func locationScopeLabel(locationID *uuid.UUID) string {
 }
 
 // ============================================================================
-// PII DECRYPTION HELPER
+// PII DECRYPTION HELPER (single-profile variant)
 // ============================================================================
 
 // decryptProfile populates the ephemeral plaintext PII fields on the profile
@@ -768,4 +771,607 @@ func safeString(str *string) string {
 		return ""
 	}
 	return *str
+}
+
+// ============================================================================
+// DECRYPTED EMPLOYEE DETAILS (wire DTO)
+// ============================================================================
+//
+// DecryptedEmployeeDetails is the fully-decrypted read projection returned to
+// the handler. Every PII field here is PLAINTEXT.
+//
+// JSON tags are load-bearing: the mobile client keys off snake_case.
+//
+// NOTE: nullable fields intentionally DO NOT carry `omitempty` — the client
+// needs to distinguish "backend returned null" from "backend never sent the
+// key". Every field the UI renders is always present in the JSON, even when
+// its value is null.
+type DecryptedEmployeeDetails struct {
+	// Identity (users)
+	UserID    uuid.UUID `json:"user_id"`
+	CompanyID uuid.UUID `json:"company_id"`
+	Username  string    `json:"username"`
+	FullName  *string   `json:"full_name"`
+
+	// Decrypted contact
+	PhoneNumber *string `json:"phone_number"`
+	Email       *string `json:"email"`
+
+	// Roster (company_employees + joined names)
+	EmployeeID          string     `json:"employee_id"`
+	RoleID              uuid.UUID  `json:"role_id"`
+	RoleName            string     `json:"role_name"`
+	PositionID          *uuid.UUID `json:"position_id"`
+	PositionTitle       *string    `json:"position_title"`
+	DepartmentID        *uuid.UUID `json:"department_id"`
+	DepartmentName      *string    `json:"department_name"`
+	PrimaryLocationID   *uuid.UUID `json:"primary_location_id"`
+	PrimaryLocationName *string    `json:"primary_location_name"`
+	LocationAccessScope string     `json:"location_access_scope"`
+	ReportsTo           *uuid.UUID `json:"reports_to"`
+	HireDate            time.Time  `json:"hire_date"`
+	IsActive            bool       `json:"is_active"`
+
+	// Profile — non-PII
+	EmployeeProfileID *uuid.UUID `json:"employee_profile_id"`
+	Gender            *string    `json:"gender"`
+	EmploymentType    *string    `json:"employment_type"`
+	EmploymentStatus  *string    `json:"employment_status"`
+	JobTitle          *string    `json:"job_title"`
+	Grade             *string    `json:"grade"`
+
+	// Cost center (FK + resolved name/code from accounting.cost_centers)
+	CostCenterID   *uuid.UUID `json:"cost_center_id"`
+	CostCenter     *string    `json:"cost_center"`
+	CostCenterName *string    `json:"cost_center_name"`
+	CostCenterCode *string    `json:"cost_center_code"`
+
+	// Probation / confirmation
+	ProbationEndDate *time.Time `json:"probation_end_date"`
+	ConfirmationDate *time.Time `json:"confirmation_date"`
+
+	// Profile — decrypted PII
+	DateOfBirth      *time.Time `json:"date_of_birth"`
+	Nationality      *string    `json:"nationality"`
+	MaritalStatus    *string    `json:"marital_status"`
+	TaxID            *string    `json:"tax_id"`
+	SocialSecurityID *string    `json:"social_security_id"`
+
+	// Timestamps
+	ProfileCreatedAt *time.Time `json:"profile_created_at"`
+	ProfileUpdatedAt *time.Time `json:"profile_updated_at"`
+	UserCreatedAt    time.Time  `json:"user_created_at"`
+	UserLastLogin    *time.Time `json:"user_last_login"`
+}
+
+// ============================================================================
+// LOCATION SCOPE RESOLUTION
+// ============================================================================
+
+// resolveLocationScopeIDs returns the locationIDs slice the repository methods
+// expect, derived from the caller's location context.
+//
+// Contract (mirrors ensureEmployeeInScope):
+//   - ScopeAll      → nil          (no filter; see the whole company)
+//   - otherwise     → [LocationID] (single-location filter)
+//
+// If you later add a SELECTED mode with multiple granted locations, extend the
+// switch here — the repository already accepts a []uuid.UUID.
+func (qs *EmployeeQueryService) resolveLocationScopeIDs(
+	ctx context.Context,
+	companyID uuid.UUID,
+) ([]uuid.UUID, error) {
+	logger := qs.logger
+	if logger == nil {
+		logger = zap.L()
+	}
+
+	locCtx, err := locationctx.FromContext(ctx)
+	if err != nil {
+		logger.Error("resolveLocationScopeIDs: location context missing",
+			zap.String("company_id", companyID.String()),
+			zap.Error(err),
+		)
+		return nil, fmt.Errorf("location context missing: %w", err)
+	}
+
+	logger.Info("resolveLocationScopeIDs",
+		zap.String("company_id", companyID.String()),
+		zap.String("mode", string(locCtx.Mode)),
+		zap.Any("location_id", locCtx.LocationID),
+	)
+
+	switch locCtx.Mode {
+	case locationctx.ScopeAll:
+		logger.Info("resolveLocationScopeIDs: returning nil (ScopeAll)",
+			zap.String("company_id", companyID.String()),
+		)
+		return nil, nil
+	default:
+		if locCtx.LocationID == nil {
+			logger.Warn("resolveLocationScopeIDs: non-ALL mode but LocationID is nil",
+				zap.String("company_id", companyID.String()),
+				zap.String("mode", string(locCtx.Mode)),
+			)
+			return nil, ErrEmployeeHasNoLocation
+		}
+		ids := []uuid.UUID{*locCtx.LocationID}
+		logger.Info("resolveLocationScopeIDs: returning single location",
+			zap.String("company_id", companyID.String()),
+			zap.String("location_id", locCtx.LocationID.String()),
+		)
+		return ids, nil
+	}
+}
+
+// ============================================================================
+// SEARCH + HYDRATE (free-text search with PII decryption)
+// ============================================================================
+
+// SearchEmployees runs the Instagram-style employee search for a company,
+// scoped to whatever locations the caller is allowed to see.
+//
+// Returns ONLY the matching user IDs. Callers that need the full record then
+// call GetEmployeeDetailsByIDs with the same company + scope.
+//
+// Modes (decided by the SQL function based on query length):
+//   - query == ""      → recommendation feed
+//   - 1-2 chars        → prefix match (username / full_name)
+//   - 3+ chars         → trigram + full-text
+func (qs *EmployeeQueryService) SearchEmployees(
+	ctx context.Context,
+	companyID uuid.UUID,
+	query string,
+	page, pageSize int,
+) ([]uuid.UUID, error) {
+	startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
+
+	logger := qs.logger
+	if logger == nil {
+		logger = zap.L()
+	}
+
+	logger.Info("service.SearchEmployees entry",
+		zap.String("company_id", companyID.String()),
+		zap.String("query_raw", query),
+		zap.Int("query_len_raw", len(query)),
+		zap.Int("page_in", page),
+		zap.Int("page_size_in", pageSize),
+		zap.String("ip", ip),
+	)
+
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 30
+	}
+	offset := (page - 1) * pageSize
+
+	locationIDs, err := qs.resolveLocationScopeIDs(ctx, companyID)
+	if err != nil {
+		logger.Error("service.SearchEmployees: resolveLocationScopeIDs failed",
+			zap.String("company_id", companyID.String()),
+			zap.Error(err),
+		)
+		return nil, err
+	}
+
+	logger.Info("service.SearchEmployees calling repo.SearchEmployeeIDs",
+		zap.String("company_id", companyID.String()),
+		zap.String("query", query),
+		zap.Int("location_ids_count", len(locationIDs)),
+		zap.Int("limit", pageSize),
+		zap.Int("offset", offset),
+	)
+
+	ids, err := qs.employeeRepo.SearchEmployeeIDs(ctx, companyID, query, locationIDs, pageSize, offset)
+	if err != nil {
+		logger.Error("service.SearchEmployees: repo.SearchEmployeeIDs failed",
+			zap.String("company_id", companyID.String()),
+			zap.String("query", query),
+			zap.Error(err),
+		)
+		return nil, fmt.Errorf("failed to search employees: %w", err)
+	}
+
+	logger.Info("service.SearchEmployees success",
+		zap.String("company_id", companyID.String()),
+		zap.String("query", query),
+		zap.Int("result_count", len(ids)),
+		zap.Duration("duration", time.Since(startTime)),
+	)
+
+	_ = qs.auditService.LogAction(
+		ctx, nil, &companyID, "hr", "employee.search_ids",
+		"employee", nil, "system", nil, nil, nil,
+		map[string]interface{}{
+			"ip":           ip,
+			"company_id":   companyID.String(),
+			"query":        query,
+			"location_ids": locationIDs,
+			"page":         page,
+			"page_size":    pageSize,
+			"return_count": len(ids),
+			"duration_ms":  time.Since(startTime).Milliseconds(),
+		},
+	)
+	return ids, nil
+}
+
+// GetEmployeeDetailsByIDs hydrates a batch of user IDs with the full employee
+// record and decrypts every PII field before returning.
+//
+// Decryption failures are swallowed per-field: a KMS blip degrades a single
+// field to nil rather than failing the whole request. The audit log records
+// the (attempted) batch, not per-field outcomes.
+func (qs *EmployeeQueryService) GetEmployeeDetailsByIDs(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userIDs []uuid.UUID,
+) ([]*DecryptedEmployeeDetails, error) {
+	startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
+
+	logger := qs.logger
+	if logger == nil {
+		logger = zap.L()
+	}
+
+	logger.Info("service.GetEmployeeDetailsByIDs entry",
+		zap.String("company_id", companyID.String()),
+		zap.Int("user_ids_count", len(userIDs)),
+		zap.String("ip", ip),
+	)
+
+	if len(userIDs) == 0 {
+		logger.Info("service.GetEmployeeDetailsByIDs: empty userIDs → short-circuit")
+		return []*DecryptedEmployeeDetails{}, nil
+	}
+
+	locationIDs, err := qs.resolveLocationScopeIDs(ctx, companyID)
+	if err != nil {
+		logger.Error("service.GetEmployeeDetailsByIDs: resolveLocationScopeIDs failed",
+			zap.String("company_id", companyID.String()),
+			zap.Error(err),
+		)
+		return nil, err
+	}
+
+	logger.Info("service.GetEmployeeDetailsByIDs calling repo.GetEmployeeFullDetailsByIDs",
+		zap.String("company_id", companyID.String()),
+		zap.Int("user_ids_count", len(userIDs)),
+		zap.Int("location_ids_count", len(locationIDs)),
+	)
+
+	raw, err := qs.employeeRepo.GetEmployeeFullDetailsByIDs(ctx, companyID, userIDs, locationIDs)
+	if err != nil {
+		logger.Error("service.GetEmployeeDetailsByIDs: repo failed",
+			zap.String("company_id", companyID.String()),
+			zap.Error(err),
+		)
+		return nil, fmt.Errorf("failed to get employee details: %w", err)
+	}
+
+	logger.Info("service.GetEmployeeDetailsByIDs: repo returned",
+		zap.String("company_id", companyID.String()),
+		zap.Int("raw_rows", len(raw)),
+	)
+
+	out := make([]*DecryptedEmployeeDetails, 0, len(raw))
+	for _, d := range raw {
+		out = append(out, qs.decryptFullDetails(ctx, d))
+	}
+
+	// Final DTO dump — one log line per row with every nullable field.
+	for _, dto := range out {
+		if dto == nil {
+			continue
+		}
+		logger.Info("service.GetEmployeeDetailsByIDs: final DTO",
+			zap.String("user_id", dto.UserID.String()),
+			zap.String("username", dto.Username),
+			zap.Any("full_name", dto.FullName),
+			zap.Any("phone_number", dto.PhoneNumber),
+			zap.Any("email", dto.Email),
+			zap.Any("date_of_birth", dto.DateOfBirth),
+			zap.Any("nationality", dto.Nationality),
+			zap.Any("marital_status", dto.MaritalStatus),
+			zap.Any("tax_id", dto.TaxID),
+			zap.Any("social_security_id", dto.SocialSecurityID),
+			zap.Any("gender", dto.Gender),
+			zap.Any("employment_type", dto.EmploymentType),
+			zap.Any("employment_status", dto.EmploymentStatus),
+			zap.Any("grade", dto.Grade),
+			zap.Any("cost_center_id", dto.CostCenterID),
+			zap.Any("cost_center", dto.CostCenter),
+			zap.Any("cost_center_name", dto.CostCenterName),
+			zap.Any("cost_center_code", dto.CostCenterCode),
+			zap.Any("probation_end_date", dto.ProbationEndDate),
+			zap.Any("confirmation_date", dto.ConfirmationDate),
+			zap.Any("user_last_login", dto.UserLastLogin),
+		)
+	}
+
+	logger.Info("service.GetEmployeeDetailsByIDs success",
+		zap.String("company_id", companyID.String()),
+		zap.Int("requested", len(userIDs)),
+		zap.Int("returned", len(out)),
+		zap.Duration("duration", time.Since(startTime)),
+	)
+
+	_ = qs.auditService.LogAction(
+		ctx, nil, &companyID, "hr", "employee.full_details.read",
+		"employee", nil, "system", nil, nil, nil,
+		map[string]interface{}{
+			"ip":            ip,
+			"company_id":    companyID.String(),
+			"requested_ids": len(userIDs),
+			"returned_ids":  len(out),
+			"location_ids":  locationIDs,
+			"duration_ms":   time.Since(startTime).Milliseconds(),
+		},
+	)
+	return out, nil
+}
+
+// ============================================================================
+// FULL-DETAILS DECRYPTION HELPER
+// ============================================================================
+
+// decryptFullDetails projects an EmployeeFullDetailsExt (encrypted blobs) into
+// a DecryptedEmployeeDetails (plaintext PII). Non-PII fields — including the
+// Ext-only CostCenterID/CostCenterName/CostCenterCode and the probation/
+// confirmation dates — are copied verbatim.
+//
+// Unlike decryptProfile, PhoneKeyID here is a non-pointer uuid.UUID on the
+// model — we test it against uuid.Nil instead of nil.
+//
+// Every field decrypt attempt is logged: "decrypted" (with length + preview),
+// "no_ciphertext" (empty column — no data to decrypt), or "decrypt_error" /
+// "parse_error" (something failed). This makes the "why is email empty?"
+// question answerable from logs alone.
+func (qs *EmployeeQueryService) decryptFullDetails(
+	ctx context.Context,
+	d *employee.EmployeeFullDetailsExt,
+) *DecryptedEmployeeDetails {
+	if d == nil {
+		return nil
+	}
+
+	out := &DecryptedEmployeeDetails{
+		// Identity
+		UserID:    d.UserID,
+		CompanyID: d.CompanyID,
+		Username:  d.Username,
+		FullName:  d.FullName,
+
+		// Roster
+		EmployeeID:          d.EmployeeID,
+		RoleID:              d.RoleID,
+		RoleName:            d.RoleName,
+		PositionID:          d.PositionID,
+		PositionTitle:       d.PositionTitle,
+		DepartmentID:        d.DepartmentID,
+		DepartmentName:      d.DepartmentName,
+		PrimaryLocationID:   d.PrimaryLocationID,
+		PrimaryLocationName: d.PrimaryLocationName,
+		LocationAccessScope: d.LocationAccessScope,
+		ReportsTo:           d.ReportsTo,
+		HireDate:            d.HireDate,
+		IsActive:            d.IsActive,
+
+		// Profile — non-PII (promoted from embedded EmployeeFullDetails)
+		EmployeeProfileID: d.EmployeeProfileID,
+		Gender:            d.Gender,
+		EmploymentType:    d.EmploymentType,
+		EmploymentStatus:  d.EmploymentStatus,
+		JobTitle:          d.JobTitle,
+		Grade:             d.Grade,
+
+		// Cost center (Ext-only fields)
+		CostCenterID:   d.CostCenterID,
+		CostCenter:     d.CostCenter,
+		CostCenterName: d.CostCenterName,
+		CostCenterCode: d.CostCenterCode,
+
+		// Probation / confirmation (Ext-only fields)
+		ProbationEndDate: d.ProbationEndDate,
+		ConfirmationDate: d.ConfirmationDate,
+
+		// Timestamps (promoted from embedded EmployeeFullDetails)
+		ProfileCreatedAt: d.ProfileCreatedAt,
+		ProfileUpdatedAt: d.ProfileUpdatedAt,
+		UserCreatedAt:    d.UserCreatedAt,
+		UserLastLogin:    d.UserLastLogin,
+	}
+
+	logger := qs.logger
+	if logger == nil {
+		logger = zap.L()
+	}
+
+	// logDecrypt is the per-field logging wrapper. Redacts high-sensitivity
+	// fields (tax_id, social_security_id) to first+last char.
+	logDecrypt := func(field, stage string, plainLen int, preview string, err error) {
+		if err != nil {
+			logger.Warn("decryptFullDetails: field failed",
+				zap.String("field", field),
+				zap.String("stage", stage),
+				zap.String("user_id", d.UserID.String()),
+				zap.Error(err),
+			)
+			return
+		}
+		if stage == "no_ciphertext" {
+			logger.Info("decryptFullDetails: field skipped",
+				zap.String("field", field),
+				zap.String("stage", stage),
+				zap.String("user_id", d.UserID.String()),
+				zap.String("reason", "empty encrypted column"),
+			)
+			return
+		}
+		logger.Info("decryptFullDetails: field ok",
+			zap.String("field", field),
+			zap.String("stage", stage),
+			zap.String("user_id", d.UserID.String()),
+			zap.Int("plain_len", plainLen),
+			zap.String("plain_preview", preview),
+		)
+	}
+
+	redact := func(field, plain string) string {
+		switch field {
+		case "tax_id", "social_security_id":
+			if len(plain) > 2 {
+				return plain[:1] + "***" + plain[len(plain)-1:]
+			}
+		}
+		return plain
+	}
+
+	// ---- Phone ----
+	if len(d.PhoneEncrypted) > 0 && d.PhoneEncryptedDEK != "" && d.PhoneKeyID != uuid.Nil {
+		plain, err := qs.encryptionMgr.DecryptField(ctx, &encryption.EncryptedData{
+			EncryptedValue: string(d.PhoneEncrypted),
+			EncryptedDEK:   d.PhoneEncryptedDEK,
+			KeyID:          d.PhoneKeyID.String(),
+		})
+		if err == nil {
+			out.PhoneNumber = &plain
+			logDecrypt("phone_number", "decrypted", len(plain), plain, nil)
+		} else {
+			logDecrypt("phone_number", "decrypt_error", 0, "", err)
+		}
+	} else {
+		logDecrypt("phone_number", "no_ciphertext", 0, "", nil)
+	}
+
+	// ---- Email ----
+	if len(d.EmailEncrypted) > 0 && d.EmailEncryptedDEK != nil && d.EmailKeyID != nil {
+		plain, err := qs.encryptionMgr.DecryptField(ctx, &encryption.EncryptedData{
+			EncryptedValue: string(d.EmailEncrypted),
+			EncryptedDEK:   *d.EmailEncryptedDEK,
+			KeyID:          d.EmailKeyID.String(),
+		})
+		if err == nil {
+			out.Email = &plain
+			logDecrypt("email", "decrypted", len(plain), plain, nil)
+		} else {
+			logDecrypt("email", "decrypt_error", 0, "", err)
+		}
+	} else {
+		logDecrypt("email", "no_ciphertext", 0, "", nil)
+	}
+
+	// ---- Tax ID ----
+	if len(d.TaxIDEncrypted) > 0 && d.TaxIDEncryptedDEK != nil && d.TaxIDKeyID != nil {
+		plain, err := qs.encryptionMgr.DecryptField(ctx, &encryption.EncryptedData{
+			EncryptedValue: string(d.TaxIDEncrypted),
+			EncryptedDEK:   *d.TaxIDEncryptedDEK,
+			KeyID:          d.TaxIDKeyID.String(),
+		})
+		if err == nil {
+			out.TaxID = &plain
+			logDecrypt("tax_id", "decrypted", len(plain), redact("tax_id", plain), nil)
+		} else {
+			logDecrypt("tax_id", "decrypt_error", 0, "", err)
+		}
+	} else {
+		logDecrypt("tax_id", "no_ciphertext", 0, "", nil)
+	}
+
+	// ---- Social Security ID ----
+	if len(d.SocialSecurityIDEncrypted) > 0 &&
+		d.SocialSecurityIDEncryptedDEK != nil &&
+		d.SocialSecurityIDKeyID != nil {
+		plain, err := qs.encryptionMgr.DecryptField(ctx, &encryption.EncryptedData{
+			EncryptedValue: string(d.SocialSecurityIDEncrypted),
+			EncryptedDEK:   *d.SocialSecurityIDEncryptedDEK,
+			KeyID:          d.SocialSecurityIDKeyID.String(),
+		})
+		if err == nil {
+			out.SocialSecurityID = &plain
+			logDecrypt("social_security_id", "decrypted", len(plain), redact("social_security_id", plain), nil)
+		} else {
+			logDecrypt("social_security_id", "decrypt_error", 0, "", err)
+		}
+	} else {
+		logDecrypt("social_security_id", "no_ciphertext", 0, "", nil)
+	}
+
+	// ---- Date of Birth (stored as RFC3339) ----
+	if len(d.DateOfBirthEncrypted) > 0 && d.DateOfBirthEncryptedDEK != nil && d.DateOfBirthKeyID != nil {
+		plain, err := qs.encryptionMgr.DecryptField(ctx, &encryption.EncryptedData{
+			EncryptedValue: string(d.DateOfBirthEncrypted),
+			EncryptedDEK:   *d.DateOfBirthEncryptedDEK,
+			KeyID:          d.DateOfBirthKeyID.String(),
+		})
+		if err == nil {
+			if t, perr := time.Parse(time.RFC3339, plain); perr == nil {
+				out.DateOfBirth = &t
+				logDecrypt("date_of_birth", "decrypted", len(plain), plain, nil)
+			} else {
+				logDecrypt("date_of_birth", "parse_error", len(plain), plain, perr)
+			}
+		} else {
+			logDecrypt("date_of_birth", "decrypt_error", 0, "", err)
+		}
+	} else {
+		logDecrypt("date_of_birth", "no_ciphertext", 0, "", nil)
+	}
+
+	// ---- Nationality ----
+	if len(d.NationalityEncrypted) > 0 && d.NationalityEncryptedDEK != nil && d.NationalityKeyID != nil {
+		plain, err := qs.encryptionMgr.DecryptField(ctx, &encryption.EncryptedData{
+			EncryptedValue: string(d.NationalityEncrypted),
+			EncryptedDEK:   *d.NationalityEncryptedDEK,
+			KeyID:          d.NationalityKeyID.String(),
+		})
+		if err == nil {
+			out.Nationality = &plain
+			logDecrypt("nationality", "decrypted", len(plain), plain, nil)
+		} else {
+			logDecrypt("nationality", "decrypt_error", 0, "", err)
+		}
+	} else {
+		logDecrypt("nationality", "no_ciphertext", 0, "", nil)
+	}
+
+	// ---- Marital Status ----
+	if len(d.MaritalStatusEncrypted) > 0 && d.MaritalStatusEncryptedDEK != nil && d.MaritalStatusKeyID != nil {
+		plain, err := qs.encryptionMgr.DecryptField(ctx, &encryption.EncryptedData{
+			EncryptedValue: string(d.MaritalStatusEncrypted),
+			EncryptedDEK:   *d.MaritalStatusEncryptedDEK,
+			KeyID:          d.MaritalStatusKeyID.String(),
+		})
+		if err == nil {
+			out.MaritalStatus = &plain
+			logDecrypt("marital_status", "decrypted", len(plain), plain, nil)
+		} else {
+			logDecrypt("marital_status", "decrypt_error", 0, "", err)
+		}
+	} else {
+		logDecrypt("marital_status", "no_ciphertext", 0, "", nil)
+	}
+
+	// ---- Summary ----
+	logger.Info("decryptFullDetails: complete",
+		zap.String("user_id", d.UserID.String()),
+		zap.Bool("has_email", out.Email != nil),
+		zap.Bool("has_dob", out.DateOfBirth != nil),
+		zap.Bool("has_tax_id", out.TaxID != nil),
+		zap.Bool("has_ssn", out.SocialSecurityID != nil),
+		zap.Bool("has_nationality", out.Nationality != nil),
+		zap.Bool("has_marital_status", out.MaritalStatus != nil),
+		zap.Bool("has_cost_center_id", out.CostCenterID != nil),
+		zap.Bool("has_cost_center_name", out.CostCenterName != nil),
+		zap.Bool("has_cost_center_code", out.CostCenterCode != nil),
+		zap.Bool("has_probation_end", out.ProbationEndDate != nil),
+		zap.Bool("has_confirmation", out.ConfirmationDate != nil),
+	)
+
+	return out
 }

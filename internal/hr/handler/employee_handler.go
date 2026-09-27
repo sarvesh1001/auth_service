@@ -25,7 +25,7 @@ import (
 type EmployeeHandler struct {
 	employeeService      *hrservice.EmployeeService
 	employeeQueryService *hrservice.EmployeeQueryService
-	companyService       *mainservice.CompanyService // 👈 ADD
+	companyService       *mainservice.CompanyService
 	auditService         *a.AuditService
 	logger               *zap.Logger
 	maxDocumentSizeMB    int
@@ -34,7 +34,7 @@ type EmployeeHandler struct {
 func NewEmployeeHandler(
 	employeeService *hrservice.EmployeeService,
 	employeeQueryService *hrservice.EmployeeQueryService,
-	companyService *mainservice.CompanyService, // 👈 ADD
+	companyService *mainservice.CompanyService,
 	auditService *a.AuditService,
 	logger *zap.Logger,
 	maxDocumentSizeMB int,
@@ -45,7 +45,7 @@ func NewEmployeeHandler(
 	return &EmployeeHandler{
 		employeeService:      employeeService,
 		employeeQueryService: employeeQueryService,
-		companyService:       companyService, // 👈 ADD
+		companyService:       companyService,
 		auditService:         auditService,
 		logger:               logger,
 		maxDocumentSizeMB:    maxDocumentSizeMB,
@@ -206,7 +206,7 @@ type UpdateEmployeeProfileRequest struct {
 	JobTitle         *string    `json:"job_title,omitempty"`
 	Grade            *string    `json:"grade,omitempty"`
 	CostCenter       *string    `json:"cost_center,omitempty"`    // legacy text
-	CostCenterID     *uuid.UUID `json:"cost_center_id,omitempty"` // 👈 ADD
+	CostCenterID     *uuid.UUID `json:"cost_center_id,omitempty"` // 👈
 	TaxID            *string    `json:"tax_id,omitempty"`
 	SocialSecurityID *string    `json:"social_security_id,omitempty"`
 	Email            *string    `json:"email,omitempty"`
@@ -270,7 +270,7 @@ func (h *EmployeeHandler) UpdateEmployeeProfile(w http.ResponseWriter, r *http.R
 	if req.CostCenter != nil {
 		updates["cost_center"] = *req.CostCenter
 	}
-	if req.CostCenterID != nil { // 👈 ADD
+	if req.CostCenterID != nil {
 		updates["cost_center_id"] = *req.CostCenterID
 	}
 	if req.TaxID != nil {
@@ -892,63 +892,6 @@ func (h *EmployeeHandler) GetEmployeeExit(w http.ResponseWriter, r *http.Request
 	})
 }
 
-type CreatePositionRequest struct {
-	DepartmentID uuid.UUID `json:"department_id" validate:"required"`
-	Title        string    `json:"title" validate:"required"`
-	IsOpen       bool      `json:"is_open"`
-}
-
-func (h *EmployeeHandler) CreatePosition(w http.ResponseWriter, r *http.Request) {
-	startTime := time.Now()
-	ctx := injectCommonContext(r.Context(), r)
-
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
-		return
-	}
-	actorType, actorID, err := h.getActorInfo(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
-		return
-	}
-	var req CreatePositionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
-		return
-	}
-	if req.DepartmentID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "Department ID is required")
-		return
-	}
-	if req.Title == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Position title is required")
-		return
-	}
-	position := &hrEmployee.Position{
-		PositionID: uuid.New(), CompanyID: companyID, DepartmentID: req.DepartmentID,
-		Title: &req.Title, IsOpen: req.IsOpen,
-		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
-	}
-	metadata := map[string]interface{}{
-		"ip_address": r.RemoteAddr, "user_agent": r.UserAgent(),
-		"endpoint": r.URL.Path, "request_method": r.Method,
-	}
-	createdPosition, err := h.employeeService.CreatePosition(ctx, position, actorType, actorID, metadata)
-	if err != nil {
-		h.logger.Error("Failed to create position",
-			util.String("company_id", companyID.String()),
-			util.String("department_id", req.DepartmentID.String()), util.ErrorField(err))
-		h.respondWithError(w, http.StatusInternalServerError, "Failed to create position")
-		return
-	}
-	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
-		"success": true, "data": createdPosition,
-		"message": "Position created successfully",
-		"meta":    map[string]interface{}{"duration": time.Since(startTime).String()},
-	})
-}
-
 func (h *EmployeeHandler) GetPositionsByDepartment(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	ctx := injectCommonContext(r.Context(), r)
@@ -1199,5 +1142,337 @@ func (h *EmployeeHandler) respondWithJSON(w http.ResponseWriter, statusCode int,
 func (h *EmployeeHandler) respondWithError(w http.ResponseWriter, statusCode int, message string) {
 	h.respondWithJSON(w, statusCode, map[string]interface{}{
 		"success": false, "error": message, "code": statusCode,
+	})
+}
+
+// dumpJSONResponse renders `v` as pretty JSON and logs it. Used temporarily
+// to verify that the wire payload matches what the client expects. Truncates
+// to maxBytes to keep log lines readable.
+func (h *EmployeeHandler) dumpJSONResponse(label string, v interface{}) {
+	const maxBytes = 16384
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		h.logger.Warn("dumpJSONResponse: marshal failed",
+			util.String("label", label), util.ErrorField(err))
+		return
+	}
+	if len(b) > maxBytes {
+		h.logger.Info(label+" (truncated)",
+			zap.Int("total_bytes", len(b)),
+			zap.String("preview", string(b[:maxBytes])),
+		)
+		return
+	}
+	h.logger.Info(label, zap.String("body", string(b)))
+}
+
+// ============================================================================
+// SEARCH + HYDRATE (Instagram-style free-text search)
+// ============================================================================
+
+// SearchEmployees — GET /companies/{companyID}/employees/search
+//
+// Free-text employee search. Returns a compact list of decrypted employee
+// records for the given page.
+//
+// Query params:
+//
+//	q          — search text (empty = recommendation feed)
+//	page       — 1-based (default 1)
+//	page_size  — 1..100 (default 30)
+//	ids_only   — if "true", return only the matched user IDs (cheap, no decrypt)
+//
+// Location scope is enforced by the service via locationctx — the handler
+// does not need to pass any location filter.
+func (h *EmployeeHandler) SearchEmployees(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	ctx := injectCommonContext(r.Context(), r)
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if page < 1 {
+		page = 1
+	}
+	pageSize, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 30
+	}
+
+	idsOnly := r.URL.Query().Get("ids_only") == "true"
+
+	h.logger.Info("handler.SearchEmployees entry",
+		zap.String("company_id", companyID.String()),
+		zap.String("query", query),
+		zap.Int("query_len", len(query)),
+		zap.Int("page", page),
+		zap.Int("page_size", pageSize),
+		zap.Bool("ids_only", idsOnly),
+		zap.String("path", r.URL.Path),
+		zap.String("raw_query_string", r.URL.RawQuery),
+	)
+
+	// ---- Step 1: search → user IDs only (fast path) ----
+	ids, err := h.employeeQueryService.SearchEmployees(ctx, companyID, query, page, pageSize)
+	if err != nil {
+		h.logger.Error("handler.SearchEmployees: service.SearchEmployees failed",
+			zap.String("company_id", companyID.String()),
+			zap.String("query", query),
+			zap.Error(err),
+		)
+		if h.mapLocationScopeError(w, err) {
+			return
+		}
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to search employees")
+		return
+	}
+
+	h.logger.Info("handler.SearchEmployees: got ids from service",
+		zap.String("company_id", companyID.String()),
+		zap.String("query", query),
+		zap.Int("ids_count", len(ids)),
+	)
+
+	if idsOnly {
+		h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"data":    ids,
+			"meta": map[string]interface{}{
+				"query":        query,
+				"page":         page,
+				"page_size":    pageSize,
+				"return_count": len(ids),
+				"ids_only":     true,
+				"duration":     time.Since(startTime).String(),
+			},
+		})
+		return
+	}
+
+	// ---- Step 2: hydrate + decrypt ----
+	h.logger.Info("handler.SearchEmployees: hydrating details",
+		zap.String("company_id", companyID.String()),
+		zap.Int("ids_count", len(ids)),
+	)
+
+	details, err := h.employeeQueryService.GetEmployeeDetailsByIDs(ctx, companyID, ids)
+	if err != nil {
+		h.logger.Error("handler.SearchEmployees: GetEmployeeDetailsByIDs failed",
+			zap.String("company_id", companyID.String()),
+			zap.Int("ids_count", len(ids)),
+			zap.Error(err),
+		)
+		if h.mapLocationScopeError(w, err) {
+			return
+		}
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to load employee details")
+		return
+	}
+
+	h.logger.Info("handler.SearchEmployees success",
+		zap.String("company_id", companyID.String()),
+		zap.String("query", query),
+		zap.Int("ids_count", len(ids)),
+		zap.Int("details_count", len(details)),
+		zap.Duration("duration", time.Since(startTime)),
+	)
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    details,
+		"meta": map[string]interface{}{
+			"query":        query,
+			"page":         page,
+			"page_size":    pageSize,
+			"return_count": len(details),
+			"ids_only":     false,
+			"duration":     time.Since(startTime).String(),
+		},
+	})
+}
+
+// GetEmployeeDetailsByIDs — POST /companies/{companyID}/employees/details
+//
+// Batch hydrate + decrypt a caller-supplied list of user IDs. Intended for
+// clients that already have IDs (e.g. from a previous `ids_only=true` search
+// or a locally cached result set) and just need the full record for a subset.
+//
+// Body:
+//
+//	{ "user_ids": ["uuid1", "uuid2", ...] }
+//
+// Caps the batch at 200 IDs to keep the single round-trip bounded.
+func (h *EmployeeHandler) GetEmployeeDetailsByIDs(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	ctx := injectCommonContext(r.Context(), r)
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+
+	var req struct {
+		UserIDs []uuid.UUID `json:"user_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	h.logger.Info("handler.GetEmployeeDetailsByIDs entry",
+		zap.String("company_id", companyID.String()),
+		zap.Int("user_ids_count", len(req.UserIDs)),
+		zap.Any("user_ids", req.UserIDs),
+		zap.String("path", r.URL.Path),
+	)
+
+	if len(req.UserIDs) == 0 {
+		resp := map[string]interface{}{
+			"success": true,
+			"data":    []interface{}{},
+			"meta":    map[string]interface{}{"return_count": 0},
+		}
+		h.dumpJSONResponse("handler.GetEmployeeDetailsByIDs response body (empty)", resp)
+		h.respondWithJSON(w, http.StatusOK, resp)
+		return
+	}
+	const maxBatch = 200
+	if len(req.UserIDs) > maxBatch {
+		h.respondWithError(w, http.StatusBadRequest,
+			fmt.Sprintf("Too many user_ids (max %d)", maxBatch))
+		return
+	}
+
+	details, err := h.employeeQueryService.GetEmployeeDetailsByIDs(ctx, companyID, req.UserIDs)
+	if err != nil {
+		h.logger.Error("handler.GetEmployeeDetailsByIDs: service failed",
+			zap.String("company_id", companyID.String()),
+			zap.Int("requested_ids", len(req.UserIDs)),
+			zap.Error(err),
+		)
+		if h.mapLocationScopeError(w, err) {
+			return
+		}
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to load employee details")
+		return
+	}
+
+	h.logger.Info("handler.GetEmployeeDetailsByIDs success",
+		zap.String("company_id", companyID.String()),
+		zap.Int("requested_ids", len(req.UserIDs)),
+		zap.Int("returned_ids", len(details)),
+		zap.Duration("duration", time.Since(startTime)),
+	)
+
+	resp := map[string]interface{}{
+		"success": true,
+		"data":    details,
+		"meta": map[string]interface{}{
+			"requested_ids": len(req.UserIDs),
+			"returned_ids":  len(details),
+			"duration":      time.Since(startTime).String(),
+		},
+	}
+
+	// 👇 Log the exact JSON body we're about to send over the wire.
+	h.dumpJSONResponse("handler.GetEmployeeDetailsByIDs response body", resp)
+
+	h.respondWithJSON(w, http.StatusOK, resp)
+}
+
+// CreatePositionRequest — new schema.
+//
+// A position is a SEAT. Its definition (title, attendance flags) lives on
+// the job it references. This request therefore requires job_id and treats
+// title as an optional override.
+type CreatePositionRequest struct {
+	DepartmentID   uuid.UUID  `json:"department_id" validate:"required"`
+	JobID          uuid.UUID  `json:"job_id"          validate:"required"`
+	LocationID     *uuid.UUID `json:"location_id,omitempty"`
+	TitleOverride  *string    `json:"title_override,omitempty"`
+	IsOpen         *bool      `json:"is_open,omitempty"`
+	WorkCenterCode *string    `json:"work_center_code,omitempty"`
+}
+
+func (h *EmployeeHandler) CreatePosition(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	ctx := injectCommonContext(r.Context(), r)
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+
+	actorType, actorID, err := h.getActorInfo(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+
+	var req CreatePositionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	if req.DepartmentID == uuid.Nil {
+		h.respondWithError(w, http.StatusBadRequest, "department_id is required")
+		return
+	}
+	if req.JobID == uuid.Nil {
+		h.respondWithError(w, http.StatusBadRequest, "job_id is required")
+		return
+	}
+
+	// Default is_open = true if the caller didn't specify.
+	isOpen := true
+	if req.IsOpen != nil {
+		isOpen = *req.IsOpen
+	}
+
+	now := time.Now().UTC()
+	position := &hrEmployee.Position{
+		PositionID:     uuid.New(),
+		CompanyID:      companyID,
+		DepartmentID:   req.DepartmentID,
+		JobID:          req.JobID,
+		LocationID:     req.LocationID,
+		TitleOverride:  req.TitleOverride,
+		IsOpen:         isOpen,
+		WorkCenterCode: req.WorkCenterCode,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+
+	metadata := map[string]interface{}{
+		"ip_address":     r.RemoteAddr,
+		"user_agent":     r.UserAgent(),
+		"endpoint":       r.URL.Path,
+		"request_method": r.Method,
+	}
+
+	createdPosition, err := h.employeeService.CreatePosition(ctx, position, actorType, actorID, metadata)
+	if err != nil {
+		h.logger.Error("Failed to create position",
+			util.String("company_id", companyID.String()),
+			util.String("department_id", req.DepartmentID.String()),
+			util.String("job_id", req.JobID.String()),
+			util.ErrorField(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to create position")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true, "data": createdPosition,
+		"message": "Position created successfully",
+		"meta":    map[string]interface{}{"duration": time.Since(startTime).String()},
 	})
 }

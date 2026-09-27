@@ -1,6 +1,4 @@
 // models.go - Complete production model definitions
-// Includes user, company, role, permission, department, position, location, subscription, payment, invoice, and reminder models.
-
 package models
 
 import (
@@ -175,7 +173,7 @@ type LoginAttempt struct {
 }
 
 // =============================================================================
-// COMPANIES – Updated with production-grade fields
+// COMPANIES
 // =============================================================================
 
 type Company struct {
@@ -185,8 +183,8 @@ type Company struct {
 	SubscriptionTier        string     `db:"subscription_tier" json:"subscription_tier"`
 	SubscriptionStatus      string     `db:"subscription_status" json:"subscription_status"`
 	MaxEmployees            int        `db:"max_employees" json:"max_employees"`
-	MaxLocations            int        `db:"max_locations" json:"max_locations"`             // Replaces max_departments
-	SubscriptionAmount      float64    `db:"subscription_amount" json:"subscription_amount"` // NEW
+	MaxLocations            int        `db:"max_locations" json:"max_locations"`
+	SubscriptionAmount      float64    `db:"subscription_amount" json:"subscription_amount"`
 	DataRegion              string     `db:"data_region" json:"data_region"`
 	IsActive                bool       `db:"is_active" json:"is_active"`
 	CreatedAt               time.Time  `db:"created_at" json:"created_at"`
@@ -195,7 +193,6 @@ type Company struct {
 	SubscriptionEndDate     *time.Time `db:"subscription_end_date" json:"subscription_end_date,omitempty"`
 	FinancialYearStartMonth int        `db:"financial_year_start_month" json:"financial_year_start_month"`
 
-	// ----- Production-grade subscription fields (NEW) -----
 	GracePeriodDays                   int        `db:"grace_period_days" json:"grace_period_days"`
 	StripeCustomerID                  *string    `db:"stripe_customer_id" json:"stripe_customer_id,omitempty"`
 	RazorpaySubscriptionID            *string    `db:"razorpay_subscription_id" json:"razorpay_subscription_id,omitempty"`
@@ -353,7 +350,7 @@ type DepartmentWithRoles struct {
 }
 
 // =============================================================================
-// COMPANY EMPLOYEES – Updated with location fields
+// COMPANY EMPLOYEES
 // =============================================================================
 
 type CompanyEmployee struct {
@@ -366,11 +363,10 @@ type CompanyEmployee struct {
 	IsActive            bool       `db:"is_active" json:"is_active"`
 	ReportsTo           *uuid.UUID `db:"reports_to" json:"reports_to,omitempty"`
 	PrimaryLocationID   *uuid.UUID `db:"primary_location_id" json:"primary_location_id,omitempty"`
-	LocationAccessScope string     `db:"location_access_scope" json:"location_access_scope"` // PRIMARY, SELECTED, ALL
+	LocationAccessScope string     `db:"location_access_scope" json:"location_access_scope"`
 	CreatedAt           time.Time  `db:"created_at" json:"created_at"`
 	UpdatedAt           time.Time  `db:"updated_at" json:"updated_at"`
 
-	// Denormalised fields (from joins)
 	Username string  `db:"username" json:"username"`
 	FullName *string `db:"full_name" json:"full_name,omitempty"`
 }
@@ -470,23 +466,87 @@ type UserPermissionSummary struct {
 }
 
 // =============================================================================
-// POSITIONS, WORK CENTERS
+// JOBS  👈 NEW
+// Job catalog — one row per distinct role per company.
+// Carries NO location and NO work center; those live on `positions`.
+// =============================================================================
+
+type Job struct {
+	JobID              uuid.UUID `db:"job_id"              json:"job_id"`
+	CompanyID          uuid.UUID `db:"company_id"          json:"company_id"`
+	JobCode            string    `db:"job_code"            json:"job_code"`
+	JobTitle           string    `db:"job_title"           json:"job_title"`
+	Description        *string   `db:"description"         json:"description,omitempty"`
+	IsSchedulable      bool      `db:"is_schedulable"      json:"is_schedulable"`
+	AttendanceRequired bool      `db:"attendance_required" json:"attendance_required"`
+	OvertimeAllowed    bool      `db:"overtime_allowed"    json:"overtime_allowed"`
+	IsActive           bool      `db:"is_active"           json:"is_active"`
+	CreatedAt          time.Time `db:"created_at"          json:"created_at"`
+	UpdatedAt          time.Time `db:"updated_at"          json:"updated_at"`
+}
+
+type CreateJobRequest struct {
+	JobCode            string  `json:"job_code"            validate:"required,min=1,max=50"`
+	JobTitle           string  `json:"job_title"           validate:"required,min=1,max=255"`
+	Description        *string `json:"description,omitempty"`
+	IsSchedulable      *bool   `json:"is_schedulable,omitempty"`
+	AttendanceRequired *bool   `json:"attendance_required,omitempty"`
+	OvertimeAllowed    *bool   `json:"overtime_allowed,omitempty"`
+}
+
+type UpdateJobRequest struct {
+	JobTitle           *string `json:"job_title,omitempty" validate:"omitempty,min=1,max=255"`
+	Description        *string `json:"description,omitempty"`
+	IsSchedulable      *bool   `json:"is_schedulable,omitempty"`
+	AttendanceRequired *bool   `json:"attendance_required,omitempty"`
+	OvertimeAllowed    *bool   `json:"overtime_allowed,omitempty"`
+	IsActive           *bool   `json:"is_active,omitempty"`
+}
+
+// =============================================================================
+// POSITIONS  👈 CHANGED
+// A "seat": one row per headcount slot. References a job (definition),
+// a location (site), and optionally a work center (sub-area at that site).
 // =============================================================================
 
 type Position struct {
-	PositionID         uuid.UUID `json:"position_id" db:"position_id"`
-	CompanyID          uuid.UUID `json:"company_id" db:"company_id"`
-	DepartmentID       uuid.UUID `json:"department_id" db:"department_id"`
-	DepartmentName     string    `json:"department_name,omitempty" db:"-"`
-	Title              string    `json:"title" db:"title"`
-	IsOpen             bool      `json:"is_open" db:"is_open"`
-	IsSchedulable      bool      `json:"is_schedulable" db:"is_schedulable"`
-	AttendanceRequired bool      `json:"attendance_required" db:"attendance_required"`
-	OvertimeAllowed    bool      `json:"overtime_allowed" db:"overtime_allowed"`
-	WorkCenterCode     *string   `json:"work_center_code,omitempty" db:"work_center_code"`
-	WorkCenterName     *string   `json:"work_center_name,omitempty" db:"-"`
-	CreatedAt          time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt          time.Time `json:"updated_at" db:"updated_at"`
+	PositionID     uuid.UUID  `db:"position_id"     json:"position_id"`
+	CompanyID      uuid.UUID  `db:"company_id"      json:"company_id"`
+	DepartmentID   uuid.UUID  `db:"department_id"   json:"department_id"`
+	JobID          uuid.UUID  `db:"job_id"          json:"job_id"`                   // 👈 NEW
+	LocationID     *uuid.UUID `db:"location_id"     json:"location_id,omitempty"`    // 👈 NEW
+	TitleOverride  *string    `db:"title_override"  json:"title_override,omitempty"` // 👈 CHANGED (was Title)
+	IsOpen         bool       `db:"is_open"         json:"is_open"`
+	WorkCenterCode *string    `db:"work_center_code" json:"work_center_code,omitempty"`
+	CreatedAt      time.Time  `db:"created_at"      json:"created_at"`
+	UpdatedAt      time.Time  `db:"updated_at"      json:"updated_at"`
+
+	// ❌ REMOVED (now on Job):
+	//   Title              string
+	//   IsSchedulable      bool
+	//   AttendanceRequired bool
+	//   OvertimeAllowed    bool
+}
+
+// PositionView is a read model with the joined fields the API needs.
+type PositionView struct {
+	Position
+	JobCode            string  `db:"job_code"            json:"job_code"`
+	JobTitle           string  `db:"job_title"           json:"job_title"`
+	IsSchedulable      bool    `db:"is_schedulable"      json:"is_schedulable"`
+	AttendanceRequired bool    `db:"attendance_required" json:"attendance_required"`
+	OvertimeAllowed    bool    `db:"overtime_allowed"    json:"overtime_allowed"`
+	DepartmentName     *string `db:"department_name"     json:"department_name,omitempty"`
+	LocationName       *string `db:"location_name"       json:"location_name,omitempty"`
+	WorkCenterName     *string `db:"work_center_name"    json:"work_center_name,omitempty"`
+}
+
+// EffectiveTitle returns the display title for the seat.
+func (p *PositionView) EffectiveTitle() string {
+	if p.TitleOverride != nil && *p.TitleOverride != "" {
+		return *p.TitleOverride
+	}
+	return p.JobTitle
 }
 
 type DepartmentTree struct {
@@ -535,14 +595,19 @@ type CompanyEmployeeWithPosition struct {
 	IsOpen        *bool      `db:"is_open" json:"is_open,omitempty"`
 }
 
+// PositionResponse  👈 CHANGED — reflects job_id / location_id / title_override
 type PositionResponse struct {
-	PositionID   string    `json:"position_id"`
-	Title        string    `json:"title"`
-	IsOpen       bool      `json:"is_open"`
-	DepartmentID string    `json:"department_id"`
-	CompanyID    string    `json:"company_id"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	PositionID     string    `json:"position_id"`
+	CompanyID      string    `json:"company_id"`
+	DepartmentID   string    `json:"department_id"`
+	JobID          string    `json:"job_id"`
+	LocationID     *string   `json:"location_id,omitempty"`
+	TitleOverride  *string   `json:"title_override,omitempty"`
+	EffectiveTitle string    `json:"effective_title"`
+	IsOpen         bool      `json:"is_open"`
+	WorkCenterCode *string   `json:"work_center_code,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 type OpenPositionsRequest struct {
@@ -560,15 +625,17 @@ type PositionsByDepartmentRequest struct {
 	Offset       *int      `json:"offset,omitempty"`
 }
 
+// WorkCenter  👈 CHANGED — added LocationID
 type WorkCenter struct {
-	WorkCenterCode string    `json:"work_center_code" db:"work_center_code"`
-	CompanyID      uuid.UUID `json:"company_id" db:"company_id"`
-	Name           string    `json:"name" db:"name"`
-	Description    *string   `json:"description" db:"description"`
-	Timezone       string    `json:"timezone" db:"timezone"`
-	IsActive       bool      `json:"is_active" db:"is_active"`
-	CreatedAt      time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at" db:"updated_at"`
+	WorkCenterCode string     `json:"work_center_code" db:"work_center_code"`
+	CompanyID      uuid.UUID  `json:"company_id" db:"company_id"`
+	LocationID     *uuid.UUID `json:"location_id,omitempty" db:"location_id"` // 👈 NEW
+	Name           string     `json:"name" db:"name"`
+	Description    *string    `json:"description" db:"description"`
+	Timezone       string     `json:"timezone" db:"timezone"`
+	IsActive       bool       `json:"is_active" db:"is_active"`
+	CreatedAt      time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at" db:"updated_at"`
 }
 
 type EmployeeWithPositionDetails struct {
@@ -608,7 +675,7 @@ type CompanyEmployeeSearchResult struct {
 }
 
 // =============================================================================
-// LOCATIONS – New models
+// LOCATIONS
 // =============================================================================
 
 type Location struct {
@@ -631,7 +698,7 @@ type EmployeeLocationAccess struct {
 	CompanyID   uuid.UUID  `db:"company_id" json:"company_id"`
 	UserID      uuid.UUID  `db:"user_id" json:"user_id"`
 	LocationID  uuid.UUID  `db:"location_id" json:"location_id"`
-	AccessLevel string     `db:"access_level" json:"access_level"` // VIEW, MANAGE, etc.
+	AccessLevel string     `db:"access_level" json:"access_level"`
 	GrantedAt   time.Time  `db:"granted_at" json:"granted_at"`
 	GrantedBy   *uuid.UUID `db:"granted_by" json:"granted_by,omitempty"`
 }
@@ -647,7 +714,6 @@ type EmployeeLocationHistory struct {
 	CreatedAt    time.Time  `db:"created_at" json:"created_at"`
 }
 
-// LocationWithAccess includes location details plus access level for a specific employee.
 type LocationWithAccess struct {
 	Location
 	AccessLevel string `json:"access_level,omitempty"`
@@ -693,7 +759,7 @@ type SubscriptionPlan struct {
 	IsActive      bool       `db:"is_active" json:"is_active"`
 	CreatedAt     time.Time  `db:"created_at" json:"created_at"`
 	UpdatedAt     time.Time  `db:"updated_at" json:"updated_at"`
-	DeletedAt     *time.Time `db:"deleted_at" json:"deleted_at,omitempty"` // soft delete
+	DeletedAt     *time.Time `db:"deleted_at" json:"deleted_at,omitempty"`
 }
 
 // =============================================================================
@@ -710,8 +776,8 @@ type CompanyPayment struct {
 	PaymentDate     time.Time       `db:"payment_date" json:"payment_date"`
 	PaymentMethod   *string         `db:"payment_method" json:"payment_method,omitempty"`
 	GatewayTxnID    *string         `db:"gateway_txn_id" json:"gateway_txn_id,omitempty"`
-	GatewayResponse json.RawMessage `db:"gateway_response" json:"gateway_response,omitempty"` // JSONB
-	Status          string          `db:"status" json:"status"`                               // pending, success, failed, refunded
+	GatewayResponse json.RawMessage `db:"gateway_response" json:"gateway_response,omitempty"`
+	Status          string          `db:"status" json:"status"`
 	Notes           *string         `db:"notes" json:"notes,omitempty"`
 	CreatedAt       time.Time       `db:"created_at" json:"created_at"`
 	UpdatedAt       time.Time       `db:"updated_at" json:"updated_at"`
@@ -733,7 +799,7 @@ type SubscriptionInvoice struct {
 	TaxTotal      float64    `db:"tax_total" json:"tax_total"`
 	DiscountTotal float64    `db:"discount_total" json:"discount_total"`
 	GrandTotal    float64    `db:"grand_total" json:"grand_total"`
-	Status        string     `db:"status" json:"status"` // draft, issued, paid, overdue, cancelled
+	Status        string     `db:"status" json:"status"`
 	Notes         *string    `db:"notes" json:"notes,omitempty"`
 	IssuedAt      *time.Time `db:"issued_at" json:"issued_at,omitempty"`
 	PaidAt        *time.Time `db:"paid_at" json:"paid_at,omitempty"`
@@ -751,10 +817,10 @@ type SubscriptionInvoiceItem struct {
 	ItemID      uuid.UUID `db:"item_id" json:"item_id"`
 	InvoiceID   uuid.UUID `db:"invoice_id" json:"invoice_id"`
 	Description string    `db:"description" json:"description"`
-	Quantity    float64   `db:"quantity" json:"quantity"` // NUMERIC(14,4)
+	Quantity    float64   `db:"quantity" json:"quantity"`
 	UnitPrice   float64   `db:"unit_price" json:"unit_price"`
-	TotalPrice  float64   `db:"total_price" json:"total_price"` // generated, but can be included
-	TaxRate     float64   `db:"tax_rate" json:"tax_rate"`       // NUMERIC(5,2)
+	TotalPrice  float64   `db:"total_price" json:"total_price"`
+	TaxRate     float64   `db:"tax_rate" json:"tax_rate"`
 	TaxAmount   float64   `db:"tax_amount" json:"tax_amount"`
 	CreatedAt   time.Time `db:"created_at" json:"created_at"`
 }
@@ -766,19 +832,18 @@ type SubscriptionInvoiceItem struct {
 type SubscriptionReminder struct {
 	ReminderID    uuid.UUID  `db:"reminder_id" json:"reminder_id"`
 	CompanyID     uuid.UUID  `db:"company_id" json:"company_id"`
-	ReminderType  string     `db:"reminder_type" json:"reminder_type"` // trial_ending, trial_ended, subscription_ending, subscription_ended, grace_period_ending, payment_failed
+	ReminderType  string     `db:"reminder_type" json:"reminder_type"`
 	ScheduledDate time.Time  `db:"scheduled_date" json:"scheduled_date"`
 	SentAt        *time.Time `db:"sent_at" json:"sent_at,omitempty"`
-	SentVia       *string    `db:"sent_via" json:"sent_via,omitempty"` // email, sms
+	SentVia       *string    `db:"sent_via" json:"sent_via,omitempty"`
 	Message       *string    `db:"message" json:"message,omitempty"`
 	CreatedAt     time.Time  `db:"created_at" json:"created_at"`
 }
 
 // =============================================================================
-// ENUM CONSTANTS – Full set including new statuses
+// ENUM CONSTANTS
 // =============================================================================
 
-// KYC
 const (
 	KYCStatusPending     = "pending"
 	KYCStatusVerified    = "verified"
@@ -793,27 +858,23 @@ const (
 	KYCLevelFull     = "full"
 )
 
-// Subscription tiers
 const (
 	SubscriptionTierBasic      = "basic"
 	SubscriptionTierPremium    = "premium"
 	SubscriptionTierEnterprise = "enterprise"
 )
 
-// Subscription statuses (old + new)
 const (
-	SubscriptionStatusActive   = "active"
-	SubscriptionStatusInactive = "inactive"
-	SubscriptionStatusPending  = "pending"
-	SubscriptionStatusEnded    = "ended"
-	// New production statuses
+	SubscriptionStatusActive    = "active"
+	SubscriptionStatusInactive  = "inactive"
+	SubscriptionStatusPending   = "pending"
+	SubscriptionStatusEnded     = "ended"
 	SubscriptionStatusTrial     = "trial"
 	SubscriptionStatusPastDue   = "past_due"
 	SubscriptionStatusExpired   = "expired"
 	SubscriptionStatusCancelled = "cancelled"
 )
 
-// Payment statuses
 const (
 	PaymentStatusPending  = "pending"
 	PaymentStatusSuccess  = "success"
@@ -821,7 +882,6 @@ const (
 	PaymentStatusRefunded = "refunded"
 )
 
-// Invoice statuses
 const (
 	InvoiceStatusDraft     = "draft"
 	InvoiceStatusIssued    = "issued"
@@ -830,7 +890,6 @@ const (
 	InvoiceStatusCancelled = "cancelled"
 )
 
-// Reminder types
 const (
 	ReminderTrialEnding        = "trial_ending"
 	ReminderTrialEnded         = "trial_ended"
@@ -840,20 +899,17 @@ const (
 	ReminderPaymentFailed      = "payment_failed"
 )
 
-// Location access scopes
 const (
 	LocationScopePrimary  = "PRIMARY"
 	LocationScopeSelected = "SELECTED"
 	LocationScopeAll      = "ALL"
 )
 
-// Location access levels
 const (
 	AccessLevelView   = "VIEW"
 	AccessLevelManage = "MANAGE"
 )
 
-// Role levels
 const (
 	RoleLevelOwner   = 100
 	RoleLevelManager = 200
@@ -861,14 +917,12 @@ const (
 	RoleLevelViewer  = 400
 )
 
-// Data regions
 const (
 	DataRegionUS = "us"
 	DataRegionEU = "eu"
 	DataRegionAS = "as"
 )
 
-// Search types
 const (
 	SearchTypeFulltext     = "fulltext"
 	SearchTypeAutocomplete = "autocomplete"
@@ -879,14 +933,11 @@ const (
 	MatchTypeAutocomplete = "autocomplete"
 )
 
-// EmployeeLocationDetails holds the employee's location settings.
 type EmployeeLocationDetails struct {
 	PrimaryLocationID uuid.UUID
-	LocationScope     string // "PRIMARY", "SELECTED", "ALL"
+	LocationScope     string
 }
 
-// EmployeeLocationGrantRequest is a single (location, access_level) pair.
-// Used inside EmployeeLocationUpdateRequest.SelectedLocations.
 type EmployeeLocationGrantRequest struct {
 	LocationID  uuid.UUID `json:"location_id" validate:"required"`
 	AccessLevel string    `json:"access_level" validate:"required,oneof=VIEW MANAGE"`
@@ -901,8 +952,8 @@ type EmployeeLocationUpdateRequest struct {
 	SelectedLocations   []EmployeeLocationGrantRequest `json:"selected_locations,omitempty"`
 	SelectedLocationIDs []uuid.UUID                    `json:"selected_location_ids,omitempty"`
 }
+
 type CompanyDetailView struct {
-	// ---- Base company fields ----
 	CompanyID   uuid.UUID `json:"company_id"`
 	CompanyName string    `json:"company_name"`
 	OwnerUserID uuid.UUID `json:"owner_user_id"`
@@ -911,13 +962,11 @@ type CompanyDetailView struct {
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 
-	// ---- Subscription / plan ----
 	SubscriptionTier   string     `json:"subscription_tier"`
 	SubscriptionStatus string     `json:"subscription_status"`
 	SubscriptionAmount float64    `json:"subscription_amount"`
 	SubscriptionPlanID *uuid.UUID `json:"subscription_plan_id,omitempty"`
 
-	// NEW joined fields
 	SubscriptionPlanCode *string `json:"subscription_plan_code,omitempty"`
 	SubscriptionPlanName *string `json:"subscription_plan_name,omitempty"`
 
@@ -928,11 +977,9 @@ type CompanyDetailView struct {
 	TrialStartDate *time.Time `json:"trial_start_date,omitempty"`
 	TrialEndDate   *time.Time `json:"trial_end_date,omitempty"`
 
-	// ---- Quotas ----
 	MaxEmployees int `json:"max_employees"`
 	MaxLocations int `json:"max_locations"`
 
-	// ---- Billing ----
 	FinancialYearStartMonth           int     `json:"financial_year_start_month"`
 	GracePeriodDays                   int     `json:"grace_period_days"`
 	StripeCustomerID                  *string `json:"stripe_customer_id,omitempty"`
@@ -942,7 +989,6 @@ type CompanyDetailView struct {
 	SubscriptionGatewaySubscriptionID *string `json:"subscription_gateway_subscription_id,omitempty"`
 }
 
-// NewCompanyDetailView builds the view from the domain model.
 func NewCompanyDetailView(c *Company) *CompanyDetailView {
 	if c == nil {
 		return nil
@@ -974,4 +1020,9 @@ func NewCompanyDetailView(c *Company) *CompanyDetailView {
 		SubscriptionGatewayCustomerID:     c.SubscriptionGatewayCustomerID,
 		SubscriptionGatewaySubscriptionID: c.SubscriptionGatewaySubscriptionID,
 	}
+}
+
+type UserDisplayName struct {
+	Username string `db:"username"  json:"username"`
+	FullName string `db:"full_name" json:"full_name"`
 }

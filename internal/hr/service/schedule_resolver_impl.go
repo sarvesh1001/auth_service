@@ -39,11 +39,21 @@ func NewEmployeeScheduleResolver(
 }
 
 // ResolveSubject returns schedule-related subject info for an employee.
-func (r *EmployeeScheduleResolver) ResolveSubject(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) (*resolver.ScheduleSubjectInfo, error) {
+//
+// Reads from GetPositionViewByID (joined with `jobs` and `locations`)
+// so the schedule engine gets the job's schedulable / attendance /
+// overtime flags along with the seat's work-center.
+func (r *EmployeeScheduleResolver) ResolveSubject(
+	ctx context.Context,
+	companyID, subjectID uuid.UUID,
+	subjectType string,
+	date time.Time,
+) (*resolver.ScheduleSubjectInfo, error) {
 	if subjectType != "employee" {
 		return nil, fmt.Errorf("unsupported subject type: %s", subjectType)
 	}
-	// Get company employee record
+
+	// Get company employee record.
 	employee, err := r.employeeRepo.GetCompanyEmployeeByUserID(ctx, subjectID)
 	if err != nil {
 		return nil, err
@@ -51,32 +61,44 @@ func (r *EmployeeScheduleResolver) ResolveSubject(ctx context.Context, companyID
 	if employee == nil || !employee.IsActive {
 		return &resolver.ScheduleSubjectInfo{IsActive: false}, nil
 	}
+
 	info := &resolver.ScheduleSubjectInfo{
 		SubjectID:   subjectID,
 		SubjectType: "employee",
 		IsActive:    true,
 		CompanyID:   companyID,
 	}
-	if employee.PositionID != nil {
-		position, err := r.employeeRepo.GetPositionByID(ctx, *employee.PositionID)
-		if err == nil && position != nil {
-			info.PositionID = &position.PositionID
-			if position.Title != nil {
-				info.PositionTitle = *position.Title
-			}
-			info.IsSchedulable = position.IsSchedulable
-			info.AttendanceRequired = position.AttendanceRequired
-			info.OvertimeAllowed = position.OvertimeAllowed
-			if position.WorkCenterCode != nil {
-				info.WorkCenterCode = position.WorkCenterCode
-				wc, err := r.workCenterRepo.GetByCode(ctx, companyID, *position.WorkCenterCode)
-				if err == nil && wc != nil {
-					info.WorkCenterName = wc.Name
-					info.WorkCenterTimezone = wc.Timezone
-				}
-			}
+
+	if employee.PositionID == nil {
+		return info, nil
+	}
+
+	// Joined view: seat + job definition + joined names.
+	pv, err := r.employeeRepo.GetPositionViewByID(ctx, *employee.PositionID)
+	if err != nil || pv == nil {
+		// A missing position is not fatal — return the employee
+		// without schedule flags; the caller can decide.
+		return info, nil
+	}
+
+	// Job-level fields — these come from the joined `jobs` row.
+	info.PositionID = &pv.PositionID
+	info.PositionTitle = pv.EffectiveTitle()
+	info.IsSchedulable = pv.IsSchedulable
+	info.AttendanceRequired = pv.AttendanceRequired
+	info.OvertimeAllowed = pv.OvertimeAllowed
+
+	// Work-center resolution — the seat carries the code; the
+	// attendance repo resolves the WC's name and timezone.
+	if pv.WorkCenterCode != nil {
+		info.WorkCenterCode = pv.WorkCenterCode
+		wc, err := r.workCenterRepo.GetByCode(ctx, companyID, *pv.WorkCenterCode)
+		if err == nil && wc != nil {
+			info.WorkCenterName = wc.Name
+			info.WorkCenterTimezone = wc.Timezone
 		}
 	}
+
 	return info, nil
 }
 

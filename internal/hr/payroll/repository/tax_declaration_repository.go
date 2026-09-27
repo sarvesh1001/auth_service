@@ -379,7 +379,7 @@ func (r *taxDeclarationRepository) ListDeclarationsByFinancialYear(
 	// 👇 Location filter — via company_employees (current assignment)
 	if locationID != nil {
 		query += fmt.Sprintf(
-			" AND user_id IN (SELECT user_id FROM company_employees WHERE company_id = $1 AND employment_location_id = $%d AND is_active = true)",
+			" AND user_id IN (SELECT user_id FROM company_employees WHERE company_id = $1 AND primary_location_id = $%d AND is_active = true)",
 			argIdx)
 		args = append(args, *locationID)
 		argIdx++

@@ -19,7 +19,6 @@ type employeeFineRepository struct {
 	client *client.PostgresClient
 }
 
-// NewEmployeeFineRepository creates a new EmployeeFineRepository instance.
 func NewEmployeeFineRepository(
 	postgresClient *client.PostgresClient,
 ) EmployeeFineRepository {
@@ -52,7 +51,7 @@ func (r *employeeFineRepository) Create(ctx context.Context, fine *models.Employ
 			payroll_run_id,
 			created_at,
 			created_by,
-			component_code
+			component_id
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 	`
 	_, err := r.client.Exec(ctx, query,
@@ -66,7 +65,7 @@ func (r *employeeFineRepository) Create(ctx context.Context, fine *models.Employ
 		fine.PayrollRunID,
 		fine.CreatedAt,
 		fine.CreatedBy,
-		fine.ComponentCode,
+		fine.ComponentID,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create employee fine: %w", err)
@@ -82,8 +81,9 @@ func (r *employeeFineRepository) Update(ctx context.Context, fine *models.Employ
 			reason = $2,
 			fine_date = $3,
 			is_processed = $4,
-			payroll_run_id = $5
-		WHERE fine_id = $6 AND company_id = $7
+			payroll_run_id = $5,
+			component_id = $6
+		WHERE fine_id = $7 AND company_id = $8
 	`
 	result, err := r.client.Exec(ctx, query,
 		fine.FineAmount,
@@ -91,6 +91,7 @@ func (r *employeeFineRepository) Update(ctx context.Context, fine *models.Employ
 		fine.FineDate,
 		fine.IsProcessed,
 		fine.PayrollRunID,
+		fine.ComponentID,
 		fine.FineID,
 		fine.CompanyID,
 	)
@@ -159,19 +160,21 @@ func (r *employeeFineRepository) GetByID(
 ) (*models.EmployeeFine, error) {
 	query := `
 		SELECT
-			fine_id,
-			company_id,
-			user_id,
-			fine_amount,
-			reason,
-			fine_date,
-			is_processed,
-			payroll_run_id,
-			created_at,
-			created_by,
-			component_code
-		FROM payroll.employee_fine
-		WHERE fine_id = $1 AND company_id = $2
+			f.fine_id,
+			f.company_id,
+			f.user_id,
+			f.fine_amount,
+			f.reason,
+			f.fine_date,
+			f.is_processed,
+			f.payroll_run_id,
+			f.created_at,
+			f.created_by,
+			f.component_id,
+			pc.component_code
+		FROM payroll.employee_fine f
+		JOIN payroll.payroll_component pc ON pc.component_id = f.component_id
+		WHERE f.fine_id = $1 AND f.company_id = $2
 	`
 	row := r.client.QueryRow(ctx, query, fineID, companyID)
 	var fine models.EmployeeFine
@@ -186,6 +189,7 @@ func (r *employeeFineRepository) GetByID(
 		&fine.PayrollRunID,
 		&fine.CreatedAt,
 		&fine.CreatedBy,
+		&fine.ComponentID,
 		&fine.ComponentCode,
 	)
 	if err != nil {
@@ -197,55 +201,49 @@ func (r *employeeFineRepository) GetByID(
 	return &fine, nil
 }
 
-// GetByFilter returns a page of fines.
-//
-// Location: filtered via filter.LocationID when non-nil. The filter is
-// expressed as a subquery against company_employees so the dynamic
-// WHERE-clause builder stays unchanged.
 func (r *employeeFineRepository) GetByFilter(
 	ctx context.Context,
 	filter models.EmployeeFineFilter,
 ) ([]models.EmployeeFine, int, error) {
-	whereClause := "WHERE company_id = $1"
+	whereClause := "WHERE f.company_id = $1"
 	args := []interface{}{filter.CompanyID}
 	paramIdx := 2
 
 	if filter.UserID != nil {
-		whereClause += fmt.Sprintf(" AND user_id = $%d", paramIdx)
+		whereClause += fmt.Sprintf(" AND f.user_id = $%d", paramIdx)
 		args = append(args, *filter.UserID)
 		paramIdx++
 	}
 	if filter.IsProcessed != nil {
-		whereClause += fmt.Sprintf(" AND is_processed = $%d", paramIdx)
+		whereClause += fmt.Sprintf(" AND f.is_processed = $%d", paramIdx)
 		args = append(args, *filter.IsProcessed)
 		paramIdx++
 	}
 	if filter.PayrollRunID != nil {
-		whereClause += fmt.Sprintf(" AND payroll_run_id = $%d", paramIdx)
+		whereClause += fmt.Sprintf(" AND f.payroll_run_id = $%d", paramIdx)
 		args = append(args, *filter.PayrollRunID)
 		paramIdx++
 	}
 	if filter.FromDate != nil {
-		whereClause += fmt.Sprintf(" AND fine_date >= $%d", paramIdx)
+		whereClause += fmt.Sprintf(" AND f.fine_date >= $%d", paramIdx)
 		args = append(args, *filter.FromDate)
 		paramIdx++
 	}
 	if filter.ToDate != nil {
-		whereClause += fmt.Sprintf(" AND fine_date <= $%d", paramIdx)
+		whereClause += fmt.Sprintf(" AND f.fine_date <= $%d", paramIdx)
 		args = append(args, *filter.ToDate)
 		paramIdx++
 	}
-	// 👇 Location filter — via company_employees (current assignment)
+	// Location filter — via company_employees (current assignment)
 	if filter.LocationID != nil {
 		whereClause += fmt.Sprintf(
-			" AND user_id IN (SELECT user_id FROM company_employees WHERE company_id = $1 AND employment_location_id = $%d AND is_active = true)",
+			" AND f.user_id IN (SELECT user_id FROM company_employees WHERE company_id = $1 AND primary_location_id = $%d AND is_active = true)",
 			paramIdx)
 		args = append(args, *filter.LocationID)
 		paramIdx++
 	}
 
-	// Count total
-	countQuery := `SELECT COUNT(*) FROM payroll.employee_fine ` + whereClause
+	countQuery := `SELECT COUNT(*) FROM payroll.employee_fine f ` + whereClause
 	var total int
 	err := r.client.QueryRow(ctx, countQuery, args...).Scan(&total)
 	if err != nil {
@@ -255,22 +253,23 @@ func (r *employeeFineRepository) GetByFilter(
 		return []models.EmployeeFine{}, 0, nil
 	}
 
-	// Fetch data
 	query := `
 		SELECT
-			fine_id,
-			company_id,
-			user_id,
-			fine_amount,
-			reason,
-			fine_date,
-			is_processed,
-			payroll_run_id,
-			created_at,
-			created_by,
-			component_code
-		FROM payroll.employee_fine
-	` + whereClause + ` ORDER BY fine_date DESC`
+			f.fine_id,
+			f.company_id,
+			f.user_id,
+			f.fine_amount,
+			f.reason,
+			f.fine_date,
+			f.is_processed,
+			f.payroll_run_id,
+			f.created_at,
+			f.created_by,
+			f.component_id,
+			pc.component_code
+		FROM payroll.employee_fine f
+		JOIN payroll.payroll_component pc ON pc.component_id = f.component_id
+	` + whereClause + ` ORDER BY f.fine_date DESC`
 
 	if filter.Page > 0 && filter.PageSize > 0 {
 		offset := (filter.Page - 1) * filter.PageSize
@@ -301,6 +300,7 @@ func (r *employeeFineRepository) GetByFilter(
 			&f.PayrollRunID,
 			&f.CreatedAt,
 			&f.CreatedBy,
+			&f.ComponentID,
 			&f.ComponentCode,
 		); err != nil {
 			return nil, 0, fmt.Errorf("failed to scan employee fine: %w", err)
@@ -321,23 +321,25 @@ func (r *employeeFineRepository) GetUnprocessedByUserAndPeriod(
 ) ([]models.EmployeeFine, error) {
 	query := `
 		SELECT
-			fine_id,
-			company_id,
-			user_id,
-			fine_amount,
-			reason,
-			fine_date,
-			is_processed,
-			payroll_run_id,
-			created_at,
-			created_by,
-			component_code
-		FROM payroll.employee_fine
-		WHERE company_id = $1
-			AND user_id = $2
-			AND is_processed = false
-			AND fine_date BETWEEN $3 AND $4
-		ORDER BY fine_date
+			f.fine_id,
+			f.company_id,
+			f.user_id,
+			f.fine_amount,
+			f.reason,
+			f.fine_date,
+			f.is_processed,
+			f.payroll_run_id,
+			f.created_at,
+			f.created_by,
+			f.component_id,
+			pc.component_code
+		FROM payroll.employee_fine f
+		JOIN payroll.payroll_component pc ON pc.component_id = f.component_id
+		WHERE f.company_id = $1
+			AND f.user_id = $2
+			AND f.is_processed = false
+			AND f.fine_date BETWEEN $3 AND $4
+		ORDER BY f.fine_date
 	`
 	rows, err := r.client.Query(ctx, query, companyID, userID, periodStart, periodEnd)
 	if err != nil {
@@ -359,6 +361,7 @@ func (r *employeeFineRepository) GetUnprocessedByUserAndPeriod(
 			&f.PayrollRunID,
 			&f.CreatedAt,
 			&f.CreatedBy,
+			&f.ComponentID,
 			&f.ComponentCode,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan employee fine: %w", err)
@@ -371,11 +374,6 @@ func (r *employeeFineRepository) GetUnprocessedByUserAndPeriod(
 	return fines, nil
 }
 
-// GetUnprocessedByCompanyAndPeriod returns unprocessed fines for a company
-// whose fine_date is in the given period.
-//
-// Location: when locationID is non-nil, only fines for employees whose
-// current employment_location_id matches are returned.
 func (r *employeeFineRepository) GetUnprocessedByCompanyAndPeriod(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -384,26 +382,28 @@ func (r *employeeFineRepository) GetUnprocessedByCompanyAndPeriod(
 ) ([]models.EmployeeFine, error) {
 	query := `
 		SELECT
-			fine_id,
-			company_id,
-			user_id,
-			fine_amount,
-			reason,
-			fine_date,
-			is_processed,
-			payroll_run_id,
-			created_at,
-			created_by,
-			component_code
-		FROM payroll.employee_fine
-		WHERE company_id = $1
-			AND is_processed = false
-			AND fine_date BETWEEN $2 AND $3
-			AND ($4::uuid IS NULL OR user_id IN (
+			f.fine_id,
+			f.company_id,
+			f.user_id,
+			f.fine_amount,
+			f.reason,
+			f.fine_date,
+			f.is_processed,
+			f.payroll_run_id,
+			f.created_at,
+			f.created_by,
+			f.component_id,
+			pc.component_code
+		FROM payroll.employee_fine f
+		JOIN payroll.payroll_component pc ON pc.component_id = f.component_id
+		WHERE f.company_id = $1
+			AND f.is_processed = false
+			AND f.fine_date BETWEEN $2 AND $3
+			AND ($4::uuid IS NULL OR f.user_id IN (
 				SELECT user_id FROM company_employees
-				WHERE company_id = $1 AND employment_location_id = $4 AND is_active = true
+				WHERE company_id = $1 AND primary_location_id = $4 AND is_active = true
 			))
-		ORDER BY user_id, fine_date
+		ORDER BY f.user_id, f.fine_date
 	`
 	rows, err := r.client.Query(ctx, query, companyID, periodStart, periodEnd, locationID)
 	if err != nil {
@@ -425,6 +425,7 @@ func (r *employeeFineRepository) GetUnprocessedByCompanyAndPeriod(
 			&f.PayrollRunID,
 			&f.CreatedAt,
 			&f.CreatedBy,
+			&f.ComponentID,
 			&f.ComponentCode,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan employee fine: %w", err)
@@ -441,11 +442,6 @@ func (r *employeeFineRepository) GetUnprocessedByCompanyAndPeriod(
 // RUN SAFETY
 // ============================================================================
 
-// LockUnprocessedForPayrollRun atomically marks unprocessed fines as
-// processed and associates them with the payroll run.
-//
-// Location: when locationID is non-nil, only fines for employees whose
-// current employment_location_id matches are locked and returned.
 func (r *employeeFineRepository) LockUnprocessedForPayrollRun(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -463,7 +459,7 @@ func (r *employeeFineRepository) LockUnprocessedForPayrollRun(
 			AND fine_date BETWEEN $3 AND $4
 			AND ($5::uuid IS NULL OR user_id IN (
 				SELECT user_id FROM company_employees
-				WHERE company_id = $2 AND employment_location_id = $5 AND is_active = true
+				WHERE company_id = $2 AND primary_location_id = $5 AND is_active = true
 			))
 		RETURNING
 			fine_id,
@@ -476,7 +472,7 @@ func (r *employeeFineRepository) LockUnprocessedForPayrollRun(
 			payroll_run_id,
 			created_at,
 			created_by,
-			component_code
+			component_id
 	`
 	rows, err := r.client.Query(ctx, query, payrollRunID, companyID, periodStart, periodEnd, locationID)
 	if err != nil {
@@ -498,7 +494,7 @@ func (r *employeeFineRepository) LockUnprocessedForPayrollRun(
 			&f.PayrollRunID,
 			&f.CreatedAt,
 			&f.CreatedBy,
-			&f.ComponentCode,
+			&f.ComponentID,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan employee fine: %w", err)
 		}
@@ -507,7 +503,41 @@ func (r *employeeFineRepository) LockUnprocessedForPayrollRun(
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("rows iteration error: %w", err)
 	}
+
+	// Populate component codes via a second lookup (rare write path; one round trip).
+	if len(fines) > 0 {
+		ids := make([]uuid.UUID, 0, len(fines))
+		for _, f := range fines {
+			ids = append(ids, f.ComponentID)
+		}
+		codeByID, err := r.lookupComponentCodes(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
+		for i := range fines {
+			fines[i].ComponentCode = codeByID[fines[i].ComponentID]
+		}
+	}
 	return fines, nil
+}
+
+func (r *employeeFineRepository) lookupComponentCodes(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error) {
+	const q = `SELECT component_id, component_code FROM payroll.payroll_component WHERE component_id = ANY($1)`
+	rows, err := r.client.Query(ctx, q, pq.Array(ids))
+	if err != nil {
+		return nil, fmt.Errorf("lookup component codes: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[uuid.UUID]string, len(ids))
+	for rows.Next() {
+		var id uuid.UUID
+		var code string
+		if err := rows.Scan(&id, &code); err != nil {
+			return nil, err
+		}
+		out[id] = code
+	}
+	return out, rows.Err()
 }
 
 // ============================================================================

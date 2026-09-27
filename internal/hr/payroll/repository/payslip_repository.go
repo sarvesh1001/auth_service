@@ -41,7 +41,7 @@ func (r *payslipRepository) GetPayslipData(ctx context.Context, runID, userID uu
 			u.full_name AS employee_name,
 			ce.employee_id,
 			COALESCE(d.department_name, '') AS department,
-			COALESCE(p.title, '') AS position,
+			COALESCE(p.title_override, j.job_title, '') AS position,
 			pr.payroll_run_id,
 			pr.period_start,
 			pr.period_end,
@@ -55,6 +55,7 @@ func (r *payslipRepository) GetPayslipData(ctx context.Context, runID, userID uu
 		JOIN users u ON u.user_id = pi.user_id
 		JOIN company_employees ce ON ce.company_id = pr.company_id AND ce.user_id = pi.user_id
 		LEFT JOIN positions p ON p.position_id = ce.position_id
+		LEFT JOIN jobs j ON j.job_id = p.job_id
 		LEFT JOIN departments d ON d.department_id = p.department_id
 		LEFT JOIN payroll.payslip_template pt ON pt.company_id = c.company_id
 		WHERE pr.payroll_run_id = $1
@@ -91,27 +92,21 @@ func (r *payslipRepository) GetPayslipData(ctx context.Context, runID, userID uu
 	}
 	data.GeneratedAt = time.Now().UTC()
 
-	// Updated ledger query using LATERAL join to pick company‑specific or global component definition
+	// Ledger query — join on component_id (PK). No LATERAL, no code ambiguity:
+	// each ledger row points at exactly one component row.
 	ledgerQuery := `
 		SELECT
-			pl.component_code,
-			COALESCE(pc.description, pl.component_code) AS description,
+			pc.component_code,
+			COALESCE(pc.description, pc.component_code) AS description,
 			pl.amount,
 			COALESCE(pc.component_type, 'earning') AS component_type
 		FROM payroll.payroll_ledger pl
 		JOIN payroll.payroll_item pi ON pi.payroll_item_id = pl.payroll_item_id
-		JOIN payroll.payroll_run pr ON pr.payroll_run_id = pi.payroll_run_id
-		LEFT JOIN LATERAL (
-			SELECT description, component_type
-			FROM payroll.payroll_component pc
-			WHERE pc.component_code = pl.component_code
-			  AND (pc.company_id = pr.company_id OR pc.company_id IS NULL)
-			ORDER BY pc.company_id NULLS LAST   -- company‑specific first
-			LIMIT 1
-		) pc ON true
+		JOIN payroll.payroll_component pc ON pc.component_id = pl.component_id
 		WHERE pi.payroll_run_id = $1
 		  AND pi.user_id = $2
 		  AND pi.is_superseded = false
+		ORDER BY pc.component_type, pc.component_code
 	`
 	rows, err := r.db.Query(ctx, ledgerQuery, runID, userID)
 	if err != nil {
@@ -137,8 +132,6 @@ func (r *payslipRepository) GetPayslipData(ctx context.Context, runID, userID uu
 
 	bank, err := r.getActiveBankDetails(ctx, data.CompanyID, userID, data.PeriodEnd)
 	if err != nil {
-		// We don't fail the entire payslip if bank details are missing – just skip them
-		// (no logging, but we can ignore the error)
 		_ = err
 	} else if bank != nil {
 		data.BankDetails = &struct {

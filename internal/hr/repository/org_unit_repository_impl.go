@@ -1,132 +1,364 @@
 package repository
 
 import (
-	"auth-service/internal/client"
-	hrErrors "auth-service/internal/hr/errors"
-	"auth-service/internal/hr/models/orgunit"
 	"context"
 	"database/sql"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/lib/pq"
+
+	"auth-service/internal/client"
+	hrErrors "auth-service/internal/hr/errors"
+	"auth-service/internal/hr/models/orgunit"
 )
 
 type OrgUnitRepositoryImpl struct {
-	client    *client.PostgresClient
-	stmtCache map[string]*sql.Stmt
-	stmtMutex sync.RWMutex
+	client *client.PostgresClient
 }
 
-func NewOrgUnitRepository(
-	postgresClient *client.PostgresClient,
-) OrgUnitRepository {
-	repo := &OrgUnitRepositoryImpl{
-		client:    postgresClient,
-		stmtCache: make(map[string]*sql.Stmt),
+func NewOrgUnitRepository(pgClient *client.PostgresClient) OrgUnitRepository {
+	return &OrgUnitRepositoryImpl{client: pgClient}
+}
+
+// ============================================================
+// TRANSACTION HELPERS
+// ============================================================
+
+func (r *OrgUnitRepositoryImpl) WithTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	tx, err := r.client.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
 	}
-
-	repo.initializePreparedStatements(context.Background())
-
-	return repo
+	if err := fn(tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+	return nil
 }
 
-func (r *OrgUnitRepositoryImpl) CreateOrgUnit(ctx context.Context, orgUnit *orgunit.OrgUnit) error {
-	query := `
+// ensureTx returns a *sql.Tx. If db is already a *sql.Tx, it's returned
+// as-is (owned=false). Otherwise a new tx is opened (owned=true).
+func (r *OrgUnitRepositoryImpl) ensureTx(ctx context.Context, db client.DBTX) (tx *sql.Tx, owned bool, err error) {
+	if existing, ok := db.(*sql.Tx); ok {
+		return existing, false, nil
+	}
+	tx, err = r.client.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("begin tx: %w", err)
+	}
+	return tx, true, nil
+}
+
+// ============================================================
+// ORG UNITS — WRITE
+// ============================================================
+
+// CreateOrgUnit inserts the org unit row only. Locations are managed
+// separately via SetOrgUnitLocations (the service wraps both in a tx).
+func (r *OrgUnitRepositoryImpl) CreateOrgUnit(ctx context.Context, db client.DBTX, ou *orgunit.OrgUnit) error {
+	const query = `
 		INSERT INTO org_units (
 			org_unit_id, company_id, org_unit_type, name, description,
-			department_id, is_active, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
-
-	_, err := r.client.Exec(ctx, query,
-		orgUnit.OrgUnitID,
-		orgUnit.CompanyID,
-		orgUnit.OrgUnitType,
-		orgUnit.Name,
-		orgUnit.Description,
-		orgUnit.DepartmentID,
-		orgUnit.IsActive,
-		orgUnit.CreatedAt,
-		orgUnit.UpdatedAt,
+			department_id, is_active,
+			created_by, updated_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+	`
+	_, err := db.ExecContext(ctx, query,
+		ou.OrgUnitID, ou.CompanyID, ou.OrgUnitType, ou.Name, ou.Description,
+		ou.DepartmentID, ou.IsActive,
+		ou.CreatedBy, ou.UpdatedBy, ou.CreatedAt, ou.UpdatedAt,
 	)
-
 	if err != nil {
 		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23505" {
 			return hrErrors.ErrOrgUnitAlreadyExists
 		}
 		return fmt.Errorf("failed to create org unit: %w", err)
 	}
-
 	return nil
 }
 
-func (r *OrgUnitRepositoryImpl) GetOrgUnitByID(ctx context.Context, companyID, orgUnitID uuid.UUID) (*orgunit.OrgUnit, error) {
-	stmt, ok := r.getStmt("get_org_unit_by_id")
-	if !ok {
-		return nil, fmt.Errorf("prepared statement not found")
+// UpdateOrgUnit updates the base row only. Locations are handled by
+// SetOrgUnitLocations (the service wraps both in a tx).
+func (r *OrgUnitRepositoryImpl) UpdateOrgUnit(ctx context.Context, db client.DBTX, ou *orgunit.OrgUnit) error {
+	const query = `
+		UPDATE org_units SET
+			name          = $1,
+			description   = $2,
+			department_id = $3,
+			is_active     = $4,
+			updated_by    = $5,
+			updated_at    = $6
+		WHERE company_id = $7 AND org_unit_id = $8
+	`
+	result, err := db.ExecContext(ctx, query,
+		ou.Name, ou.Description, ou.DepartmentID,
+		ou.IsActive, ou.UpdatedBy, ou.UpdatedAt,
+		ou.CompanyID, ou.OrgUnitID,
+	)
+	if err != nil {
+		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23505" {
+			return hrErrors.ErrOrgUnitAlreadyExists
+		}
+		return fmt.Errorf("failed to update org unit: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return hrErrors.ErrOrgUnitNotFound
+	}
+	return nil
+}
+
+func (r *OrgUnitRepositoryImpl) DeleteOrgUnit(ctx context.Context, db client.DBTX, companyID, orgUnitID, actorID uuid.UUID) error {
+	tx, owned, err := r.ensureTx(ctx, db)
+	if err != nil {
+		return err
+	}
+	if owned {
+		defer tx.Rollback()
 	}
 
-	rows, err := stmt.QueryContext(ctx, companyID, orgUnitID)
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE org_unit_members
+		SET effective_to = CURRENT_DATE,
+		    updated_at   = NOW(),
+		    updated_by   = $1
+		WHERE org_unit_id = $2 AND effective_to IS NULL
+	`, actorID, orgUnitID); err != nil {
+		return fmt.Errorf("failed to end memberships: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE org_unit_roles
+		SET effective_to = CURRENT_DATE,
+		    is_primary   = false,
+		    updated_at   = NOW(),
+		    updated_by   = $1
+		WHERE org_unit_id = $2 AND effective_to IS NULL
+	`, actorID, orgUnitID); err != nil {
+		return fmt.Errorf("failed to end roles: %w", err)
+	}
+
+	result, err := tx.ExecContext(ctx, `
+		UPDATE org_units
+		SET is_active  = false,
+		    updated_by = $1,
+		    updated_at = NOW()
+		WHERE company_id = $2 AND org_unit_id = $3 AND is_active = true
+	`, actorID, companyID, orgUnitID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get org unit: %w", err)
+		return fmt.Errorf("failed to delete org unit: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return hrErrors.ErrOrgUnitNotFound
+	}
+
+	if owned {
+		return tx.Commit()
+	}
+	return nil
+}
+
+// ============================================================
+// ORG UNITS ↔ LOCATIONS
+// ============================================================
+
+// SetOrgUnitLocations replaces the org's location set atomically.
+// Passing an empty slice makes the org universal.
+func (r *OrgUnitRepositoryImpl) SetOrgUnitLocations(
+	ctx context.Context,
+	db client.DBTX,
+	orgUnitID uuid.UUID,
+	locationIDs []uuid.UUID,
+	actorID uuid.UUID,
+) error {
+	tx, owned, err := r.ensureTx(ctx, db)
+	if err != nil {
+		return err
+	}
+	if owned {
+		defer tx.Rollback()
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM org_unit_locations WHERE org_unit_id = $1`, orgUnitID,
+	); err != nil {
+		return fmt.Errorf("clear org unit locations: %w", err)
+	}
+
+	if len(locationIDs) > 0 {
+		// Bulk insert with unnest — one round-trip.
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO org_unit_locations (org_unit_id, location_id, created_by)
+			SELECT $1, unnest($2::uuid[]), $3
+		`, orgUnitID, pq.Array(locationIDs), actorID); err != nil {
+			if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23503" {
+				return fmt.Errorf("location does not exist: %w", err)
+			}
+			return fmt.Errorf("insert org unit locations: %w", err)
+		}
+	}
+
+	if owned {
+		return tx.Commit()
+	}
+	return nil
+}
+
+// GetOrgUnitLocations returns the org's bound location IDs.
+func (r *OrgUnitRepositoryImpl) GetOrgUnitLocations(
+	ctx context.Context,
+	db client.DBTX,
+	orgUnitID uuid.UUID,
+) ([]uuid.UUID, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT location_id
+		FROM org_unit_locations
+		WHERE org_unit_id = $1
+		ORDER BY created_at
+	`, orgUnitID)
+	if err != nil {
+		return nil, fmt.Errorf("get org unit locations: %w", err)
 	}
 	defer rows.Close()
 
-	if rows.Next() {
-		return r.scanOrgUnit(rows)
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
 	}
-
-	return nil, hrErrors.ErrOrgUnitNotFound
+	return ids, rows.Err()
 }
 
-func (r *OrgUnitRepositoryImpl) GetOrgUnitWithDetails(
+// GetOrgUnitLocationsDetailed returns the org's bound locations with
+// code + name. Used by the details view.
+func (r *OrgUnitRepositoryImpl) GetOrgUnitLocationsDetailed(
 	ctx context.Context,
-	companyID uuid.UUID,
+	db client.DBTX,
 	orgUnitID uuid.UUID,
-) (*orgunit.OrgUnitWithDetails, error) {
-
-	tx, err := r.client.BeginTx(ctx, nil)
+) ([]orgunit.LocationBrief, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT l.location_id, l.location_code, l.location_name
+		FROM org_unit_locations oul
+		JOIN locations l ON l.location_id = oul.location_id
+		WHERE oul.org_unit_id = $1
+		ORDER BY oul.created_at
+	`, orgUnitID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+		return nil, fmt.Errorf("get org unit locations detailed: %w", err)
 	}
-	defer tx.Rollback()
+	defer rows.Close()
 
-	// 1️⃣ Get org unit + department name (HR-only, schema-safe)
-	ouQuery := `
-		SELECT 
-			ou.org_unit_id,
-			ou.company_id,
-			ou.org_unit_type,
-			ou.name,
-			ou.description,
-			ou.department_id,
-			ou.is_active,
-			ou.created_at,
-			ou.updated_at,
+	var out []orgunit.LocationBrief
+	for rows.Next() {
+		var lb orgunit.LocationBrief
+		if err := rows.Scan(&lb.LocationID, &lb.LocationCode, &lb.LocationName); err != nil {
+			return nil, err
+		}
+		out = append(out, lb)
+	}
+	return out, rows.Err()
+}
+
+// hydrateLocations loads HomeLocationIDs for a batch of org units.
+func (r *OrgUnitRepositoryImpl) hydrateLocations(
+	ctx context.Context,
+	db client.DBTX,
+	orgUnits []*orgunit.OrgUnit,
+) error {
+	if len(orgUnits) == 0 {
+		return nil
+	}
+
+	ids := make([]uuid.UUID, 0, len(orgUnits))
+	byID := make(map[uuid.UUID]*orgunit.OrgUnit, len(orgUnits))
+	for _, ou := range orgUnits {
+		ids = append(ids, ou.OrgUnitID)
+		byID[ou.OrgUnitID] = ou
+	}
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT org_unit_id, location_id
+		FROM org_unit_locations
+		WHERE org_unit_id = ANY($1)
+		ORDER BY created_at
+	`, pq.Array(ids))
+	if err != nil {
+		return fmt.Errorf("hydrate org unit locations: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var ouID, locID uuid.UUID
+		if err := rows.Scan(&ouID, &locID); err != nil {
+			return err
+		}
+		if ou, ok := byID[ouID]; ok {
+			ou.HomeLocationIDs = append(ou.HomeLocationIDs, locID)
+		}
+	}
+	return rows.Err()
+}
+
+// ============================================================
+// ORG UNITS — READ
+// ============================================================
+
+func (r *OrgUnitRepositoryImpl) GetOrgUnitByID(ctx context.Context, db client.DBTX, companyID, orgUnitID uuid.UUID) (*orgunit.OrgUnit, error) {
+	const query = `
+		SELECT
+			ou.org_unit_id, ou.company_id, ou.org_unit_type, ou.name, ou.description,
+			ou.department_id, ou.is_active,
+			ou.created_by, ou.updated_by, ou.created_at, ou.updated_at,
+			org_unit_location_count(ou.org_unit_id) AS location_count,
+			org_unit_member_count(ou.org_unit_id)   AS member_count
+		FROM org_units ou
+		WHERE ou.company_id = $1 AND ou.org_unit_id = $2
+	`
+	row := db.QueryRowContext(ctx, query, companyID, orgUnitID)
+	ou, err := scanOrgUnitRow(row)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, hrErrors.ErrOrgUnitNotFound
+		}
+		return nil, fmt.Errorf("failed to get org unit: %w", err)
+	}
+
+	if err := r.hydrateLocations(ctx, db, []*orgunit.OrgUnit{ou}); err != nil {
+		return nil, err
+	}
+	return ou, nil
+}
+
+func (r *OrgUnitRepositoryImpl) GetOrgUnitWithDetails(ctx context.Context, db client.DBTX, companyID, orgUnitID uuid.UUID) (*orgunit.OrgUnitWithDetails, error) {
+	// 1. Org unit + department name
+	const ouQuery = `
+		SELECT
+			ou.org_unit_id, ou.company_id, ou.org_unit_type, ou.name, ou.description,
+			ou.department_id, ou.is_active,
+			ou.created_by, ou.updated_by, ou.created_at, ou.updated_at,
 			d.department_name
 		FROM org_units ou
-		LEFT JOIN departments d 
-			ON ou.department_id = d.department_id
-		WHERE ou.company_id = $1 
-		  AND ou.org_unit_id = $2
+		LEFT JOIN departments d ON ou.department_id = d.department_id
+		WHERE ou.company_id = $1 AND ou.org_unit_id = $2
 	`
-
 	var ou orgunit.OrgUnit
 	var deptName sql.NullString
+	var createdBy, updatedBy uuid.NullUUID
 
-	err = tx.QueryRow(ouQuery, companyID, orgUnitID).Scan(
-		&ou.OrgUnitID,
-		&ou.CompanyID,
-		&ou.OrgUnitType,
-		&ou.Name,
-		&ou.Description,
-		&ou.DepartmentID,
-		&ou.IsActive,
-		&ou.CreatedAt,
-		&ou.UpdatedAt,
+	err := db.QueryRowContext(ctx, ouQuery, companyID, orgUnitID).Scan(
+		&ou.OrgUnitID, &ou.CompanyID, &ou.OrgUnitType, &ou.Name, &ou.Description,
+		&ou.DepartmentID, &ou.IsActive,
+		&createdBy, &updatedBy, &ou.CreatedAt, &ou.UpdatedAt,
 		&deptName,
 	)
 	if err != nil {
@@ -135,29 +367,31 @@ func (r *OrgUnitRepositoryImpl) GetOrgUnitWithDetails(
 		}
 		return nil, fmt.Errorf("failed to get org unit: %w", err)
 	}
-
-	// 2️⃣ Member count
-	countQuery := `
-		SELECT COUNT(*)
-		FROM org_unit_members
-		WHERE org_unit_id = $1
-		  AND effective_to IS NULL
-	`
-	var memberCount int
-	if err := tx.QueryRow(countQuery, orgUnitID).Scan(&memberCount); err != nil {
-		return nil, fmt.Errorf("failed to count members: %w", err)
+	if createdBy.Valid {
+		ou.CreatedBy = &createdBy.UUID
+	}
+	if updatedBy.Valid {
+		ou.UpdatedBy = &updatedBy.UUID
 	}
 
-	// 3️⃣ Active members
-	membersQuery := `
-		SELECT user_id, effective_from, effective_to
-		FROM org_unit_members
-		WHERE org_unit_id = $1
-		  AND effective_to IS NULL
-		ORDER BY effective_from
-	`
+	// 2. Configured locations (the org's binding).
+	configuredLocs, err := r.GetOrgUnitLocationsDetailed(ctx, db, orgUnitID)
+	if err != nil {
+		return nil, err
+	}
+	for _, l := range configuredLocs {
+		ou.HomeLocationIDs = append(ou.HomeLocationIDs, l.LocationID)
+	}
 
-	memberRows, err := tx.Query(membersQuery, orgUnitID)
+	// 3. Active members.
+	memberRows, err := db.QueryContext(ctx, `
+		SELECT org_unit_id, user_id, location_id,
+		       effective_from, effective_to,
+		       created_by, updated_by, created_at, updated_at
+		FROM org_unit_members
+		WHERE org_unit_id = $1 AND effective_to IS NULL
+		ORDER BY effective_from
+	`, orgUnitID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get members: %w", err)
 	}
@@ -165,29 +399,22 @@ func (r *OrgUnitRepositoryImpl) GetOrgUnitWithDetails(
 
 	var activeMembers []orgunit.OrgUnitMember
 	for memberRows.Next() {
-		var m orgunit.OrgUnitMember
-		var effTo sql.NullTime
-
-		if err := memberRows.Scan(&m.UserID, &m.EffectiveFrom, &effTo); err != nil {
+		m, err := scanOrgUnitMember(memberRows)
+		if err != nil {
 			return nil, fmt.Errorf("failed to scan member: %w", err)
 		}
-		if effTo.Valid {
-			m.EffectiveTo = &effTo.Time
-		}
-		m.OrgUnitID = orgUnitID
-		activeMembers = append(activeMembers, m)
+		activeMembers = append(activeMembers, *m)
 	}
 
-	// 4️⃣ Active roles
-	rolesQuery := `
-		SELECT user_id, role, position_id, effective_from, effective_to
+	// 4. Active roles.
+	roleRows, err := db.QueryContext(ctx, `
+		SELECT org_unit_id, user_id, role, position_id, location_id,
+		       is_primary, effective_from, effective_to,
+		       created_by, updated_by, created_at, updated_at
 		FROM org_unit_roles
-		WHERE org_unit_id = $1
-		  AND effective_to IS NULL
+		WHERE org_unit_id = $1 AND effective_to IS NULL
 		ORDER BY role, user_id
-	`
-
-	roleRows, err := tx.Query(rolesQuery, orgUnitID)
+	`, orgUnitID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get roles: %w", err)
 	}
@@ -195,162 +422,92 @@ func (r *OrgUnitRepositoryImpl) GetOrgUnitWithDetails(
 
 	var roles []orgunit.OrgUnitRole
 	for roleRows.Next() {
-		var rle orgunit.OrgUnitRole
-		var positionID sql.NullString
-		var effTo sql.NullTime
-
-		if err := roleRows.Scan(
-			&rle.UserID,
-			&rle.Role,
-			&positionID,
-			&rle.EffectiveFrom,
-			&effTo,
-		); err != nil {
+		rle, err := scanOrgUnitRole(roleRows)
+		if err != nil {
 			return nil, fmt.Errorf("failed to scan role: %w", err)
 		}
-
-		if positionID.Valid {
-			pid, _ := uuid.Parse(positionID.String)
-			rle.PositionID = &pid
-		}
-		if effTo.Valid {
-			rle.EffectiveTo = &effTo.Time
-		}
-
-		rle.OrgUnitID = orgUnitID
-		roles = append(roles, rle)
+		roles = append(roles, *rle)
 	}
 
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("failed to commit transaction: %w", err)
+	// 5. Member footprint (which locations active members are actually at).
+	locRows, err := db.QueryContext(ctx, `
+		SELECT l.location_id, l.location_code, l.location_name, COUNT(*) AS member_count
+		FROM org_unit_members m
+		JOIN locations l ON l.location_id = m.location_id
+		WHERE m.org_unit_id = $1 AND m.effective_to IS NULL
+		GROUP BY l.location_id, l.location_code, l.location_name
+		ORDER BY member_count DESC, l.location_name
+	`, orgUnitID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get location footprint: %w", err)
+	}
+	defer locRows.Close()
+
+	var footprint []orgunit.LocationBrief
+	for locRows.Next() {
+		var lb orgunit.LocationBrief
+		if err := locRows.Scan(&lb.LocationID, &lb.LocationCode, &lb.LocationName, &lb.MemberCount); err != nil {
+			return nil, fmt.Errorf("failed to scan location: %w", err)
+		}
+		footprint = append(footprint, lb)
 	}
 
-	// 5️⃣ Assemble result
+	ou.LocationCount = len(footprint)
+	ou.MemberCount = len(activeMembers)
+
 	result := &orgunit.OrgUnitWithDetails{
 		OrgUnit:       ou,
-		MemberCount:   memberCount,
 		ActiveMembers: activeMembers,
 		Roles:         roles,
+		HomeLocations: configuredLocs,
+		Locations:     footprint,
 	}
-
 	if deptName.Valid {
 		result.Department = &deptName.String
 	}
-
 	return result, nil
 }
 
-func (r *OrgUnitRepositoryImpl) UpdateOrgUnit(ctx context.Context, orgUnit *orgunit.OrgUnit) error {
-	query := `
-		UPDATE org_units SET
-			name = $1, description = $2, department_id = $3,
-			is_active = $4, updated_at = $5
-		WHERE company_id = $6 AND org_unit_id = $7`
-
-	result, err := r.client.Exec(ctx, query,
-		orgUnit.Name,
-		orgUnit.Description,
-		orgUnit.DepartmentID,
-		orgUnit.IsActive,
-		orgUnit.UpdatedAt,
-		orgUnit.CompanyID,
-		orgUnit.OrgUnitID,
-	)
-
-	if err != nil {
-		return fmt.Errorf("failed to update org unit: %w", err)
-	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return hrErrors.ErrOrgUnitNotFound
-	}
-
-	return nil
-}
-
-func (r *OrgUnitRepositoryImpl) DeleteOrgUnit(ctx context.Context, companyID, orgUnitID uuid.UUID) error {
-	// First, end all memberships
-	endMembersQuery := `
-		UPDATE org_unit_members
-		SET effective_to = CURRENT_DATE
-		WHERE org_unit_id = $1 AND effective_to IS NULL`
-
-	_, err := r.client.Exec(ctx, endMembersQuery, orgUnitID)
-	if err != nil {
-		return fmt.Errorf("failed to end memberships: %w", err)
-	}
-
-	// End all roles
-	endRolesQuery := `
-		UPDATE org_unit_roles
-		SET effective_to = CURRENT_DATE
-		WHERE org_unit_id = $1 AND effective_to IS NULL`
-
-	_, err = r.client.Exec(ctx, endRolesQuery, orgUnitID)
-	if err != nil {
-		return fmt.Errorf("failed to end roles: %w", err)
-	}
-
-	// Soft delete org unit
-	query := `UPDATE org_units SET is_active = false WHERE company_id = $1 AND org_unit_id = $2`
-	result, err := r.client.Exec(ctx, query, companyID, orgUnitID)
-	if err != nil {
-		return fmt.Errorf("failed to delete org unit: %w", err)
-	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return hrErrors.ErrOrgUnitNotFound
-	}
-
-	return nil
-}
-
-func (r *OrgUnitRepositoryImpl) SoftDeleteOrgUnit(ctx context.Context, companyID, orgUnitID uuid.UUID) error {
-	return r.DeleteOrgUnit(ctx, companyID, orgUnitID)
-}
-
-func (r *OrgUnitRepositoryImpl) ListOrgUnits(ctx context.Context, companyID uuid.UUID, orgUnitType *string, isActive *bool, limit, offset int) ([]*orgunit.OrgUnit, int, error) {
+func (r *OrgUnitRepositoryImpl) ListOrgUnits(ctx context.Context, db client.DBTX, companyID uuid.UUID, orgUnitType *string, isActive *bool, limit, offset int) ([]*orgunit.OrgUnit, int, error) {
 	conditions := []string{"company_id = $1"}
 	params := []interface{}{companyID}
-	paramIdx := 2
+	idx := 2
 
 	if orgUnitType != nil {
-		conditions = append(conditions, fmt.Sprintf("org_unit_type = $%d", paramIdx))
+		conditions = append(conditions, fmt.Sprintf("org_unit_type = $%d", idx))
 		params = append(params, *orgUnitType)
-		paramIdx++
+		idx++
 	}
-
 	if isActive != nil {
-		conditions = append(conditions, fmt.Sprintf("is_active = $%d", paramIdx))
+		conditions = append(conditions, fmt.Sprintf("is_active = $%d", idx))
 		params = append(params, *isActive)
-		paramIdx++
+		idx++
 	}
+	where := "WHERE " + strings.Join(conditions, " AND ")
 
-	whereClause := ""
-	if len(conditions) > 0 {
-		whereClause = "WHERE " + strings.Join(conditions, " AND ")
-	}
-
-	// Count
-	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM org_units %s", whereClause)
-	var totalCount int
-	err := r.client.QueryRow(ctx, countQuery, params...).Scan(&totalCount)
-	if err != nil {
+	var total int
+	if err := db.QueryRowContext(ctx,
+		fmt.Sprintf("SELECT COUNT(*) FROM org_units %s", where),
+		params...,
+	).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("failed to count org units: %w", err)
 	}
 
-	// List
-	listQuery := fmt.Sprintf(`
-		SELECT org_unit_id, company_id, org_unit_type, name, description,
-			   department_id, is_active, created_at, updated_at
-		FROM org_units %s
-		ORDER BY created_at DESC
-		LIMIT $%d OFFSET $%d`, whereClause, paramIdx, paramIdx+1)
-
 	params = append(params, limit, offset)
-	rows, err := r.client.Query(ctx, listQuery, params...)
+	listQuery := fmt.Sprintf(`
+		SELECT
+			ou.org_unit_id, ou.company_id, ou.org_unit_type, ou.name, ou.description,
+			ou.department_id, ou.is_active,
+			ou.created_by, ou.updated_by, ou.created_at, ou.updated_at,
+			org_unit_location_count(ou.org_unit_id) AS location_count,
+			org_unit_member_count(ou.org_unit_id)   AS member_count
+		FROM org_units ou
+		%s
+		ORDER BY ou.created_at DESC
+		LIMIT $%d OFFSET $%d
+	`, where, idx, idx+1)
+
+	rows, err := db.QueryContext(ctx, listQuery, params...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to list org units: %w", err)
 	}
@@ -358,63 +515,97 @@ func (r *OrgUnitRepositoryImpl) ListOrgUnits(ctx context.Context, companyID uuid
 
 	orgUnits := make([]*orgunit.OrgUnit, 0, limit)
 	for rows.Next() {
-		ou, err := r.scanOrgUnit(rows)
+		ou, err := scanOrgUnitRows(rows)
 		if err != nil {
 			return nil, 0, fmt.Errorf("failed to scan org unit: %w", err)
 		}
 		orgUnits = append(orgUnits, ou)
 	}
-
-	return orgUnits, totalCount, nil
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	if err := r.hydrateLocations(ctx, db, orgUnits); err != nil {
+		return nil, 0, err
+	}
+	return orgUnits, total, nil
 }
 
-func (r *OrgUnitRepositoryImpl) SearchOrgUnits(ctx context.Context, companyID uuid.UUID, filters map[string]interface{}, limit, offset int) ([]*orgunit.OrgUnit, int, error) {
+func (r *OrgUnitRepositoryImpl) SearchOrgUnits(ctx context.Context, db client.DBTX, companyID uuid.UUID, filters map[string]interface{}, limit, offset int) ([]*orgunit.OrgUnit, int, error) {
 	conditions := []string{"company_id = $1"}
 	params := []interface{}{companyID}
-	paramIdx := 2
+	idx := 2
 
 	for field, value := range filters {
 		switch field {
 		case "name":
-			conditions = append(conditions, fmt.Sprintf("name ILIKE $%d", paramIdx))
+			conditions = append(conditions, fmt.Sprintf("name ILIKE $%d", idx))
 			params = append(params, "%"+value.(string)+"%")
-			paramIdx++
+			idx++
 		case "org_unit_type":
-			conditions = append(conditions, fmt.Sprintf("org_unit_type = $%d", paramIdx))
+			conditions = append(conditions, fmt.Sprintf("org_unit_type = $%d", idx))
 			params = append(params, value)
-			paramIdx++
+			idx++
 		case "is_active":
-			conditions = append(conditions, fmt.Sprintf("is_active = $%d", paramIdx))
+			conditions = append(conditions, fmt.Sprintf("is_active = $%d", idx))
 			params = append(params, value)
-			paramIdx++
+			idx++
 		case "department_id":
-			conditions = append(conditions, fmt.Sprintf("department_id = $%d", paramIdx))
+			conditions = append(conditions, fmt.Sprintf("department_id = $%d", idx))
 			params = append(params, value)
-			paramIdx++
+			idx++
+
+		// Single-location filter — orgs bound to exactly this location.
+		// Accepts the legacy key `home_location_id` for compatibility.
+		case "location_id", "home_location_id":
+			conditions = append(conditions, fmt.Sprintf(
+				"EXISTS (SELECT 1 FROM org_unit_locations oul WHERE oul.org_unit_id = org_units.org_unit_id AND oul.location_id = $%d)",
+				idx))
+			params = append(params, value)
+			idx++
+
+		// Multi-location filter — orgs bound to any of these.
+		case "location_ids", "home_location_ids":
+			conditions = append(conditions, fmt.Sprintf(
+				"EXISTS (SELECT 1 FROM org_unit_locations oul WHERE oul.org_unit_id = org_units.org_unit_id AND oul.location_id = ANY($%d))",
+				idx))
+			params = append(params, pq.Array(value))
+			idx++
+
+		// Universal-only / bound-only flag.
+		case "is_universal":
+			if v, ok := value.(bool); ok && v {
+				conditions = append(conditions,
+					"NOT EXISTS (SELECT 1 FROM org_unit_locations oul WHERE oul.org_unit_id = org_units.org_unit_id)")
+			} else if ok {
+				conditions = append(conditions,
+					"EXISTS (SELECT 1 FROM org_unit_locations oul WHERE oul.org_unit_id = org_units.org_unit_id)")
+			}
 		}
 	}
+	where := "WHERE " + strings.Join(conditions, " AND ")
 
-	whereClause := ""
-	if len(conditions) > 0 {
-		whereClause = "WHERE " + strings.Join(conditions, " AND ")
-	}
-
-	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM org_units %s", whereClause)
-	var totalCount int
-	err := r.client.QueryRow(ctx, countQuery, params...).Scan(&totalCount)
-	if err != nil {
+	var total int
+	if err := db.QueryRowContext(ctx,
+		fmt.Sprintf("SELECT COUNT(*) FROM org_units %s", where), params...,
+	).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("failed to count search results: %w", err)
 	}
 
-	searchQuery := fmt.Sprintf(`
-		SELECT org_unit_id, company_id, org_unit_type, name, description,
-			   department_id, is_active, created_at, updated_at
-		FROM org_units %s
-		ORDER BY name
-		LIMIT $%d OFFSET $%d`, whereClause, paramIdx, paramIdx+1)
-
 	params = append(params, limit, offset)
-	rows, err := r.client.Query(ctx, searchQuery, params...)
+	searchQuery := fmt.Sprintf(`
+		SELECT
+			ou.org_unit_id, ou.company_id, ou.org_unit_type, ou.name, ou.description,
+			ou.department_id, ou.is_active,
+			ou.created_by, ou.updated_by, ou.created_at, ou.updated_at,
+			org_unit_location_count(ou.org_unit_id) AS location_count,
+			org_unit_member_count(ou.org_unit_id)   AS member_count
+		FROM org_units ou
+		%s
+		ORDER BY ou.name
+		LIMIT $%d OFFSET $%d
+	`, where, idx, idx+1)
+
+	rows, err := db.QueryContext(ctx, searchQuery, params...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to search org units: %w", err)
 	}
@@ -422,25 +613,34 @@ func (r *OrgUnitRepositoryImpl) SearchOrgUnits(ctx context.Context, companyID uu
 
 	orgUnits := make([]*orgunit.OrgUnit, 0, limit)
 	for rows.Next() {
-		ou, err := r.scanOrgUnit(rows)
+		ou, err := scanOrgUnitRows(rows)
 		if err != nil {
 			return nil, 0, fmt.Errorf("failed to scan org unit: %w", err)
 		}
 		orgUnits = append(orgUnits, ou)
 	}
-
-	return orgUnits, totalCount, nil
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	if err := r.hydrateLocations(ctx, db, orgUnits); err != nil {
+		return nil, 0, err
+	}
+	return orgUnits, total, nil
 }
 
-func (r *OrgUnitRepositoryImpl) GetActiveOrgUnits(ctx context.Context, companyID uuid.UUID) ([]*orgunit.OrgUnit, error) {
-	query := `
-		SELECT org_unit_id, company_id, org_unit_type, name, description,
-			   department_id, is_active, created_at, updated_at
-		FROM org_units
-		WHERE company_id = $1 AND is_active = true
-		ORDER BY name`
-
-	rows, err := r.client.Query(ctx, query, companyID)
+func (r *OrgUnitRepositoryImpl) GetActiveOrgUnits(ctx context.Context, db client.DBTX, companyID uuid.UUID) ([]*orgunit.OrgUnit, error) {
+	const query = `
+		SELECT
+			ou.org_unit_id, ou.company_id, ou.org_unit_type, ou.name, ou.description,
+			ou.department_id, ou.is_active,
+			ou.created_by, ou.updated_by, ou.created_at, ou.updated_at,
+			org_unit_location_count(ou.org_unit_id) AS location_count,
+			org_unit_member_count(ou.org_unit_id)   AS member_count
+		FROM org_units ou
+		WHERE ou.company_id = $1 AND ou.is_active = true
+		ORDER BY ou.name
+	`
+	rows, err := db.QueryContext(ctx, query, companyID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get active org units: %w", err)
 	}
@@ -448,115 +648,153 @@ func (r *OrgUnitRepositoryImpl) GetActiveOrgUnits(ctx context.Context, companyID
 
 	var orgUnits []*orgunit.OrgUnit
 	for rows.Next() {
-		ou, err := r.scanOrgUnit(rows)
+		ou, err := scanOrgUnitRows(rows)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan org unit: %w", err)
 		}
 		orgUnits = append(orgUnits, ou)
 	}
-
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := r.hydrateLocations(ctx, db, orgUnits); err != nil {
+		return nil, err
+	}
 	return orgUnits, nil
 }
 
-func (r *OrgUnitRepositoryImpl) CheckOrgUnitExists(ctx context.Context, companyID uuid.UUID, name string, orgUnitType string) (bool, error) {
+func (r *OrgUnitRepositoryImpl) CheckOrgUnitExists(ctx context.Context, db client.DBTX, companyID uuid.UUID, name string, orgUnitType string) (bool, error) {
 	var exists bool
-	query := `SELECT EXISTS(SELECT 1 FROM org_units WHERE company_id = $1 AND name = $2 AND org_unit_type = $3)`
-	err := r.client.QueryRow(ctx, query, companyID, name, orgUnitType).Scan(&exists)
-	if err != nil {
+	const query = `
+		SELECT EXISTS (
+			SELECT 1 FROM org_units
+			WHERE company_id = $1
+			  AND org_unit_type = $2
+			  AND lower(name) = lower($3)
+			  AND is_active = true
+		)
+	`
+	if err := db.QueryRowContext(ctx, query, companyID, orgUnitType, name).Scan(&exists); err != nil {
 		return false, fmt.Errorf("failed to check org unit existence: %w", err)
 	}
 	return exists, nil
 }
 
-func (r *OrgUnitRepositoryImpl) AddMember(ctx context.Context, member *orgunit.OrgUnitMember) error {
-	// End any existing active membership first
-	endQuery := `
-		UPDATE org_unit_members
-		SET effective_to = $1
-		WHERE org_unit_id = $2 AND user_id = $3 AND effective_to IS NULL`
+// ============================================================
+// MEMBERS
+// ============================================================
 
-	_, err := r.client.Exec(ctx, endQuery, member.EffectiveFrom.Add(-24*time.Hour), member.OrgUnitID, member.UserID)
+func (r *OrgUnitRepositoryImpl) AddMember(ctx context.Context, db client.DBTX, member *orgunit.OrgUnitMember) error {
+	tx, owned, err := r.ensureTx(ctx, db)
 	if err != nil {
-		return fmt.Errorf("failed to end existing membership: %w", err)
+		return err
+	}
+	if owned {
+		defer tx.Rollback()
 	}
 
-	// Add new membership
-	query := `
-		INSERT INTO org_unit_members (org_unit_id, user_id, effective_from, effective_to)
-		VALUES ($1, $2, $3, $4)`
+	if !member.EffectiveFrom.IsZero() {
+		prevEnd := member.EffectiveFrom.AddDate(0, 0, -1)
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE org_unit_members
+			SET effective_to = $1,
+			    updated_at   = NOW(),
+			    updated_by   = $2
+			WHERE org_unit_id = $3
+			  AND user_id     = $4
+			  AND effective_to IS NULL
+			  AND effective_from <> $5
+		`, prevEnd, member.UpdatedBy, member.OrgUnitID, member.UserID, member.EffectiveFrom); err != nil {
+			return fmt.Errorf("failed to end previous membership: %w", err)
+		}
+	}
 
-	_, err = r.client.Exec(ctx, query,
-		member.OrgUnitID,
-		member.UserID,
-		member.EffectiveFrom,
-		member.EffectiveTo,
-	)
-
-	if err != nil {
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO org_unit_members (
+			org_unit_id, user_id, location_id,
+			effective_from, effective_to,
+			created_at, updated_at, created_by, updated_by
+		) VALUES (
+			$1, $2, $3,
+			$4, $5,
+			NOW(), NOW(), $6, $6
+		)
+		ON CONFLICT (org_unit_id, user_id, effective_from)
+		DO UPDATE SET
+			location_id  = EXCLUDED.location_id,
+			effective_to = EXCLUDED.effective_to,
+			updated_at   = NOW(),
+			updated_by   = EXCLUDED.updated_by
+	`, member.OrgUnitID, member.UserID, member.LocationID,
+		member.EffectiveFrom, member.EffectiveTo,
+		member.CreatedBy); err != nil {
 		return fmt.Errorf("failed to add member: %w", err)
 	}
 
+	if owned {
+		return tx.Commit()
+	}
 	return nil
 }
 
-func (r *OrgUnitRepositoryImpl) RemoveMember(ctx context.Context, orgUnitID, userID uuid.UUID, effectiveTo time.Time) error {
-	query := `
+func (r *OrgUnitRepositoryImpl) RemoveMember(
+	ctx context.Context, db client.DBTX,
+	orgUnitID, userID uuid.UUID,
+	effectiveTo time.Time, actorID uuid.UUID,
+) error {
+	result, err := db.ExecContext(ctx, `
 		UPDATE org_unit_members
-		SET effective_to = $1
-		WHERE org_unit_id = $2 AND user_id = $3 AND effective_to IS NULL`
-
-	result, err := r.client.Exec(ctx, query, effectiveTo, orgUnitID, userID)
+		SET effective_to = $1,
+		    updated_at   = NOW(),
+		    updated_by   = $2
+		WHERE org_unit_id = $3 AND user_id = $4 AND effective_to IS NULL
+	`, effectiveTo, actorID, orgUnitID, userID)
 	if err != nil {
 		return fmt.Errorf("failed to remove member: %w", err)
 	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
 		return hrErrors.ErrOrgUnitMemberNotFound
 	}
-
 	return nil
 }
 
-func (r *OrgUnitRepositoryImpl) GetMember(ctx context.Context, orgUnitID, userID uuid.UUID) (*orgunit.OrgUnitMember, error) {
-	query := `
-		SELECT org_unit_id, user_id, effective_from, effective_to
+func (r *OrgUnitRepositoryImpl) GetMember(ctx context.Context, db client.DBTX, orgUnitID, userID uuid.UUID) (*orgunit.OrgUnitMember, error) {
+	const query = `
+		SELECT org_unit_id, user_id, location_id,
+		       effective_from, effective_to,
+		       created_by, updated_by, created_at, updated_at
 		FROM org_unit_members
 		WHERE org_unit_id = $1 AND user_id = $2
 		ORDER BY effective_from DESC
-		LIMIT 1`
-
-	var member orgunit.OrgUnitMember
-	var effTo sql.NullTime
-	err := r.client.QueryRow(ctx, query, orgUnitID, userID).Scan(
-		&member.OrgUnitID,
-		&member.UserID,
-		&member.EffectiveFrom,
-		&effTo,
-	)
-
+		LIMIT 1
+	`
+	rows, err := db.QueryContext(ctx, query, orgUnitID, userID)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, hrErrors.ErrOrgUnitMemberNotFound
-		}
 		return nil, fmt.Errorf("failed to get member: %w", err)
 	}
+	defer rows.Close()
 
-	if effTo.Valid {
-		member.EffectiveTo = &effTo.Time
+	if !rows.Next() {
+		return nil, hrErrors.ErrOrgUnitMemberNotFound
 	}
-
-	return &member, nil
+	m, err := scanOrgUnitMember(rows)
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan member: %w", err)
+	}
+	return m, nil
 }
 
-func (r *OrgUnitRepositoryImpl) GetActiveMembers(ctx context.Context, orgUnitID uuid.UUID) ([]*orgunit.OrgUnitMember, error) {
-	query := `
-		SELECT org_unit_id, user_id, effective_from, effective_to
+func (r *OrgUnitRepositoryImpl) GetActiveMembers(ctx context.Context, db client.DBTX, orgUnitID uuid.UUID) ([]*orgunit.OrgUnitMember, error) {
+	const query = `
+		SELECT org_unit_id, user_id, location_id,
+		       effective_from, effective_to,
+		       created_by, updated_by, created_at, updated_at
 		FROM org_unit_members
 		WHERE org_unit_id = $1 AND effective_to IS NULL
-		ORDER BY effective_from`
-
-	rows, err := r.client.Query(ctx, query, orgUnitID)
+		ORDER BY effective_from
+	`
+	rows, err := db.QueryContext(ctx, query, orgUnitID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get active members: %w", err)
 	}
@@ -564,45 +802,38 @@ func (r *OrgUnitRepositoryImpl) GetActiveMembers(ctx context.Context, orgUnitID 
 
 	var members []*orgunit.OrgUnitMember
 	for rows.Next() {
-		var member orgunit.OrgUnitMember
-		var effTo sql.NullTime
-		err = rows.Scan(&member.OrgUnitID, &member.UserID, &member.EffectiveFrom, &effTo)
+		m, err := scanOrgUnitMember(rows)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan member: %w", err)
 		}
-		if effTo.Valid {
-			member.EffectiveTo = &effTo.Time
-		}
-		members = append(members, &member)
+		members = append(members, m)
 	}
-
-	return members, nil
+	return members, rows.Err()
 }
 
-func (r *OrgUnitRepositoryImpl) GetUserMemberships(ctx context.Context, userID uuid.UUID, onlyActive bool) ([]*orgunit.UserOrgUnitMembership, error) {
+func (r *OrgUnitRepositoryImpl) GetUserMemberships(ctx context.Context, db client.DBTX, userID uuid.UUID, onlyActive bool) ([]*orgunit.UserOrgUnitMembership, error) {
 	conditions := []string{"oum.user_id = $1"}
 	params := []interface{}{userID}
-
 	if onlyActive {
 		conditions = append(conditions, "oum.effective_to IS NULL")
 	}
-
-	whereClause := ""
-	if len(conditions) > 0 {
-		whereClause = "WHERE " + strings.Join(conditions, " AND ")
-	}
+	where := "WHERE " + strings.Join(conditions, " AND ")
 
 	query := fmt.Sprintf(`
-		SELECT oum.org_unit_id, oum.user_id, ou.name as org_unit_name,
-			   ou.org_unit_type, our.role, our.position_id
+		SELECT oum.org_unit_id, oum.user_id, oum.location_id,
+		       ou.name AS org_unit_name, ou.org_unit_type,
+		       our.role, our.position_id
 		FROM org_unit_members oum
 		JOIN org_units ou ON oum.org_unit_id = ou.org_unit_id
-		LEFT JOIN org_unit_roles our ON oum.org_unit_id = our.org_unit_id 
-			AND oum.user_id = our.user_id AND our.effective_to IS NULL
+		LEFT JOIN org_unit_roles our
+			ON oum.org_unit_id = our.org_unit_id
+			AND oum.user_id = our.user_id
+			AND our.effective_to IS NULL
 		%s
-		ORDER BY ou.org_unit_type, ou.name`, whereClause)
+		ORDER BY ou.org_unit_type, ou.name
+	`, where)
 
-	rows, err := r.client.Query(ctx, query, params...)
+	rows, err := db.QueryContext(ctx, query, params...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user memberships: %w", err)
 	}
@@ -610,52 +841,48 @@ func (r *OrgUnitRepositoryImpl) GetUserMemberships(ctx context.Context, userID u
 
 	var memberships []*orgunit.UserOrgUnitMembership
 	for rows.Next() {
-		var membership orgunit.UserOrgUnitMembership
-		var role, positionID sql.NullString
-		err = rows.Scan(
-			&membership.OrgUnitID,
-			&membership.UserID,
-			&membership.OrgUnitName,
-			&membership.OrgUnitType,
-			&role,
-			&positionID,
-		)
-		if err != nil {
+		var m orgunit.UserOrgUnitMembership
+		var locID, posID uuid.NullUUID
+		var role sql.NullString
+		if err := rows.Scan(
+			&m.OrgUnitID, &m.UserID, &locID,
+			&m.OrgUnitName, &m.OrgUnitType,
+			&role, &posID,
+		); err != nil {
 			return nil, fmt.Errorf("failed to scan membership: %w", err)
 		}
+		if locID.Valid {
+			m.LocationID = &locID.UUID
+		}
+		if posID.Valid {
+			m.PositionID = &posID.UUID
+		}
 		if role.Valid {
-			membership.Role = &role.String
+			m.Role = &role.String
 		}
-		if positionID.Valid {
-			pid, _ := uuid.Parse(positionID.String)
-			membership.PositionID = &pid
-		}
-		memberships = append(memberships, &membership)
+		memberships = append(memberships, &m)
 	}
-
-	return memberships, nil
+	return memberships, rows.Err()
 }
 
-func (r *OrgUnitRepositoryImpl) GetOrgUnitMembers(ctx context.Context, orgUnitID uuid.UUID, onlyActive bool) ([]*orgunit.OrgUnitMember, error) {
+func (r *OrgUnitRepositoryImpl) GetOrgUnitMembers(ctx context.Context, db client.DBTX, orgUnitID uuid.UUID, onlyActive bool) ([]*orgunit.OrgUnitMember, error) {
 	conditions := []string{"org_unit_id = $1"}
 	params := []interface{}{orgUnitID}
-
 	if onlyActive {
 		conditions = append(conditions, "effective_to IS NULL")
 	}
-
-	whereClause := ""
-	if len(conditions) > 0 {
-		whereClause = "WHERE " + strings.Join(conditions, " AND ")
-	}
+	where := "WHERE " + strings.Join(conditions, " AND ")
 
 	query := fmt.Sprintf(`
-		SELECT org_unit_id, user_id, effective_from, effective_to
+		SELECT org_unit_id, user_id, location_id,
+		       effective_from, effective_to,
+		       created_by, updated_by, created_at, updated_at
 		FROM org_unit_members
 		%s
-		ORDER BY effective_from`, whereClause)
+		ORDER BY effective_from
+	`, where)
 
-	rows, err := r.client.Query(ctx, query, params...)
+	rows, err := db.QueryContext(ctx, query, params...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get org unit members: %w", err)
 	}
@@ -663,132 +890,216 @@ func (r *OrgUnitRepositoryImpl) GetOrgUnitMembers(ctx context.Context, orgUnitID
 
 	var members []*orgunit.OrgUnitMember
 	for rows.Next() {
-		var member orgunit.OrgUnitMember
-		var effTo sql.NullTime
-		err = rows.Scan(&member.OrgUnitID, &member.UserID, &member.EffectiveFrom, &effTo)
+		m, err := scanOrgUnitMember(rows)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan member: %w", err)
 		}
-		if effTo.Valid {
-			member.EffectiveTo = &effTo.Time
-		}
-		members = append(members, &member)
+		members = append(members, m)
 	}
-
-	return members, nil
+	return members, rows.Err()
 }
 
-func (r *OrgUnitRepositoryImpl) AssignRole(ctx context.Context, role *orgunit.OrgUnitRole) error {
-	// End any existing active role first
-	endQuery := `
-		UPDATE org_unit_roles
-		SET effective_to = $1
-		WHERE org_unit_id = $2 AND user_id = $3 AND role = $4 AND effective_to IS NULL`
+func (r *OrgUnitRepositoryImpl) MemberExists(ctx context.Context, db client.DBTX, orgUnitID, userID uuid.UUID, effectiveFrom time.Time) (bool, error) {
+	var exists bool
+	const query = `
+		SELECT EXISTS (
+			SELECT 1 FROM org_unit_members
+			WHERE org_unit_id = $1 AND user_id = $2 AND effective_from = $3
+		)
+	`
+	if err := db.QueryRowContext(ctx, query, orgUnitID, userID, effectiveFrom).Scan(&exists); err != nil {
+		return false, fmt.Errorf("failed to check member existence: %w", err)
+	}
+	return exists, nil
+}
 
-	_, err := r.client.Exec(ctx, endQuery, role.EffectiveFrom.Add(-24*time.Hour),
-		role.OrgUnitID, role.UserID, role.Role)
+func (r *OrgUnitRepositoryImpl) EndActiveMembership(ctx context.Context, db client.DBTX, orgUnitID, userID uuid.UUID, effectiveTo time.Time) error {
+	_, err := db.ExecContext(ctx, `
+		UPDATE org_unit_members
+		SET effective_to = $1, updated_at = NOW()
+		WHERE org_unit_id = $2 AND user_id = $3 AND effective_to IS NULL
+	`, effectiveTo, orgUnitID, userID)
+	return err
+}
+
+func (r *OrgUnitRepositoryImpl) GetActiveUsersByOrgUnit(ctx context.Context, db client.DBTX, orgUnitID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT user_id FROM org_unit_members
+		WHERE org_unit_id = $1 AND effective_to IS NULL
+	`, orgUnitID)
 	if err != nil {
-		return fmt.Errorf("failed to end existing role: %w", err)
+		return nil, fmt.Errorf("failed to fetch org unit users: %w", err)
+	}
+	defer rows.Close()
+
+	ids := make([]uuid.UUID, 0)
+	for rows.Next() {
+		var uid uuid.UUID
+		if err := rows.Scan(&uid); err != nil {
+			return nil, fmt.Errorf("failed to scan user_id: %w", err)
+		}
+		ids = append(ids, uid)
+	}
+	return ids, rows.Err()
+}
+
+// ============================================================
+// ROLES
+// ============================================================
+
+func (r *OrgUnitRepositoryImpl) AssignRole(ctx context.Context, db client.DBTX, role *orgunit.OrgUnitRole) error {
+	tx, owned, err := r.ensureTx(ctx, db)
+	if err != nil {
+		return err
+	}
+	if owned {
+		defer tx.Rollback()
 	}
 
-	// Assign new role
-	query := `
-		INSERT INTO org_unit_roles (org_unit_id, user_id, role, position_id, effective_from, effective_to)
-		VALUES ($1, $2, $3, $4, $5, $6)`
+	if !role.EffectiveFrom.IsZero() {
+		prevEnd := role.EffectiveFrom.AddDate(0, 0, -1)
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE org_unit_roles
+			SET effective_to = $1,
+			    updated_at   = NOW(),
+			    updated_by   = $2
+			WHERE org_unit_id = $3
+			  AND user_id     = $4
+			  AND role        = $5
+			  AND effective_to IS NULL
+			  AND effective_from <> $6
+		`, prevEnd, role.UpdatedBy, role.OrgUnitID, role.UserID, role.Role, role.EffectiveFrom); err != nil {
+			return fmt.Errorf("failed to end previous role: %w", err)
+		}
+	}
 
-	_, err = r.client.Exec(ctx, query,
-		role.OrgUnitID,
-		role.UserID,
-		role.Role,
-		role.PositionID,
-		role.EffectiveFrom,
-		role.EffectiveTo,
-	)
+	if role.IsPrimary {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE org_unit_roles
+			SET is_primary = false,
+			    updated_at = NOW(),
+			    updated_by = $1
+			WHERE org_unit_id  = $2
+			  AND user_id      = $3
+			  AND is_primary   = true
+			  AND effective_to IS NULL
+			  AND NOT (role = $4 AND effective_from = $5)
+		`, role.UpdatedBy, role.OrgUnitID, role.UserID,
+			role.Role, role.EffectiveFrom); err != nil {
+			return fmt.Errorf("failed to clear previous primary role: %w", err)
+		}
+	}
 
-	if err != nil {
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO org_unit_roles (
+			org_unit_id, user_id, role,
+			position_id, location_id, is_primary,
+			effective_from, effective_to,
+			created_at, updated_at, created_by, updated_by
+		) VALUES (
+			$1, $2, $3,
+			$4, $5, $6,
+			$7, $8,
+			NOW(), NOW(), $9, $9
+		)
+		ON CONFLICT (org_unit_id, user_id, role, effective_from)
+		DO UPDATE SET
+			position_id  = EXCLUDED.position_id,
+			location_id  = EXCLUDED.location_id,
+			is_primary   = EXCLUDED.is_primary,
+			effective_to = EXCLUDED.effective_to,
+			updated_at   = NOW(),
+			updated_by   = EXCLUDED.updated_by
+	`, role.OrgUnitID, role.UserID, role.Role,
+		role.PositionID, role.LocationID, role.IsPrimary,
+		role.EffectiveFrom, role.EffectiveTo,
+		role.CreatedBy); err != nil {
+		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23505" {
+			switch pgErr.Constraint {
+			case "uq_our_primary_per_user_org_unit":
+				return hrErrors.ErrOrgUnitPrimaryAlreadyExists
+			default:
+				return hrErrors.ErrOrgUnitRoleAlreadyExists
+			}
+		}
 		return fmt.Errorf("failed to assign role: %w", err)
 	}
 
+	if owned {
+		return tx.Commit()
+	}
 	return nil
 }
 
-func (r *OrgUnitRepositoryImpl) RemoveRole(ctx context.Context, orgUnitID, userID uuid.UUID, role string, effectiveTo time.Time) error {
-	query := `
+func (r *OrgUnitRepositoryImpl) RemoveRole(
+	ctx context.Context, db client.DBTX,
+	orgUnitID, userID uuid.UUID,
+	role string, effectiveTo time.Time, actorID uuid.UUID,
+) error {
+	result, err := db.ExecContext(ctx, `
 		UPDATE org_unit_roles
-		SET effective_to = $1
-		WHERE org_unit_id = $2 AND user_id = $3 AND role = $4 AND effective_to IS NULL`
-
-	result, err := r.client.Exec(ctx, query, effectiveTo, orgUnitID, userID, role)
+		SET effective_to = $1,
+		    is_primary   = false,
+		    updated_at   = NOW(),
+		    updated_by   = $2
+		WHERE org_unit_id  = $3
+		  AND user_id      = $4
+		  AND role         = $5
+		  AND effective_to IS NULL
+	`, effectiveTo, actorID, orgUnitID, userID, role)
 	if err != nil {
 		return fmt.Errorf("failed to remove role: %w", err)
 	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
 		return hrErrors.ErrOrgUnitRoleNotFound
 	}
-
 	return nil
 }
 
-func (r *OrgUnitRepositoryImpl) GetRole(ctx context.Context, orgUnitID, userID uuid.UUID, role string) (*orgunit.OrgUnitRole, error) {
-	query := `
-		SELECT org_unit_id, user_id, role, position_id, effective_from, effective_to
+func (r *OrgUnitRepositoryImpl) GetRole(ctx context.Context, db client.DBTX, orgUnitID, userID uuid.UUID, role string) (*orgunit.OrgUnitRole, error) {
+	const query = `
+		SELECT org_unit_id, user_id, role, position_id, location_id,
+		       is_primary, effective_from, effective_to,
+		       created_by, updated_by, created_at, updated_at
 		FROM org_unit_roles
 		WHERE org_unit_id = $1 AND user_id = $2 AND role = $3
 		ORDER BY effective_from DESC
-		LIMIT 1`
-
-	var ouRole orgunit.OrgUnitRole
-	var positionID sql.NullString
-	var effTo sql.NullTime
-	err := r.client.QueryRow(ctx, query, orgUnitID, userID, role).Scan(
-		&ouRole.OrgUnitID,
-		&ouRole.UserID,
-		&ouRole.Role,
-		&positionID,
-		&ouRole.EffectiveFrom,
-		&effTo,
-	)
-
+		LIMIT 1
+	`
+	rows, err := db.QueryContext(ctx, query, orgUnitID, userID, role)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, hrErrors.ErrOrgUnitRoleNotFound
-		}
 		return nil, fmt.Errorf("failed to get role: %w", err)
 	}
+	defer rows.Close()
 
-	if positionID.Valid {
-		pid, _ := uuid.Parse(positionID.String)
-		ouRole.PositionID = &pid
+	if !rows.Next() {
+		return nil, hrErrors.ErrOrgUnitRoleNotFound
 	}
-	if effTo.Valid {
-		ouRole.EffectiveTo = &effTo.Time
+	rle, err := scanOrgUnitRole(rows)
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan role: %w", err)
 	}
-
-	return &ouRole, nil
+	return rle, nil
 }
 
-func (r *OrgUnitRepositoryImpl) GetUserRoles(ctx context.Context, userID uuid.UUID, onlyActive bool) ([]*orgunit.OrgUnitRole, error) {
+func (r *OrgUnitRepositoryImpl) GetUserRoles(ctx context.Context, db client.DBTX, userID uuid.UUID, onlyActive bool) ([]*orgunit.OrgUnitRole, error) {
 	conditions := []string{"user_id = $1"}
 	params := []interface{}{userID}
-
 	if onlyActive {
 		conditions = append(conditions, "effective_to IS NULL")
 	}
-
-	whereClause := ""
-	if len(conditions) > 0 {
-		whereClause = "WHERE " + strings.Join(conditions, " AND ")
-	}
+	where := "WHERE " + strings.Join(conditions, " AND ")
 
 	query := fmt.Sprintf(`
-		SELECT org_unit_id, user_id, role, position_id, effective_from, effective_to
-		FROM org_unit_roles
-		%s
-		ORDER BY effective_from DESC`, whereClause)
+		SELECT org_unit_id, user_id, role, position_id, location_id,
+		       is_primary, effective_from, effective_to,
+		       created_by, updated_by, created_at, updated_at
+		FROM org_unit_roles %s
+		ORDER BY effective_from DESC
+	`, where)
 
-	rows, err := r.client.Query(ctx, query, params...)
+	rows, err := db.QueryContext(ctx, query, params...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user roles: %w", err)
 	}
@@ -796,53 +1107,32 @@ func (r *OrgUnitRepositoryImpl) GetUserRoles(ctx context.Context, userID uuid.UU
 
 	var roles []*orgunit.OrgUnitRole
 	for rows.Next() {
-		var role orgunit.OrgUnitRole
-		var positionID sql.NullString
-		var effTo sql.NullTime
-		err = rows.Scan(
-			&role.OrgUnitID,
-			&role.UserID,
-			&role.Role,
-			&positionID,
-			&role.EffectiveFrom,
-			&effTo,
-		)
+		rle, err := scanOrgUnitRole(rows)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan role: %w", err)
 		}
-		if positionID.Valid {
-			pid, _ := uuid.Parse(positionID.String)
-			role.PositionID = &pid
-		}
-		if effTo.Valid {
-			role.EffectiveTo = &effTo.Time
-		}
-		roles = append(roles, &role)
+		roles = append(roles, rle)
 	}
-
-	return roles, nil
+	return roles, rows.Err()
 }
 
-func (r *OrgUnitRepositoryImpl) GetOrgUnitRoles(ctx context.Context, orgUnitID uuid.UUID, onlyActive bool) ([]*orgunit.OrgUnitRole, error) {
+func (r *OrgUnitRepositoryImpl) GetOrgUnitRoles(ctx context.Context, db client.DBTX, orgUnitID uuid.UUID, onlyActive bool) ([]*orgunit.OrgUnitRole, error) {
 	conditions := []string{"org_unit_id = $1"}
 	params := []interface{}{orgUnitID}
-
 	if onlyActive {
 		conditions = append(conditions, "effective_to IS NULL")
 	}
-
-	whereClause := ""
-	if len(conditions) > 0 {
-		whereClause = "WHERE " + strings.Join(conditions, " AND ")
-	}
+	where := "WHERE " + strings.Join(conditions, " AND ")
 
 	query := fmt.Sprintf(`
-		SELECT org_unit_id, user_id, role, position_id, effective_from, effective_to
-		FROM org_unit_roles
-		%s
-		ORDER BY role, user_id`, whereClause)
+		SELECT org_unit_id, user_id, role, position_id, location_id,
+		       is_primary, effective_from, effective_to,
+		       created_by, updated_by, created_at, updated_at
+		FROM org_unit_roles %s
+		ORDER BY role, user_id
+	`, where)
 
-	rows, err := r.client.Query(ctx, query, params...)
+	rows, err := db.QueryContext(ctx, query, params...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get org unit roles: %w", err)
 	}
@@ -850,175 +1140,132 @@ func (r *OrgUnitRepositoryImpl) GetOrgUnitRoles(ctx context.Context, orgUnitID u
 
 	var roles []*orgunit.OrgUnitRole
 	for rows.Next() {
-		var role orgunit.OrgUnitRole
-		var positionID sql.NullString
-		var effTo sql.NullTime
-		err = rows.Scan(
-			&role.OrgUnitID,
-			&role.UserID,
-			&role.Role,
-			&positionID,
-			&role.EffectiveFrom,
-			&effTo,
-		)
+		rle, err := scanOrgUnitRole(rows)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan role: %w", err)
 		}
-		if positionID.Valid {
-			pid, _ := uuid.Parse(positionID.String)
-			role.PositionID = &pid
-		}
-		if effTo.Valid {
-			role.EffectiveTo = &effTo.Time
-		}
-		roles = append(roles, &role)
+		roles = append(roles, rle)
 	}
-
-	return roles, nil
+	return roles, rows.Err()
 }
 
-func (r *OrgUnitRepositoryImpl) scanOrgUnit(rows *sql.Rows) (*orgunit.OrgUnit, error) {
+// ============================================================
+// SCAN HELPERS
+// ============================================================
+
+type rowScanner interface {
+	Scan(dest ...interface{}) error
+}
+
+func scanOrgUnitRow(row rowScanner) (*orgunit.OrgUnit, error) {
 	var ou orgunit.OrgUnit
-	var description, departmentID sql.NullString
+	var deptID, createdBy, updatedBy uuid.NullUUID
+	var description sql.NullString
 
-	err := rows.Scan(
-		&ou.OrgUnitID,
-		&ou.CompanyID,
-		&ou.OrgUnitType,
-		&ou.Name,
-		&description,
-		&departmentID,
-		&ou.IsActive,
-		&ou.CreatedAt,
-		&ou.UpdatedAt,
+	err := row.Scan(
+		&ou.OrgUnitID, &ou.CompanyID, &ou.OrgUnitType, &ou.Name, &description,
+		&deptID, &ou.IsActive,
+		&createdBy, &updatedBy, &ou.CreatedAt, &ou.UpdatedAt,
+		&ou.LocationCount,
+		&ou.MemberCount,
 	)
-
 	if err != nil {
 		return nil, err
 	}
-
 	if description.Valid {
 		ou.Description = &description.String
 	}
-	if departmentID.Valid {
-		did, _ := uuid.Parse(departmentID.String)
-		ou.DepartmentID = &did
+	if deptID.Valid {
+		ou.DepartmentID = &deptID.UUID
 	}
-
+	if createdBy.Valid {
+		ou.CreatedBy = &createdBy.UUID
+	}
+	if updatedBy.Valid {
+		ou.UpdatedBy = &updatedBy.UUID
+	}
 	return &ou, nil
 }
 
-func (r *OrgUnitRepositoryImpl) initializePreparedStatements(ctx context.Context) {
-	statements := map[string]string{
-		"get_org_unit_by_id": `
-			SELECT org_unit_id, company_id, org_unit_type, name, description,
-				   department_id, is_active, created_at, updated_at
-			FROM org_units WHERE company_id = $1 AND org_unit_id = $2`,
-	}
-
-	for name, query := range statements {
-		stmt, err := r.client.DB.PrepareContext(ctx, query)
-		if err != nil {
-			// silently skip; statement will be missing but caught later
-			continue
-		}
-		r.stmtMutex.Lock()
-		r.stmtCache[name] = stmt
-		r.stmtMutex.Unlock()
-	}
+func scanOrgUnitRows(rows *sql.Rows) (*orgunit.OrgUnit, error) {
+	return scanOrgUnitRow(rows)
 }
 
-func (r *OrgUnitRepositoryImpl) getStmt(name string) (*sql.Stmt, bool) {
-	r.stmtMutex.RLock()
-	defer r.stmtMutex.RUnlock()
-	stmt, exists := r.stmtCache[name]
-	return stmt, exists
+// scanOrgUnitMember reads a row matching:
+//
+//	org_unit_id, user_id, location_id,
+//	effective_from, effective_to,
+//	created_by, updated_by, created_at, updated_at
+func scanOrgUnitMember(rows *sql.Rows) (*orgunit.OrgUnitMember, error) {
+	var m orgunit.OrgUnitMember
+	var locID, createdBy, updatedBy uuid.NullUUID
+	var effTo sql.NullTime
+
+	if err := rows.Scan(
+		&m.OrgUnitID, &m.UserID, &locID,
+		&m.EffectiveFrom, &effTo,
+		&createdBy, &updatedBy, &m.CreatedAt, &m.UpdatedAt,
+	); err != nil {
+		return nil, err
+	}
+	if locID.Valid {
+		m.LocationID = &locID.UUID
+	}
+	if effTo.Valid {
+		m.EffectiveTo = &effTo.Time
+	}
+	if createdBy.Valid {
+		m.CreatedBy = &createdBy.UUID
+	}
+	if updatedBy.Valid {
+		m.UpdatedBy = &updatedBy.UUID
+	}
+	return &m, nil
 }
 
-func (r *OrgUnitRepositoryImpl) HealthCheck(ctx context.Context) error {
-	query := `SELECT 1 FROM org_units LIMIT 1`
-	_, err := r.client.Exec(ctx, query)
-	if err != nil {
+// scanOrgUnitRole reads a row matching:
+//
+//	org_unit_id, user_id, role, position_id, location_id,
+//	is_primary, effective_from, effective_to,
+//	created_by, updated_by, created_at, updated_at
+func scanOrgUnitRole(rows *sql.Rows) (*orgunit.OrgUnitRole, error) {
+	var rle orgunit.OrgUnitRole
+	var posID, locID, createdBy, updatedBy uuid.NullUUID
+	var effTo sql.NullTime
+
+	if err := rows.Scan(
+		&rle.OrgUnitID, &rle.UserID, &rle.Role,
+		&posID, &locID, &rle.IsPrimary,
+		&rle.EffectiveFrom, &effTo,
+		&createdBy, &updatedBy, &rle.CreatedAt, &rle.UpdatedAt,
+	); err != nil {
+		return nil, err
+	}
+	if posID.Valid {
+		rle.PositionID = &posID.UUID
+	}
+	if locID.Valid {
+		rle.LocationID = &locID.UUID
+	}
+	if effTo.Valid {
+		rle.EffectiveTo = &effTo.Time
+	}
+	if createdBy.Valid {
+		rle.CreatedBy = &createdBy.UUID
+	}
+	if updatedBy.Valid {
+		rle.UpdatedBy = &updatedBy.UUID
+	}
+	return &rle, nil
+}
+
+// ============================================================
+// HEALTH
+// ============================================================
+
+func (r *OrgUnitRepositoryImpl) HealthCheck(ctx context.Context, db client.DBTX) error {
+	if err := db.QueryRowContext(ctx, `SELECT 1`).Scan(new(int)); err != nil {
 		return fmt.Errorf("org unit repository health check failed: %w", err)
 	}
 	return nil
-}
-
-func (r *OrgUnitRepositoryImpl) MemberExists(
-	ctx context.Context,
-	orgUnitID uuid.UUID,
-	userID uuid.UUID,
-	effectiveFrom time.Time,
-) (bool, error) {
-
-	query := `
-		SELECT EXISTS (
-			SELECT 1
-			FROM org_unit_members
-			WHERE org_unit_id = $1
-			  AND user_id = $2
-			  AND effective_from = $3
-		)
-	`
-
-	var exists bool
-	err := r.client.QueryRow(
-		ctx,
-		query,
-		orgUnitID,
-		userID,
-		effectiveFrom,
-	).Scan(&exists)
-
-	if err != nil {
-		return false, fmt.Errorf("failed to check member existence: %w", err)
-	}
-
-	return exists, nil
-}
-
-func (r *OrgUnitRepositoryImpl) EndActiveMembership(
-	ctx context.Context,
-	orgUnitID, userID uuid.UUID,
-	effectiveTo time.Time,
-) error {
-	query := `
-		UPDATE org_unit_members
-		SET effective_to = $1
-		WHERE org_unit_id = $2
-		  AND user_id = $3
-		  AND effective_to IS NULL
-	`
-	_, err := r.client.Exec(ctx, query, effectiveTo, orgUnitID, userID)
-	return err
-}
-
-func (r *OrgUnitRepositoryImpl) GetActiveUsersByOrgUnit(
-	ctx context.Context,
-	orgUnitID uuid.UUID,
-) ([]uuid.UUID, error) {
-
-	query := `
-		SELECT user_id
-		FROM org_unit_members
-		WHERE org_unit_id = $1
-		  AND effective_to IS NULL
-	`
-
-	rows, err := r.client.Query(ctx, query, orgUnitID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch org unit users: %w", err)
-	}
-	defer rows.Close()
-
-	userIDs := make([]uuid.UUID, 0)
-	for rows.Next() {
-		var userID uuid.UUID
-		if err := rows.Scan(&userID); err != nil {
-			return nil, fmt.Errorf("failed to scan user_id: %w", err)
-		}
-		userIDs = append(userIDs, userID)
-	}
-
-	return userIDs, nil
 }

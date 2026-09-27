@@ -1113,196 +1113,6 @@ func (h *RBACHandler) GetUserHierarchy(w http.ResponseWriter, r *http.Request) {
 	h.respondWithJSON(w, http.StatusOK, successResponse(hierarchy, "User hierarchy retrieved successfully"))
 }
 
-// ---------- Employee/Manager management ----------
-
-// AddEmployee adds an employee with a role.
-// @Summary Add employee
-// @Tags rbac
-// @Accept json
-// @Produce json
-// @Param companyID path string true "Company UUID"
-// @Param body body object true "Employee details" example({"phone":"+919876543210","username":"jdoe","full_name":"John Doe","employee_id":"EMP001","role_id":"...","reports_to":"...","position_id":"..."})
-// @Success 201 {object} map[string]interface{} "Employee added"
-// @Failure 400 {object} map[string]interface{} "Invalid input or role/position mismatch"
-// @Failure 403 {object} map[string]interface{} "Permission denied"
-// @Failure 409 {object} map[string]interface{} "Employee already exists or limit reached"
-// @Router /api/v1/companies/{companyID}/rbac/employees [post]
-func (h *RBACHandler) AddEmployee(w http.ResponseWriter, r *http.Request) {
-	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
-
-	var req struct {
-		PhoneNumber string     `json:"phone" validate:"required"`
-		Username    string     `json:"username" validate:"required,min=3,max=100,alphanum"`
-		FullName    string     `json:"full_name" validate:"required,max=255"`
-		EmployeeID  string     `json:"employee_id" validate:"required"`
-		RoleID      uuid.UUID  `json:"role_id" validate:"required"`
-		ReportsTo   *uuid.UUID `json:"reports_to,omitempty"`
-		PositionID  *uuid.UUID `json:"position_id,omitempty"`
-	}
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body: unknown fields not allowed")
-		return
-	}
-
-	// Validate role belongs to company
-	role, err := h.companyService.GetRole(ctx, req.RoleID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid role ID")
-		return
-	}
-	if role.CompanyID != companyID {
-		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Role does not belong to this company")
-		return
-	}
-
-	// Validate position if provided
-	if req.PositionID != nil {
-		position, err := h.companyService.GetPosition(ctx, *req.PositionID)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, err, "Invalid position ID")
-			return
-		}
-		if position.CompanyID != companyID {
-			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Position does not belong to this company")
-			return
-		}
-		if !position.IsOpen {
-			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Position is not open for assignment")
-			return
-		}
-	}
-
-	// Validate reports-to if provided
-	if req.ReportsTo != nil {
-		isActive, err := h.companyService.IsUserActiveEmployee(ctx, companyID, *req.ReportsTo)
-		if err != nil || !isActive {
-			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Reports-to employee not found or not active")
-			return
-		}
-	}
-
-	employeeReq := &service.AddEmployeeRequest{
-		CompanyID:   companyID,
-		PhoneNumber: req.PhoneNumber,
-		Username:    req.Username,
-		FullName:    req.FullName,
-		EmployeeID:  req.EmployeeID,
-		RoleID:      req.RoleID,
-		ReportsTo:   req.ReportsTo,
-		PositionID:  req.PositionID,
-	}
-	if err := h.companyService.AddEmployee(ctx, employeeReq); err != nil {
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, err, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusCreated, successResponse(nil, "Employee added successfully"))
-}
-
-// AddManager adds a manager with a role (role level >= 500).
-// @Summary Add manager
-// @Tags rbac
-// @Accept json
-// @Produce json
-// @Param companyID path string true "Company UUID"
-// @Param body body object true "Manager details" example({"phone":"+919876543210","username":"mgr","full_name":"Manager Name","employee_id":"MGR001","role_id":"...","reports_to":"...","position_id":"..."})
-// @Success 201 {object} map[string]interface{} "Manager added"
-// @Failure 400 {object} map[string]interface{} "Invalid input or role level too low"
-// @Failure 403 {object} map[string]interface{} "Permission denied"
-// @Router /api/v1/companies/{companyID}/rbac/managers [post]
-func (h *RBACHandler) AddManager(w http.ResponseWriter, r *http.Request) {
-	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
-
-	var req struct {
-		PhoneNumber string     `json:"phone" validate:"required"`
-		Username    string     `json:"username" validate:"required,min=3,max=100,alphanum"`
-		FullName    string     `json:"full_name" validate:"required,max=255"`
-		EmployeeID  string     `json:"employee_id" validate:"required"`
-		RoleID      uuid.UUID  `json:"role_id" validate:"required"`
-		ReportsTo   *uuid.UUID `json:"reports_to,omitempty"`
-		PositionID  *uuid.UUID `json:"position_id,omitempty"`
-	}
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body: unknown fields not allowed")
-		return
-	}
-
-	role, err := h.companyService.GetRole(ctx, req.RoleID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid role ID")
-		return
-	}
-	if role.CompanyID != companyID {
-		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Role does not belong to this company")
-		return
-	}
-	if role.RoleLevel < 500 {
-		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Role level must be 500 or higher for managers")
-		return
-	}
-
-	if req.PositionID != nil {
-		position, err := h.companyService.GetPosition(ctx, *req.PositionID)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, err, "Invalid position ID")
-			return
-		}
-		if position.CompanyID != companyID {
-			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Position does not belong to this company")
-			return
-		}
-		if !position.IsOpen {
-			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Position is not open for assignment")
-			return
-		}
-	}
-
-	if req.ReportsTo != nil {
-		isActive, err := h.companyService.IsUserActiveEmployee(ctx, companyID, *req.ReportsTo)
-		if err != nil || !isActive {
-			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "Reports-to employee not found or not active")
-			return
-		}
-	}
-
-	managerReq := &service.AddEmployeeRequest{
-		CompanyID:   companyID,
-		PhoneNumber: req.PhoneNumber,
-		Username:    req.Username,
-		FullName:    req.FullName,
-		EmployeeID:  req.EmployeeID,
-		RoleID:      req.RoleID,
-		ReportsTo:   req.ReportsTo,
-		PositionID:  req.PositionID,
-	}
-	if err := h.companyService.AddEmployee(ctx, managerReq); err != nil {
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, err, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusCreated, successResponse(nil, "Manager added successfully"))
-}
-
 // UpdateEmployeePosition updates the position of an employee.
 // @Summary Update employee position
 // @Tags rbac
@@ -2176,4 +1986,306 @@ func (h *RBACHandler) AddMember(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.respondWithJSON(w, http.StatusCreated, successResponse(nil, "Member added successfully"))
+}
+
+// ============================================================
+// UpdateMember — PATCH /companies/{companyID}/rbac/members/{userID}
+//
+// Full HR update that mirrors AddMember's writable surface (everything
+// except user_id / company_id / employee_id). Updates all four tables
+// atomically: users, company_employees, employee_location_access,
+// employee_profiles. PII is re-encrypted by the service before persist.
+// ============================================================
+// @Summary Update member (HR full update)
+// @Description Update everything that AddMember writes, except employee_id.
+// @Tags rbac
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param userID path string true "User UUID"
+// @Param body body object true "Fields to update (all optional)"
+// @Success 200 {object} map[string]interface{} "Member updated"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Failure 404 {object} map[string]interface{} "Member not found"
+// @Failure 409 {object} map[string]interface{} "Conflict (duplicate username)"
+// @Router /api/v1/companies/{companyID}/rbac/members/{userID} [patch]
+func (h *RBACHandler) UpdateMember(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	userIDStr := chi.URLParam(r, "userID")
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
+		return
+	}
+
+	updatedBy, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Authentication required")
+		return
+	}
+
+	// ✅ DisallowUnknownFields catches any attempt to inject user_id /
+	// company_id / employee_id — the struct doesn't declare them.
+	var req service.UpdateMemberRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body: unknown fields not allowed")
+		return
+	}
+
+	// ---- Pre-flight validation (mirrors AddMember) ----
+
+	if req.RoleID != nil {
+		role, err := h.companyService.GetRole(ctx, *req.RoleID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, err, "Invalid role ID")
+			return
+		}
+		if role.CompanyID != companyID {
+			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput,
+				"Role does not belong to this company")
+			return
+		}
+	}
+
+	if req.PositionID != nil {
+		position, err := h.companyService.GetPosition(ctx, *req.PositionID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, err, "Invalid position ID")
+			return
+		}
+		if position.CompanyID != companyID {
+			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput,
+				"Position does not belong to this company")
+			return
+		}
+		if !position.IsOpen {
+			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidState,
+				"Position is not open for assignment")
+			return
+		}
+	}
+
+	if req.ReportsTo != nil {
+		if *req.ReportsTo == userID {
+			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput,
+				"Employee cannot report to themselves")
+			return
+		}
+		isActive, err := h.companyService.IsUserActiveEmployee(ctx, companyID, *req.ReportsTo)
+		if err != nil || !isActive {
+			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput,
+				"Reports-to employee not found or not active")
+			return
+		}
+	}
+
+	if req.LocationAccessScope != nil {
+		valid := map[string]bool{"PRIMARY": true, "SELECTED": true, "ALL": true}
+		if !valid[*req.LocationAccessScope] {
+			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput,
+				"location_access_scope must be one of PRIMARY, SELECTED, ALL")
+			return
+		}
+	}
+
+	// ---- Delegate to service (single atomic tx) ----
+	if err := h.companyService.UpdateMember(ctx, companyID, userID, &req, updatedBy); err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	// ---- Post-update audit ----
+	if h.auditService != nil {
+		ip, _ := ctx.Value("ip_address").(string)
+		_ = h.auditService.LogAction(ctx, nil, nil, "employee", "update_member", "hr",
+			nil, "hr", &updatedBy, nil, nil, map[string]interface{}{
+				"company_id": companyID.String(),
+				"user_id":    userID.String(),
+				"ip_address": ip,
+			})
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Member updated successfully"))
+}
+
+// ============================================================
+// UpdateMyProfile — PATCH /users/me
+//
+// User self-service. Only touches the users table (username + full_name).
+// The userID comes from the JWT — the body can never target another user.
+// ============================================================
+// @Summary Update my profile
+// @Description Update the authenticated user's own username and/or full_name.
+// @Tags users
+// @Accept json
+// @Produce json
+// @Param body body object true "Fields to update" example({"username":"jdoe","full_name":"John Doe"})
+// @Success 200 {object} map[string]interface{} "Profile updated"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 401 {object} map[string]interface{} "Authentication required"
+// @Failure 409 {object} map[string]interface{} "Username already taken"
+// @Router /api/v1/users/me [patch]
+func (h *RBACHandler) UpdateMyProfile(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
+
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Authentication required")
+		return
+	}
+
+	var req service.UpdateMyProfileRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body: unknown fields not allowed")
+		return
+	}
+
+	if req.Username == nil && req.FullName == nil {
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput,
+			"At least one of username or full_name is required")
+		return
+	}
+
+	updated, err := h.userService.UpdateMyProfile(ctx, userID, &req)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+		"user_id":    updated.UserID.String(),
+		"username":   updated.Username,
+		"full_name":  updated.FullName,
+		"updated_at": updated.UpdatedAt.Format(time.RFC3339),
+	}, "Profile updated successfully"))
+}
+
+// ============================================================
+// GetUserDisplayName — GET /companies/{companyID}/users/{userID}/display-name
+//
+// Returns only {username, full_name} for the given user. Cheap,
+// cache-free, no PII, no audit — safe to call from comment feeds,
+// mention pickers, notification renderers, etc.
+// ============================================================
+// @Summary Get user display name
+// @Description Returns only the username and full name for a user.
+// @Tags users
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param userID path string true "User UUID"
+// @Success 200 {object} map[string]interface{} "Display name"
+// @Failure 400 {object} map[string]interface{} "Invalid user ID"
+// @Failure 404 {object} map[string]interface{} "User not found"
+// @Router /api/v1/companies/{companyID}/users/{userID}/display-name [get]
+func (h *RBACHandler) GetUserDisplayName(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
+
+	userIDStr := chi.URLParam(r, "userID")
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
+		return
+	}
+
+	display, err := h.userService.GetUserDisplayName(ctx, userID)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+		"user_id":   userID,
+		"username":  display.Username,
+		"full_name": display.FullName,
+	}, "User display name retrieved successfully"))
+}
+
+// ============================================================
+// GetMyDepartments — GET /companies/{companyID}/me/departments
+//
+// Self-service. Returns the departments of the CALLER. The user id
+// is taken from the JWT context, never from the URL — so an employee
+// can only ever read their own departments, regardless of role.
+//
+// No permission bitmask required. Scope is enforced by:
+//  1. JWTAuthMiddlewareWithRedis   (valid token)
+//  2. SessionValidationMiddleware  (active session)
+//  3. EnhancedCompanyAccessMiddleware
+//     {companyID} in URL must match company_id in the token
+//  4. Identity comes from the token — the {userID} is not addressable.
+//
+// ============================================================
+// @Summary Get my departments
+// @Description Returns the departments of the authenticated user.
+// @Tags rbac
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Success 200 {object} map[string]interface{} "My departments"
+// @Failure 400 {object} map[string]interface{} "Invalid company ID"
+// @Failure 401 {object} map[string]interface{} "Authentication required"
+// @Router /api/v1/companies/{companyID}/me/departments [get]
+func (h *RBACHandler) GetMyDepartments(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	// ✅ Identity from JWT — never from URL
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Authentication required")
+		return
+	}
+
+	departments, err := h.companyService.GetUserDepartments(ctx, companyID, userID)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	type DepartmentResponse struct {
+		DepartmentID       uuid.UUID  `json:"department_id"`
+		DepartmentName     string     `json:"department_name"`
+		SystemDepartmentID *uuid.UUID `json:"system_department_id,omitempty"`
+		ParentDepartmentID *uuid.UUID `json:"parent_department_id,omitempty"`
+		IsActive           bool       `json:"is_active"`
+		CreatedAt          string     `json:"created_at"`
+		UpdatedAt          string     `json:"updated_at"`
+	}
+
+	response := make([]DepartmentResponse, len(departments))
+	for i, dept := range departments {
+		response[i] = DepartmentResponse{
+			DepartmentID:       dept.DepartmentID,
+			DepartmentName:     dept.DepartmentName,
+			SystemDepartmentID: dept.SystemDepartmentID,
+			ParentDepartmentID: dept.ParentDepartmentID,
+			IsActive:           dept.IsActive,
+			CreatedAt:          dept.CreatedAt.Format(time.RFC3339),
+			UpdatedAt:          dept.UpdatedAt.Format(time.RFC3339),
+		}
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Your departments retrieved successfully"))
 }

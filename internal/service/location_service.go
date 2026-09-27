@@ -878,3 +878,240 @@ func (s *LocationService) GetMyLocations(ctx context.Context, companyID, userID 
 
 	return resp, nil
 }
+
+// =====================================================================
+// NEW — multi-layer location validation
+// =====================================================================
+
+// CheckLocationAccess is the single entry point for "can this existing
+// user see this location". It loads the employee's current scope + primary
+// from the DB, then delegates to IsLocationAllowed which enforces:
+//
+//   - location exists, belongs to the company, is active (Redis-cached)
+//   - ALL      → any company location, level = MANAGE
+//   - PRIMARY  → only the employee's primary location
+//   - SELECTED → only locations granted in employee_location_access
+//
+// Returns (allowed, accessLevel, err). accessLevel is "" when !allowed.
+//
+// Missing employee rows are treated as "no access" (false, "", nil) rather
+// than an error, so callers can distinguish authorization failures from
+// system failures.
+func (s *LocationService) CheckLocationAccess(
+	ctx context.Context,
+	companyID, userID, locationID uuid.UUID,
+) (bool, string, error) {
+	if companyID == uuid.Nil || userID == uuid.Nil || locationID == uuid.Nil {
+		return false, "", nil
+	}
+
+	details, err := s.locationRepo.GetEmployeeLocationDetails(
+		ctx, s.pgClient.Pool(), companyID, userID,
+	)
+	if err != nil {
+		if errors.Is(err, apperrors.ErrNotFound) {
+			return false, "", nil
+		}
+		return false, "", fmt.Errorf("%w: %v", apperrors.ErrInternal, err)
+	}
+
+	scope := details.LocationScope
+	if scope == "" {
+		// Scope unset means "auto" per the model; treat as SELECTED.
+		scope = models.LocationScopeSelected
+	}
+
+	return s.IsLocationAllowed(
+		ctx,
+		companyID, userID, locationID,
+		scope,
+		details.PrimaryLocationID,
+	)
+}
+
+// ValidateProspectiveLocationAccess checks every location that will be written
+// during AddMember against the scope the request declares — before the
+// employee row exists.
+//
+// Returns the effective (primaryLocationID, scope) that the caller should
+// persist. Callers must overwrite req.PrimaryLocationID / req.LocationAccessScope
+// with the returned values so downstream code doesn't re-derive them.
+//
+// Inputs:
+//   - companyID     : tenant
+//   - req           : AddMemberRequest (scope, primary, selected, work center…)
+//   - resolvedWCLoc : work center's location_id, if a WC was chosen (may be nil)
+//
+// Rules applied, in order:
+//
+//  1. Scope resolution: if req.LocationAccessScope is empty, derive it:
+//       PRIMARY  ← primary_location_id was provided
+//       SELECTED ← selected_locations / selected_location_ids was provided
+//       ALL      ← otherwise
+//
+//  2. Allowed-set construction:
+//       PRIMARY  → { primary_location_id }
+//       SELECTED → { every selected location }
+//       ALL      → { all active locations of the company } — reject if empty
+//
+//  3. Tenancy + scope check on every candidate location:
+//       - primary_location_id
+//       - work center's location (if resolvedWCLoc != nil)
+//       - every selected location
+//       - position location (req.LocationID) — only when WC is not set
+//     Each must (a) belong to the company & be active, and
+//     (b) be inside the allowed set.
+//
+//  4. Normalisation: if no primary was supplied, derive one:
+//       work center's location → else first selected → else nil.
+func (s *LocationService) ValidateProspectiveLocationAccess(
+	ctx context.Context,
+	companyID uuid.UUID,
+	req *AddMemberRequest,
+	resolvedWCLoc *uuid.UUID,
+) (*uuid.UUID, string, error) {
+
+	// --- 1. Resolve scope ---------------------------------------------
+	scope := req.LocationAccessScope
+	if scope == "" {
+		switch {
+		case req.PrimaryLocationID != nil:
+			scope = models.LocationScopePrimary
+		case len(req.SelectedLocations) > 0 || len(req.SelectedLocationIDs) > 0:
+			scope = models.LocationScopeSelected
+		default:
+			scope = models.LocationScopeAll
+		}
+	}
+	switch scope {
+	case models.LocationScopePrimary,
+		models.LocationScopeSelected,
+		models.LocationScopeAll:
+	default:
+		return nil, "", fmt.Errorf(
+			"%w: invalid location_access_scope '%s'",
+			apperrors.ErrInvalidInput, scope,
+		)
+	}
+
+	// --- 2. Build allowed set -----------------------------------------
+	allowed := make(map[uuid.UUID]struct{})
+
+	switch scope {
+	case models.LocationScopePrimary:
+		if req.PrimaryLocationID == nil {
+			return nil, "", fmt.Errorf(
+				"%w: PRIMARY scope requires primary_location_id",
+				apperrors.ErrInvalidInput,
+			)
+		}
+		allowed[*req.PrimaryLocationID] = struct{}{}
+
+	case models.LocationScopeSelected:
+		for _, sl := range req.SelectedLocations {
+			if sl.LocationID != uuid.Nil {
+				allowed[sl.LocationID] = struct{}{}
+			}
+		}
+		for _, id := range req.SelectedLocationIDs {
+			if id != uuid.Nil {
+				allowed[id] = struct{}{}
+			}
+		}
+		if len(allowed) == 0 {
+			return nil, "", fmt.Errorf(
+				"%w: SELECTED scope requires at least one selected location",
+				apperrors.ErrInvalidInput,
+			)
+		}
+
+	case models.LocationScopeAll:
+		locs, _, err := s.locationRepo.ListLocations(
+			ctx, s.pgClient.Pool(), companyID, s.cfg.MaxLimit, 0,
+		)
+		if err != nil {
+			return nil, "", fmt.Errorf(
+				"%w: failed to load company locations: %v",
+				apperrors.ErrInternal, err,
+			)
+		}
+		if len(locs) == 0 {
+			return nil, "", fmt.Errorf(
+				"%w: company has no active locations to grant",
+				apperrors.ErrInvalidState,
+			)
+		}
+		for _, l := range locs {
+			allowed[l.LocationID] = struct{}{}
+		}
+	}
+
+	// --- 3. Tenancy + scope check on every candidate ------------------
+	checkOne := func(id uuid.UUID, label string) error {
+		if id == uuid.Nil {
+			return nil
+		}
+		ok, err := s.isLocationInCompany(ctx, companyID, id)
+		if err != nil {
+			return fmt.Errorf("%w: %v", apperrors.ErrInternal, err)
+		}
+		if !ok {
+			return fmt.Errorf(
+				"%w: %s (%s) does not exist in this company or is inactive",
+				apperrors.ErrInvalidInput, label, id,
+			)
+		}
+		if _, in := allowed[id]; !in {
+			return fmt.Errorf(
+				"%w: %s (%s) is outside the employee's declared scope %s",
+				apperrors.ErrInvalidInput, label, id, scope,
+			)
+		}
+		return nil
+	}
+
+	if req.PrimaryLocationID != nil {
+		if err := checkOne(*req.PrimaryLocationID, "primary_location_id"); err != nil {
+			return nil, "", err
+		}
+	}
+	if resolvedWCLoc != nil {
+		if err := checkOne(*resolvedWCLoc, "work center location"); err != nil {
+			return nil, "", err
+		}
+	}
+	for _, sl := range req.SelectedLocations {
+		if err := checkOne(sl.LocationID, "selected location"); err != nil {
+			return nil, "", err
+		}
+	}
+	for _, id := range req.SelectedLocationIDs {
+		if err := checkOne(id, "selected location"); err != nil {
+			return nil, "", err
+		}
+	}
+	// Position location only needs checking when we're not already using
+	// the work center's location as the seat's location.
+	if req.LocationID != nil && resolvedWCLoc == nil {
+		if err := checkOne(*req.LocationID, "position location"); err != nil {
+			return nil, "", err
+		}
+	}
+
+	// --- 4. Normalise primary -----------------------------------------
+	primaryLocationID := req.PrimaryLocationID
+	if primaryLocationID == nil {
+		switch {
+		case resolvedWCLoc != nil:
+			primaryLocationID = resolvedWCLoc
+		case len(req.SelectedLocations) > 0:
+			id := req.SelectedLocations[0].LocationID
+			primaryLocationID = &id
+		case len(req.SelectedLocationIDs) > 0:
+			id := req.SelectedLocationIDs[0]
+			primaryLocationID = &id
+		}
+	}
+
+	return primaryLocationID, scope, nil
+}

@@ -118,6 +118,8 @@ func (h *AvatarHandler) respondWithError(w http.ResponseWriter, status int, mess
 	})
 }
 
+// parseUUIDParam reads a UUID from a named URL param. Still used for
+// {id} (avatar ID) in GetAvatar / SetPrimary / DeleteAvatar / ReactivateAvatar.
 func (h *AvatarHandler) parseUUIDParam(r *http.Request, paramName string) (uuid.UUID, error) {
 	idStr := chi.URLParam(r, paramName)
 	if idStr == "" {
@@ -378,27 +380,39 @@ func (h *AvatarHandler) GetPrimaryAvatar(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// GetUserPrimaryAvatar returns the primary avatar of any user (by userId).
-// Requires the caller to have hr.employee.view permission and the target user to be in the same company.
+// ============================================================
+// GetUserPrimaryAvatar — returns the caller's primary avatar.
+//
+// ✅ FIXED: the user id is now read from the JWT context (populated by
+//    JWTAuthMiddlewareWithRedis), NOT from a {userId} URL parameter.
+//    The route may still declare {userId} for backwards compatibility
+//    with existing clients — the path segment is simply ignored.
+//
+//    This means a caller can never fetch another user's avatar by
+//    tampering with the URL. Company scoping is still enforced via the
+//    X-Company-ID header (the service uses it to validate the caller
+//    belongs to that company).
+// ============================================================
 func (h *AvatarHandler) GetUserPrimaryAvatar(w http.ResponseWriter, r *http.Request) {
 	ctx := h.injectClientIP(r.Context(), r)
 
-	// 1. Extract target user ID from URL
-	targetUserID, err := h.parseUUIDParam(r, "userId")
+	// 1. Identity from the token — never from the URL
+	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid user ID")
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
 
-	// 2. Get company ID from header (required)
+	// 2. Company ID from header (still required so the service can
+	//    confirm the caller belongs to the company they're querying).
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "missing or invalid X-Company-ID header")
 		return
 	}
 
-	// 3. Call service
-	avatar, err := h.service.GetUserPrimaryAvatar(ctx, targetUserID, companyID)
+	// 3. Fetch the caller's own primary avatar
+	avatar, err := h.service.GetUserPrimaryAvatar(ctx, userID, companyID)
 	if err != nil {
 		if err == errors.ErrNotFound {
 			h.respondWithJSON(w, http.StatusOK, map[string]interface{}{

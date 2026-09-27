@@ -206,6 +206,698 @@ type LoginFlowResponse struct {
 	UserID        string `json:"user_id,omitempty"`
 }
 
+// ============================================================
+// CreatePosition — handler
+//
+// New schema: job_id (required), location_id (optional),
+// title_override (optional). Booleans moved to jobs.
+// ============================================================
+// CreatePosition creates a new position.
+// @Summary Create position
+// @Tags admin-positions
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param body body service.CreatePositionRequest true "Position details"
+// @Success 201 {object} map[string]interface{} "Position created"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Router /api/v1/companies/{companyID}/positions [post]
+
+func (h *AdminHandler) CreatePosition(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	var req service.CreatePositionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+	req.CompanyID = companyID
+
+	// Defaults
+	if req.IsOpen == nil {
+		v := true
+		req.IsOpen = &v
+	}
+	if req.JobID == uuid.Nil {
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "job_id is required")
+		return
+	}
+	if req.DepartmentID == uuid.Nil {
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "department_id is required")
+		return
+	}
+
+	position, err := h.companyService.CreatePosition(ctx, &req, requesterID)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	response := map[string]interface{}{
+		"position_id":      position.PositionID.String(),
+		"company_id":       position.CompanyID.String(),
+		"department_id":    position.DepartmentID.String(),
+		"job_id":           position.JobID.String(),
+		"location_id":      position.LocationID,
+		"title_override":   position.TitleOverride,
+		"is_open":          position.IsOpen,
+		"work_center_code": position.WorkCenterCode,
+		"created_at":       position.CreatedAt,
+		"updated_at":       position.UpdatedAt,
+	}
+	h.respondWithJSON(w, http.StatusCreated, successResponse(response, "Position created successfully"))
+}
+
+// ============================================================
+// ListPositions — handler
+// Returns PositionView (job title, location name, WC name joined).
+// ============================================================
+// ListPositions lists positions for a company with filters.
+// @Summary List positions
+// @Tags admin-positions
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param department_id query string false "Filter by department ID"
+// @Param only_open query bool false "Only open positions"
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "Positions with metadata"
+// @Failure 400 {object} map[string]interface{} "Invalid parameters"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Router /api/v1/companies/{companyID}/positions [get]
+func (h *AdminHandler) ListPositions(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
+	_, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	limit := h.getIntQueryParam(r, "limit", 50)
+	offset := h.getIntQueryParam(r, "offset", 0)
+	onlyOpen := h.getBoolQueryParam(r, "only_open", false)
+
+	var departmentID *uuid.UUID
+	if deptIDStr := r.URL.Query().Get("department_id"); deptIDStr != "" {
+		deptID, err := uuid.Parse(deptIDStr)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, err, "Invalid department ID")
+			return
+		}
+		departmentID = &deptID
+	}
+
+	positions, total, err := h.companyService.ListPositions(ctx, companyID, departmentID, onlyOpen, limit, offset)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	positionResponses := make([]map[string]interface{}, len(positions))
+	for i, pos := range positions {
+		positionResponses[i] = map[string]interface{}{
+			"position_id":         pos.PositionID.String(),
+			"company_id":          pos.CompanyID.String(),
+			"department_id":       pos.DepartmentID.String(),
+			"department_name":     pos.DepartmentName,
+			"job_id":              pos.JobID.String(),
+			"job_code":            pos.JobCode,
+			"job_title":           pos.JobTitle,
+			"title_override":      pos.TitleOverride,
+			"effective_title":     pos.EffectiveTitle(),
+			"location_id":         pos.LocationID,
+			"location_name":       pos.LocationName,
+			"is_open":             pos.IsOpen,
+			"work_center_code":    pos.WorkCenterCode,
+			"work_center_name":    pos.WorkCenterName,
+			"is_schedulable":      pos.IsSchedulable,
+			"attendance_required": pos.AttendanceRequired,
+			"overtime_allowed":    pos.OvertimeAllowed,
+			"created_at":          pos.CreatedAt,
+			"updated_at":          pos.UpdatedAt,
+		}
+	}
+
+	response := map[string]interface{}{
+		"positions": positionResponses,
+		"meta": map[string]interface{}{
+			"total":  total,
+			"limit":  limit,
+			"offset": offset,
+			"count":  len(positions),
+		},
+	}
+	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Positions listed successfully"))
+}
+
+// ============================================================
+// GetPosition — handler
+// ============================================================
+// ============================
+// POSITION HANDLERS
+// ============================
+
+// GetPosition retrieves a position by ID.
+// @Summary Get position
+// @Tags admin-positions
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param positionID path string true "Position UUID"
+// @Success 200 {object} map[string]interface{} "Position details"
+// @Failure 400 {object} map[string]interface{} "Invalid IDs"
+// @Failure 403 {object} map[string]interface{} "Forbidden"
+// @Router /api/v1/companies/{companyID}/positions/{positionID} [get]
+
+func (h *AdminHandler) GetPosition(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
+	_, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	positionIDStr := chi.URLParam(r, "positionID")
+	positionID, err := uuid.Parse(positionIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid position ID")
+		return
+	}
+
+	position, err := h.companyService.GetPosition(ctx, positionID)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+	if position.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden, customErrors.ErrPermissionDenied, "Position not found in this company")
+		return
+	}
+
+	response := map[string]interface{}{
+		"position_id":         position.PositionID.String(),
+		"company_id":          position.CompanyID.String(),
+		"department_id":       position.DepartmentID.String(),
+		"department_name":     position.DepartmentName,
+		"job_id":              position.JobID.String(),
+		"job_code":            position.JobCode,
+		"job_title":           position.JobTitle,
+		"title_override":      position.TitleOverride,
+		"effective_title":     position.EffectiveTitle(),
+		"location_id":         position.LocationID,
+		"location_name":       position.LocationName,
+		"is_open":             position.IsOpen,
+		"work_center_code":    position.WorkCenterCode,
+		"work_center_name":    position.WorkCenterName,
+		"is_schedulable":      position.IsSchedulable,
+		"attendance_required": position.AttendanceRequired,
+		"overtime_allowed":    position.OvertimeAllowed,
+		"created_at":          position.CreatedAt,
+		"updated_at":          position.UpdatedAt,
+	}
+	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Position retrieved successfully"))
+}
+
+// ============================================================
+// UpdatePosition — handler
+// ============================================================
+// UpdatePosition updates a position.
+// @Summary Update position
+// @Tags admin-positions
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param positionID path string true "Position UUID"
+// @Param body body service.UpdatePositionRequest true "Update fields"
+// @Success 200 {object} map[string]interface{} "Position updated"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Failure 403 {object} map[string]interface{} "Forbidden"
+// @Router /api/v1/companies/{companyID}/positions/{positionID} [put]
+
+func (h *AdminHandler) UpdatePosition(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	positionIDStr := chi.URLParam(r, "positionID")
+	positionID, err := uuid.Parse(positionIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid position ID")
+		return
+	}
+
+	var req service.UpdatePositionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+	req.PositionID = positionID
+
+	// Fetch existing view (for ownership check + defaults).
+	existingPosition, err := h.companyService.GetPosition(ctx, positionID)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+	if existingPosition.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden, customErrors.ErrPermissionDenied, "Cannot update position in another company")
+		return
+	}
+
+	// Fill defaults from existing view when the caller omitted fields.
+	if req.DepartmentID == uuid.Nil {
+		req.DepartmentID = existingPosition.DepartmentID
+	}
+	if req.JobID == uuid.Nil {
+		req.JobID = existingPosition.JobID
+	}
+	if req.LocationID == nil {
+		req.LocationID = existingPosition.LocationID
+	}
+	if req.TitleOverride == nil {
+		req.TitleOverride = existingPosition.TitleOverride
+	}
+	if req.WorkCenterCode == nil {
+		req.WorkCenterCode = existingPosition.WorkCenterCode
+	}
+	// IsOpen comes from the body; default to existing if the JSON omitted it.
+	// (IsOpen is a plain bool — treat `false` as an explicit value; if you
+	// want to distinguish, make it *bool on the request. Keeping bool here.)
+	_ = existingPosition
+
+	if err := h.companyService.UpdatePosition(ctx, &req, requesterID); err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Position updated successfully"))
+}
+
+// ============================================================
+// UpdatePositionStatus — handler
+// Only toggles is_open now. Attendance / schedulable / overtime
+// live on the job; a WC change is a seat-level edit via UpdatePosition.
+// ============================================================
+// UpdatePositionStatus updates the status flags of a position.
+// @Summary Update position status
+// @Tags admin-positions
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param positionID path string true "Position UUID"
+// @Param body body object true "Status flags" example({"is_open":false,"is_schedulable":true})
+// @Success 200 {object} map[string]interface{} "Status updated"
+// @Failure 400 {object} map[string]interface{} "Invalid input"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Failure 403 {object} map[string]interface{} "Forbidden"
+// @Router /api/v1/companies/{companyID}/positions/{positionID}/status [patch]
+
+func (h *AdminHandler) UpdatePositionStatus(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	positionIDStr := chi.URLParam(r, "positionID")
+	positionID, err := uuid.Parse(positionIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid position ID")
+		return
+	}
+
+	var req struct {
+		IsOpen         *bool   `json:"is_open,omitempty"`
+		WorkCenterCode *string `json:"work_center_code,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	existingPosition, err := h.companyService.GetPosition(ctx, positionID)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+	if existingPosition.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden, customErrors.ErrPermissionDenied, "Cannot update position in another company")
+		return
+	}
+
+	// Toggle status if provided.
+	if req.IsOpen != nil {
+		if err := h.companyService.UpdatePositionStatus(ctx, positionID, *req.IsOpen, requesterID); err != nil {
+			status, msg := h.mapServiceError(err)
+			h.respondWithError(w, status, err, msg)
+			return
+		}
+	}
+
+	// WC change is an update to the seat itself (only if provided).
+	if req.WorkCenterCode != nil {
+		updateReq := &service.UpdatePositionRequest{
+			PositionID:     positionID,
+			DepartmentID:   existingPosition.DepartmentID,
+			JobID:          existingPosition.JobID,
+			LocationID:     existingPosition.LocationID,
+			TitleOverride:  existingPosition.TitleOverride,
+			IsOpen:         existingPosition.IsOpen,
+			WorkCenterCode: req.WorkCenterCode,
+		}
+		if err := h.companyService.UpdatePosition(ctx, updateReq, requesterID); err != nil {
+			status, msg := h.mapServiceError(err)
+			h.respondWithError(w, status, err, msg)
+			return
+		}
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Position status updated successfully"))
+}
+
+// ============================================================
+// GetOpenPositions — handler
+// ============================================================
+func (h *AdminHandler) GetOpenPositions(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
+
+	companyIDStr := r.URL.Query().Get("company_id")
+	if companyIDStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "company_id is required")
+		return
+	}
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	var isOpen *bool
+	if isOpenStr := r.URL.Query().Get("is_open"); isOpenStr != "" {
+		openVal, err := strconv.ParseBool(isOpenStr)
+		if err == nil {
+			isOpen = &openVal
+		}
+	}
+
+	limit := h.getIntQueryParam(r, "limit", 50)
+	offset := h.getIntQueryParam(r, "offset", 0)
+
+	positions, total, err := h.companyService.GetOpenPositions(ctx, companyID, isOpen, limit, offset)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	positionResponses := make([]map[string]interface{}, len(positions))
+	for i, pos := range positions {
+		positionResponses[i] = map[string]interface{}{
+			"position_id":         pos.PositionID.String(),
+			"company_id":          pos.CompanyID.String(),
+			"department_id":       pos.DepartmentID.String(),
+			"department_name":     pos.DepartmentName,
+			"job_id":              pos.JobID.String(),
+			"job_code":            pos.JobCode,
+			"job_title":           pos.JobTitle,
+			"title_override":      pos.TitleOverride,
+			"effective_title":     pos.EffectiveTitle(),
+			"location_id":         pos.LocationID,
+			"location_name":       pos.LocationName,
+			"is_open":             pos.IsOpen,
+			"work_center_code":    pos.WorkCenterCode,
+			"work_center_name":    pos.WorkCenterName,
+			"is_schedulable":      pos.IsSchedulable,
+			"attendance_required": pos.AttendanceRequired,
+			"overtime_allowed":    pos.OvertimeAllowed,
+			"created_at":          pos.CreatedAt,
+			"updated_at":          pos.UpdatedAt,
+		}
+	}
+
+	response := map[string]interface{}{
+		"positions": positionResponses,
+		"meta": map[string]interface{}{
+			"total":  total,
+			"limit":  limit,
+			"offset": offset,
+			"count":  len(positions),
+		},
+	}
+	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Open positions retrieved successfully"))
+}
+
+// ============================================================
+// CreateCompany — handler
+// Add owner_job_code passthrough (optional). Service defaults to "CEO".
+// ============================================================
+type CreateCompanyRequest struct {
+	CompanyName             string   `json:"company_name" validate:"required,max=255"`
+	OwnerPhone              string   `json:"owner_phone" validate:"required"`
+	OwnerUsername           string   `json:"owner_username" validate:"required,min=3,max=100,alphanum"`
+	OwnerFullName           string   `json:"owner_full_name" validate:"required,max=255"`
+	OwnerPositionTitle      string   `json:"owner_position_title"`
+	OwnerJobCode            string   `json:"owner_job_code,omitempty"` // 👈 NEW — optional; service derives from title
+	SubscriptionTier        string   `json:"subscription_tier"`
+	SubscriptionPlanCode    string   `json:"subscription_plan_code"`
+	MaxEmployees            int      `json:"max_employees" validate:"required,min=1,max=2000"`
+	MaxLocations            int      `json:"max_locations" validate:"required,min=1,max=500"`
+	DataRegion              string   `json:"data_region"   validate:"required"`
+	SubscriptionMonths      int      `json:"subscription_months" validate:"min=0,max=36"`
+	SubscriptionDays        int      `json:"subscription_days"   validate:"min=0,max=30"`
+	TrialDays               int      `json:"trial_days"          validate:"min=0"`
+	Departments             []string `json:"departments"`
+	FinancialYearStartMonth int      `json:"financial_year_start_month" validate:"required,min=1,max=12"`
+	WorkCenterCode          string   `json:"work_center_code" validate:"required,max=100"`
+	WorkCenterName          string   `json:"work_center_name" validate:"required,max=255"`
+	WorkCenterDesc          *string  `json:"work_center_description,omitempty"`
+	WorkCenterTZ            string   `json:"work_center_timezone" validate:"required"`
+	WorkCenterActive        bool     `json:"work_center_is_active"`
+	PositionWorkCenterCode  *string  `json:"position_work_center_code,omitempty"`
+	LocationCode            string   `json:"location_code" validate:"required"`
+	LocationName            string   `json:"location_name" validate:"required"`
+	AddressLine1            *string  `json:"address_line1,omitempty"`
+	AddressLine2            *string  `json:"address_line2,omitempty"`
+	City                    *string  `json:"city,omitempty"`
+	State                   *string  `json:"state,omitempty"`
+	Country                 *string  `json:"country,omitempty"`
+	Pincode                 *string  `json:"pincode,omitempty"`
+
+	OwnerDateOfBirth      *time.Time `json:"owner_date_of_birth,omitempty"`
+	OwnerGender           *string    `json:"owner_gender,omitempty"`
+	OwnerMaritalStatus    *string    `json:"owner_marital_status,omitempty"`
+	OwnerNationality      *string    `json:"owner_nationality,omitempty"`
+	OwnerEmploymentType   *string    `json:"owner_employment_type,omitempty"`
+	OwnerEmploymentStatus *string    `json:"owner_employment_status,omitempty"`
+	OwnerProbationEndDate *time.Time `json:"owner_probation_end_date,omitempty"`
+	OwnerConfirmationDate *time.Time `json:"owner_confirmation_date,omitempty"`
+	OwnerGrade            *string    `json:"owner_grade,omitempty"`
+	OwnerCostCenterID     *uuid.UUID `json:"owner_cost_center_id,omitempty"`
+	OwnerCostCenter       *string    `json:"owner_cost_center,omitempty"`
+	OwnerTaxID            *string    `json:"owner_tax_id,omitempty"`
+	OwnerSocialSecurityID *string    `json:"owner_social_security_id,omitempty"`
+	OwnerEmail            *string    `json:"owner_email,omitempty"`
+}
+
+// CreateCompany creates a new company (admin only).
+// @Summary Create company
+// @Tags admin-companies
+// @Accept json
+// @Produce json
+// @Param body body CreateCompanyRequest true "Company creation details"
+// @Success 201 {object} map[string]interface{} "Company created"
+// @Failure 400 {object} map[string]interface{} "Validation failed"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Failure 403 {object} map[string]interface{} "Permission denied"
+// @Failure 409 {object} map[string]interface{} "Company already exists"
+// @Router /api/v1/admin/companies [post]
+
+func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
+	adminID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	var req CreateCompanyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	// If the caller didn't provide a position title, default it — the
+	// service will normalize further and default the job code to "CEO".
+	if strings.TrimSpace(req.OwnerPositionTitle) == "" {
+		req.OwnerPositionTitle = "CEO"
+	}
+
+	if err := validateCreateCompanyRequest(req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Validation failed")
+		return
+	}
+
+	var ownerDOB *time.Time
+	if req.OwnerDateOfBirth != nil {
+		utc := req.OwnerDateOfBirth.UTC()
+		ownerDOB = &utc
+	}
+	var ownerProbation *time.Time
+	if req.OwnerProbationEndDate != nil {
+		utc := req.OwnerProbationEndDate.UTC()
+		ownerProbation = &utc
+	}
+	var ownerConfirmation *time.Time
+	if req.OwnerConfirmationDate != nil {
+		utc := req.OwnerConfirmationDate.UTC()
+		ownerConfirmation = &utc
+	}
+
+	companyReq := service.CreateCompanyRequest{
+		CompanyName:             req.CompanyName,
+		OwnerPhone:              req.OwnerPhone,
+		OwnerUsername:           req.OwnerUsername,
+		OwnerFullName:           req.OwnerFullName,
+		OwnerPositionTitle:      req.OwnerPositionTitle,
+		OwnerJobCode:            req.OwnerJobCode, // 👈 NEW passthrough
+		SubscriptionTier:        req.SubscriptionTier,
+		SubscriptionPlanCode:    req.SubscriptionPlanCode,
+		MaxEmployees:            req.MaxEmployees,
+		MaxLocations:            req.MaxLocations,
+		DataRegion:              req.DataRegion,
+		SubscriptionMonths:      req.SubscriptionMonths,
+		SubscriptionDays:        req.SubscriptionDays,
+		TrialDays:               req.TrialDays,
+		Departments:             req.Departments,
+		FinancialYearStartMonth: req.FinancialYearStartMonth,
+		WorkCenterCode:          req.WorkCenterCode,
+		WorkCenterName:          req.WorkCenterName,
+		WorkCenterDesc:          req.WorkCenterDesc,
+		WorkCenterTZ:            req.WorkCenterTZ,
+		WorkCenterActive:        req.WorkCenterActive,
+		PositionWorkCenterCode:  req.PositionWorkCenterCode,
+		LocationCode:            req.LocationCode,
+		LocationName:            req.LocationName,
+		AddressLine1:            req.AddressLine1,
+		AddressLine2:            req.AddressLine2,
+		City:                    req.City,
+		State:                   req.State,
+		Country:                 req.Country,
+		Pincode:                 req.Pincode,
+		OwnerDateOfBirth:        ownerDOB,
+		OwnerGender:             req.OwnerGender,
+		OwnerMaritalStatus:      req.OwnerMaritalStatus,
+		OwnerNationality:        req.OwnerNationality,
+		OwnerEmploymentType:     req.OwnerEmploymentType,
+		OwnerEmploymentStatus:   req.OwnerEmploymentStatus,
+		OwnerProbationEndDate:   ownerProbation,
+		OwnerConfirmationDate:   ownerConfirmation,
+		OwnerGrade:              req.OwnerGrade,
+		OwnerCostCenterID:       req.OwnerCostCenterID,
+		OwnerCostCenter:         req.OwnerCostCenter,
+		OwnerTaxID:              req.OwnerTaxID,
+		OwnerSocialSecurityID:   req.OwnerSocialSecurityID,
+		OwnerEmail:              req.OwnerEmail,
+	}
+
+	company, err := h.companyService.CreateCompany(ctx, &companyReq, adminID)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		if strings.Contains(err.Error(), "already exists") {
+			status = http.StatusConflict
+			msg = "Company already exists for this owner"
+		}
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	message := "Company created successfully"
+	switch {
+	case req.TrialDays > 0:
+		message = fmt.Sprintf("Company created with a %d-day trial", req.TrialDays)
+	case req.SubscriptionMonths > 0 || req.SubscriptionDays > 0:
+		message = "Company created and subscription activated"
+	default:
+		message = "Company created. Extend the subscription from the owner side to activate."
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"message": message,
+		"data": map[string]interface{}{
+			"company_id":          company.CompanyID.String(),
+			"company_name":        company.CompanyName,
+			"owner_user_id":       company.OwnerUserID.String(),
+			"subscription_status": company.SubscriptionStatus,
+			"subscription_tier":   company.SubscriptionTier,
+			"subscription_plan":   req.SubscriptionPlanCode,
+			"subscription_start":  company.SubscriptionStartDate,
+			"subscription_end":    company.SubscriptionEndDate,
+			"trial_start":         company.TrialStartDate,
+			"trial_end":           company.TrialEndDate,
+			"subscription_months": req.SubscriptionMonths,
+			"subscription_days":   req.SubscriptionDays,
+			"trial_days":          req.TrialDays,
+			"max_locations":       company.MaxLocations,
+			"max_employees":       company.MaxEmployees,
+			"departments_created": len(req.Departments) + 1,
+			"owner_job_title":     req.OwnerPositionTitle,
+			"created_at":          company.CreatedAt,
+		},
+	})
+}
+
 // InitiateAdminLogin handles the first step of admin login.
 // @Summary Initiate admin login
 // @Description Determines the login flow based on admin existence, MPIN status, and device trust.
@@ -5825,54 +6517,6 @@ func (h *AdminHandler) UpdateAdminUserRole(w http.ResponseWriter, r *http.Reques
 // POSITION HANDLERS
 // ============================
 
-// GetPosition retrieves a position by ID.
-// @Summary Get position
-// @Tags admin-positions
-// @Produce json
-// @Param companyID path string true "Company UUID"
-// @Param positionID path string true "Position UUID"
-// @Success 200 {object} map[string]interface{} "Position details"
-// @Failure 400 {object} map[string]interface{} "Invalid IDs"
-// @Failure 403 {object} map[string]interface{} "Forbidden"
-// @Router /api/v1/companies/{companyID}/positions/{positionID} [get]
-func (h *AdminHandler) GetPosition(w http.ResponseWriter, r *http.Request) {
-	ctx := h.injectClientIP(r.Context(), r)
-
-	_, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-		return
-	}
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
-
-	positionIDStr := chi.URLParam(r, "positionID")
-	positionID, err := uuid.Parse(positionIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid position ID")
-		return
-	}
-
-	position, err := h.companyService.GetPosition(ctx, positionID)
-	if err != nil {
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, err, msg)
-		return
-	}
-
-	if position.CompanyID != companyID {
-		h.respondWithError(w, http.StatusForbidden, customErrors.ErrPermissionDenied, "Position not found in this company")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(position, "Position retrieved successfully"))
-}
-
 // DeletePosition deletes a position.
 // @Summary Delete position
 // @Tags admin-positions
@@ -6752,453 +7396,12 @@ type CreatePositionRequest struct {
 	WorkCenterCode     string    `json:"work_center_code"`
 }
 
-// CreatePosition creates a new position.
-// @Summary Create position
-// @Tags admin-positions
-// @Accept json
-// @Produce json
-// @Param companyID path string true "Company UUID"
-// @Param body body service.CreatePositionRequest true "Position details"
-// @Success 201 {object} map[string]interface{} "Position created"
-// @Failure 400 {object} map[string]interface{} "Invalid input"
-// @Failure 401 {object} map[string]interface{} "Unauthorized"
-// @Failure 403 {object} map[string]interface{} "Permission denied"
-// @Router /api/v1/companies/{companyID}/positions [post]
-func (h *AdminHandler) CreatePosition(w http.ResponseWriter, r *http.Request) {
-	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
-
-	requesterID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-		return
-	}
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
-
-	var req service.CreatePositionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
-	req.CompanyID = companyID
-
-	if req.IsOpen == nil {
-		defaultVal := true
-		req.IsOpen = &defaultVal
-	}
-	if req.IsSchedulable == nil {
-		defaultVal := true
-		req.IsSchedulable = &defaultVal
-	}
-	if req.AttendanceRequired == nil {
-		defaultVal := true
-		req.AttendanceRequired = &defaultVal
-	}
-	if req.OvertimeAllowed == nil {
-		defaultVal := false
-		req.OvertimeAllowed = &defaultVal
-	}
-
-	position, err := h.companyService.CreatePosition(ctx, &req, requesterID)
-	if err != nil {
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, err, msg)
-		return
-	}
-
-	response := map[string]interface{}{
-		"position_id":         position.PositionID.String(),
-		"title":               position.Title,
-		"department_id":       position.DepartmentID.String(),
-		"company_id":          position.CompanyID.String(),
-		"is_open":             position.IsOpen,
-		"is_schedulable":      position.IsSchedulable,
-		"attendance_required": position.AttendanceRequired,
-		"overtime_allowed":    position.OvertimeAllowed,
-		"work_center_code":    position.WorkCenterCode,
-		"created_at":          position.CreatedAt,
-		"updated_at":          position.UpdatedAt,
-	}
-	h.respondWithJSON(w, http.StatusCreated, successResponse(response, "Position created successfully"))
-}
-
-// ListPositions lists positions for a company with filters.
-// @Summary List positions
-// @Tags admin-positions
-// @Produce json
-// @Param companyID path string true "Company UUID"
-// @Param department_id query string false "Filter by department ID"
-// @Param only_open query bool false "Only open positions"
-// @Param limit query int false "Page size" default(50)
-// @Param offset query int false "Offset" default(0)
-// @Success 200 {object} map[string]interface{} "Positions with metadata"
-// @Failure 400 {object} map[string]interface{} "Invalid parameters"
-// @Failure 401 {object} map[string]interface{} "Unauthorized"
-// @Router /api/v1/companies/{companyID}/positions [get]
-func (h *AdminHandler) ListPositions(w http.ResponseWriter, r *http.Request) {
-	ctx := h.injectClientIP(r.Context(), r)
-
-	_, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-		return
-	}
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
-
-	limit := h.getIntQueryParam(r, "limit", 50)
-	offset := h.getIntQueryParam(r, "offset", 0)
-	onlyOpen := h.getBoolQueryParam(r, "only_open", false)
-
-	var departmentID *uuid.UUID
-	if deptIDStr := r.URL.Query().Get("department_id"); deptIDStr != "" {
-		deptID, err := uuid.Parse(deptIDStr)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, err, "Invalid department ID")
-			return
-		}
-		departmentID = &deptID
-	}
-
-	positions, total, err := h.companyService.ListPositions(ctx, companyID, departmentID, onlyOpen, limit, offset)
-	if err != nil {
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, err, msg)
-		return
-	}
-
-	positionResponses := make([]map[string]interface{}, len(positions))
-	for i, pos := range positions {
-		positionResponses[i] = map[string]interface{}{
-			"position_id":         pos.PositionID.String(),
-			"title":               pos.Title,
-			"department_id":       pos.DepartmentID.String(),
-			"department_name":     pos.DepartmentName,
-			"company_id":          pos.CompanyID.String(),
-			"is_open":             pos.IsOpen,
-			"is_schedulable":      pos.IsSchedulable,
-			"attendance_required": pos.AttendanceRequired,
-			"overtime_allowed":    pos.OvertimeAllowed,
-			"work_center_code":    pos.WorkCenterCode,
-			"work_center_name":    pos.WorkCenterName,
-			"created_at":          pos.CreatedAt,
-			"updated_at":          pos.UpdatedAt,
-		}
-	}
-
-	response := map[string]interface{}{
-		"positions": positionResponses,
-		"meta": map[string]interface{}{
-			"total":  total,
-			"limit":  limit,
-			"offset": offset,
-			"count":  len(positions),
-		},
-	}
-	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Positions listed successfully"))
-}
-
-// UpdatePosition updates a position.
-// @Summary Update position
-// @Tags admin-positions
-// @Accept json
-// @Produce json
-// @Param companyID path string true "Company UUID"
-// @Param positionID path string true "Position UUID"
-// @Param body body service.UpdatePositionRequest true "Update fields"
-// @Success 200 {object} map[string]interface{} "Position updated"
-// @Failure 400 {object} map[string]interface{} "Invalid input"
-// @Failure 401 {object} map[string]interface{} "Unauthorized"
-// @Failure 403 {object} map[string]interface{} "Forbidden"
-// @Router /api/v1/companies/{companyID}/positions/{positionID} [put]
-func (h *AdminHandler) UpdatePosition(w http.ResponseWriter, r *http.Request) {
-	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
-
-	requesterID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-		return
-	}
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
-
-	positionIDStr := chi.URLParam(r, "positionID")
-	positionID, err := uuid.Parse(positionIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid position ID")
-		return
-	}
-
-	var req service.UpdatePositionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
-	req.PositionID = positionID
-
-	existingPosition, err := h.companyService.GetPosition(ctx, positionID)
-	if err != nil {
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, err, msg)
-		return
-	}
-	if existingPosition.CompanyID != companyID {
-		h.respondWithError(w, http.StatusForbidden, customErrors.ErrPermissionDenied, "Cannot update position in another company")
-		return
-	}
-
-	if err := h.companyService.UpdatePosition(ctx, &req, requesterID); err != nil {
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, err, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Position updated successfully"))
-}
-
-// UpdatePositionStatus updates the status flags of a position.
-// @Summary Update position status
-// @Tags admin-positions
-// @Accept json
-// @Produce json
-// @Param companyID path string true "Company UUID"
-// @Param positionID path string true "Position UUID"
-// @Param body body object true "Status flags" example({"is_open":false,"is_schedulable":true})
-// @Success 200 {object} map[string]interface{} "Status updated"
-// @Failure 400 {object} map[string]interface{} "Invalid input"
-// @Failure 401 {object} map[string]interface{} "Unauthorized"
-// @Failure 403 {object} map[string]interface{} "Forbidden"
-// @Router /api/v1/companies/{companyID}/positions/{positionID}/status [patch]
-func (h *AdminHandler) UpdatePositionStatus(w http.ResponseWriter, r *http.Request) {
-	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
-
-	requesterID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-		return
-	}
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
-
-	positionIDStr := chi.URLParam(r, "positionID")
-	positionID, err := uuid.Parse(positionIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid position ID")
-		return
-	}
-
-	var req struct {
-		IsOpen             *bool   `json:"is_open,omitempty"`
-		IsSchedulable      *bool   `json:"is_schedulable,omitempty"`
-		AttendanceRequired *bool   `json:"attendance_required,omitempty"`
-		OvertimeAllowed    *bool   `json:"overtime_allowed,omitempty"`
-		WorkCenterCode     *string `json:"work_center_code,omitempty"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
-
-	existingPosition, err := h.companyService.GetPosition(ctx, positionID)
-	if err != nil {
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, err, msg)
-		return
-	}
-	if existingPosition.CompanyID != companyID {
-		h.respondWithError(w, http.StatusForbidden, customErrors.ErrPermissionDenied, "Cannot update position in another company")
-		return
-	}
-
-	updateReq := &service.UpdatePositionRequest{
-		PositionID:         positionID,
-		Title:              existingPosition.Title,
-		DepartmentID:       existingPosition.DepartmentID,
-		IsOpen:             existingPosition.IsOpen,
-		IsSchedulable:      &existingPosition.IsSchedulable,
-		AttendanceRequired: &existingPosition.AttendanceRequired,
-		OvertimeAllowed:    &existingPosition.OvertimeAllowed,
-		WorkCenterCode:     existingPosition.WorkCenterCode,
-	}
-	if req.IsOpen != nil {
-		updateReq.IsOpen = *req.IsOpen
-	}
-	if req.IsSchedulable != nil {
-		updateReq.IsSchedulable = req.IsSchedulable
-	}
-	if req.AttendanceRequired != nil {
-		updateReq.AttendanceRequired = req.AttendanceRequired
-	}
-	if req.OvertimeAllowed != nil {
-		updateReq.OvertimeAllowed = req.OvertimeAllowed
-	}
-	if req.WorkCenterCode != nil {
-		updateReq.WorkCenterCode = req.WorkCenterCode
-	}
-
-	if err := h.companyService.UpdatePosition(ctx, updateReq, requesterID); err != nil {
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, err, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Position status updated successfully"))
-}
-
-// GetOpenPositions retrieves open positions for a company.
-// @Summary Get open positions
-// @Tags admin-positions
-// @Produce json
-// @Param company_id query string true "Company UUID"
-// @Param is_open query bool false "Filter by open status"
-// @Param limit query int false "Page size" default(50)
-// @Param offset query int false "Offset" default(0)
-// @Success 200 {object} map[string]interface{} "Open positions with metadata"
-// @Failure 400 {object} map[string]interface{} "Missing company_id"
-// @Failure 401 {object} map[string]interface{} "Unauthorized"
-// @Router /api/v1/companies/{companyID}/positions/open [get]
-func (h *AdminHandler) GetOpenPositions(w http.ResponseWriter, r *http.Request) {
-	ctx := h.injectClientIP(r.Context(), r)
-
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput, "company_id is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
-
-	var isOpen *bool
-	if isOpenStr := r.URL.Query().Get("is_open"); isOpenStr != "" {
-		openVal, err := strconv.ParseBool(isOpenStr)
-		if err == nil {
-			isOpen = &openVal
-		}
-	}
-
-	limit := h.getIntQueryParam(r, "limit", 50)
-	offset := h.getIntQueryParam(r, "offset", 0)
-
-	positions, total, err := h.companyService.GetOpenPositions(ctx, companyID, isOpen, limit, offset)
-	if err != nil {
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, err, msg)
-		return
-	}
-
-	positionResponses := make([]map[string]interface{}, len(positions))
-	for i, pos := range positions {
-		positionResponses[i] = map[string]interface{}{
-			"position_id":         pos.PositionID.String(),
-			"title":               pos.Title,
-			"is_open":             pos.IsOpen,
-			"is_schedulable":      pos.IsSchedulable,
-			"attendance_required": pos.AttendanceRequired,
-			"overtime_allowed":    pos.OvertimeAllowed,
-			"work_center_code":    pos.WorkCenterCode,
-			"work_center_name":    pos.WorkCenterName,
-			"department_id":       pos.DepartmentID.String(),
-			"company_id":          pos.CompanyID.String(),
-			"created_at":          pos.CreatedAt,
-			"updated_at":          pos.UpdatedAt,
-		}
-	}
-
-	response := map[string]interface{}{
-		"positions": positionResponses,
-		"meta": map[string]interface{}{
-			"total":  total,
-			"limit":  limit,
-			"offset": offset,
-			"count":  len(positions),
-		},
-	}
-	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Open positions retrieved successfully"))
-}
-
 // ============================
 // CREATE COMPANY
 // ============================
 // =====================================================================
 // Handler-level request DTO + validation
 // =====================================================================
-
-// CreateCompanyRequest is the request payload for creating a company.
-type CreateCompanyRequest struct {
-	CompanyName             string   `json:"company_name" validate:"required,max=255"`
-	OwnerPhone              string   `json:"owner_phone" validate:"required"`
-	OwnerUsername           string   `json:"owner_username" validate:"required,min=3,max=100,alphanum"`
-	OwnerFullName           string   `json:"owner_full_name" validate:"required,max=255"`
-	OwnerPositionTitle      string   `json:"owner_position_title" validate:"required,max=255"`
-	SubscriptionTier        string   `json:"subscription_tier"`
-	SubscriptionPlanCode    string   `json:"subscription_plan_code"`
-	MaxEmployees            int      `json:"max_employees" validate:"required,min=1,max=2000"`
-	MaxLocations            int      `json:"max_locations" validate:"required,min=1,max=500"`
-	DataRegion              string   `json:"data_region"   validate:"required"`
-	SubscriptionMonths      int      `json:"subscription_months" validate:"min=0,max=36"`
-	SubscriptionDays        int      `json:"subscription_days"   validate:"min=0,max=30"`
-	TrialDays               int      `json:"trial_days"          validate:"min=0"`
-	Departments             []string `json:"departments"`
-	FinancialYearStartMonth int      `json:"financial_year_start_month" validate:"required,min=1,max=12"`
-	WorkCenterCode          string   `json:"work_center_code" validate:"required,max=100"`
-	WorkCenterName          string   `json:"work_center_name" validate:"required,max=255"`
-	WorkCenterDesc          *string  `json:"work_center_description,omitempty"`
-	WorkCenterTZ            string   `json:"work_center_timezone" validate:"required"`
-	WorkCenterActive        bool     `json:"work_center_is_active"`
-	PositionWorkCenterCode  *string  `json:"position_work_center_code,omitempty"`
-	LocationCode            string   `json:"location_code" validate:"required"`
-	LocationName            string   `json:"location_name" validate:"required"`
-	AddressLine1            *string  `json:"address_line1,omitempty"`
-	AddressLine2            *string  `json:"address_line2,omitempty"`
-	City                    *string  `json:"city,omitempty"`
-	State                   *string  `json:"state,omitempty"`
-	Country                 *string  `json:"country,omitempty"`
-	Pincode                 *string  `json:"pincode,omitempty"`
-
-	// ============================================================
-	// 👇 Owner employee profile — mirrors AddMemberRequest.
-	//    All optional / nullable; missing values → NULL in DB.
-	//    CostCenter is nullable (cost_center can be null).
-	// ============================================================
-	OwnerDateOfBirth      *time.Time `json:"owner_date_of_birth,omitempty"`
-	OwnerGender           *string    `json:"owner_gender,omitempty"`
-	OwnerMaritalStatus    *string    `json:"owner_marital_status,omitempty"`
-	OwnerNationality      *string    `json:"owner_nationality,omitempty"`
-	OwnerEmploymentType   *string    `json:"owner_employment_type,omitempty"`
-	OwnerEmploymentStatus *string    `json:"owner_employment_status,omitempty"`
-	OwnerProbationEndDate *time.Time `json:"owner_probation_end_date,omitempty"`
-	OwnerConfirmationDate *time.Time `json:"owner_confirmation_date,omitempty"`
-	OwnerGrade            *string    `json:"owner_grade,omitempty"`
-	OwnerCostCenterID     *uuid.UUID `json:"owner_cost_center_id,omitempty"`
-	OwnerCostCenter       *string    `json:"owner_cost_center,omitempty"`
-	OwnerTaxID            *string    `json:"owner_tax_id,omitempty"`
-	OwnerSocialSecurityID *string    `json:"owner_social_security_id,omitempty"`
-	OwnerEmail            *string    `json:"owner_email,omitempty"`
-}
-
 // validateCreateCompanyRequest validates company creation input.
 //
 // Subscription-related fields are OPTIONAL here:
@@ -7403,147 +7606,6 @@ func validateCreateCompanyRequest(req CreateCompanyRequest) error {
 // CreateCompany handler
 // =====================================================================
 
-// CreateCompany creates a new company (admin only).
-// @Summary Create company
-// @Tags admin-companies
-// @Accept json
-// @Produce json
-// @Param body body CreateCompanyRequest true "Company creation details"
-// @Success 201 {object} map[string]interface{} "Company created"
-// @Failure 400 {object} map[string]interface{} "Validation failed"
-// @Failure 401 {object} map[string]interface{} "Unauthorized"
-// @Failure 403 {object} map[string]interface{} "Permission denied"
-// @Failure 409 {object} map[string]interface{} "Company already exists"
-// @Router /api/v1/admin/companies [post]
-func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
-	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
-	adminID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
-		return
-	}
-
-	var req CreateCompanyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
-	if err := validateCreateCompanyRequest(req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Validation failed")
-		return
-	}
-
-	// Normalize time fields to UTC at the boundary.
-	var ownerDOB *time.Time
-	if req.OwnerDateOfBirth != nil {
-		utc := req.OwnerDateOfBirth.UTC()
-		ownerDOB = &utc
-	}
-	var ownerProbation *time.Time
-	if req.OwnerProbationEndDate != nil {
-		utc := req.OwnerProbationEndDate.UTC()
-		ownerProbation = &utc
-	}
-	var ownerConfirmation *time.Time
-	if req.OwnerConfirmationDate != nil {
-		utc := req.OwnerConfirmationDate.UTC()
-		ownerConfirmation = &utc
-	}
-
-	companyReq := service.CreateCompanyRequest{
-		CompanyName:             req.CompanyName,
-		OwnerPhone:              req.OwnerPhone,
-		OwnerUsername:           req.OwnerUsername,
-		OwnerFullName:           req.OwnerFullName,
-		OwnerPositionTitle:      req.OwnerPositionTitle,
-		SubscriptionTier:        req.SubscriptionTier,
-		SubscriptionPlanCode:    req.SubscriptionPlanCode,
-		MaxEmployees:            req.MaxEmployees,
-		MaxLocations:            req.MaxLocations,
-		DataRegion:              req.DataRegion,
-		SubscriptionMonths:      req.SubscriptionMonths,
-		SubscriptionDays:        req.SubscriptionDays,
-		TrialDays:               req.TrialDays,
-		Departments:             req.Departments,
-		FinancialYearStartMonth: req.FinancialYearStartMonth,
-		WorkCenterCode:          req.WorkCenterCode,
-		WorkCenterName:          req.WorkCenterName,
-		WorkCenterDesc:          req.WorkCenterDesc,
-		WorkCenterTZ:            req.WorkCenterTZ,
-		WorkCenterActive:        req.WorkCenterActive,
-		PositionWorkCenterCode:  req.PositionWorkCenterCode,
-		LocationCode:            req.LocationCode,
-		LocationName:            req.LocationName,
-		AddressLine1:            req.AddressLine1,
-		AddressLine2:            req.AddressLine2,
-		City:                    req.City,
-		State:                   req.State,
-		Country:                 req.Country,
-		Pincode:                 req.Pincode,
-
-		// 👇 Owner employee profile
-		OwnerDateOfBirth:      ownerDOB,
-		OwnerGender:           req.OwnerGender,
-		OwnerMaritalStatus:    req.OwnerMaritalStatus,
-		OwnerNationality:      req.OwnerNationality,
-		OwnerEmploymentType:   req.OwnerEmploymentType,
-		OwnerEmploymentStatus: req.OwnerEmploymentStatus,
-		OwnerProbationEndDate: ownerProbation,
-		OwnerConfirmationDate: ownerConfirmation,
-		OwnerGrade:            req.OwnerGrade,
-		OwnerCostCenterID:     req.OwnerCostCenterID,
-		OwnerCostCenter:       req.OwnerCostCenter,
-		OwnerTaxID:            req.OwnerTaxID,
-		OwnerSocialSecurityID: req.OwnerSocialSecurityID,
-		OwnerEmail:            req.OwnerEmail,
-	}
-
-	company, err := h.companyService.CreateCompany(ctx, &companyReq, adminID)
-	if err != nil {
-		status, msg := h.mapServiceError(err)
-		if strings.Contains(err.Error(), "already exists") {
-			status = http.StatusConflict
-			msg = "Company already exists for this owner"
-		}
-		h.respondWithError(w, status, err, msg)
-		return
-	}
-
-	message := "Company created successfully"
-	switch {
-	case req.TrialDays > 0:
-		message = fmt.Sprintf("Company created with a %d-day trial", req.TrialDays)
-	case req.SubscriptionMonths > 0 || req.SubscriptionDays > 0:
-		message = "Company created and subscription activated"
-	default:
-		message = "Company created. Extend the subscription from the owner side to activate."
-	}
-
-	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
-		"success": true,
-		"message": message,
-		"data": map[string]interface{}{
-			"company_id":          company.CompanyID.String(),
-			"company_name":        company.CompanyName,
-			"owner_user_id":       company.OwnerUserID.String(),
-			"subscription_status": company.SubscriptionStatus,
-			"subscription_tier":   company.SubscriptionTier,
-			"subscription_plan":   req.SubscriptionPlanCode,
-			"subscription_start":  company.SubscriptionStartDate,
-			"subscription_end":    company.SubscriptionEndDate,
-			"trial_start":         company.TrialStartDate,
-			"trial_end":           company.TrialEndDate,
-			"subscription_months": req.SubscriptionMonths,
-			"subscription_days":   req.SubscriptionDays,
-			"trial_days":          req.TrialDays,
-			"max_locations":       company.MaxLocations,
-			"max_employees":       company.MaxEmployees,
-			"departments_created": len(req.Departments) + 1,
-			"created_at":          company.CreatedAt,
-		},
-	})
-}
-
 // sanitizeUserForAdminResponse returns a sanitized map for admin responses.
 func (h *AdminHandler) sanitizeUserForAdminResponse(user *models.User) map[string]interface{} {
 	if user == nil {
@@ -7706,3 +7768,121 @@ func (h *AdminHandler) UpdateCompanyDetailsHandler(w http.ResponseWriter, r *htt
 }
 
 //
+
+func (h *AdminHandler) GetUserPhoneNumber(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	userIDStr := chi.URLParam(r, "userID")
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
+		return
+	}
+
+	// Authorization: owner or super employee only.
+	requester, err := h.adminService.GetAdminUser(ctx, requesterID, requesterID)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+	if !requester.IsOwner() && !requester.IsSuperEmployee() {
+		h.respondWithError(w, http.StatusForbidden,
+			customErrors.ErrPermissionDenied,
+			"Only owner or super employee can view user phone numbers")
+		return
+	}
+
+	phoneNumber, err := h.userService.GetPhoneNumberByUserID(ctx, userID)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	response := map[string]interface{}{
+		"user_id":          userID.String(),
+		"phone_number":     phoneNumber,                  // plaintext (privileged)
+		"masked_phone":     maskPhoneNumber(phoneNumber), // ****1234
+		"accessed_by":      requesterID.String(),
+		"access_timestamp": time.Now().UTC(),
+	}
+	h.respondWithJSON(w, http.StatusOK,
+		successResponse(response, "User phone number retrieved successfully"))
+}
+
+// ChangeUserPhone replaces a user's phone number.
+// The service re-computes phone_hash and re-encrypts the phone.
+//
+//	PUT /admin/users/{userID}/phone
+func (h *AdminHandler) ChangeUserPhone(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	userIDStr := chi.URLParam(r, "userID")
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
+		return
+	}
+
+	var req struct {
+		NewPhone string `json:"new_phone" validate:"required"`
+		Reason   string `json:"reason,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+	req.NewPhone = util.SanitizeInput(req.NewPhone)
+	req.Reason = util.SanitizeInput(req.Reason)
+
+	if strings.TrimSpace(req.NewPhone) == "" {
+		h.respondWithError(w, http.StatusBadRequest,
+			customErrors.ErrInvalidInput, "new_phone is required")
+		return
+	}
+
+	// Authorization: owner or super employee only.
+	requester, err := h.adminService.GetAdminUser(ctx, requesterID, requesterID)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+	if !requester.IsOwner() && !requester.IsSuperEmployee() {
+		h.respondWithError(w, http.StatusForbidden,
+			customErrors.ErrPermissionDenied,
+			"Only owner or super employee can change user phone numbers")
+		return
+	}
+
+	// Service performs: length check, duplicate-hash check,
+	// encryption, cache invalidation, audit log, idempotency store.
+	if err := h.userService.UpdatePhoneNumber(ctx, userID, req.NewPhone); err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	response := map[string]interface{}{
+		"user_id":          userID.String(),
+		"masked_phone":     maskPhoneNumber(req.NewPhone),
+		"changed_by":       requesterID.String(),
+		"reason":           req.Reason,
+		"change_timestamp": time.Now().UTC(),
+	}
+	h.respondWithJSON(w, http.StatusOK,
+		successResponse(response, "User phone number updated successfully"))
+}

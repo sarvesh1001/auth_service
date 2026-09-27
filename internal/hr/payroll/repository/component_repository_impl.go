@@ -36,6 +36,7 @@ func (r *componentRepository) GetComponentsByCompany(
 
 	query := `
 		SELECT
+			component_id,
 			company_id,
 			component_code,
 			component_type,
@@ -45,9 +46,9 @@ func (r *componentRepository) GetComponentsByCompany(
 			is_active,
 			contribution_side
 		FROM payroll.payroll_component
-		WHERE (company_id = $1 OR company_id IS NULL)
+		WHERE company_id = $1
 		  AND is_active = true
-		ORDER BY company_id DESC
+		ORDER BY component_code
 	`
 
 	rows, err := r.client.Query(ctx, query, companyID)
@@ -61,6 +62,7 @@ func (r *componentRepository) GetComponentsByCompany(
 	for rows.Next() {
 		var comp models.PayrollComponent
 		if err := rows.Scan(
+			&comp.ComponentID,
 			&comp.CompanyID,
 			&comp.ComponentCode,
 			&comp.ComponentType,
@@ -72,11 +74,7 @@ func (r *componentRepository) GetComponentsByCompany(
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan component row: %w", err)
 		}
-
-		// Company overrides win
-		if _, exists := components[comp.ComponentCode]; !exists {
-			components[comp.ComponentCode] = &comp
-		}
+		components[comp.ComponentCode] = &comp
 	}
 
 	if err := rows.Err(); err != nil {
@@ -94,6 +92,7 @@ func (r *componentRepository) GetComponent(
 
 	query := `
 		SELECT
+			component_id,
 			company_id,
 			component_code,
 			component_type,
@@ -103,10 +102,9 @@ func (r *componentRepository) GetComponent(
 			is_active,
 			contribution_side
 		FROM payroll.payroll_component
-		WHERE component_code = $2
+		WHERE company_id = $1
+		  AND component_code = $2
 		  AND is_active = true
-		  AND (company_id = $1 OR company_id IS NULL)
-		ORDER BY company_id DESC
 		LIMIT 1
 	`
 
@@ -114,6 +112,7 @@ func (r *componentRepository) GetComponent(
 
 	var comp models.PayrollComponent
 	err := row.Scan(
+		&comp.ComponentID,
 		&comp.CompanyID,
 		&comp.ComponentCode,
 		&comp.ComponentType,
@@ -146,6 +145,7 @@ func (r *componentRepository) GetComponentsByCodes(
 
 	query := `
 		SELECT
+			component_id,
 			company_id,
 			component_code,
 			component_type,
@@ -155,10 +155,10 @@ func (r *componentRepository) GetComponentsByCodes(
 			is_active,
 			contribution_side
 		FROM payroll.payroll_component
-		WHERE (company_id = $1 OR company_id IS NULL)
+		WHERE company_id = $1
 		  AND component_code = ANY($2)
 		  AND is_active = true
-		ORDER BY company_id DESC
+		ORDER BY component_code
 	`
 
 	rows, err := r.client.Query(ctx, query, companyID, pq.Array(codes))
@@ -167,11 +167,11 @@ func (r *componentRepository) GetComponentsByCodes(
 	}
 	defer rows.Close()
 
-	componentMap := make(map[string]*models.PayrollComponent)
-
+	var components []*models.PayrollComponent
 	for rows.Next() {
 		var comp models.PayrollComponent
 		if err := rows.Scan(
+			&comp.ComponentID,
 			&comp.CompanyID,
 			&comp.ComponentCode,
 			&comp.ComponentType,
@@ -183,20 +183,11 @@ func (r *componentRepository) GetComponentsByCodes(
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan component row: %w", err)
 		}
-
-		// Company override wins
-		if _, exists := componentMap[comp.ComponentCode]; !exists {
-			componentMap[comp.ComponentCode] = &comp
-		}
+		components = append(components, &comp)
 	}
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("rows iteration error: %w", err)
-	}
-
-	var components []*models.PayrollComponent
-	for _, comp := range componentMap {
-		components = append(components, comp)
 	}
 
 	return components, nil

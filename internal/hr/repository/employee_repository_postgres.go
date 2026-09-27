@@ -12,8 +12,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgtype" // for UUIDArray
+
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v4"
+	"go.uber.org/zap"
 )
 
 // NOTE ON LOCATION SCOPING
@@ -44,12 +47,24 @@ import (
 // PII columns (email, tax_id, social_security_id, date_of_birth, nationality,
 // marital_status) have been dropped from the schema. `gender` remains
 // plaintext because it is not part of the encryption scheme.
+//
+// NOTE ON POSITIONS
+//
+// A position is a "seat". Its definition (title, is_schedulable,
+// attendance_required, overtime_allowed) lives on the `jobs` table and is
+// referenced by positions.job_id. The seat itself carries location_id and
+// work_center_code. Title is title_override (nullable) — the effective
+// display title is COALESCE(p.title_override, j.job_title).
+//
+// The repository returns *employee.Position (base) for CRUD and
+// *employee.PositionView (joined) for reads that need the job fields.
 
 // EmployeeRepositoryImpl handles PostgreSQL HR employee operations
 type EmployeeRepositoryImpl struct {
 	client    *client.PostgresClient
 	stmtCache map[string]*sql.Stmt
 	stmtMutex sync.RWMutex
+	logger    *zap.Logger
 }
 
 // NewEmployeeRepository creates a new PostgreSQL employee repository
@@ -57,6 +72,7 @@ func NewEmployeeRepository(postgresClient *client.PostgresClient) EmployeeReposi
 	repo := &EmployeeRepositoryImpl{
 		client:    postgresClient,
 		stmtCache: make(map[string]*sql.Stmt),
+		logger:    zap.L(),
 	}
 
 	go repo.initializePreparedStatements(context.Background())
@@ -64,9 +80,6 @@ func NewEmployeeRepository(postgresClient *client.PostgresClient) EmployeeReposi
 }
 
 // employeeProfileColumns is the canonical SELECT list for employee_profiles.
-// Every query that feeds scanEmployeeProfile must use this exact column order.
-// All PII is read from the *_encrypted siblings; the plaintext PII columns
-// have been dropped. `gender` stays plaintext.
 const employeeProfileColumns = `
 	ep.employee_profile_id, ep.user_id, ep.company_id,
 	ep.gender,
@@ -86,12 +99,13 @@ const employeeProfileColumns = `
 // ============================================================================
 
 func (r *EmployeeRepositoryImpl) CreateEmployeeProfile(ctx context.Context, profile *employee.EmployeeProfile) error {
-	// Fetch position title (kept for compatibility with prior behavior).
+	// Fetch the effective position title (title_override > job_title).
 	var jobTitle *string
 	queryGetTitle := `
-		SELECT p.title
+		SELECT COALESCE(p.title_override, j.job_title)
 		FROM company_employees ce
 		LEFT JOIN positions p ON ce.position_id = p.position_id
+		LEFT JOIN jobs      j ON j.job_id        = p.job_id
 		WHERE ce.user_id = $1 AND ce.company_id = $2
 		LIMIT 1`
 
@@ -101,8 +115,6 @@ func (r *EmployeeRepositoryImpl) CreateEmployeeProfile(ctx context.Context, prof
 	}
 	profile.JobTitle = jobTitle
 
-	// Plaintext PII columns have been dropped. Only the encrypted siblings
-	// are written; gender stays plaintext.
 	query := `
 		INSERT INTO employee_profiles (
 			employee_profile_id, user_id, company_id,
@@ -362,7 +374,6 @@ func (r *EmployeeRepositoryImpl) SearchEmployeeProfiles(
 			params = append(params, value)
 			paramCount++
 		case "email_hash":
-			// Service hashes the plaintext search term and passes the digest.
 			conditions = append(conditions, fmt.Sprintf("ep.email_hash = $%d", paramCount))
 			params = append(params, value)
 			paramCount++
@@ -724,16 +735,26 @@ func (r *EmployeeRepositoryImpl) UpdateEmployeeExit(ctx context.Context, exit *e
 // ============================================================================
 
 func (r *EmployeeRepositoryImpl) CreatePosition(ctx context.Context, position *employee.Position) error {
-	query := `
+	const query = `
 		INSERT INTO positions (
-			position_id, company_id, department_id, title, is_open,
-			created_at, updated_at, work_center_code
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
+			position_id, company_id, department_id,
+			job_id, location_id, title_override,
+			is_open, work_center_code,
+			created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
 
 	_, err := r.client.Exec(ctx, query,
-		position.PositionID, position.CompanyID, position.DepartmentID,
-		position.Title, position.IsOpen, position.CreatedAt,
-		position.UpdatedAt, position.WorkCenterCode)
+		position.PositionID,
+		position.CompanyID,
+		position.DepartmentID,
+		position.JobID,
+		position.LocationID,
+		position.TitleOverride,
+		position.IsOpen,
+		position.WorkCenterCode,
+		position.CreatedAt,
+		position.UpdatedAt,
+	)
 	if err != nil {
 		return fmt.Errorf("failed to create position: %w", err)
 	}
@@ -759,9 +780,12 @@ func (r *EmployeeRepositoryImpl) GetPositionByID(ctx context.Context, positionID
 }
 
 func (r *EmployeeRepositoryImpl) GetPositionsByDepartment(ctx context.Context, companyID, departmentID uuid.UUID) ([]*employee.Position, error) {
-	query := `
-		SELECT position_id, company_id, department_id, title, is_open,
-		       created_at, updated_at, work_center_code
+	const query = `
+		SELECT
+			position_id, company_id, department_id,
+			job_id, location_id, title_override,
+			is_open, work_center_code,
+			created_at, updated_at
 		FROM positions
 		WHERE company_id = $1 AND department_id = $2
 		ORDER BY created_at DESC`
@@ -818,14 +842,27 @@ func (r *EmployeeRepositoryImpl) UpdatePosition(ctx context.Context, position *e
 	now := time.Now().UTC()
 	position.UpdatedAt = now
 
-	query := `
+	const query = `
 		UPDATE positions SET
-			title = $1, is_open = $2, updated_at = $3, work_center_code = $4
-		WHERE position_id = $5`
+			department_id    = $1,
+			job_id           = $2,
+			location_id      = $3,
+			title_override   = $4,
+			is_open          = $5,
+			work_center_code = $6,
+			updated_at       = $7
+		WHERE position_id = $8`
 
 	result, err := r.client.Exec(ctx, query,
-		position.Title, position.IsOpen, position.UpdatedAt,
-		position.WorkCenterCode, position.PositionID)
+		position.DepartmentID,
+		position.JobID,
+		position.LocationID,
+		position.TitleOverride,
+		position.IsOpen,
+		position.WorkCenterCode,
+		position.UpdatedAt,
+		position.PositionID,
+	)
 	if err != nil {
 		return fmt.Errorf("failed to update position: %w", err)
 	}
@@ -968,8 +1005,6 @@ func (r *EmployeeRepositoryImpl) CreateEmployeeProfilesBatch(ctx context.Context
 	}
 	defer tx.Rollback()
 
-	// Plaintext PII columns have been dropped. Only encrypted siblings and
-	// non-PII (gender, employment_*, cost_center*) are written.
 	query := `
 		INSERT INTO employee_profiles (
 			employee_profile_id, user_id, company_id,
@@ -1255,13 +1290,11 @@ func (r *EmployeeRepositoryImpl) GetActiveEmployeesByDateRange(
 func (r *EmployeeRepositoryImpl) scanEmployeeProfile(rows *sql.Rows) (*employee.EmployeeProfile, error) {
 	var profile employee.EmployeeProfile
 
-	// Non-PII / plaintext columns that still exist.
 	var probationEndDate, confirmationDate sql.NullTime
 	var gender, employmentType, employmentStatus,
 		jobTitle, grade, costCenter sql.NullString
 	var costCenterID uuid.NullUUID
 
-	// Encrypted siblings — opaque to this layer.
 	var (
 		emailHash sql.NullString
 		emailCT   []byte
@@ -1307,8 +1340,6 @@ func (r *EmployeeRepositoryImpl) scanEmployeeProfile(rows *sql.Rows) (*employee.
 		return nil, err
 	}
 
-	// Non-PII / plaintext assignments. PII plaintext is populated later by
-	// the service layer after decrypting the *Encrypted siblings.
 	if gender.Valid {
 		profile.Gender = &gender.String
 	}
@@ -1337,7 +1368,6 @@ func (r *EmployeeRepositoryImpl) scanEmployeeProfile(rows *sql.Rows) (*employee.
 		profile.CostCenterID = &costCenterID.UUID
 	}
 
-	// Encrypted siblings — opaque to this layer.
 	if emailHash.Valid {
 		profile.EmailHash = &emailHash.String
 	}
@@ -1503,20 +1533,39 @@ func (r *EmployeeRepositoryImpl) scanEmployeeExit(rows *sql.Rows) (*employee.Emp
 	return &exit, nil
 }
 
+// scanPosition mirrors the canonical positions SELECT list:
+//
+//	position_id, company_id, department_id,
+//	job_id, location_id, title_override,
+//	is_open, work_center_code,
+//	created_at, updated_at
 func (r *EmployeeRepositoryImpl) scanPosition(rows *sql.Rows) (*employee.Position, error) {
 	var position employee.Position
-	var title sql.NullString
+	var locationID uuid.NullUUID
+	var titleOverride sql.NullString
 	var workCenterCode sql.NullString
 
 	err := rows.Scan(
-		&position.PositionID, &position.CompanyID, &position.DepartmentID,
-		&title, &position.IsOpen, &position.CreatedAt,
-		&position.UpdatedAt, &workCenterCode)
+		&position.PositionID,
+		&position.CompanyID,
+		&position.DepartmentID,
+		&position.JobID,
+		&locationID,
+		&titleOverride,
+		&position.IsOpen,
+		&workCenterCode,
+		&position.CreatedAt,
+		&position.UpdatedAt,
+	)
 	if err != nil {
 		return nil, err
 	}
-	if title.Valid {
-		position.Title = &title.String
+	if locationID.Valid {
+		id := locationID.UUID
+		position.LocationID = &id
+	}
+	if titleOverride.Valid {
+		position.TitleOverride = &titleOverride.String
 	}
 	if workCenterCode.Valid {
 		position.WorkCenterCode = &workCenterCode.String
@@ -1562,7 +1611,25 @@ func (r *EmployeeRepositoryImpl) initializePreparedStatements(ctx context.Contex
 			SELECT ` + employeeProfileColumns + `
 			FROM employee_profiles ep
 			WHERE ep.user_id = $1 AND ep.company_id = $2`,
-
+		"get_position_view_by_id": `
+	SELECT
+		p.position_id, p.company_id, p.department_id,
+		p.job_id, p.location_id, p.title_override,
+		p.is_open, p.work_center_code,
+		p.created_at, p.updated_at,
+		j.job_code, j.job_title,
+		j.is_schedulable, j.attendance_required, j.overtime_allowed,
+		d.department_name,
+		l.location_name,
+		wc.name AS work_center_name
+	FROM positions p
+	INNER JOIN jobs j ON j.job_id = p.job_id
+	LEFT JOIN departments d ON d.department_id = p.department_id
+	LEFT JOIN locations l ON l.location_id = p.location_id
+	LEFT JOIN attendance.work_centers wc
+	       ON wc.company_id = p.company_id
+	      AND wc.work_center_code = p.work_center_code
+	WHERE p.position_id = $1`,
 		"get_department_history_by_user_id": `
 			SELECT id, user_id, company_id, department_id, start_date, end_date,
 			       change_reason, created_at
@@ -1578,14 +1645,21 @@ func (r *EmployeeRepositoryImpl) initializePreparedStatements(ctx context.Contex
 			ORDER BY uploaded_at DESC`,
 
 		"get_position_by_id": `
-			SELECT position_id, company_id, department_id, title, is_open,
-			       created_at, updated_at, work_center_code
+			SELECT
+				position_id, company_id, department_id,
+				job_id, location_id, title_override,
+				is_open, work_center_code,
+				created_at, updated_at
 			FROM positions WHERE position_id = $1`,
 
 		"get_open_positions": `
-			SELECT position_id, company_id, department_id, title, is_open,
-			       created_at, updated_at, work_center_code
-			FROM positions WHERE company_id = $1 AND is_open = true
+			SELECT
+				position_id, company_id, department_id,
+				job_id, location_id, title_override,
+				is_open, work_center_code,
+				created_at, updated_at
+			FROM positions
+			WHERE company_id = $1 AND is_open = true
 			ORDER BY created_at DESC`,
 	}
 
@@ -1799,15 +1873,6 @@ func (r *EmployeeRepositoryImpl) GetEmploymentLocationID(ctx context.Context, co
 // TX VARIANTS
 // ============================================================================
 
-// CreateEmployeeProfileTx inserts an employee_profiles row using the caller's
-// transaction. Used by the atomic hire flow (CompanyService.AddMember) so the
-// profile insert commits together with the user + roster inserts.
-//
-// ON CONFLICT (company_id, user_id) DO NOTHING makes the method re-entrant.
-//
-// Callers must populate the *Encrypted / *EncryptedDEK / *KeyID / EmailHash
-// fields on the model before calling this method — encryption is done in the
-// service layer. Plaintext PII columns have been dropped from the schema.
 func (r *EmployeeRepositoryImpl) CreateEmployeeProfileTx(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -1855,4 +1920,786 @@ func (r *EmployeeRepositoryImpl) CreateEmployeeProfileTx(
 		return fmt.Errorf("failed to create employee profile (tx): %w", err)
 	}
 	return nil
+}
+
+// ============================================================================
+// SEARCH + HYDRATE (location-scoped; encryption-agnostic)
+// ============================================================================
+
+func toUUIDArray(ids []uuid.UUID) pgtype.UUIDArray {
+	if len(ids) == 0 {
+		return pgtype.UUIDArray{Status: pgtype.Null}
+	}
+	arr := pgtype.UUIDArray{
+		Elements: make([]pgtype.UUID, len(ids)),
+		Status:   pgtype.Present,
+	}
+	for i, id := range ids {
+		arr.Elements[i] = pgtype.UUID{
+			Bytes:  [16]byte(id),
+			Status: pgtype.Present,
+		}
+	}
+	return arr
+}
+
+func (r *EmployeeRepositoryImpl) SearchEmployeeIDs(
+	ctx context.Context,
+	companyID uuid.UUID,
+	query string,
+	locationIDs []uuid.UUID,
+	limit, offset int,
+) ([]uuid.UUID, error) {
+	startTime := time.Now()
+
+	logger := r.logger
+	if logger == nil {
+		logger = zap.L()
+	}
+
+	if limit <= 0 || limit > 500 {
+		limit = 30
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	trimmed := strings.TrimSpace(query)
+
+	var qArg interface{}
+	if trimmed == "" {
+		qArg = nil
+	} else {
+		qArg = query
+	}
+
+	locArg := toUUIDArrayLiteral(locationIDs)
+
+	logger.Info("repo.SearchEmployeeIDs entry",
+		zap.String("company_id", companyID.String()),
+		zap.String("query_raw", query),
+		zap.String("query_trimmed", trimmed),
+		zap.Int("query_len_trimmed", len(trimmed)),
+		zap.Bool("query_arg_is_nil", qArg == nil),
+		zap.Int("location_ids_count", len(locationIDs)),
+		zap.Bool("location_arg_is_null", locArg == nil),
+		zap.Int("limit", limit),
+		zap.Int("offset", offset),
+	)
+
+	const sqlQuery = `
+		SELECT user_id
+		FROM search_company_employee_ids($1, $2, $3::uuid[], $4, $5)`
+
+	rows, err := r.client.Query(ctx, sqlQuery, companyID, qArg, locArg, limit, offset)
+	if err != nil {
+		logger.Error("repo.SearchEmployeeIDs: query failed",
+			zap.String("company_id", companyID.String()),
+			zap.String("query_trimmed", trimmed),
+			zap.Error(err),
+		)
+		return nil, fmt.Errorf("failed to search company employee ids: %w", err)
+	}
+	defer rows.Close()
+
+	ids := make([]uuid.UUID, 0, limit)
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			logger.Error("repo.SearchEmployeeIDs: scan failed",
+				zap.String("company_id", companyID.String()),
+				zap.Error(err),
+			)
+			return nil, fmt.Errorf("failed to scan employee id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		logger.Error("repo.SearchEmployeeIDs: rows.Err",
+			zap.String("company_id", companyID.String()),
+			zap.Error(err),
+		)
+		return nil, fmt.Errorf("error iterating employee ids: %w", err)
+	}
+
+	logger.Info("repo.SearchEmployeeIDs success",
+		zap.String("company_id", companyID.String()),
+		zap.String("query_trimmed", trimmed),
+		zap.Int("result_count", len(ids)),
+		zap.Duration("duration", time.Since(startTime)),
+	)
+
+	return ids, nil
+}
+
+func (r *EmployeeRepositoryImpl) GetEmployeeFullDetailsByIDs(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userIDs []uuid.UUID,
+	locationIDs []uuid.UUID,
+) ([]*employee.EmployeeFullDetailsExt, error) {
+	startTime := time.Now()
+
+	logger := r.logger
+	if logger == nil {
+		logger = zap.L()
+	}
+
+	logger.Info("repo.GetEmployeeFullDetailsByIDs entry",
+		zap.String("company_id", companyID.String()),
+		zap.Int("user_ids_count", len(userIDs)),
+		zap.Int("location_ids_count", len(locationIDs)),
+	)
+
+	if len(userIDs) == 0 {
+		logger.Info("repo.GetEmployeeFullDetailsByIDs: empty userIDs → short-circuit")
+		return []*employee.EmployeeFullDetailsExt{}, nil
+	}
+
+	userArg := toUUIDArrayLiteral(userIDs)
+	locArg := toUUIDArrayLiteral(locationIDs)
+
+	const query = `
+		SELECT
+			-- company_employees
+			ce.company_id, ce.user_id, ce.employee_id, ce.role_id,
+			ce.hire_date, ce.is_active, ce.reports_to, ce.position_id,
+			ce.primary_location_id, ce.location_access_scope,
+			ce.created_at, ce.updated_at,
+
+			-- users (identity + encrypted phone)
+			u.username, u.full_name, u.phone_hash,
+			u.phone_encrypted, u.phone_encrypted_dek, u.phone_key_id,
+			u.created_at, u.last_login,
+
+			-- joined names
+			r.role_name,
+			COALESCE(p.title_override, j.job_title) AS position_title,
+			loc.location_name AS primary_location_name,
+			d.department_id   AS department_id,
+			d.department_name AS department_name,
+
+			-- employee_profiles (non-PII)
+			ep.employee_profile_id, ep.gender, ep.employment_type,
+			ep.employment_status, ep.job_title, ep.grade,
+			ep.cost_center, ep.cost_center_id,
+			ep.probation_end_date, ep.confirmation_date,
+
+			-- resolved cost-center name + code
+			cc.cost_center_name, cc.cost_center_code,
+
+			-- employee_profiles (encrypted PII)
+			ep.email_hash,
+			ep.email_encrypted, ep.email_encrypted_dek, ep.email_key_id,
+
+			ep.tax_id_encrypted, ep.tax_id_encrypted_dek, ep.tax_id_key_id,
+
+			ep.social_security_id_encrypted,
+			ep.social_security_id_encrypted_dek,
+			ep.social_security_id_key_id,
+
+			ep.date_of_birth_encrypted,
+			ep.date_of_birth_encrypted_dek,
+			ep.date_of_birth_key_id,
+
+			ep.nationality_encrypted,
+			ep.nationality_encrypted_dek,
+			ep.nationality_key_id,
+
+			ep.marital_status_encrypted,
+			ep.marital_status_encrypted_dek,
+			ep.marital_status_key_id,
+
+			ep.created_at AS profile_created_at,
+			ep.updated_at AS profile_updated_at
+
+		FROM company_employees ce
+		JOIN users u   ON u.user_id = ce.user_id
+		JOIN roles r   ON r.role_id = ce.role_id
+		LEFT JOIN positions p
+			ON p.position_id = ce.position_id
+		LEFT JOIN jobs j
+			ON j.job_id = p.job_id
+		LEFT JOIN locations loc
+			ON loc.location_id = ce.primary_location_id
+		LEFT JOIN employee_department_history edh
+			ON edh.user_id = ce.user_id
+		   AND edh.company_id = ce.company_id
+		   AND edh.end_date IS NULL
+		LEFT JOIN departments d
+			ON d.department_id = edh.department_id
+		LEFT JOIN employee_profiles ep
+			ON ep.company_id = ce.company_id
+		   AND ep.user_id = ce.user_id
+		LEFT JOIN accounting.cost_centers cc
+			ON cc.cost_center_id = ep.cost_center_id
+		WHERE ce.company_id = $1
+		  AND ce.user_id = ANY($2::uuid[])
+		  AND (
+		        $3::uuid[] IS NULL
+		     OR cardinality($3::uuid[]) = 0
+		     OR ce.primary_location_id = ANY($3::uuid[])
+		  )`
+
+	rows, err := r.client.Query(ctx, query, companyID, userArg, locArg)
+	if err != nil {
+		logger.Error("repo.GetEmployeeFullDetailsByIDs: query failed",
+			zap.String("company_id", companyID.String()),
+			zap.Error(err),
+		)
+		return nil, fmt.Errorf("failed to hydrate employee details: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]*employee.EmployeeFullDetailsExt, 0, len(userIDs))
+	for rows.Next() {
+		d, err := scanEmployeeFullDetailsExt(rows)
+		if err != nil {
+			logger.Error("repo.GetEmployeeFullDetailsByIDs: scan failed",
+				zap.String("company_id", companyID.String()),
+				zap.Error(err),
+			)
+			return nil, fmt.Errorf("failed to scan employee details: %w", err)
+		}
+		logFullDetailsRowExt(logger, d)
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		logger.Error("repo.GetEmployeeFullDetailsByIDs: rows.Err",
+			zap.String("company_id", companyID.String()),
+			zap.Error(err),
+		)
+		return nil, fmt.Errorf("error iterating employee details: %w", err)
+	}
+
+	logger.Info("repo.GetEmployeeFullDetailsByIDs success",
+		zap.String("company_id", companyID.String()),
+		zap.Int("requested", len(userIDs)),
+		zap.Int("returned", len(out)),
+		zap.Duration("duration", time.Since(startTime)),
+	)
+
+	return out, nil
+}
+
+func scanEmployeeFullDetailsExt(rows *sql.Rows) (*employee.EmployeeFullDetailsExt, error) {
+	var d employee.EmployeeFullDetailsExt
+
+	var rosterCreatedAt, rosterUpdatedAt time.Time
+	_ = rosterCreatedAt
+	_ = rosterUpdatedAt
+
+	var (
+		fullName          sql.NullString
+		reportsTo         uuid.NullUUID
+		positionID        uuid.NullUUID
+		primaryLocationID uuid.NullUUID
+		positionTitle     sql.NullString
+		primaryLocationNm sql.NullString
+		departmentID      uuid.NullUUID
+		departmentName    sql.NullString
+
+		employeeProfileID uuid.NullUUID
+		gender            sql.NullString
+		employmentType    sql.NullString
+		employmentStatus  sql.NullString
+		jobTitle          sql.NullString
+		grade             sql.NullString
+		costCenter        sql.NullString
+
+		costCenterID     uuid.NullUUID
+		probationEndDate sql.NullTime
+		confirmationDate sql.NullTime
+		costCenterName   sql.NullString
+		costCenterCode   sql.NullString
+
+		lastLogin        sql.NullTime
+		profileCreatedAt sql.NullTime
+		profileUpdatedAt sql.NullTime
+
+		emailHash sql.NullString
+		emailCT   []byte
+		emailDEK  sql.NullString
+		emailKey  uuid.NullUUID
+
+		taxCT  []byte
+		taxDEK sql.NullString
+		taxKey uuid.NullUUID
+
+		ssnCT  []byte
+		ssnDEK sql.NullString
+		ssnKey uuid.NullUUID
+
+		dobCT  []byte
+		dobDEK sql.NullString
+		dobKey uuid.NullUUID
+
+		natCT  []byte
+		natDEK sql.NullString
+		natKey uuid.NullUUID
+
+		marCT  []byte
+		marDEK sql.NullString
+		marKey uuid.NullUUID
+	)
+
+	if err := rows.Scan(
+		&d.CompanyID, &d.UserID, &d.EmployeeID, &d.RoleID,
+		&d.HireDate, &d.IsActive, &reportsTo, &positionID,
+		&primaryLocationID, &d.LocationAccessScope,
+		&rosterCreatedAt, &rosterUpdatedAt,
+
+		&d.Username, &fullName, &d.PhoneHash,
+		&d.PhoneEncrypted, &d.PhoneEncryptedDEK, &d.PhoneKeyID,
+		&d.UserCreatedAt, &lastLogin,
+
+		&d.RoleName,
+		&positionTitle,
+		&primaryLocationNm,
+		&departmentID,
+		&departmentName,
+
+		&employeeProfileID, &gender, &employmentType,
+		&employmentStatus, &jobTitle, &grade,
+		&costCenter, &costCenterID,
+		&probationEndDate, &confirmationDate,
+		&costCenterName, &costCenterCode,
+
+		&emailHash,
+		&emailCT, &emailDEK, &emailKey,
+
+		&taxCT, &taxDEK, &taxKey,
+		&ssnCT, &ssnDEK, &ssnKey,
+		&dobCT, &dobDEK, &dobKey,
+		&natCT, &natDEK, &natKey,
+		&marCT, &marDEK, &marKey,
+
+		&profileCreatedAt, &profileUpdatedAt,
+	); err != nil {
+		return nil, err
+	}
+
+	if fullName.Valid {
+		d.FullName = &fullName.String
+	}
+	if reportsTo.Valid {
+		id := reportsTo.UUID
+		d.ReportsTo = &id
+	}
+	if positionID.Valid {
+		id := positionID.UUID
+		d.PositionID = &id
+	}
+	if primaryLocationID.Valid {
+		id := primaryLocationID.UUID
+		d.PrimaryLocationID = &id
+	}
+	if positionTitle.Valid {
+		d.PositionTitle = &positionTitle.String
+	}
+	if primaryLocationNm.Valid {
+		d.PrimaryLocationName = &primaryLocationNm.String
+	}
+	if departmentID.Valid {
+		id := departmentID.UUID
+		d.DepartmentID = &id
+	}
+	if departmentName.Valid {
+		d.DepartmentName = &departmentName.String
+	}
+	if lastLogin.Valid {
+		d.UserLastLogin = &lastLogin.Time
+	}
+	if employeeProfileID.Valid {
+		id := employeeProfileID.UUID
+		d.EmployeeProfileID = &id
+	}
+	if gender.Valid {
+		d.Gender = &gender.String
+	}
+	if employmentType.Valid {
+		d.EmploymentType = &employmentType.String
+	}
+	if employmentStatus.Valid {
+		d.EmploymentStatus = &employmentStatus.String
+	}
+	if jobTitle.Valid {
+		d.JobTitle = &jobTitle.String
+	}
+	if grade.Valid {
+		d.Grade = &grade.String
+	}
+	if costCenter.Valid {
+		d.CostCenter = &costCenter.String
+	}
+	if profileCreatedAt.Valid {
+		d.ProfileCreatedAt = &profileCreatedAt.Time
+	}
+	if profileUpdatedAt.Valid {
+		d.ProfileUpdatedAt = &profileUpdatedAt.Time
+	}
+
+	if costCenterID.Valid {
+		id := costCenterID.UUID
+		d.CostCenterID = &id
+	}
+	if costCenterName.Valid {
+		d.CostCenterName = &costCenterName.String
+	}
+	if costCenterCode.Valid {
+		d.CostCenterCode = &costCenterCode.String
+	}
+	if probationEndDate.Valid {
+		d.ProbationEndDate = &probationEndDate.Time
+	}
+	if confirmationDate.Valid {
+		d.ConfirmationDate = &confirmationDate.Time
+	}
+
+	if emailHash.Valid {
+		d.EmailHash = &emailHash.String
+	}
+	if len(emailCT) > 0 {
+		d.EmailEncrypted = emailCT
+	}
+	if emailDEK.Valid {
+		d.EmailEncryptedDEK = &emailDEK.String
+	}
+	if emailKey.Valid {
+		id := emailKey.UUID
+		d.EmailKeyID = &id
+	}
+
+	if len(taxCT) > 0 {
+		d.TaxIDEncrypted = taxCT
+	}
+	if taxDEK.Valid {
+		d.TaxIDEncryptedDEK = &taxDEK.String
+	}
+	if taxKey.Valid {
+		id := taxKey.UUID
+		d.TaxIDKeyID = &id
+	}
+
+	if len(ssnCT) > 0 {
+		d.SocialSecurityIDEncrypted = ssnCT
+	}
+	if ssnDEK.Valid {
+		d.SocialSecurityIDEncryptedDEK = &ssnDEK.String
+	}
+	if ssnKey.Valid {
+		id := ssnKey.UUID
+		d.SocialSecurityIDKeyID = &id
+	}
+
+	if len(dobCT) > 0 {
+		d.DateOfBirthEncrypted = dobCT
+	}
+	if dobDEK.Valid {
+		d.DateOfBirthEncryptedDEK = &dobDEK.String
+	}
+	if dobKey.Valid {
+		id := dobKey.UUID
+		d.DateOfBirthKeyID = &id
+	}
+
+	if len(natCT) > 0 {
+		d.NationalityEncrypted = natCT
+	}
+	if natDEK.Valid {
+		d.NationalityEncryptedDEK = &natDEK.String
+	}
+	if natKey.Valid {
+		id := natKey.UUID
+		d.NationalityKeyID = &id
+	}
+
+	if len(marCT) > 0 {
+		d.MaritalStatusEncrypted = marCT
+	}
+	if marDEK.Valid {
+		d.MaritalStatusEncryptedDEK = &marDEK.String
+	}
+	if marKey.Valid {
+		id := marKey.UUID
+		d.MaritalStatusKeyID = &id
+	}
+
+	return &d, nil
+}
+
+func toUUIDArrayLiteral(ids []uuid.UUID) interface{} {
+	if len(ids) == 0 {
+		return nil
+	}
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = id.String()
+	}
+	return "{" + strings.Join(parts, ",") + "}"
+}
+
+func logFullDetailsRowExt(logger *zap.Logger, d *employee.EmployeeFullDetailsExt) {
+	if logger == nil || d == nil {
+		return
+	}
+
+	present := func(p *string) string {
+		if p == nil {
+			return "nil"
+		}
+		if *p == "" {
+			return "empty"
+		}
+		return fmt.Sprintf("len=%d", len(*p))
+	}
+	presentUUID := func(p *uuid.UUID) string {
+		if p == nil {
+			return "nil"
+		}
+		return p.String()
+	}
+	presentTime := func(p *time.Time) string {
+		if p == nil {
+			return "nil"
+		}
+		return p.Format(time.RFC3339)
+	}
+	presentBytes := func(b []byte) string {
+		if len(b) == 0 {
+			return "empty"
+		}
+		return fmt.Sprintf("len=%d", len(b))
+	}
+
+	logger.Info("repo row — raw from DB",
+		zap.String("user_id", d.UserID.String()),
+		zap.String("username", d.Username),
+		zap.String("full_name", present(d.FullName)),
+		zap.String("gender", present(d.Gender)),
+		zap.String("employment_type", present(d.EmploymentType)),
+		zap.String("employment_status", present(d.EmploymentStatus)),
+		zap.String("job_title", present(d.JobTitle)),
+		zap.String("grade", present(d.Grade)),
+		zap.String("cost_center", present(d.CostCenter)),
+		zap.String("cost_center_id", presentUUID(d.CostCenterID)),
+		zap.String("cost_center_name", present(d.CostCenterName)),
+		zap.String("cost_center_code", present(d.CostCenterCode)),
+		zap.String("probation_end_date", presentTime(d.ProbationEndDate)),
+		zap.String("confirmation_date", presentTime(d.ConfirmationDate)),
+
+		zap.String("phone_ct", presentBytes(d.PhoneEncrypted)),
+		zap.String("phone_dek", d.PhoneEncryptedDEK),
+		zap.String("phone_kid", d.PhoneKeyID.String()),
+
+		zap.String("email_ct", presentBytes(d.EmailEncrypted)),
+		zap.Any("email_dek", d.EmailEncryptedDEK),
+		zap.Any("email_kid", d.EmailKeyID),
+
+		zap.String("tax_ct", presentBytes(d.TaxIDEncrypted)),
+		zap.Any("tax_dek", d.TaxIDEncryptedDEK),
+		zap.Any("tax_kid", d.TaxIDKeyID),
+
+		zap.String("ssn_ct", presentBytes(d.SocialSecurityIDEncrypted)),
+		zap.Any("ssn_dek", d.SocialSecurityIDEncryptedDEK),
+		zap.Any("ssn_kid", d.SocialSecurityIDKeyID),
+
+		zap.String("dob_ct", presentBytes(d.DateOfBirthEncrypted)),
+		zap.Any("dob_dek", d.DateOfBirthEncryptedDEK),
+		zap.Any("dob_kid", d.DateOfBirthKeyID),
+
+		zap.String("nat_ct", presentBytes(d.NationalityEncrypted)),
+		zap.Any("nat_dek", d.NationalityEncryptedDEK),
+		zap.Any("nat_kid", d.NationalityKeyID),
+
+		zap.String("mar_ct", presentBytes(d.MaritalStatusEncrypted)),
+		zap.Any("mar_dek", d.MaritalStatusEncryptedDEK),
+		zap.Any("mar_kid", d.MaritalStatusKeyID),
+	)
+}
+
+func (r *EmployeeRepositoryImpl) UpdateEmployeeProfileTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	profile *employee.EmployeeProfile,
+) error {
+	profile.UpdatedAt = time.Now().UTC()
+
+	const query = `
+		UPDATE employee_profiles SET
+			gender = $1,
+			employment_type = $2, employment_status = $3,
+			probation_end_date = $4, confirmation_date = $5,
+			job_title = $6, grade = $7, cost_center = $8, cost_center_id = $9,
+			email_hash = $10,
+			email_encrypted = $11, email_encrypted_dek = $12, email_key_id = $13,
+			tax_id_encrypted = $14, tax_id_encrypted_dek = $15, tax_id_key_id = $16,
+			social_security_id_encrypted = $17, social_security_id_encrypted_dek = $18, social_security_id_key_id = $19,
+			date_of_birth_encrypted = $20, date_of_birth_encrypted_dek = $21, date_of_birth_key_id = $22,
+			nationality_encrypted = $23, nationality_encrypted_dek = $24, nationality_key_id = $25,
+			marital_status_encrypted = $26, marital_status_encrypted_dek = $27, marital_status_key_id = $28,
+			updated_at = $29
+		WHERE employee_profile_id = $30`
+
+	res, err := tx.ExecContext(ctx, query,
+		profile.Gender,
+		profile.EmploymentType, profile.EmploymentStatus,
+		profile.ProbationEndDate, profile.ConfirmationDate,
+		profile.JobTitle, profile.Grade, profile.CostCenter, profile.CostCenterID,
+		profile.EmailHash,
+		profile.EmailEncrypted, profile.EmailEncryptedDEK, profile.EmailKeyID,
+		profile.TaxIDEncrypted, profile.TaxIDEncryptedDEK, profile.TaxIDKeyID,
+		profile.SocialSecurityIDEncrypted, profile.SocialSecurityIDEncryptedDEK, profile.SocialSecurityIDKeyID,
+		profile.DateOfBirthEncrypted, profile.DateOfBirthEncryptedDEK, profile.DateOfBirthKeyID,
+		profile.NationalityEncrypted, profile.NationalityEncryptedDEK, profile.NationalityKeyID,
+		profile.MaritalStatusEncrypted, profile.MaritalStatusEncryptedDEK, profile.MaritalStatusKeyID,
+		profile.UpdatedAt,
+		profile.EmployeeProfileID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update employee profile (tx): %w", err)
+	}
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected == 0 {
+		return hrErrors.ErrEmployeeProfileNotFound
+	}
+	return nil
+}
+
+func (r *EmployeeRepositoryImpl) GetDueScheduledExits(
+	ctx context.Context, effectiveDate time.Time,
+) ([]EnforcedExitPair, error) {
+	rows, err := r.client.Query(ctx, `
+		SELECT company_id, user_id
+		FROM employee_exit
+		WHERE exit_state = 'scheduled'
+		  AND exit_date <= $1
+	`, effectiveDate)
+	if err != nil {
+		return nil, fmt.Errorf("get due scheduled exits: %w", err)
+	}
+	defer rows.Close()
+
+	var out []EnforcedExitPair
+	for rows.Next() {
+		var p EnforcedExitPair
+		if err := rows.Scan(&p.CompanyID, &p.UserID); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// GetPositionViewByID returns a joined view: the seat + its job's
+// definition + human-readable location & work-center names.
+//
+// Use this when you need job-level fields (is_schedulable,
+// attendance_required, overtime_allowed, job_title) or joined names.
+// Use GetPositionByID when you only need the seat row.
+func (r *EmployeeRepositoryImpl) GetPositionViewByID(
+	ctx context.Context,
+	positionID uuid.UUID,
+) (*employee.PositionView, error) {
+	stmt, ok := r.getStmt("get_position_view_by_id")
+	if !ok {
+		return nil, fmt.Errorf("prepared statement not found: get_position_view_by_id")
+	}
+
+	rows, err := stmt.QueryContext(ctx, positionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get position view: %w", err)
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		return r.scanPositionView(rows)
+	}
+	return nil, hrErrors.ErrPositionNotFound
+}
+
+// scanPositionView mirrors the canonical positions-view SELECT list:
+//
+//	position_id, company_id, department_id,
+//	job_id, location_id, title_override,
+//	is_open, work_center_code,
+//	created_at, updated_at,
+//	job_code, job_title,
+//	is_schedulable, attendance_required, overtime_allowed,
+//	department_name, location_name, work_center_name
+func (r *EmployeeRepositoryImpl) scanPositionView(rows *sql.Rows) (*employee.PositionView, error) {
+	var pv employee.PositionView
+	var locationID uuid.NullUUID
+	var titleOverride sql.NullString
+	var workCenterCode sql.NullString
+	var departmentName sql.NullString
+	var locationName sql.NullString
+	var workCenterName sql.NullString
+
+	err := rows.Scan(
+		&pv.PositionID,
+		&pv.CompanyID,
+		&pv.DepartmentID,
+		&pv.JobID,
+		&locationID,
+		&titleOverride,
+		&pv.IsOpen,
+		&workCenterCode,
+		&pv.CreatedAt,
+		&pv.UpdatedAt,
+		&pv.JobCode,
+		&pv.JobTitle,
+		&pv.IsSchedulable,
+		&pv.AttendanceRequired,
+		&pv.OvertimeAllowed,
+		&departmentName,
+		&locationName,
+		&workCenterName,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if locationID.Valid {
+		id := locationID.UUID
+		pv.LocationID = &id
+	}
+	if titleOverride.Valid {
+		pv.TitleOverride = &titleOverride.String
+	}
+	if workCenterCode.Valid {
+		pv.WorkCenterCode = &workCenterCode.String
+	}
+	if departmentName.Valid {
+		pv.DepartmentName = &departmentName.String
+	}
+	if locationName.Valid {
+		pv.LocationName = &locationName.String
+	}
+	if workCenterName.Valid {
+		pv.WorkCenterName = &workCenterName.String
+	}
+	return &pv, nil
+}
+
+// PositionHasAssignedEmployees returns true when ANY active employee
+// currently sits on the given seat. Replaces the paginated
+// GetEmployeesByCompany(limit=1) check in CompanyService.DeletePosition,
+// which silently missed employees beyond row #1.
+func (r *EmployeeRepositoryImpl) PositionHasAssignedEmployees(
+	ctx context.Context,
+	companyID, positionID uuid.UUID,
+) (bool, error) {
+	const query = `
+		SELECT EXISTS (
+			SELECT 1
+			FROM company_employees
+			WHERE company_id = $1
+			  AND position_id = $2
+			  AND is_active = true
+		)`
+	var exists bool
+	if err := r.client.QueryRow(ctx, query, companyID, positionID).Scan(&exists); err != nil {
+		return false, fmt.Errorf("position_has_assigned_employees: %w", err)
+	}
+	return exists, nil
 }

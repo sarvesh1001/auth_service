@@ -51,6 +51,9 @@ var (
 	ErrEMINotFound         = errors.New("EMI: not found")
 	ErrLoanPaymentNotFound = errors.New("loan payment: not found")
 	ErrPayrollJobNotFound  = errors.New("payroll job: not found")
+	// Add these two:
+	ErrOrgUnitPrimaryAlreadyExists = errors.New("org unit: primary assignment already exists")
+	ErrOrgUnitRoleAlreadyExists    = errors.New("org unit role: already exists")
 
 	ErrPayslipNotFound                 = errors.New("payslip: not found")
 	ErrPayslipTemplateNotFound         = errors.New("payslip template: not found")

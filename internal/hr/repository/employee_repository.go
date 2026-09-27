@@ -3,11 +3,18 @@ package repository
 import (
 	"auth-service/internal/hr/models/employee"
 	"context"
-	"database/sql" // 👈 ADD
+	"database/sql"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// EnforcedExitPair identifies a (company, user) that a scheduled-exit
+// enforcement pass will flip (or has just flipped) to effective.
+type EnforcedExitPair struct {
+	CompanyID uuid.UUID
+	UserID    uuid.UUID
+}
 
 // EmployeeRepository defines the interface for HR employee operations
 type EmployeeRepository interface {
@@ -46,6 +53,7 @@ type EmployeeRepository interface {
 	GetConfidentialDocumentsByUserID(ctx context.Context, userID, companyID uuid.UUID) ([]*employee.EmployeeDocument, error)
 	UpdateEmployeeDocument(ctx context.Context, doc *employee.EmployeeDocument) error
 	DeleteEmployeeDocument(ctx context.Context, documentID uuid.UUID) error
+	PositionHasAssignedEmployees(ctx context.Context, companyID, positionID uuid.UUID) (bool, error)
 
 	// EmployeeExit operations
 	CreateEmployeeExit(ctx context.Context, exit *employee.EmployeeExit) error
@@ -74,32 +82,24 @@ type EmployeeRepository interface {
 	CreateEmployeeDocumentsBatch(ctx context.Context, documents []*employee.EmployeeDocument) error
 
 	// Search and analytics
-	// GetEmployeeStatsByCompany returns aggregate stats, optionally scoped
-	// to a single employment location.
 	GetEmployeeStatsByCompany(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID) (map[string]interface{}, error)
-
 	GetEmployeeCountByDepartment(ctx context.Context, companyID uuid.UUID) (map[uuid.UUID]int, error)
-
-	// GetActiveEmployeesByDateRange returns active employees whose profile
-	// was created within [startDate, endDate], optionally scoped to a
-	// single employment location.
 	GetActiveEmployeesByDateRange(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, startDate, endDate time.Time) ([]*employee.EmployeeProfile, error)
 
-	GetActiveDepartmentAssignment(
-		ctx context.Context,
-		userID uuid.UUID,
-	) (*employee.EmployeeDepartmentHistory, error)
-	EnforceScheduledEmployeeExits(
-		ctx context.Context,
-		effectiveDate time.Time,
-		enforcedBy uuid.UUID,
-	) (int, error)
-	RehireEmployee(
-		ctx context.Context,
-		companyID, userID uuid.UUID,
-	) error
+	GetActiveDepartmentAssignment(ctx context.Context, userID uuid.UUID) (*employee.EmployeeDepartmentHistory, error)
+
+	// GetDueScheduledExits returns the (company_id, user_id) pairs whose
+	// exit_state='scheduled' and exit_date <= effectiveDate. Called BEFORE
+	// EnforceScheduledEmployeeExits so the service can enqueue resolver jobs
+	// for the affected users.
+	GetDueScheduledExits(ctx context.Context, effectiveDate time.Time) ([]EnforcedExitPair, error)
+
+	EnforceScheduledEmployeeExits(ctx context.Context, effectiveDate time.Time, enforcedBy uuid.UUID) (int, error)
+	RehireEmployee(ctx context.Context, companyID, userID uuid.UUID) error
+
 	// Health check
 	HealthCheck(ctx context.Context) error
+
 	// GetActiveUsersByPosition returns all active user IDs for a given position.
 	GetActiveUsersByPosition(ctx context.Context, positionID uuid.UUID) ([]uuid.UUID, error)
 	CreateEmployeeProfileTx(ctx context.Context, tx *sql.Tx, profile *employee.EmployeeProfile) error
@@ -107,4 +107,16 @@ type EmployeeRepository interface {
 	// GetActiveEmployeesByCompany returns all active employee user IDs for a company.
 	GetActiveEmployeesByCompany(ctx context.Context, companyID uuid.UUID) ([]uuid.UUID, error)
 	GetCompanyEmployeeByUserID(ctx context.Context, userID uuid.UUID) (*employee.CompanyEmployee, error)
+
+	SearchEmployeeIDs(
+		ctx context.Context,
+		companyID uuid.UUID,
+		query string,
+		locationIDs []uuid.UUID,
+		limit, offset int,
+	) ([]uuid.UUID, error)
+
+	UpdateEmployeeProfileTx(ctx context.Context, tx *sql.Tx, profile *employee.EmployeeProfile) error
+	GetPositionViewByID(ctx context.Context, positionID uuid.UUID) (*employee.PositionView, error)
+	GetEmployeeFullDetailsByIDs(ctx context.Context, companyID uuid.UUID, userIDs []uuid.UUID, locationIDs []uuid.UUID) ([]*employee.EmployeeFullDetailsExt, error)
 }

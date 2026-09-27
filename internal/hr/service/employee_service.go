@@ -11,9 +11,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
+	"auth-service/internal/client"
 	"auth-service/internal/devicefp"
 	"auth-service/internal/encryption"
+	leaveRepo "auth-service/internal/hr/leave/repository"
 	"auth-service/internal/hr/models/employee"
 	"auth-service/internal/hr/repository"
 	"auth-service/internal/infrastructure/audit"
@@ -39,6 +42,10 @@ type EmployeeService struct {
 	documentStorage   DocumentStorage
 	encryptionMgr     *encryption.EncryptionManager
 	maxDocumentSizeMB int
+
+	// 👇 ADD
+	pgClient     *client.PostgresClient
+	resolverJobs leaveRepo.ResolverJobRepository
 }
 
 type EmployeeServiceConfig struct {
@@ -52,6 +59,8 @@ func NewEmployeeService(
 	auditService *audit.AuditService,
 	idempotencyStore idempotency.Store,
 	config EmployeeServiceConfig,
+	pgClient *client.PostgresClient, // 👈 ADD
+	resolverJobs leaveRepo.ResolverJobRepository, // 👈 ADD
 ) *EmployeeService {
 	if auditService == nil {
 		panic("auditService is required for EmployeeService")
@@ -65,6 +74,12 @@ func NewEmployeeService(
 	if config.EncryptionMgr == nil {
 		panic("encryptionMgr is required for EmployeeService")
 	}
+	if pgClient == nil {
+		panic("pgClient is required for EmployeeService")
+	}
+	if resolverJobs == nil {
+		panic("resolverJobs is required for EmployeeService")
+	}
 	if config.MaxDocumentSizeMB <= 0 {
 		config.MaxDocumentSizeMB = 50
 	}
@@ -76,6 +91,8 @@ func NewEmployeeService(
 		documentStorage:   config.DocumentStorage,
 		encryptionMgr:     config.EncryptionMgr,
 		maxDocumentSizeMB: config.MaxDocumentSizeMB,
+		pgClient:          pgClient,
+		resolverJobs:      resolverJobs,
 	}
 }
 
@@ -111,8 +128,6 @@ func (s *EmployeeService) ensureEmployeeInScope(
 // PII ENCRYPTION HELPERS
 // ============================================================================
 
-// encryptStringField encrypts a single plaintext string into the given
-// encrypted siblings. No-op when the input is nil/empty.
 func (s *EmployeeService) encryptStringField(
 	ctx context.Context,
 	plaintext *string,
@@ -139,7 +154,6 @@ func (s *EmployeeService) encryptStringField(
 	return nil
 }
 
-// encryptTimeField encrypts a *time.Time as RFC3339.
 func (s *EmployeeService) encryptTimeField(
 	ctx context.Context,
 	t *time.Time,
@@ -155,11 +169,6 @@ func (s *EmployeeService) encryptTimeField(
 	return s.encryptStringField(ctx, &str, purpose, outCT, outDEK, outKey)
 }
 
-// encryptPIIFields populates the encrypted siblings for every PII field on
-// the profile. Called on create and update paths.
-//
-// Plaintext PII columns have been dropped from the schema; only the
-// *Encrypted / *EncryptedDEK / *KeyID siblings are persisted.
 func (s *EmployeeService) encryptPIIFields(ctx context.Context, p *employee.EmployeeProfile) error {
 	if err := s.encryptStringField(ctx, p.Email, "employee.email",
 		&p.EmailEncrypted, &p.EmailEncryptedDEK, &p.EmailKeyID); err != nil {
@@ -193,9 +202,6 @@ func (s *EmployeeService) encryptPIIFields(ctx context.Context, p *employee.Empl
 	return nil
 }
 
-// decryptPIIFields overwrites the in-memory plaintext PII fields from the
-// encrypted siblings when they are present. Failures are swallowed so a
-// decryption failure never takes down a read path.
 func (s *EmployeeService) decryptPIIFields(ctx context.Context, p *employee.EmployeeProfile) {
 	if len(p.EmailEncrypted) > 0 && p.EmailEncryptedDEK != nil && p.EmailKeyID != nil {
 		if plain, err := s.encryptionMgr.DecryptField(ctx, &encryption.EncryptedData{
@@ -321,21 +327,10 @@ func (s *EmployeeService) CreateEmployeeProfile(
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, profile)
 
-	// Return decrypted view to caller.
 	s.decryptPIIFields(ctx, profile)
 	return profile, nil
 }
 
-// CreateEmployeeProfileInTx inserts an employee profile inside the caller's
-// transaction, applying the same PII encryption as CreateEmployeeProfile.
-//
-// Used by CompanyService.AddMember so the whole hire (user + roster row +
-// profile + location grants) commits atomically and PII is never persisted
-// in plaintext.
-//
-// Idempotency and audit are the caller's responsibility — this method only
-// encrypts, generates IDs/timestamps when missing, and writes via the
-// repository's tx variant.
 func (s *EmployeeService) CreateEmployeeProfileInTx(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -364,8 +359,6 @@ func (s *EmployeeService) CreateEmployeeProfileInTx(
 		return nil, fmt.Errorf("company_id is required")
 	}
 
-	// 🔐 Encrypt PII before persisting. Only the *_encrypted siblings are
-	// written; the plaintext PII columns have been dropped from the schema.
 	if err := s.encryptPIIFields(ctx, profile); err != nil {
 		return nil, err
 	}
@@ -374,7 +367,6 @@ func (s *EmployeeService) CreateEmployeeProfileInTx(
 		return nil, fmt.Errorf("failed to create employee profile (tx): %w", err)
 	}
 
-	// Hand the caller a decrypted copy for its own audit/logging.
 	out := *profile
 	s.decryptPIIFields(ctx, &out)
 	return &out, nil
@@ -406,7 +398,6 @@ func (s *EmployeeService) UpdateEmployeeProfile(
 		return nil, err
 	}
 
-	// Decrypt existing PII so the response payload (and audit) show plaintext.
 	s.decryptPIIFields(ctx, existingProfile)
 
 	beforeJSON, _ := json.Marshal(existingProfile)
@@ -471,7 +462,6 @@ func (s *EmployeeService) UpdateEmployeeProfile(
 		}
 	}
 
-	// 🔐 Re-encrypt any changed PII fields.
 	if err := s.encryptPIIFields(ctx, &updatedProfile); err != nil {
 		return nil, err
 	}
@@ -496,7 +486,6 @@ func (s *EmployeeService) UpdateEmployeeProfile(
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, &updatedProfile)
 
-	// Hand the caller a decrypted copy.
 	out := updatedProfile
 	s.decryptPIIFields(ctx, &out)
 	return &out, nil
@@ -551,7 +540,7 @@ func (s *EmployeeService) DeleteEmployeeProfile(
 }
 
 // ============================================================================
-// EMPLOYEE DOCUMENT WRITES  (unchanged — no PII on the document model)
+// EMPLOYEE DOCUMENT WRITES
 // ============================================================================
 
 func (s *EmployeeService) UploadEmployeeDocument(
@@ -836,6 +825,10 @@ func (s *EmployeeService) CreateEmployeeExit(
 // POSITION WRITES
 // ============================================================================
 
+// ============================================================================
+// POSITION WRITES
+// ============================================================================
+
 func (s *EmployeeService) CreatePosition(
 	ctx context.Context,
 	position *employee.Position,
@@ -869,11 +862,18 @@ func (s *EmployeeService) CreatePosition(
 
 	afterJSON, _ := json.Marshal(position)
 	ip, _ := ctx.Value("ip_address").(string)
+
+	// Audit metadata now carries the new schema fields (job_id + location_id)
+	// and the seat's title override rather than the old `Title`.
 	auditMeta := mergeMetadata(metadata, map[string]interface{}{
-		"ip":          ip,
-		"position_id": position.PositionID.String(),
-		"company_id":  position.CompanyID.String(),
-		"title":       position.Title,
+		"ip":             ip,
+		"position_id":    position.PositionID.String(),
+		"company_id":     position.CompanyID.String(),
+		"department_id":  position.DepartmentID.String(),
+		"job_id":         position.JobID.String(),
+		"location_id":    position.LocationID,
+		"title_override": position.TitleOverride,
+		"work_center":    position.WorkCenterCode,
 	})
 	_ = s.auditService.LogAction(
 		ctx, nil, &position.CompanyID, "hr",
@@ -913,6 +913,13 @@ func (s *EmployeeService) RehireEmployee(
 		return err
 	}
 
+	// 👇 Enqueue resolver job.
+	if err := s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
+		return s.resolverJobs.EnqueueUserResolution(ctx, tx, companyID, userID, "rehire")
+	}); err != nil {
+		return fmt.Errorf("enqueue resolver job: %w", err)
+	}
+
 	ip, _ := ctx.Value("ip_address").(string)
 	auditMeta := mergeMetadata(metadata, map[string]interface{}{
 		"ip":         ip,
@@ -938,7 +945,32 @@ func (s *EmployeeService) EnforceScheduledEmployeeExits(
 	effectiveDate time.Time,
 	actorID uuid.UUID,
 ) (int, error) {
-	return s.employeeRepo.EnforceScheduledEmployeeExits(ctx, effectiveDate, actorID)
+	// 1. Snapshot the pairs that are about to flip to 'effective'.
+	pairs, err := s.employeeRepo.GetDueScheduledExits(ctx, effectiveDate)
+	if err != nil {
+		return 0, fmt.Errorf("list due scheduled exits: %w", err)
+	}
+
+	// 2. Run the enforcement function (unchanged).
+	count, err := s.employeeRepo.EnforceScheduledEmployeeExits(ctx, effectiveDate, actorID)
+	if err != nil {
+		return 0, err
+	}
+
+	// 3. Enqueue end_entitlements for each (company, user) that just exited.
+	logger := zap.L()
+	for _, p := range pairs {
+		if err := s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
+			return s.resolverJobs.EnqueueEndEntitlements(ctx, tx, p.CompanyID, p.UserID, "scheduled exit")
+		}); err != nil {
+			logger.Warn("enqueue end_entitlements failed",
+				zap.String("company_id", p.CompanyID.String()),
+				zap.String("user_id", p.UserID.String()),
+				zap.Error(err),
+			)
+		}
+	}
+	return count, nil
 }
 
 func (s *EmployeeService) HealthCheck(ctx context.Context) error {
@@ -980,4 +1012,40 @@ func mergeMetadata(base, extra map[string]interface{}) map[string]interface{} {
 		base[k] = v
 	}
 	return base
+}
+
+func (s *EmployeeService) UpdateEmployeeProfileInTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	profile *employee.EmployeeProfile,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) (*employee.EmployeeProfile, error) {
+	if profile == nil {
+		return nil, fmt.Errorf("profile is required")
+	}
+	if profile.EmployeeProfileID == uuid.Nil {
+		return nil, fmt.Errorf("employee_profile_id is required")
+	}
+	if profile.UserID == uuid.Nil {
+		return nil, fmt.Errorf("user_id is required")
+	}
+	if profile.CompanyID == uuid.Nil {
+		return nil, fmt.Errorf("company_id is required")
+	}
+
+	profile.UpdatedAt = time.Now().UTC()
+
+	if err := s.encryptPIIFields(ctx, profile); err != nil {
+		return nil, err
+	}
+
+	if err := s.employeeRepo.UpdateEmployeeProfileTx(ctx, tx, profile); err != nil {
+		return nil, fmt.Errorf("failed to update employee profile (tx): %w", err)
+	}
+
+	out := *profile
+	s.decryptPIIFields(ctx, &out)
+	return &out, nil
 }

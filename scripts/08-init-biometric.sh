@@ -7,9 +7,6 @@ CREATE SCHEMA IF NOT EXISTS biometric;
 
 -- ============================================================
 -- GEOFENCES
--- Must be created before attendance_devices because devices FK to it.
--- A geofence is a physical zone (gate, floor, parking) belonging to
--- exactly one employment location (public.locations).
 -- ============================================================
 CREATE TABLE IF NOT EXISTS attendance.geofences (
     geofence_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -66,7 +63,6 @@ CREATE TABLE IF NOT EXISTS attendance.attendance_event_types (
 
 -- ============================================================
 -- DEVICES
--- A device sits inside exactly one geofence.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS attendance.attendance_devices (
     device_id        VARCHAR(256) PRIMARY KEY,
@@ -209,9 +205,6 @@ CREATE TABLE IF NOT EXISTS attendance.attendance_sources (
 
 -- ============================================================
 -- ATTENDANCE EVENTS
--- Two location dimensions (both snapshots at write time):
---   employment_location_id → the employee's org unit
---   geofence_id            → the physical fence the punch occurred in
 -- ============================================================
 CREATE TABLE IF NOT EXISTS attendance.attendance_events (
     attendance_event_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -304,7 +297,7 @@ CREATE INDEX idx_attendance_policies_effective ON attendance.user_attendance_pol
 CREATE INDEX idx_uap_subject ON attendance.user_attendance_policies (subject_type, subject_id, effective_from, effective_to);
 
 -- ============================================================
--- DAILY SUMMARY (snapshot of employment location)
+-- DAILY SUMMARY
 -- ============================================================
 CREATE TABLE IF NOT EXISTS attendance.attendance_daily_summary (
     attendance_summary_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -336,7 +329,7 @@ CREATE INDEX idx_attendance_daily_summary_date_status ON attendance.attendance_d
 CREATE INDEX idx_att_summary_company_emploc_date ON attendance.attendance_daily_summary (company_id, employment_location_id, attendance_date DESC) WHERE is_finalized = true;
 
 -- ============================================================
--- SESSION SUMMARY (snapshot of employment location)
+-- SESSION SUMMARY
 -- ============================================================
 CREATE TABLE IF NOT EXISTS attendance.attendance_session_summary (
     summary_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -370,7 +363,6 @@ CREATE INDEX idx_att_session_summary_company_emploc ON attendance.attendance_ses
 
 -- ============================================================
 -- WORK CENTERS / CALENDARS / SCHEDULES
--- All have an optional location_id (nullable = company-wide).
 -- ============================================================
 CREATE TABLE IF NOT EXISTS attendance.work_centers (
     work_center_code VARCHAR(100) NOT NULL,
@@ -383,7 +375,7 @@ CREATE TABLE IF NOT EXISTS attendance.work_centers (
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT fk_work_centers_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
-    CONSTRAINT fk_work_centers_location FOREIGN KEY (location_id) REFERENCES locations(location_id) ON DELETE CASCADE,
+    CONSTRAINT fk_work_centers_location FOREIGN KEY (location_id) REFERENCES locations(location_id) ON DELETE SET NULL,
     PRIMARY KEY (company_id, work_center_code)
 );
 
@@ -505,6 +497,12 @@ CREATE INDEX idx_work_center_shifts_company ON attendance.work_center_shifts (co
 CREATE INDEX idx_work_center_shifts_active ON attendance.work_center_shifts (is_active) WHERE is_active = true;
 CREATE INDEX idx_work_center_shifts_dates ON attendance.work_center_shifts (effective_from, effective_to);
 
+-- ============================================================
+-- USER WORK CENTER ASSIGNMENTS
+--   Half-open range '[)' — a closed range [today, today)
+--   is EMPTY, so a new assignment starting today does NOT
+--   overlap the previous one that was closed at 'today'.
+-- ============================================================
 CREATE TABLE IF NOT EXISTS attendance.user_work_center_assignments (
     assignment_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id       UUID NOT NULL,
@@ -515,10 +513,15 @@ CREATE TABLE IF NOT EXISTS attendance.user_work_center_assignments (
     is_active        BOOLEAN DEFAULT true,
     created_at       TIMESTAMPTZ DEFAULT NOW(),
     updated_at       TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE (user_id, work_center_code, effective_from),
+    UNIQUE (company_id, user_id, work_center_code, effective_from),
     CONSTRAINT fk_user_work_center_user FOREIGN KEY (user_id) REFERENCES users(user_id),
     CONSTRAINT fk_user_work_center_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
-    CONSTRAINT fk_uwca_work_center FOREIGN KEY (company_id, work_center_code) REFERENCES attendance.work_centers(company_id, work_center_code)
+    CONSTRAINT fk_uwca_work_center FOREIGN KEY (company_id, work_center_code) REFERENCES attendance.work_centers(company_id, work_center_code),
+    CONSTRAINT no_overlap_user_work_centers EXCLUDE USING gist (
+        company_id WITH =,
+        user_id WITH =,
+        daterange(effective_from, COALESCE(effective_to, 'infinity'), '[)') WITH &&
+    )
 );
 
 CREATE INDEX idx_user_work_center_user ON attendance.user_work_center_assignments (user_id, is_active, effective_from DESC);
@@ -704,7 +707,7 @@ CREATE INDEX idx_face_embeddings_updated ON biometric.unified_face_embeddings(co
 CREATE INDEX idx_device_embedding_sync_company ON biometric.device_embedding_sync(company_id);
 
 -- ============================================================
--- ACADEMICS (student attendance — unchanged, derives via enrollment/session)
+-- ACADEMICS (student attendance)
 -- ============================================================
 CREATE TABLE IF NOT EXISTS academics.student_attendance (
     attendance_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -987,48 +990,108 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- ============================================================
+-- SYNC WORK CENTER ASSIGNMENT — corrected
+--
+-- Fires on INSERT or UPDATE OF position_id on company_employees.
+--
+-- 1. Guards on OLD.position_id IS DISTINCT FROM NEW.position_id,
+--    so UpdateEmployeeTx (which always includes position_id in the
+--    SET clause) does not spuriously open a new row.
+-- 2. Closes the currently open row at v_effective_from (with the
+--    exclusion constraint using '[)', [old, today) does NOT overlap
+--    [today, ∞)).
+-- 3. If the new position has no work center, only closes — no insert.
+-- ============================================================
+-- ============================================================
+-- SYNC WORK CENTER ASSIGNMENT — corrected
+--
+-- Fires on INSERT or UPDATE OF position_id on company_employees.
+--
+-- 1. Guards on position_id actually changing.
+-- 2. Same-day short-circuit: if a row already exists for
+--    (company, user, WC, today), reopen it instead of trying
+--    to insert a duplicate. Handles "user moves away and back
+--    on the same day" without tripping the unique constraint.
+-- 3. Otherwise: close the currently-open row, then insert.
+-- 4. If the new position has no WC, only closes — no insert.
+-- ============================================================
 CREATE OR REPLACE FUNCTION sync_work_center_assignment()
 RETURNS TRIGGER AS $$
 DECLARE
-    wc_code VARCHAR;
-    effective_date DATE;
+    v_wc_code        VARCHAR;
+    v_effective_from DATE;
+    v_existing_id    UUID;
 BEGIN
+    -- Guard: only fire when position_id actually changed.
+    IF TG_OP = 'UPDATE'
+       AND OLD.position_id IS NOT DISTINCT FROM NEW.position_id THEN
+        RETURN NEW;
+    END IF;
+
     IF TG_OP = 'INSERT' THEN
-        effective_date := NEW.hire_date;
-    ELSIF TG_OP = 'UPDATE' AND OLD.position_id IS DISTINCT FROM NEW.position_id THEN
-        effective_date := NOW();
+        v_effective_from := COALESCE(NEW.hire_date::date, CURRENT_DATE);
     ELSE
-        RETURN NEW;
+        v_effective_from := CURRENT_DATE;
     END IF;
 
-    SELECT work_center_code INTO wc_code
-    FROM positions
-    WHERE position_id = NEW.position_id;
-
-    IF wc_code IS NULL THEN
-        RETURN NEW;
+    -- Resolve the work center for the new position.
+    IF NEW.position_id IS NOT NULL THEN
+        SELECT work_center_code INTO v_wc_code
+        FROM positions
+        WHERE position_id = NEW.position_id;
     END IF;
 
-    IF TG_OP = 'INSERT' OR (TG_OP = 'UPDATE' AND OLD.position_id IS DISTINCT FROM NEW.position_id) THEN
-        IF TG_OP = 'UPDATE' THEN
+    -- Same-day re-assignment short-circuit.
+    -- If (user, company, WC, today) already exists, do not close+insert.
+    -- Reopen the existing row if it was closed, then return.
+    IF v_wc_code IS NOT NULL THEN
+        SELECT assignment_id INTO v_existing_id
+        FROM attendance.user_work_center_assignments
+        WHERE user_id          = NEW.user_id
+          AND company_id       = NEW.company_id
+          AND work_center_code = v_wc_code
+          AND effective_from   = v_effective_from
+        LIMIT 1;
+
+        IF v_existing_id IS NOT NULL THEN
             UPDATE attendance.user_work_center_assignments
-            SET effective_to = NOW(), is_active = false
-            WHERE user_id = NEW.user_id
-              AND effective_to IS NULL
-              AND is_active = true;
+            SET effective_to = NULL,
+                is_active    = true,
+                updated_at   = NOW()
+            WHERE assignment_id = v_existing_id
+              AND (effective_to IS NOT NULL OR is_active = false);
+            RETURN NEW;
         END IF;
-
-        INSERT INTO attendance.user_work_center_assignments (
-            assignment_id, company_id, user_id, work_center_code, effective_from, effective_to, is_active, created_at
-        ) VALUES (
-            gen_random_uuid(), NEW.company_id, NEW.user_id, wc_code, effective_date, NULL, true, NOW()
-        );
     END IF;
+
+    -- Close whatever row is currently open for this user in this company.
+    UPDATE attendance.user_work_center_assignments
+    SET effective_to = v_effective_from,
+        is_active    = false,
+        updated_at   = NOW()
+    WHERE user_id       = NEW.user_id
+      AND company_id    = NEW.company_id
+      AND effective_to IS NULL
+      AND is_active    = true;
+
+    -- New position has no WC → already closed old row, nothing to open.
+    IF v_wc_code IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    -- Open the new assignment.
+    INSERT INTO attendance.user_work_center_assignments (
+        assignment_id, company_id, user_id, work_center_code,
+        effective_from, effective_to, is_active, created_at, updated_at
+    ) VALUES (
+        gen_random_uuid(), NEW.company_id, NEW.user_id, v_wc_code,
+        v_effective_from, NULL, true, NOW(), NOW()
+    );
 
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
 -- ============================================================
 -- TRIGGERS
 -- ============================================================
@@ -1119,13 +1182,13 @@ VALUES
 ON CONFLICT DO NOTHING;
 
 -- ============================================================
--- POST-CREATE: FKs that must be added after public tables exist
+-- POST-CREATE: FKs that need attendance.work_centers to exist
 -- ============================================================
 ALTER TABLE positions ADD CONSTRAINT fk_positions_work_center
     FOREIGN KEY (company_id, work_center_code)
     REFERENCES attendance.work_centers(company_id, work_center_code);
 
--- Payroll constraints (payroll.payroll_run is created in another script)
+-- Payroll constraints
 ALTER TABLE payroll.payroll_run DROP CONSTRAINT IF EXISTS payroll_run_status_check;
 ALTER TABLE payroll.payroll_run ADD CONSTRAINT payroll_run_status_check
 CHECK (status IN ('draft','processing','executing','calculated','approved','paid','failed','partially_processed','cancelled'));
@@ -1135,5 +1198,66 @@ ADD CONSTRAINT uq_payroll_component_company_code UNIQUE (company_id, component_c
 
 ALTER TABLE payroll.payroll_item
 ADD CONSTRAINT payroll_item_run_user_unique UNIQUE (payroll_run_id, user_id);
+
+-- ============================================================
+-- APPENDIX — POSITION / LOCATION CONSISTENCY
+--   Auto-fill and validate positions.location_id against the
+--   location that owns positions.work_center_code.
+-- ============================================================
+CREATE OR REPLACE FUNCTION enforce_position_location_matches_work_center()
+RETURNS TRIGGER AS $$
+DECLARE
+    wc_loc UUID;
+BEGIN
+    IF NEW.work_center_code IS NULL THEN
+        RETURN NEW;   -- company-wide seat, no site constraint
+    END IF;
+
+    SELECT location_id INTO wc_loc
+    FROM attendance.work_centers
+    WHERE company_id       = NEW.company_id
+      AND work_center_code = NEW.work_center_code;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'work center % not found for company %',
+            NEW.work_center_code, NEW.company_id;
+    END IF;
+
+    IF wc_loc IS NOT NULL
+       AND NEW.location_id IS NOT NULL
+       AND wc_loc <> NEW.location_id
+    THEN
+        RAISE EXCEPTION
+            'position.location_id (%) does not match work center location (%)',
+            NEW.location_id, wc_loc;
+    END IF;
+
+    IF NEW.location_id IS NULL AND wc_loc IS NOT NULL THEN
+        NEW.location_id := wc_loc;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_enforce_position_location ON positions;
+CREATE TRIGGER trg_enforce_position_location
+    BEFORE INSERT OR UPDATE OF work_center_code, location_id ON positions
+    FOR EACH ROW
+    EXECUTE FUNCTION enforce_position_location_matches_work_center();
+-- ============================================================
+-- Late FK: company_employees.position_id → positions
+--
+-- Defined here (not inline on company_employees) because positions
+-- is created later in this file. ON DELETE RESTRICT is deliberate:
+-- a seat with an active employee is load-bearing — hard-deleting it
+-- would orphan the roster row and break the owner.
+-- ============================================================
+ALTER TABLE company_employees
+    ADD CONSTRAINT fk_employees_position
+    FOREIGN KEY (position_id)
+    REFERENCES positions(position_id)
+    ON DELETE RESTRICT
+    ON UPDATE CASCADE;    
 EOSQL
 echo "✅ Biometric schema initialized successfully!"

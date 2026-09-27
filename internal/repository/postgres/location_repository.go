@@ -38,7 +38,7 @@ type LocationRepository interface {
 	GetEmployeeLocationDetails(ctx context.Context, db client.DBTX, companyID, userID uuid.UUID) (*models.EmployeeLocationDetails, error)
 	IsLocationAccessible(ctx context.Context, db client.DBTX, companyID, userID, locationID uuid.UUID) (bool, error)
 	GetLocationAccessLevel(ctx context.Context, db client.DBTX, companyID, userID, locationID uuid.UUID) (string, error)
-
+	DeleteAllLocationAccessForUser(ctx context.Context, db client.DBTX, companyID, userID uuid.UUID) error
 	// Location history
 	AddLocationHistory(ctx context.Context, db client.DBTX, history *models.EmployeeLocationHistory) error
 	CloseActiveLocationHistory(ctx context.Context, db client.DBTX, companyID, userID uuid.UUID, endDate time.Time) error

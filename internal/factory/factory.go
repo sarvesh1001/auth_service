@@ -35,6 +35,7 @@ import (
 	leavehandler "auth-service/internal/hr/leave/handler"
 	leaverepo "auth-service/internal/hr/leave/repository"
 	leavesvc "auth-service/internal/hr/leave/service"
+	leaveworker "auth-service/internal/hr/leave/worker" // 👈 ADD
 	payrollhandler "auth-service/internal/hr/payroll/handler"
 	payrollrepo "auth-service/internal/hr/payroll/repository"
 	payrollsvc "auth-service/internal/hr/payroll/service"
@@ -149,7 +150,6 @@ type Factory struct {
 	authHandler                  *handler.AuthHandler
 	router                       chi.Router
 	logger                       *zap.Logger
-	auditOutboxService           *audit.AuditOutboxService
 	auditOutboxCancel            context.CancelFunc
 	once                         sync.Once
 	closeOnce                    sync.Once
@@ -182,44 +182,50 @@ type Factory struct {
 	payrollJobRepo               payrollrepo.PayrollJobRepository
 	payrollWorker                *payrollsvc.PayrollWorker
 	payrollWorkerCancel          context.CancelFunc
-	bankExportSvc                payrollsvc.BankExportService
-	componentSvc                 payrollsvc.ComponentService
-	loanSvc                      payrollsvc.LoanService
-	payslipSvc                   payrollsvc.PayslipService
-	reportingSvc                 payrollsvc.ReportingService
-	taxDeclarationSvc            payrollsvc.TaxDeclarationService
-	bankExportHandler            *payrollhandler.BankExportHandler
-	componentHandler             *payrollhandler.ComponentHandler
-	loanHandler                  *payrollhandler.LoanHandler
-	payslipHandler               *payrollhandler.PayslipHandler
-	reportingHandler             *payrollhandler.ReportingHandler
-	taxDeclarationHandler        *payrollhandler.TaxDeclarationHandler
-	academicsInfra               *AcademicsInfraFactory
-	accountingInfra              *AccountingInfraFactory
-	analyticsConsumer            *consumer.AnalyticsConsumer
-	analyticsConsumerCancel      context.CancelFunc
-	inventoryInfra               *InventoryInfraFactory
-	studentConsumer              *consumer.StudentConsumer
-	studentConsumerCancel        context.CancelFunc
-	accountingConsumer           *consumer.AccountingConsumer
-	accountingConsumerCancel     context.CancelFunc
-	inventoryConsumer            *consumer.InventoryConsumer
-	inventoryConsumerCancel      context.CancelFunc
-	salesInfra                   *SalesInfraFactory
-	subscriptionInfra            *SubscriptionInfraFactory
-	salesConsumer                *consumer.SalesConsumer
-	salesConsumerCancel          context.CancelFunc
-	subscriptionConsumer         *consumer.SubscriptionConsumer
-	subscriptionConsumerCancel   context.CancelFunc
-	outboxRepo                   outbox.Repository
-	idempotencyStore             idempotency.Store
-	outboxProcessor              *outbox.Processor
-	outboxCancel                 context.CancelFunc
-	emailSender                  email.Sender
-	analyticsCHRepo              *clickhouse.AnalyticsRepository
-	analyticsESRepo              *elasticsearch.AnalyticsESRepository
-	analyticsService             *service.AnalyticsService
-	analyticsHandler             *handler.AnalyticsHandler
+
+	// 👇 ADD
+	resolverJobRepo      leaverepo.ResolverJobRepository
+	resolverWorker       *leaveworker.ResolverWorker
+	resolverWorkerCancel context.CancelFunc
+
+	bankExportSvc              payrollsvc.BankExportService
+	componentSvc               payrollsvc.ComponentService
+	loanSvc                    payrollsvc.LoanService
+	payslipSvc                 payrollsvc.PayslipService
+	reportingSvc               payrollsvc.ReportingService
+	taxDeclarationSvc          payrollsvc.TaxDeclarationService
+	bankExportHandler          *payrollhandler.BankExportHandler
+	componentHandler           *payrollhandler.ComponentHandler
+	loanHandler                *payrollhandler.LoanHandler
+	payslipHandler             *payrollhandler.PayslipHandler
+	reportingHandler           *payrollhandler.ReportingHandler
+	taxDeclarationHandler      *payrollhandler.TaxDeclarationHandler
+	academicsInfra             *AcademicsInfraFactory
+	accountingInfra            *AccountingInfraFactory
+	analyticsConsumer          *consumer.AnalyticsConsumer
+	analyticsConsumerCancel    context.CancelFunc
+	inventoryInfra             *InventoryInfraFactory
+	studentConsumer            *consumer.StudentConsumer
+	studentConsumerCancel      context.CancelFunc
+	accountingConsumer         *consumer.AccountingConsumer
+	accountingConsumerCancel   context.CancelFunc
+	inventoryConsumer          *consumer.InventoryConsumer
+	inventoryConsumerCancel    context.CancelFunc
+	salesInfra                 *SalesInfraFactory
+	subscriptionInfra          *SubscriptionInfraFactory
+	salesConsumer              *consumer.SalesConsumer
+	salesConsumerCancel        context.CancelFunc
+	subscriptionConsumer       *consumer.SubscriptionConsumer
+	subscriptionConsumerCancel context.CancelFunc
+	outboxRepo                 outbox.Repository
+	idempotencyStore           idempotency.Store
+	outboxProcessor            *outbox.Processor
+	outboxCancel               context.CancelFunc
+	emailSender                email.Sender
+	analyticsCHRepo            *clickhouse.AnalyticsRepository
+	analyticsESRepo            *elasticsearch.AnalyticsESRepository
+	analyticsService           *service.AnalyticsService
+	analyticsHandler           *handler.AnalyticsHandler
 
 	attendanceFactory   *AttendanceFactory
 	auditConsumer       *audit.AuditClickHouseConsumer
@@ -246,6 +252,12 @@ type Factory struct {
 	locationRepo    postgres.LocationRepository
 	locationService *service.LocationService
 	locationHandler *locationhandler.LocationHandler
+	// ================================================
+
+	// 🆕 JOB =========================================
+	jobRepo    postgres.JobRepository
+	jobService *service.JobService
+	jobHandler *handler.JobHandler
 	// ================================================
 
 	// 🆕 SUBSCRIPTION ====================================
@@ -500,6 +512,7 @@ func NewFactory() (*Factory, error) {
 	}
 
 	f.initializePayrollWorker()
+	f.initializeResolverWorker() // 👈 ADD
 
 	// Start Kafka consumers
 	if f.kafkaProducer != nil && len(f.config.Kafka.Brokers) > 0 {
@@ -799,6 +812,12 @@ func (f *Factory) Close() error {
 		if f.payrollWorkerCancel != nil {
 			f.logger.Info("Stopping payroll worker...")
 			f.payrollWorkerCancel()
+		}
+
+		// 👈 ADD
+		if f.resolverWorkerCancel != nil {
+			f.logger.Info("Stopping leave resolver worker...")
+			f.resolverWorkerCancel()
 		}
 
 		if f.analyticsConsumerCancel != nil {
@@ -1145,13 +1164,14 @@ func (f *Factory) PayrollEngineService() payrollsvc.PayrollEngineService {
 			f.StatutoryEngine(),
 			f.GetAttendancePayrollBridge(),
 			f.GetAuditService(),
-			f.idempotencyStore,
+			f.idempotencyStore, // ✅ position 7
 			f.AttendanceRuleRepository(),
 			f.EmployeeFineRepository(),
 			f.ArrearsRepository(),
 			f.LoanRepository(),
 			f.ComponentRepository(),
 			f.CompanySettingsRepository(),
+			f.logger, // ✅ position 14
 		)
 	}
 	return f.payrollEngineSvc
@@ -1518,6 +1538,14 @@ func (f *Factory) LeaveRepository() leaverepo.LeaveRepository {
 	return f.leaveRepository
 }
 
+// 👈 ADD — placed next to LeaveRepository()
+func (f *Factory) ResolverJobRepository() leaverepo.ResolverJobRepository {
+	if f.resolverJobRepo == nil {
+		f.resolverJobRepo = leaverepo.NewResolverJobRepository(f.PostgresClient())
+	}
+	return f.resolverJobRepo
+}
+
 // ----- Services -----
 
 func (f *Factory) GetEmployeeService() *hrservice.EmployeeService {
@@ -1529,8 +1557,10 @@ func (f *Factory) GetEmployeeService() *hrservice.EmployeeService {
 			hrservice.EmployeeServiceConfig{
 				MaxDocumentSizeMB: f.config.HR.Documents.MaxSizeMB,
 				DocumentStorage:   f.DocumentStorage(),
-				EncryptionMgr:     f.EncryptionManager(), // 👈 ADD THIS LINE
+				EncryptionMgr:     f.EncryptionManager(),
 			},
+			f.PostgresClient(),        // 👈 ADD
+			f.ResolverJobRepository(), // 👈 ADD
 		)
 	}
 	return f.employeeService
@@ -1542,7 +1572,6 @@ func (f *Factory) GetEmployeeQueryService() *hrservice.EmployeeQueryService {
 			f.DocumentStorage(),
 			f.GetAuditService(),
 			f.EncryptionManager(), // 👈 ADD THIS LINE (fixes the compiler error)
-
 		)
 	}
 	return f.employeeQueryService
@@ -1551,17 +1580,20 @@ func (f *Factory) GetEmployeeQueryService() *hrservice.EmployeeQueryService {
 func (f *Factory) GetOrgUnitService() *hrservice.OrgUnitService {
 	if f.orgUnitService == nil {
 		f.orgUnitService = hrservice.NewOrgUnitService(
-			f.OrgUnitRepository(),
+			f.PostgresClient(),     // ✅
+			f.OrgUnitRepository(),  // ✅
+			f.LocationRepository(), // ✅ NEW — added
 			f.GetAuditService(),
 			f.idempotencyStore,
 		)
 	}
 	return f.orgUnitService
 }
-
 func (f *Factory) GetOrgUnitQueryService() *hrservice.OrgUnitQueryService {
 	if f.orgUnitQueryService == nil {
 		f.orgUnitQueryService = hrservice.NewOrgUnitQueryService(
+			f.PostgresClient(), // ✅ FIX
+
 			f.OrgUnitRepository(),
 			f.GetAuditService(),
 		)
@@ -1608,6 +1640,8 @@ func (f *Factory) LeavePolicyConfigService() leavesvc.LeavePolicyConfigService {
 			f.LeaveRepository(),
 			f.idempotencyStore,
 			f.GetAuditService(),
+			f.PostgresClient(),        // 👈 ADD
+			f.ResolverJobRepository(), // 👈 ADD
 		)
 	}
 	return f.leavePolicyConfigService
@@ -1663,6 +1697,9 @@ func (f *Factory) GetLeavePolicyResolutionService() leavesvc.LeavePolicyResoluti
 	if f.leavePolicyResolutionService == nil {
 		f.leavePolicyResolutionService = leavesvc.NewLeavePolicyResolutionService(
 			f.LeaveRepository(),
+			f.ResolverJobRepository(), // ← NEW
+			f.PostgresClient(),        // ← NEW
+
 			f.idempotencyStore,
 			f.GetAuditService(),
 		)
@@ -1763,6 +1800,27 @@ func (f *Factory) initializePayrollWorker() {
 	)
 }
 
+// 👈 ADD — placed next to initializePayrollWorker
+func (f *Factory) initializeResolverWorker() {
+	if f.resolverWorker != nil {
+		return
+	}
+	interval := 30 * time.Second
+	if !f.config.IsProduction() {
+		interval = 5 * time.Second
+	}
+	f.resolverWorker = leaveworker.NewResolverWorker(
+		f.ResolverJobRepository(),
+		f.GetLeavePolicyResolutionService(),
+		f.logger,
+		interval,
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	f.resolverWorkerCancel = cancel
+	go f.resolverWorker.Start(ctx)
+	f.logger.Info("leave resolver worker started", zap.Duration("interval", interval))
+}
+
 // ----- Kafka logging -----
 
 func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
@@ -1839,23 +1897,6 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 	return mgr, nil
 }
 
-func (f *Factory) GetAuditOutboxService() *audit.AuditOutboxService {
-	if f.auditOutboxService == nil {
-		if f.kafkaProducer == nil {
-			f.logger.Warn("Kafka producer not available, audit outbox disabled")
-			return nil
-		}
-		f.auditOutboxService = audit.NewAuditOutboxService(
-			f.PostgresClient(),
-			f.kafkaProducer,
-			500,
-			5*time.Second,
-			"audit-logs",
-		)
-	}
-	return f.auditOutboxService
-}
-
 // ----- Repository getters -----
 
 func (f *Factory) AdminDeviceRepository() *scylla.AdminDeviceRepositoryImpl {
@@ -1922,6 +1963,42 @@ func (f *Factory) CompanyRepository() postgres.CompanyRepository {
 	}
 	return f.postgresCompanyRepository
 }
+
+// 🆕 JOB REPOSITORY =============================================
+// Reuses the same CompanyRepositoryImpl concrete type (see postgres package).
+func (f *Factory) JobRepository() postgres.JobRepository {
+	if f.jobRepo == nil {
+		f.jobRepo = postgres.NewJobRepository(f.PostgresClient())
+	}
+	return f.jobRepo
+}
+
+// 🆕 JOB SERVICE ================================================
+func (f *Factory) JobService() *service.JobService {
+	if f.jobService == nil {
+		f.jobService = service.NewJobService(
+			f.PostgresClient(),
+			f.JobRepository(),
+			f.CompanyRepository(),
+			f.GetAuditService(),
+			f.idempotencyStore,
+		)
+	}
+	return f.jobService
+}
+
+// 🆕 JOB HANDLER ================================================
+func (f *Factory) JobHandler() *handler.JobHandler {
+	if f.jobHandler == nil {
+		f.jobHandler = handler.NewJobHandler(
+			f.JobService(),
+			f.GetCompanyService(),
+		)
+	}
+	return f.jobHandler
+}
+
+// ================================================================
 
 func (f *Factory) PepperStoreRepository() pepperstore.PepperStore {
 	if f.pepperStoreRepo == nil {
@@ -2229,7 +2306,9 @@ func (f *Factory) GetCompanyService() *service.CompanyService {
 			f.PostgresClient(),
 			f.CompanyRepository(),
 			f.LocationRepository(),
-			f.HREmployeeRepository(), // 👈 ADD THIS LINE
+			f.LocationService(),                        // 👈 ADD — locationService
+			f.attendanceFactory.WorkCenterRepository(), // 👈 ADD — workCenterRepo (Case A: reuse AttendanceFactory instance)
+			f.HREmployeeRepository(),
 			f.GetEmployeeService(),
 			f.GetUserService(),
 			f.SubscriptionPlanService(),
@@ -2241,10 +2320,12 @@ func (f *Factory) GetCompanyService() *service.CompanyService {
 			f.idempotencyStore,
 			*f.config,
 			f.RedisClient().Client(),
+			f.ResolverJobRepository(),
 		)
 	}
 	return f.companyService
 }
+
 func (f *Factory) GetAdminDeviceService() *service.AdminDeviceService {
 	if f.adminDeviceService == nil {
 		deviceRepo := f.AdminDeviceRepository()
@@ -2813,7 +2894,7 @@ func (f *Factory) LifecycleHandler() *handler.SubscriptionLifecycleHandler {
 
 // ============================================================
 
-// InitializeHandlers – updated to include KYC, avatar, location and subscription handlers.
+// InitializeHandlers – updated to include KYC, avatar, location, job and subscription handlers.
 func (f *Factory) InitializeHandlers() error {
 	logger := f.logger
 
@@ -2979,6 +3060,10 @@ func (f *Factory) InitializeHandlers() error {
 	avatarHandler := f.AvatarHandler()
 	locationHandler := f.LocationHandler()
 
+	// 🆕 JOB HANDLER ============================================
+	jobHandler := f.JobHandler()
+	// ===========================================================
+
 	planHandler := f.SubscriptionPlanHandler()
 	paymentHandler := f.PaymentHandler()
 	invoiceHandler := f.InvoiceHandler()
@@ -3053,9 +3138,10 @@ func (f *Factory) InitializeHandlers() error {
 		f.AnalyticsHandler(),
 		f.LocationService(),
 		companyService,
+		jobHandler, // 🆕 JOB HANDLER — final argument
 	)
 
-	logger.Info("Handlers and router initialized with JWT, bitmask, QR web login, attendance, leave, payroll, biometric, accounting, inventory, subscription, sales, KYC, avatar, location, and subscription lifecycle systems")
+	logger.Info("Handlers and router initialized with JWT, bitmask, QR web login, attendance, leave, payroll, biometric, accounting, inventory, subscription, sales, KYC, avatar, location, job and subscription lifecycle systems")
 	return nil
 }
 

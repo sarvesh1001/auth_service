@@ -47,7 +47,6 @@ func NewStatutoryRepository(postgresClient *client.PostgresClient) StatutoryRepo
 }
 
 // WithTx executes a function within a transaction.
-// The provided StatutoryRepository uses the transaction for all DB operations.
 func (r *statutoryRepository) WithTx(ctx context.Context, fn func(StatutoryRepository) error) error {
 	pgClient, ok := r.db.(*client.PostgresClient)
 	if !ok {
@@ -518,7 +517,7 @@ func (r *statutoryRepository) LoadActiveContributionRules(ctx context.Context, c
 	ruleSet, err := r.ResolveRuleSet(ctx, companyID, asOf)
 	if err != nil {
 		if errors.Is(err, hrErrors.ErrStatutoryRuleSetNotFound) {
-			return nil, nil // no active rule set -> no rules
+			return nil, nil
 		}
 		return nil, err
 	}
@@ -694,18 +693,22 @@ func (r *statutoryRepository) ListContributionRulesByStatutoryCode(ctx context.C
 
 // ----------------------------------------------------------------------
 // Statutory Component Mapping
+//
+// DB column is now component_id. ComponentCode is JOIN-populated.
 // ----------------------------------------------------------------------
 
 func (r *statutoryRepository) LoadStatutoryComponentMappingsByRuleSet(ctx context.Context, ruleSetID uuid.UUID) ([]models.StatutoryComponentMapping, error) {
 	const query = `
-		SELECT mapping_id, company_id, statutory_code, component_code,
-		       effective_from, effective_to, is_active,
-		       version, created_at, created_by,
-		       deactivated_at, deactivated_by, rule_set_id
-		FROM payroll.statutory_component_mapping
-		WHERE rule_set_id = $1
-		  AND is_active = true
-		ORDER BY statutory_code, component_code
+		SELECT m.mapping_id, m.company_id, m.statutory_code,
+		       m.component_id, pc.component_code,
+		       m.effective_from, m.effective_to, m.is_active,
+		       m.version, m.created_at, m.created_by,
+		       m.deactivated_at, m.deactivated_by, m.rule_set_id
+		FROM payroll.statutory_component_mapping m
+		JOIN payroll.payroll_component pc ON pc.component_id = m.component_id
+		WHERE m.rule_set_id = $1
+		  AND m.is_active = true
+		ORDER BY m.statutory_code, pc.component_code
 	`
 	rows, err := r.db.Query(ctx, query, ruleSetID)
 	if err != nil {
@@ -719,6 +722,7 @@ func (r *statutoryRepository) LoadStatutoryComponentMappingsByRuleSet(ctx contex
 			&m.MappingID,
 			&m.CompanyID,
 			&m.StatutoryCode,
+			&m.ComponentID,
 			&m.ComponentCode,
 			&m.EffectiveFrom,
 			&m.EffectiveTo,
@@ -740,35 +744,35 @@ func (r *statutoryRepository) LoadStatutoryComponentMappingsByRuleSet(ctx contex
 	return mappings, nil
 }
 
-func (r *statutoryRepository) componentExistsForCompany(ctx context.Context, companyID uuid.UUID, componentCode string) (bool, error) {
+// resolveComponent returns the active component ID for (companyID, code).
+func (r *statutoryRepository) resolveComponent(ctx context.Context, companyID uuid.UUID, componentCode string) (uuid.UUID, error) {
 	const query = `
-		SELECT EXISTS (
-			SELECT 1
-			FROM payroll.payroll_component
-			WHERE component_code = $2
-			  AND is_active = true
-			  AND (company_id = $1 OR company_id IS NULL)
-		)
+		SELECT component_id
+		FROM payroll.payroll_component
+		WHERE company_id = $1
+		  AND component_code = $2
+		  AND is_active = true
+		LIMIT 1
 	`
-	var exists bool
-	err := r.db.QueryRow(ctx, query, companyID, componentCode).Scan(&exists)
+	var id uuid.UUID
+	err := r.db.QueryRow(ctx, query, companyID, componentCode).Scan(&id)
 	if err != nil {
-		return false, fmt.Errorf("failed to check component existence: %w", err)
+		if errors.Is(err, sql.ErrNoRows) {
+			return uuid.Nil, hrErrors.ErrPayrollComponentNotFound
+		}
+		return uuid.Nil, fmt.Errorf("resolve component %s: %w", componentCode, err)
 	}
-	return exists, nil
+	return id, nil
 }
 
 func (r *statutoryRepository) CreateComponentMapping(ctx context.Context, input models.CreateComponentMappingInput) error {
-	exists, err := r.componentExistsForCompany(ctx, input.CompanyID, input.ComponentCode)
+	componentID, err := r.resolveComponent(ctx, input.CompanyID, input.ComponentCode)
 	if err != nil {
-		return err
-	}
-	if !exists {
-		return fmt.Errorf("component_code %s does not exist or is not active for company %s", input.ComponentCode, input.CompanyID)
+		return fmt.Errorf("component_code %s does not exist or is not active for company %s: %w", input.ComponentCode, input.CompanyID, err)
 	}
 	const query = `
 		INSERT INTO payroll.statutory_component_mapping (
-			mapping_id, company_id, statutory_code, component_code,
+			mapping_id, company_id, statutory_code, component_id,
 			effective_from, effective_to, is_active, version,
 			created_at, created_by, rule_set_id
 		) VALUES ($1, $2, $3, $4, $5, NULL, true, 1, NOW(), $6, $7)
@@ -778,7 +782,7 @@ func (r *statutoryRepository) CreateComponentMapping(ctx context.Context, input 
 		mappingID,
 		input.CompanyID,
 		input.StatutoryCode,
-		input.ComponentCode,
+		componentID,
 		input.EffectiveFrom,
 		input.CreatedBy,
 		input.RuleSetID,
@@ -804,22 +808,22 @@ func (r *statutoryRepository) UpdateComponentMapping(ctx context.Context, input 
 	if currentVersion != input.Version {
 		return fmt.Errorf("version mismatch: expected %d, got %d", input.Version, currentVersion)
 	}
-	// Validate new component if changed
+
+	var newComponentID *uuid.UUID
 	if input.ComponentCode != nil {
-		exists, err := r.componentExistsForCompany(ctx, companyID, *input.ComponentCode)
+		id, err := r.resolveComponent(ctx, companyID, *input.ComponentCode)
 		if err != nil {
-			return err
+			return fmt.Errorf("component_code %s does not exist or is not active for company %s: %w", *input.ComponentCode, companyID, err)
 		}
-		if !exists {
-			return fmt.Errorf("component_code %s does not exist or is not active for company %s", *input.ComponentCode, companyID)
-		}
+		newComponentID = &id
 	}
+
 	var updates []string
 	args := []interface{}{input.MappingID}
 	argPos := 2
-	if input.ComponentCode != nil {
-		updates = append(updates, fmt.Sprintf("component_code = $%d", argPos))
-		args = append(args, *input.ComponentCode)
+	if newComponentID != nil {
+		updates = append(updates, fmt.Sprintf("component_id = $%d", argPos))
+		args = append(args, *newComponentID)
 		argPos++
 	}
 	if input.EffectiveFrom != nil {
@@ -869,19 +873,21 @@ func (r *statutoryRepository) DeactivateComponentMapping(ctx context.Context, ma
 
 func (r *statutoryRepository) ListComponentMappings(ctx context.Context, companyID uuid.UUID, statutoryCode *string) ([]models.StatutoryComponentMapping, error) {
 	query := `
-		SELECT mapping_id, company_id, statutory_code, component_code,
-		       effective_from, effective_to, is_active,
-		       version, created_at, created_by,
-		       deactivated_at, deactivated_by, rule_set_id
-		FROM payroll.statutory_component_mapping
-		WHERE company_id = $1
+		SELECT m.mapping_id, m.company_id, m.statutory_code,
+		       m.component_id, pc.component_code,
+		       m.effective_from, m.effective_to, m.is_active,
+		       m.version, m.created_at, m.created_by,
+		       m.deactivated_at, m.deactivated_by, m.rule_set_id
+		FROM payroll.statutory_component_mapping m
+		JOIN payroll.payroll_component pc ON pc.component_id = m.component_id
+		WHERE m.company_id = $1
 	`
 	args := []interface{}{companyID}
 	if statutoryCode != nil {
-		query += " AND statutory_code = $2"
+		query += " AND m.statutory_code = $2"
 		args = append(args, *statutoryCode)
 	}
-	query += " ORDER BY statutory_code, effective_from DESC"
+	query += " ORDER BY m.statutory_code, m.effective_from DESC"
 	rows, err := r.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list component mappings: %w", err)
@@ -894,6 +900,7 @@ func (r *statutoryRepository) ListComponentMappings(ctx context.Context, company
 			&m.MappingID,
 			&m.CompanyID,
 			&m.StatutoryCode,
+			&m.ComponentID,
 			&m.ComponentCode,
 			&m.EffectiveFrom,
 			&m.EffectiveTo,
@@ -998,7 +1005,6 @@ func (r *statutoryRepository) CreateTaxSlab(ctx context.Context, input models.Cr
 }
 
 func (r *statutoryRepository) UpdateTaxSlab(ctx context.Context, input models.UpdateTaxSlabInput) error {
-	// Fetch current values
 	var current struct {
 		MinAmount     float64
 		MaxAmount     *float64

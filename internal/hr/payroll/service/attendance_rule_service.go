@@ -62,7 +62,6 @@ type attendanceRuleService struct {
 	auditService     *audit.AuditService
 }
 
-// NewAttendanceRuleService now requires idempotency and audit.
 func NewAttendanceRuleService(
 	ruleRepo repository.AttendanceRuleRepository,
 	compRepo repository.ComponentRepository,
@@ -79,7 +78,6 @@ func NewAttendanceRuleService(
 
 // CreateRule – with idempotency and audit
 func (s *attendanceRuleService) CreateRule(ctx context.Context, input CreateAttendanceRuleInput) (*models.AttendanceRule, error) {
-	// Idempotency
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
 		idempKey = fmt.Sprintf("att_rule_create-%s-%s", input.CompanyID.String(), input.RuleType)
@@ -89,7 +87,6 @@ func (s *attendanceRuleService) CreateRule(ctx context.Context, input CreateAtte
 		return cached, nil
 	}
 
-	// Validations
 	if input.CompanyID == uuid.Nil {
 		return nil, errors.New("company_id is required")
 	}
@@ -112,7 +109,7 @@ func (s *attendanceRuleService) CreateRule(ctx context.Context, input CreateAtte
 		return nil, errors.New("created_by is required")
 	}
 
-	// Validate component
+	// Resolve component (code -> component struct with ID + code).
 	comp, err := s.compRepo.GetComponent(ctx, input.CompanyID, input.ComponentCode)
 	if err != nil {
 		return nil, fmt.Errorf("failed to validate component: %w", err)
@@ -129,7 +126,8 @@ func (s *attendanceRuleService) CreateRule(ctx context.Context, input CreateAtte
 		Value:            input.Value,
 		BasedOn:          input.BasedOn,
 		ThresholdMinutes: input.ThresholdMinutes,
-		ComponentCode:    input.ComponentCode,
+		ComponentID:      comp.ComponentID,
+		ComponentCode:    comp.ComponentCode,
 		IsActive:         true,
 		CreatedBy:        &input.CreatedBy,
 	}
@@ -144,13 +142,12 @@ func (s *attendanceRuleService) CreateRule(ctx context.Context, input CreateAtte
 	}
 	afterJSON, _ := json.Marshal(rule)
 
-	// Audit
 	ip, _ := ctx.Value("ip_address").(string)
 	auditMeta := map[string]interface{}{
 		"ip":             ip,
 		"company_id":     input.CompanyID.String(),
 		"rule_type":      input.RuleType,
-		"component_code": input.ComponentCode,
+		"component_code": comp.ComponentCode,
 	}
 	_ = s.auditService.LogAction(
 		ctx,
@@ -182,7 +179,6 @@ func (s *attendanceRuleService) UpdateRuleVersion(ctx context.Context, input Upd
 		return cached, nil
 	}
 
-	// Validations
 	if input.CompanyID == uuid.Nil {
 		return nil, errors.New("company_id is required")
 	}
@@ -225,7 +221,6 @@ func (s *attendanceRuleService) UpdateRuleVersion(ctx context.Context, input Upd
 	}
 	beforeJSON, _ := json.Marshal(existing)
 
-	// Deactivate old if active
 	if existing.IsActive {
 		if err := s.ruleRepo.SoftDeactivate(ctx, input.CompanyID, input.RuleID, input.UpdatedBy); err != nil {
 			return nil, fmt.Errorf("failed to deactivate old rule: %w", err)
@@ -240,7 +235,8 @@ func (s *attendanceRuleService) UpdateRuleVersion(ctx context.Context, input Upd
 		Value:            input.Value,
 		BasedOn:          input.BasedOn,
 		ThresholdMinutes: input.ThresholdMinutes,
-		ComponentCode:    input.ComponentCode,
+		ComponentID:      comp.ComponentID,
+		ComponentCode:    comp.ComponentCode,
 		IsActive:         true,
 		CreatedBy:        &input.UpdatedBy,
 	}
@@ -259,7 +255,7 @@ func (s *attendanceRuleService) UpdateRuleVersion(ctx context.Context, input Upd
 		"ip":             ip,
 		"old_rule_id":    input.RuleID.String(),
 		"new_rule_id":    newRule.RuleID.String(),
-		"component_code": input.ComponentCode,
+		"component_code": comp.ComponentCode,
 	}
 	_ = s.auditService.LogAction(
 		ctx,
@@ -280,7 +276,6 @@ func (s *attendanceRuleService) UpdateRuleVersion(ctx context.Context, input Upd
 	return newRule, nil
 }
 
-// ActivateRule – with idempotency
 func (s *attendanceRuleService) ActivateRule(ctx context.Context, companyID, ruleID, actorID uuid.UUID) error {
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
@@ -331,7 +326,6 @@ func (s *attendanceRuleService) ActivateRule(ctx context.Context, companyID, rul
 	return nil
 }
 
-// DeactivateRule – with idempotency
 func (s *attendanceRuleService) DeactivateRule(ctx context.Context, companyID, ruleID, actorID uuid.UUID) error {
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
@@ -379,7 +373,6 @@ func (s *attendanceRuleService) DeactivateRule(ctx context.Context, companyID, r
 	return nil
 }
 
-// BulkDeactivateByType – with idempotency (store boolean)
 func (s *attendanceRuleService) BulkDeactivateByType(ctx context.Context, companyID uuid.UUID, ruleType string, actorID uuid.UUID) error {
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
@@ -394,7 +387,6 @@ func (s *attendanceRuleService) BulkDeactivateByType(ctx context.Context, compan
 		return errors.New("invalid input")
 	}
 
-	// Fetch rules to deactivate for audit
 	rules, err := s.ruleRepo.GetByRuleType(ctx, companyID, ruleType)
 	if err != nil {
 		return err
@@ -404,7 +396,7 @@ func (s *attendanceRuleService) BulkDeactivateByType(ctx context.Context, compan
 	if err := s.ruleRepo.BulkDeactivateByType(ctx, companyID, ruleType, actorID); err != nil {
 		return err
 	}
-	afterJSON, _ := json.Marshal(rules) // state after – may need to fetch again; but we'll just mark as changed
+	afterJSON, _ := json.Marshal(rules)
 
 	ip, _ := ctx.Value("ip_address").(string)
 	_ = s.auditService.LogAction(
@@ -429,8 +421,6 @@ func (s *attendanceRuleService) BulkDeactivateByType(ctx context.Context, compan
 	return nil
 }
 
-// Read methods – no idempotency, but we add audit for sensitive reads (optional)
-// We'll keep them as is but remove logger.
 func (s *attendanceRuleService) GetRuleByID(ctx context.Context, companyID, ruleID uuid.UUID) (*models.AttendanceRule, error) {
 	if companyID == uuid.Nil || ruleID == uuid.Nil {
 		return nil, errors.New("invalid IDs")
@@ -463,7 +453,6 @@ func (s *attendanceRuleService) GetRulesByType(ctx context.Context, companyID uu
 }
 
 func (s *attendanceRuleService) ValidateRuleConsistency(rule *models.AttendanceRule) error {
-	// unchanged – kept as is
 	if rule == nil {
 		return errors.New("rule cannot be nil")
 	}

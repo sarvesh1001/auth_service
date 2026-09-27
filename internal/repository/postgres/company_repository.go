@@ -4440,61 +4440,78 @@ func (r *CompanyRepositoryImpl) GetActiveDepartmentCount(
 func (r *CompanyRepositoryImpl) CreatePosition(
 	ctx context.Context, db client.DBTX, position *models.Position,
 ) error {
-	query := `
+	const query = `
 		INSERT INTO positions (
-			position_id, company_id, department_id, title,
-			is_open, is_schedulable, attendance_required,
-			overtime_allowed, work_center_code,
+			position_id, company_id, department_id,
+			job_id, location_id, title_override,
+			is_open, work_center_code,
 			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
 	_, err := db.ExecContext(ctx, query,
 		position.PositionID,
 		position.CompanyID,
 		position.DepartmentID,
-		position.Title,
+		position.JobID,
+		position.LocationID,
+		position.TitleOverride,
 		position.IsOpen,
-		position.IsSchedulable,
-		position.AttendanceRequired,
-		position.OvertimeAllowed,
 		position.WorkCenterCode,
 		position.CreatedAt,
 		position.UpdatedAt,
 	)
 	if err != nil {
-		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23505" {
-			return apperrors.ErrDuplicate
-		}
-		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23503" {
-			if pgErr.Constraint == "fk_positions_work_center" {
-				return apperrors.ErrNotFound
+		if pgErr, ok := err.(*pq.Error); ok {
+			switch pgErr.Code {
+			case "23505":
+				return apperrors.ErrDuplicate
+			case "23503":
+				switch pgErr.Constraint {
+				case "fk_positions_work_center",
+					"fk_positions_job",
+					"fk_positions_location":
+					return apperrors.ErrNotFound
+				}
 			}
 		}
 		return fmt.Errorf("failed to create position: %w", err)
 	}
 	return nil
 }
-
 func (r *CompanyRepositoryImpl) GetPosition(
 	ctx context.Context, db client.DBTX, positionID uuid.UUID,
-) (*models.Position, error) {
-	query := `
-        SELECT
-            p.position_id, p.company_id, p.department_id, p.title,
-            p.is_open, p.is_schedulable, p.attendance_required,
-            p.overtime_allowed, p.work_center_code, wc.name as work_center_name,
-            p.created_at, p.updated_at
-        FROM positions p
-        LEFT JOIN attendance.work_centers wc ON p.company_id = wc.company_id AND p.work_center_code = wc.work_center_code
-        WHERE p.position_id = $1`
-	var position models.Position
-	var workCenterCode sql.NullString
-	var workCenterName sql.NullString
+) (*models.PositionView, error) {
+	const query = `
+		SELECT
+			p.position_id, p.company_id, p.department_id,
+			p.job_id, p.location_id, p.title_override,
+			p.is_open, p.work_center_code,
+			p.created_at, p.updated_at,
+			j.job_code, j.job_title,
+			j.is_schedulable, j.attendance_required, j.overtime_allowed,
+			d.department_name,
+			l.location_name,
+			wc.name AS work_center_name
+		FROM positions p
+		INNER JOIN jobs j ON j.job_id = p.job_id
+		LEFT JOIN departments d ON d.department_id = p.department_id
+		LEFT JOIN locations l ON l.location_id = p.location_id
+		LEFT JOIN attendance.work_centers wc
+		       ON wc.company_id = p.company_id
+		      AND wc.work_center_code = p.work_center_code
+		WHERE p.position_id = $1`
+
+	var pv models.PositionView
+	var locationID uuid.NullUUID
+	var titleOverride, wcCode, deptName, locName, wcName sql.NullString
+
 	err := db.QueryRowContext(ctx, query, positionID).Scan(
-		&position.PositionID, &position.CompanyID, &position.DepartmentID,
-		&position.Title, &position.IsOpen, &position.IsSchedulable,
-		&position.AttendanceRequired, &position.OvertimeAllowed,
-		&workCenterCode, &workCenterName,
-		&position.CreatedAt, &position.UpdatedAt,
+		&pv.PositionID, &pv.CompanyID, &pv.DepartmentID,
+		&pv.JobID, &locationID, &titleOverride,
+		&pv.IsOpen, &wcCode,
+		&pv.CreatedAt, &pv.UpdatedAt,
+		&pv.JobCode, &pv.JobTitle,
+		&pv.IsSchedulable, &pv.AttendanceRequired, &pv.OvertimeAllowed,
+		&deptName, &locName, &wcName,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -4502,121 +4519,154 @@ func (r *CompanyRepositoryImpl) GetPosition(
 		}
 		return nil, fmt.Errorf("failed to get position: %w", err)
 	}
-	if workCenterCode.Valid {
-		position.WorkCenterCode = &workCenterCode.String
+	if locationID.Valid {
+		pv.LocationID = &locationID.UUID
 	}
-	if workCenterName.Valid {
-		position.WorkCenterName = &workCenterName.String
+	if titleOverride.Valid {
+		pv.TitleOverride = &titleOverride.String
 	}
-	return &position, nil
+	if wcCode.Valid {
+		pv.WorkCenterCode = &wcCode.String
+	}
+	if deptName.Valid {
+		pv.DepartmentName = &deptName.String
+	}
+	if locName.Valid {
+		pv.LocationName = &locName.String
+	}
+	if wcName.Valid {
+		pv.WorkCenterName = &wcName.String
+	}
+	return &pv, nil
 }
 
 func (r *CompanyRepositoryImpl) UpdatePosition(
 	ctx context.Context, db client.DBTX, position *models.Position,
 ) error {
 	position.UpdatedAt = time.Now().UTC()
-	query := `
-        UPDATE positions SET
-            title = $1,
-            department_id = $2,
-            is_open = $3,
-            is_schedulable = $4,
-            attendance_required = $5,
-            overtime_allowed = $6,
-            work_center_code = $7,
-            updated_at = $8
-        WHERE position_id = $9`
-	result, err := db.ExecContext(ctx, query,
-		position.Title,
+	const query = `
+		UPDATE positions SET
+			department_id    = $1,
+			job_id           = $2,
+			location_id      = $3,
+			title_override   = $4,
+			is_open          = $5,
+			work_center_code = $6,
+			updated_at       = $7
+		WHERE position_id = $8`
+	res, err := db.ExecContext(ctx, query,
 		position.DepartmentID,
+		position.JobID,
+		position.LocationID,
+		position.TitleOverride,
 		position.IsOpen,
-		position.IsSchedulable,
-		position.AttendanceRequired,
-		position.OvertimeAllowed,
 		position.WorkCenterCode,
 		position.UpdatedAt,
 		position.PositionID,
 	)
 	if err != nil {
 		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23503" {
-			if pgErr.Constraint == "fk_positions_work_center" {
+			switch pgErr.Constraint {
+			case "fk_positions_work_center",
+				"fk_positions_job",
+				"fk_positions_location":
 				return apperrors.ErrNotFound
 			}
 		}
 		return fmt.Errorf("failed to update position: %w", err)
 	}
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
+	if rows, _ := res.RowsAffected(); rows == 0 {
 		return apperrors.ErrNotFound
 	}
 	return nil
 }
-
 func (r *CompanyRepositoryImpl) GetPositionsByDepartment(
 	ctx context.Context, db client.DBTX,
 	departmentID uuid.UUID,
 	limit, offset int,
 	onlyOpen bool,
-) ([]*models.Position, int, error) {
+) ([]*models.PositionView, int, error) {
 	if limit <= 0 || limit > DefaultCompanyPageSize {
 		limit = DefaultCompanyPageSize
 	}
 	if offset < 0 {
 		offset = 0
 	}
+
 	var totalCount int
 	countQuery := `SELECT COUNT(*) FROM positions WHERE department_id = $1`
 	if onlyOpen {
 		countQuery += ` AND is_open = true`
 	}
-	err := db.QueryRowContext(ctx, countQuery, departmentID).Scan(&totalCount)
-	if err != nil {
+	if err := db.QueryRowContext(ctx, countQuery, departmentID).Scan(&totalCount); err != nil {
 		return nil, 0, fmt.Errorf("failed to count department positions: %w", err)
 	}
+
 	query := `
-        SELECT
-            p.position_id, p.company_id, p.title, p.is_open,
-            p.is_schedulable, p.attendance_required, p.overtime_allowed,
-            p.work_center_code, wc.name as work_center_name,
-            p.created_at, p.updated_at, d.department_name
-        FROM positions p
-        INNER JOIN departments d ON p.department_id = d.department_id
-        LEFT JOIN attendance.work_centers wc ON p.company_id = wc.company_id AND p.work_center_code = wc.work_center_code
-        WHERE p.department_id = $1`
+		SELECT
+			p.position_id, p.company_id, p.department_id,
+			p.job_id, p.location_id, p.title_override,
+			p.is_open, p.work_center_code,
+			p.created_at, p.updated_at,
+			j.job_code, j.job_title,
+			j.is_schedulable, j.attendance_required, j.overtime_allowed,
+			d.department_name,
+			l.location_name,
+			wc.name AS work_center_name
+		FROM positions p
+		INNER JOIN jobs j ON j.job_id = p.job_id
+		INNER JOIN departments d ON d.department_id = p.department_id
+		LEFT JOIN locations l ON l.location_id = p.location_id
+		LEFT JOIN attendance.work_centers wc
+		       ON wc.company_id = p.company_id
+		      AND wc.work_center_code = p.work_center_code
+		WHERE p.department_id = $1`
 	if onlyOpen {
 		query += ` AND p.is_open = true`
 	}
 	query += ` ORDER BY p.created_at DESC LIMIT $2 OFFSET $3`
+
 	rows, err := db.QueryContext(ctx, query, departmentID, limit, offset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to query department positions: %w", err)
 	}
 	defer rows.Close()
 
-	positions := make([]*models.Position, 0, limit)
+	positions := make([]*models.PositionView, 0, limit)
 	for rows.Next() {
-		var position models.Position
-		var departmentName string
-		var workCenterCode sql.NullString
-		var workCenterName sql.NullString
-		err := rows.Scan(
-			&position.PositionID, &position.CompanyID, &position.Title,
-			&position.IsOpen, &position.IsSchedulable, &position.AttendanceRequired,
-			&position.OvertimeAllowed, &workCenterCode, &workCenterName,
-			&position.CreatedAt, &position.UpdatedAt, &departmentName,
-		)
-		if err != nil {
+		var pv models.PositionView
+		var locationID uuid.NullUUID
+		var titleOverride, wcCode, deptName, locName, wcName sql.NullString
+		if err := rows.Scan(
+			&pv.PositionID, &pv.CompanyID, &pv.DepartmentID,
+			&pv.JobID, &locationID, &titleOverride,
+			&pv.IsOpen, &wcCode,
+			&pv.CreatedAt, &pv.UpdatedAt,
+			&pv.JobCode, &pv.JobTitle,
+			&pv.IsSchedulable, &pv.AttendanceRequired, &pv.OvertimeAllowed,
+			&deptName, &locName, &wcName,
+		); err != nil {
 			continue
 		}
-		position.DepartmentID = departmentID
-		position.DepartmentName = departmentName
-		if workCenterCode.Valid {
-			position.WorkCenterCode = &workCenterCode.String
+		if locationID.Valid {
+			pv.LocationID = &locationID.UUID
 		}
-		if workCenterName.Valid {
-			position.WorkCenterName = &workCenterName.String
+		if titleOverride.Valid {
+			pv.TitleOverride = &titleOverride.String
 		}
-		positions = append(positions, &position)
+		if wcCode.Valid {
+			pv.WorkCenterCode = &wcCode.String
+		}
+		if deptName.Valid {
+			pv.DepartmentName = &deptName.String
+		}
+		if locName.Valid {
+			pv.LocationName = &locName.String
+		}
+		if wcName.Valid {
+			pv.WorkCenterName = &wcName.String
+		}
+		positions = append(positions, &pv)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, 0, fmt.Errorf("error iterating department position rows: %w", err)
@@ -4629,63 +4679,88 @@ func (r *CompanyRepositoryImpl) GetPositionsByCompany(
 	companyID uuid.UUID,
 	limit, offset int,
 	onlyOpen bool,
-) ([]*models.Position, int, error) {
+) ([]*models.PositionView, int, error) {
 	if limit <= 0 || limit > DefaultCompanyPageSize {
 		limit = DefaultCompanyPageSize
 	}
 	if offset < 0 {
 		offset = 0
 	}
+
 	var totalCount int
 	countQuery := `SELECT COUNT(*) FROM positions WHERE company_id = $1`
 	if onlyOpen {
 		countQuery += ` AND is_open = true`
 	}
-	err := db.QueryRowContext(ctx, countQuery, companyID).Scan(&totalCount)
-	if err != nil {
+	if err := db.QueryRowContext(ctx, countQuery, companyID).Scan(&totalCount); err != nil {
 		return nil, 0, fmt.Errorf("failed to count positions: %w", err)
 	}
+
 	query := `
-        SELECT
-            p.position_id, p.department_id, p.title, p.is_open,
-            p.is_schedulable, p.attendance_required, p.overtime_allowed,
-            p.work_center_code, wc.name as work_center_name,
-            p.created_at, p.updated_at
-        FROM positions p
-        LEFT JOIN attendance.work_centers wc ON p.company_id = wc.company_id AND p.work_center_code = wc.work_center_code
-        WHERE p.company_id = $1`
+		SELECT
+			p.position_id, p.company_id, p.department_id,
+			p.job_id, p.location_id, p.title_override,
+			p.is_open, p.work_center_code,
+			p.created_at, p.updated_at,
+			j.job_code, j.job_title,
+			j.is_schedulable, j.attendance_required, j.overtime_allowed,
+			d.department_name,
+			l.location_name,
+			wc.name AS work_center_name
+		FROM positions p
+		INNER JOIN jobs j ON j.job_id = p.job_id
+		LEFT JOIN departments d ON d.department_id = p.department_id
+		LEFT JOIN locations l ON l.location_id = p.location_id
+		LEFT JOIN attendance.work_centers wc
+		       ON wc.company_id = p.company_id
+		      AND wc.work_center_code = p.work_center_code
+		WHERE p.company_id = $1`
 	if onlyOpen {
 		query += ` AND p.is_open = true`
 	}
 	query += ` ORDER BY p.created_at DESC LIMIT $2 OFFSET $3`
+
 	rows, err := db.QueryContext(ctx, query, companyID, limit, offset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to query positions: %w", err)
 	}
 	defer rows.Close()
 
-	positions := make([]*models.Position, 0, limit)
+	positions := make([]*models.PositionView, 0, limit)
 	for rows.Next() {
-		var position models.Position
-		var workCenterCode sql.NullString
-		var workCenterName sql.NullString
-		err := rows.Scan(
-			&position.PositionID, &position.DepartmentID, &position.Title,
-			&position.IsOpen, &position.IsSchedulable, &position.AttendanceRequired,
-			&position.OvertimeAllowed, &workCenterCode, &workCenterName,
-			&position.CreatedAt, &position.UpdatedAt,
-		)
-		if err != nil {
+		var pv models.PositionView
+		var locationID uuid.NullUUID
+		var titleOverride, wcCode, deptName, locName, wcName sql.NullString
+		if err := rows.Scan(
+			&pv.PositionID, &pv.CompanyID, &pv.DepartmentID,
+			&pv.JobID, &locationID, &titleOverride,
+			&pv.IsOpen, &wcCode,
+			&pv.CreatedAt, &pv.UpdatedAt,
+			&pv.JobCode, &pv.JobTitle,
+			&pv.IsSchedulable, &pv.AttendanceRequired, &pv.OvertimeAllowed,
+			&deptName, &locName, &wcName,
+		); err != nil {
 			continue
 		}
-		position.CompanyID = companyID
-		if workCenterCode.Valid {
-			position.WorkCenterCode = &workCenterCode.String
+		if locationID.Valid {
+			pv.LocationID = &locationID.UUID
 		}
-		if workCenterName.Valid {
-			position.WorkCenterName = &workCenterName.String
+		if titleOverride.Valid {
+			pv.TitleOverride = &titleOverride.String
 		}
-		positions = append(positions, &position)
+		if wcCode.Valid {
+			pv.WorkCenterCode = &wcCode.String
+		}
+		if deptName.Valid {
+			pv.DepartmentName = &deptName.String
+		}
+		if locName.Valid {
+			pv.LocationName = &locName.String
+		}
+		if wcName.Valid {
+			pv.WorkCenterName = &wcName.String
+		}
+		positions = append(positions, &pv)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, 0, fmt.Errorf("error iterating position rows: %w", err)
@@ -4696,16 +4771,16 @@ func (r *CompanyRepositoryImpl) GetPositionsByCompany(
 func (r *CompanyRepositoryImpl) GetOpenPositions(
 	ctx context.Context, db client.DBTX,
 	companyID uuid.UUID, isOpen *bool, limit, offset int,
-) ([]*models.Position, int, error) {
+) ([]*models.PositionView, int, error) {
 	if limit <= 0 {
 		limit = DefaultCompanyPageSize
 	}
 	if offset < 0 {
 		offset = 0
 	}
+
 	var countQuery string
-	var countArgs []interface{}
-	countArgs = append(countArgs, companyID)
+	countArgs := []interface{}{companyID}
 	if isOpen != nil {
 		countQuery = `SELECT COUNT(*) FROM positions WHERE company_id = $1 AND is_open = $2`
 		countArgs = append(countArgs, *isOpen)
@@ -4713,25 +4788,31 @@ func (r *CompanyRepositoryImpl) GetOpenPositions(
 		countQuery = `SELECT COUNT(*) FROM positions WHERE company_id = $1`
 	}
 	var totalCount int
-	err := db.QueryRowContext(ctx, countQuery, countArgs...).Scan(&totalCount)
-	if err != nil {
+	if err := db.QueryRowContext(ctx, countQuery, countArgs...).Scan(&totalCount); err != nil {
 		return nil, 0, fmt.Errorf("failed to count positions: %w", err)
 	}
 
 	query := `
 		SELECT
-			p.position_id, p.company_id, p.department_id, p.title,
-			p.is_open, p.is_schedulable, p.attendance_required,
-			p.overtime_allowed, p.work_center_code,
-			wc.name as work_center_name,
-			p.created_at, p.updated_at
+			p.position_id, p.company_id, p.department_id,
+			p.job_id, p.location_id, p.title_override,
+			p.is_open, p.work_center_code,
+			p.created_at, p.updated_at,
+			j.job_code, j.job_title,
+			j.is_schedulable, j.attendance_required, j.overtime_allowed,
+			d.department_name,
+			l.location_name,
+			wc.name AS work_center_name
 		FROM positions p
-		INNER JOIN departments d ON p.department_id = d.department_id
-		LEFT JOIN attendance.work_centers wc ON p.company_id = wc.company_id AND p.work_center_code = wc.work_center_code
-		WHERE p.company_id = $1 AND d.is_active = true
-	`
-	var queryArgs []interface{}
-	queryArgs = append(queryArgs, companyID)
+		INNER JOIN jobs j ON j.job_id = p.job_id
+		INNER JOIN departments d ON d.department_id = p.department_id
+		LEFT JOIN locations l ON l.location_id = p.location_id
+		LEFT JOIN attendance.work_centers wc
+		       ON wc.company_id = p.company_id
+		      AND wc.work_center_code = p.work_center_code
+		WHERE p.company_id = $1 AND d.is_active = true`
+
+	queryArgs := []interface{}{companyID}
 	argCounter := 2
 	if isOpen != nil {
 		query += fmt.Sprintf(" AND p.is_open = $%d", argCounter)
@@ -4747,42 +4828,47 @@ func (r *CompanyRepositoryImpl) GetOpenPositions(
 	}
 	defer rows.Close()
 
-	var positions []*models.Position
+	var positions []*models.PositionView
 	for rows.Next() {
-		var position models.Position
-		var workCenterCode sql.NullString
-		var workCenterName sql.NullString
-		err := rows.Scan(
-			&position.PositionID,
-			&position.CompanyID,
-			&position.DepartmentID,
-			&position.Title,
-			&position.IsOpen,
-			&position.IsSchedulable,
-			&position.AttendanceRequired,
-			&position.OvertimeAllowed,
-			&workCenterCode,
-			&workCenterName,
-			&position.CreatedAt,
-			&position.UpdatedAt,
-		)
-		if err != nil {
+		var pv models.PositionView
+		var locationID uuid.NullUUID
+		var titleOverride, wcCode, deptName, locName, wcName sql.NullString
+		if err := rows.Scan(
+			&pv.PositionID, &pv.CompanyID, &pv.DepartmentID,
+			&pv.JobID, &locationID, &titleOverride,
+			&pv.IsOpen, &wcCode,
+			&pv.CreatedAt, &pv.UpdatedAt,
+			&pv.JobCode, &pv.JobTitle,
+			&pv.IsSchedulable, &pv.AttendanceRequired, &pv.OvertimeAllowed,
+			&deptName, &locName, &wcName,
+		); err != nil {
 			continue
 		}
-		if workCenterCode.Valid {
-			position.WorkCenterCode = &workCenterCode.String
+		if locationID.Valid {
+			pv.LocationID = &locationID.UUID
 		}
-		if workCenterName.Valid {
-			position.WorkCenterName = &workCenterName.String
+		if titleOverride.Valid {
+			pv.TitleOverride = &titleOverride.String
 		}
-		positions = append(positions, &position)
+		if wcCode.Valid {
+			pv.WorkCenterCode = &wcCode.String
+		}
+		if deptName.Valid {
+			pv.DepartmentName = &deptName.String
+		}
+		if locName.Valid {
+			pv.LocationName = &locName.String
+		}
+		if wcName.Valid {
+			pv.WorkCenterName = &wcName.String
+		}
+		positions = append(positions, &pv)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, 0, fmt.Errorf("error iterating position rows: %w", err)
 	}
 	return positions, totalCount, nil
 }
-
 func (r *CompanyRepositoryImpl) WorkCenterExists(
 	ctx context.Context, db client.DBTX,
 	companyID uuid.UUID, workCenterCode string,
@@ -4796,8 +4882,27 @@ func (r *CompanyRepositoryImpl) WorkCenterExists(
 	return exists, nil
 }
 
-// CreateCompany manages its own tx — no DBTX parameter.
-// (unchanged from your original)
+// ============================================================
+// CreateCompany — manages its own tx.
+//
+// Flow (all inside one transaction):
+//  1. INSERT companies
+//  2. INSERT attendance.work_centers       (optional)
+//  3. INSERT roles                         (owner role)
+//  4. INSERT departments                   (Administration)
+//  5. INSERT jobs                          (owner's job catalog entry)  👈 NEW
+//  6. INSERT positions                     (owner's seat)               👈 CHANGED
+//  7. INSERT departments                   (additional)
+//  8. INSERT role_departments              (link owner role → depts)
+//  9. INSERT role_permissions              (grant module perms)
+//  10. INSERT company_employees             (owner as employee)
+//  11. COMMIT
+//
+// The position's location_id is left NULL. The service layer
+// creates the default location AFTER this function returns, then
+// calls SetWorkCenterLocation(), which backfills positions.location_id
+// via the trig_enforce_position_location trigger.
+// ============================================================
 func (r *CompanyRepositoryImpl) CreateCompany(
 	ctx context.Context,
 	company *models.Company,
@@ -4806,37 +4911,38 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 	positionDetails *models.Position,
 	workCenterDetails *models.WorkCenter,
 ) error {
-	// ... unchanged ...
 	tx, err := r.client.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
+	// ------------------------------------------------------------
+	// Defaults
+	// ------------------------------------------------------------
 	if company.MaxLocations == 0 {
 		company.MaxLocations = 10
 	}
 	if company.GracePeriodDays == 0 {
 		company.GracePeriodDays = 3
 	}
-	if company.SubscriptionAmount == 0 {
-		company.SubscriptionAmount = 0
-	}
 
-	companyQuery := `
-        INSERT INTO companies (
-            company_id, company_name, owner_user_id, subscription_tier,
-            subscription_status, max_employees, max_locations, subscription_amount,
-            data_region, is_active, created_at, updated_at, subscription_start_date,
-            subscription_end_date, financial_year_start_month,
-            grace_period_days,
-            stripe_customer_id, razorpay_subscription_id, payment_provider_txn_id,
-            trial_start_date, trial_end_date,
-            subscription_plan_id,
-            subscription_gateway_customer_id, subscription_gateway_subscription_id,
-            subscription_trial_ends
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
-    `
+	// ------------------------------------------------------------
+	// 1. companies
+	// ------------------------------------------------------------
+	const companyQuery = `
+		INSERT INTO companies (
+			company_id, company_name, owner_user_id, subscription_tier,
+			subscription_status, max_employees, max_locations, subscription_amount,
+			data_region, is_active, created_at, updated_at, subscription_start_date,
+			subscription_end_date, financial_year_start_month,
+			grace_period_days,
+			stripe_customer_id, razorpay_subscription_id, payment_provider_txn_id,
+			trial_start_date, trial_end_date,
+			subscription_plan_id,
+			subscription_gateway_customer_id, subscription_gateway_subscription_id,
+			subscription_trial_ends
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`
 	_, err = tx.ExecContext(ctx, companyQuery,
 		company.CompanyID, company.CompanyName, company.OwnerUserID,
 		company.SubscriptionTier, company.SubscriptionStatus,
@@ -4858,16 +4964,19 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 		return fmt.Errorf("failed to create company: %w", err)
 	}
 
+	// ------------------------------------------------------------
+	// 2. attendance.work_centers (optional)
+	//    location_id is NULL — SetWorkCenterLocation() links it later.
+	// ------------------------------------------------------------
 	if workCenterDetails != nil && workCenterDetails.WorkCenterCode != "" {
-		workCenterQuery := `
-            INSERT INTO attendance.work_centers (
-                work_center_code, company_id, name,
-                description, timezone, is_active,
-                created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            ON CONFLICT (company_id, work_center_code) DO NOTHING
-        `
-		_, err = tx.ExecContext(ctx, workCenterQuery,
+		const wcQuery = `
+			INSERT INTO attendance.work_centers (
+				work_center_code, company_id, name,
+				description, timezone, is_active,
+				created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			ON CONFLICT (company_id, work_center_code) DO NOTHING`
+		_, err = tx.ExecContext(ctx, wcQuery,
 			workCenterDetails.WorkCenterCode, company.CompanyID,
 			workCenterDetails.Name, workCenterDetails.Description,
 			workCenterDetails.Timezone, workCenterDetails.IsActive,
@@ -4878,13 +4987,15 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 		}
 	}
 
+	// ------------------------------------------------------------
+	// 3. roles (owner)
+	// ------------------------------------------------------------
 	ownerRoleID := uuid.New()
 	_, err = tx.ExecContext(ctx, `
-        INSERT INTO roles (
-            role_id, role_name, role_level, company_id,
-            is_system_role, description, created_at, updated_at
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-    `,
+		INSERT INTO roles (
+			role_id, role_name, role_level, company_id,
+			is_system_role, description, created_at, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
 		ownerRoleID, "Owner", 1000, company.CompanyID, true,
 		"Company owner with full permissions",
 		company.CreatedAt, company.UpdatedAt,
@@ -4893,74 +5004,128 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 		return fmt.Errorf("failed to create owner role: %w", err)
 	}
 
+	// ------------------------------------------------------------
+	// 4. Administration department
+	// ------------------------------------------------------------
 	var adminSystemDeptID uuid.UUID
 	err = tx.QueryRowContext(ctx, `
-        SELECT system_department_id FROM system_departments
-        WHERE module_code = 'administration' LIMIT 1
-    `).Scan(&adminSystemDeptID)
+		SELECT system_department_id FROM system_departments
+		WHERE module_code = 'administration' LIMIT 1`,
+	).Scan(&adminSystemDeptID)
 	if err != nil {
 		return fmt.Errorf("failed to get administration system department: %w", err)
 	}
 
 	adminDeptID := uuid.New()
-	departmentName := "Administration"
-	_, err = tx.ExecContext(ctx, `
-        INSERT INTO departments (
-            department_id, company_id, department_name,
-            system_department_id, is_active, created_at, updated_at
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7)
-    `,
-		adminDeptID, company.CompanyID, departmentName,
+	const adminDeptQuery = `
+		INSERT INTO departments (
+			department_id, company_id, department_name,
+			system_department_id, is_active, created_at, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7)`
+	_, err = tx.ExecContext(ctx, adminDeptQuery,
+		adminDeptID, company.CompanyID, "Administration",
 		adminSystemDeptID, true, company.CreatedAt, company.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create administration department: %w", err)
 	}
 
+	// ------------------------------------------------------------
+	// 5. jobs — the owner's job catalog entry  👈 NEW
+	//
+	// One row per distinct (company_id, job_code). This is what
+	// makes "the owner is a CEO" a *definition* separate from the
+	// seat they occupy.
+	//
+	// Flags default to:
+	//   is_schedulable      = TRUE
+	//   attendance_required = TRUE
+	//   overtime_allowed    = FALSE
+	//
+	// The caller can override afterwards via UpdateJob().
+	// ------------------------------------------------------------
+	var ownerJobID uuid.UUID
+	{
+		jobCode := slugifyJobCode(ownerPositionTitle)
+		const jobQuery = `
+			INSERT INTO jobs (
+				company_id, job_code, job_title,
+				is_schedulable, attendance_required, overtime_allowed
+			) VALUES ($1, $2, $3, TRUE, TRUE, FALSE)
+			ON CONFLICT (company_id, job_code) DO UPDATE
+				SET updated_at = NOW()
+			RETURNING job_id`
+		if err := tx.QueryRowContext(ctx, jobQuery,
+			company.CompanyID, jobCode, ownerPositionTitle,
+		).Scan(&ownerJobID); err != nil {
+			return fmt.Errorf("failed to create owner job: %w", err)
+		}
+	}
+
+	// ------------------------------------------------------------
+	// 6. positions — the owner's seat  👈 CHANGED
+	//
+	//   job_id         → the job we just created
+	//   location_id    → NULL (SetWorkCenterLocation backfills)
+	//   title_override → NULL (job_title is authoritative)
+	//   is_open        → positionDetails.IsOpen
+	//   work_center    → positionDetails.WorkCenterCode (optional)
+	//
+	// is_schedulable / attendance_required / overtime_allowed live
+	// on jobs now — they are NOT columns on positions.
+	// ------------------------------------------------------------
 	ownerPositionID := uuid.New()
-	positionQuery := `
-        INSERT INTO positions (
-            position_id, company_id, department_id, title,
-            is_open, is_schedulable, attendance_required,
-            overtime_allowed, work_center_code,
-            created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-    `
+	const positionQuery = `
+		INSERT INTO positions (
+			position_id, company_id, department_id,
+			job_id, location_id, title_override,
+			is_open, work_center_code,
+			created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
 	_, err = tx.ExecContext(ctx, positionQuery,
-		ownerPositionID, company.CompanyID, adminDeptID, ownerPositionTitle,
-		positionDetails.IsOpen, positionDetails.IsSchedulable,
-		positionDetails.AttendanceRequired, positionDetails.OvertimeAllowed,
+		ownerPositionID,
+		company.CompanyID,
+		adminDeptID,
+		ownerJobID,
+		nil, // location_id — set by SetWorkCenterLocation after location is created
+		nil, // title_override — NULL → effective title comes from jobs.job_title
+		positionDetails.IsOpen,
 		positionDetails.WorkCenterCode,
-		company.CreatedAt, company.UpdatedAt,
+		company.CreatedAt,
+		company.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create owner position: %w", err)
 	}
 
+	// ------------------------------------------------------------
+	// 7. Additional departments
+	// ------------------------------------------------------------
 	ownerAccessDeptIDs := []uuid.UUID{adminDeptID}
 	ownerAccessModules := []string{"administration"}
+
 	for _, deptName := range additionalDepartments {
 		deptID := uuid.New()
+
 		var systemDeptID uuid.UUID
 		err = tx.QueryRowContext(ctx, `
-            SELECT system_department_id FROM system_departments
-            WHERE module_code = $1 LIMIT 1
-        `, strings.ToLower(strings.TrimSpace(deptName))).Scan(&systemDeptID)
+			SELECT system_department_id FROM system_departments
+			WHERE module_code = $1 LIMIT 1`,
+			strings.ToLower(strings.TrimSpace(deptName)),
+		).Scan(&systemDeptID)
 		if err != nil {
 			systemDeptID = adminSystemDeptID
 		}
-		_, err = tx.ExecContext(ctx, `
-            INSERT INTO departments (
-                department_id, company_id, department_name,
-                system_department_id, is_active, created_at, updated_at
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7)
-        `,
-			deptID, company.CompanyID, deptName, systemDeptID,
-			true, company.CreatedAt, company.UpdatedAt,
+
+		_, err = tx.ExecContext(ctx, adminDeptQuery,
+			deptID, company.CompanyID, deptName,
+			systemDeptID, true, company.CreatedAt, company.UpdatedAt,
 		)
 		if err != nil {
+			// skip silently — same as before
 			continue
 		}
+
 		ownerAccessDeptIDs = append(ownerAccessDeptIDs, deptID)
 		if systemDeptID == adminSystemDeptID {
 			ownerAccessModules = append(ownerAccessModules, "administration")
@@ -4969,18 +5134,25 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 		}
 	}
 
+	// ------------------------------------------------------------
+	// 8. role_departments — link owner role to all its departments
+	// ------------------------------------------------------------
 	for _, deptID := range ownerAccessDeptIDs {
 		_, _ = tx.ExecContext(ctx,
 			`INSERT INTO role_departments (role_id, department_id) VALUES ($1,$2)`,
 			ownerRoleID, deptID,
 		)
 	}
+
+	// ------------------------------------------------------------
+	// 9. role_permissions — grant every permission matching the
+	//    owner's accessible modules.
+	// ------------------------------------------------------------
 	_, err = tx.ExecContext(ctx, `
-        INSERT INTO role_permissions (role_id, permission_id, granted_by, granted_at)
-        SELECT $1, p.permission_id, $2, $3
-        FROM permissions p
-        WHERE p.module = ANY($4)
-    `,
+		INSERT INTO role_permissions (role_id, permission_id, granted_by, granted_at)
+		SELECT $1, p.permission_id, $2, $3
+		FROM permissions p
+		WHERE p.module = ANY($4)`,
 		ownerRoleID, company.OwnerUserID, company.CreatedAt,
 		pq.Array(ownerAccessModules),
 	)
@@ -4988,27 +5160,40 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 		return fmt.Errorf("failed to grant permissions: %w", err)
 	}
 
+	// ------------------------------------------------------------
+	// 10. company_employees — the owner as an employee.
+	//
+	//    Note: this INSERT fires the AFTER INSERT trigger
+	//    trg_sync_work_center_assignment on company_employees.
+	//    That trigger reads positions.work_center_code via the
+	//    ownerPositionID we just inserted. If a work center was
+	//    set on the position and it belongs to the company, a
+	//    user_work_center_assignments row is created here in tx.
+	// ------------------------------------------------------------
 	_, err = tx.ExecContext(ctx, `
-        INSERT INTO company_employees (
-            company_id, user_id, employee_id,
-            role_id, position_id,
-            hire_date, is_active, created_at, updated_at
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-    `,
+		INSERT INTO company_employees (
+			company_id, user_id, employee_id,
+			role_id, position_id,
+			hire_date, is_active, created_at, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
 		company.CompanyID, company.OwnerUserID,
 		"OWNER-"+company.CompanyID.String()[:8],
-		ownerRoleID, ownerPositionID, company.CreatedAt, true,
+		ownerRoleID, ownerPositionID,
+		company.CreatedAt, true,
 		company.CreatedAt, company.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert owner employee: %w", err)
 	}
+
+	// ------------------------------------------------------------
+	// 11. Commit
+	// ------------------------------------------------------------
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 	return nil
 }
-
 func (r *CompanyRepositoryImpl) AddRoleDepartments(
 	ctx context.Context, db client.DBTX,
 	roleID uuid.UUID, departmentIDs []uuid.UUID,
@@ -5428,7 +5613,7 @@ func (r *CompanyRepositoryImpl) GetEmployeeWithPosition(
             ce.company_id, ce.user_id, ce.employee_id, ce.role_id, ce.position_id,
             ce.hire_date, ce.is_active, ce.reports_to, ce.created_at, ce.updated_at,
             COALESCE(r.role_name, '') AS role_name,
-            COALESCE(p.title, '') AS position_title,
+            COALESCE(p.title_override, j.job_title, '') AS position_title,
             COALESCE(p.work_center_code, '') AS work_center_code,
             COALESCE(d.department_name, '') AS department_name,
             u.username,
@@ -5436,6 +5621,7 @@ func (r *CompanyRepositoryImpl) GetEmployeeWithPosition(
         FROM company_employees ce
         LEFT JOIN roles r ON ce.role_id = r.role_id
         LEFT JOIN positions p ON ce.position_id = p.position_id
+        LEFT JOIN jobs j ON j.job_id = p.job_id
         LEFT JOIN departments d ON p.department_id = d.department_id
         LEFT JOIN users u ON ce.user_id = u.user_id
         WHERE ce.company_id = $1 AND ce.user_id = $2
@@ -5465,21 +5651,25 @@ func (r *CompanyRepositoryImpl) GetEmployeeWithPosition(
 	}
 	return &result, nil
 }
-
 func (r *CompanyRepositoryImpl) PositionExists(
 	ctx context.Context, db client.DBTX,
-	companyID, departmentID uuid.UUID, title string,
+	companyID, departmentID uuid.UUID,
+	titleOverride *string,
+	locationID *uuid.UUID,
 ) (bool, error) {
-	query := `
+	const query = `
 		SELECT EXISTS (
 			SELECT 1 FROM positions
-			WHERE company_id = $1 AND department_id = $2 AND LOWER(title) = LOWER($3)
+			WHERE company_id = $1
+			  AND department_id = $2
+			  AND COALESCE(title_override, '') = COALESCE($3, '')
+			  AND COALESCE(location_id, '00000000-0000-0000-0000-000000000000'::uuid)
+			    = COALESCE($4, '00000000-0000-0000-0000-000000000000'::uuid)
 		)`
 	var exists bool
-	err := db.QueryRowContext(ctx, query, companyID, departmentID, title).Scan(&exists)
+	err := db.QueryRowContext(ctx, query, companyID, departmentID, titleOverride, locationID).Scan(&exists)
 	return exists, err
 }
-
 func (r *CompanyRepositoryImpl) SearchDepartments(
 	ctx context.Context, db client.DBTX,
 	companyID uuid.UUID,
@@ -5728,16 +5918,243 @@ func (r *CompanyRepositoryImpl) SetWorkCenterLocation(
 	ctx context.Context, db client.DBTX,
 	companyID uuid.UUID, workCenterCode string, locationID uuid.UUID,
 ) error {
-	query := `
-        UPDATE attendance.work_centers
-        SET location_id = $1, updated_at = NOW()
-        WHERE company_id = $2 AND work_center_code = $3
-    `
-	result, err := db.ExecContext(ctx, query, locationID, companyID, workCenterCode)
+	// 1. Link the WC to the location.
+	const wcQuery = `
+		UPDATE attendance.work_centers
+		SET location_id = $1, updated_at = NOW()
+		WHERE company_id = $2 AND work_center_code = $3
+	`
+	res, err := db.ExecContext(ctx, wcQuery, locationID, companyID, workCenterCode)
 	if err != nil {
 		return fmt.Errorf("set work center location: %w", err)
 	}
-	if rows, _ := result.RowsAffected(); rows == 0 {
+	if rows, _ := res.RowsAffected(); rows == 0 {
+		return apperrors.ErrNotFound
+	}
+
+	// 2. Backfill positions that use this WC and have NULL location_id.
+	//    Runs after step 1 so the enforce_position_location trigger sees
+	//    a matching WC.location_id.
+	const posQuery = `
+		UPDATE positions
+		SET location_id = $1, updated_at = NOW()
+		WHERE company_id = $2
+		  AND work_center_code = $3
+		  AND location_id IS NULL
+	`
+	if _, err := db.ExecContext(ctx, posQuery, locationID, companyID, workCenterCode); err != nil {
+		return fmt.Errorf("backfill position location: %w", err)
+	}
+	return nil
+}
+
+func (r *CompanyRepositoryImpl) UpdateEmployeeTx(
+	ctx context.Context,
+	db client.DBTX,
+	emp *models.CompanyEmployee,
+) error {
+	emp.UpdatedAt = time.Now().UTC()
+
+	const query = `
+		UPDATE company_employees SET
+			employee_id = $1,
+			role_id = $2,
+			position_id = $3,
+			reports_to = $4,
+			is_active = $5,
+			hire_date = $6,
+			updated_at = $7
+		WHERE company_id = $8 AND user_id = $9`
+
+	res, err := db.ExecContext(ctx, query,
+		emp.EmployeeID,
+		emp.RoleID,
+		emp.PositionID,
+		emp.ReportsTo,
+		emp.IsActive,
+		emp.HireDate,
+		emp.UpdatedAt,
+		emp.CompanyID,
+		emp.UserID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update company employee (tx): %w", err)
+	}
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected == 0 {
+		return apperrors.ErrNotFound
+	}
+	return nil
+}
+
+// ============================================================
+// Missing JobRepository methods
+// ============================================================
+
+func (r *CompanyRepositoryImpl) FindOrCreateJob(
+	ctx context.Context, db client.DBTX,
+	companyID uuid.UUID,
+	jobCode, jobTitle string,
+	isSchedulable, attendanceRequired, overtimeAllowed bool,
+) (*models.Job, error) {
+	if jobCode == "" {
+		jobCode = slugifyJobCode(jobTitle)
+	}
+
+	const query = `
+		INSERT INTO jobs (
+			company_id, job_code, job_title,
+			is_schedulable, attendance_required, overtime_allowed,
+			is_active, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, TRUE, NOW(), NOW())
+		ON CONFLICT (company_id, job_code) DO UPDATE
+			SET updated_at = NOW()
+		RETURNING job_id, company_id, job_code, job_title, description,
+		          is_schedulable, attendance_required, overtime_allowed,
+		          is_active, created_at, updated_at`
+
+	var j models.Job
+	var desc sql.NullString
+
+	err := db.QueryRowContext(ctx, query,
+		companyID, jobCode, jobTitle,
+		isSchedulable, attendanceRequired, overtimeAllowed,
+	).Scan(
+		&j.JobID,
+		&j.CompanyID,
+		&j.JobCode,
+		&j.JobTitle,
+		&desc,
+		&j.IsSchedulable,
+		&j.AttendanceRequired,
+		&j.OvertimeAllowed,
+		&j.IsActive,
+		&j.CreatedAt,
+		&j.UpdatedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("find or create job: %w", err)
+	}
+	if desc.Valid {
+		j.Description = &desc.String
+	}
+	return &j, nil
+}
+
+func (r *CompanyRepositoryImpl) GetJobByID(ctx context.Context, jobID uuid.UUID) (*models.Job, error) {
+	const query = `
+		SELECT job_id, company_id, job_code, job_title, description,
+		       is_schedulable, attendance_required, overtime_allowed,
+		       is_active, created_at, updated_at
+		FROM jobs
+		WHERE job_id = $1`
+
+	var j models.Job
+	var desc sql.NullString
+
+	err := r.client.QueryRow(ctx, query, jobID).Scan(
+		&j.JobID,
+		&j.CompanyID,
+		&j.JobCode,
+		&j.JobTitle,
+		&desc,
+		&j.IsSchedulable,
+		&j.AttendanceRequired,
+		&j.OvertimeAllowed,
+		&j.IsActive,
+		&j.CreatedAt,
+		&j.UpdatedAt,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, apperrors.ErrNotFound
+		}
+		return nil, fmt.Errorf("get job by id: %w", err)
+	}
+	if desc.Valid {
+		j.Description = &desc.String
+	}
+	return &j, nil
+}
+
+func (r *CompanyRepositoryImpl) ListJobsByCompany(ctx context.Context, companyID uuid.UUID) ([]*models.Job, error) {
+	const query = `
+		SELECT job_id, company_id, job_code, job_title, description,
+		       is_schedulable, attendance_required, overtime_allowed,
+		       is_active, created_at, updated_at
+		FROM jobs
+		WHERE company_id = $1
+		ORDER BY is_active DESC, job_title ASC`
+
+	rows, err := r.client.Query(ctx, query, companyID)
+	if err != nil {
+		return nil, fmt.Errorf("list jobs by company: %w", err)
+	}
+	defer rows.Close()
+
+	jobs := make([]*models.Job, 0)
+	for rows.Next() {
+		var j models.Job
+		var desc sql.NullString
+		if err := rows.Scan(
+			&j.JobID,
+			&j.CompanyID,
+			&j.JobCode,
+			&j.JobTitle,
+			&desc,
+			&j.IsSchedulable,
+			&j.AttendanceRequired,
+			&j.OvertimeAllowed,
+			&j.IsActive,
+			&j.CreatedAt,
+			&j.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan job: %w", err)
+		}
+		if desc.Valid {
+			j.Description = &desc.String
+		}
+		jobs = append(jobs, &j)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate job rows: %w", err)
+	}
+	return jobs, nil
+}
+
+func (r *CompanyRepositoryImpl) UpdateJob(ctx context.Context, j *models.Job) error {
+	j.UpdatedAt = time.Now().UTC()
+
+	const query = `
+		UPDATE jobs SET
+			job_code           = $1,
+			job_title          = $2,
+			description        = $3,
+			is_schedulable     = $4,
+			attendance_required= $5,
+			overtime_allowed   = $6,
+			is_active          = $7,
+			updated_at         = $8
+		WHERE job_id = $9`
+
+	res, err := r.client.Exec(ctx, query,
+		j.JobCode,
+		j.JobTitle,
+		j.Description,
+		j.IsSchedulable,
+		j.AttendanceRequired,
+		j.OvertimeAllowed,
+		j.IsActive,
+		j.UpdatedAt,
+		j.JobID,
+	)
+	if err != nil {
+		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23505" {
+			return apperrors.ErrDuplicate
+		}
+		return fmt.Errorf("update job: %w", err)
+	}
+	if rows, _ := res.RowsAffected(); rows == 0 {
 		return apperrors.ErrNotFound
 	}
 	return nil

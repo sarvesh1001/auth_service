@@ -33,21 +33,20 @@ func NewLeaveAdminHandler(
 
 // ---------- request/response DTOs ----------
 
+// CreateLeaveTypeRequest — accrual schedule is no longer a property of the
+// leave type. It now lives on the policy rule (leave.leave_policy_rule),
+// which is where the accrual engine reads it from.
 type CreateLeaveTypeRequest struct {
-	Code              string `json:"code"`
-	Name              string `json:"name"`
-	IsPaid            bool   `json:"is_paid"`
-	RequiresApproval  bool   `json:"requires_approval"`
-	AccrualMethod     string `json:"accrual_method"`
-	CarryForwardLimit *int   `json:"carry_forward_limit,omitempty"`
+	Code             string `json:"code"`
+	Name             string `json:"name"`
+	IsPaid           bool   `json:"is_paid"`
+	RequiresApproval bool   `json:"requires_approval"`
 }
 
 type UpdateLeaveTypeRequest struct {
-	Name              *string `json:"name,omitempty"`
-	IsPaid            *bool   `json:"is_paid,omitempty"`
-	RequiresApproval  *bool   `json:"requires_approval,omitempty"`
-	AccrualMethod     *string `json:"accrual_method,omitempty"`
-	CarryForwardLimit *int    `json:"carry_forward_limit,omitempty"`
+	Name             *string `json:"name,omitempty"`
+	IsPaid           *bool   `json:"is_paid,omitempty"`
+	RequiresApproval *bool   `json:"requires_approval,omitempty"`
 }
 
 type CreateEntitlementRequest struct {
@@ -72,6 +71,9 @@ type CreateLeavePolicyRequest struct {
 	EffectiveTo             *time.Time `json:"effective_to,omitempty"`
 }
 
+// AddPolicyRuleRequest — this is now the ONLY place accrual_method and
+// carry_forward_limit are supplied. SAP-aligned: the accrual schedule is
+// a property of the policy rule (Quota Type / Generation Rule).
 type AddPolicyRuleRequest struct {
 	LeaveTypeID       uuid.UUID `json:"leave_type_id"`
 	TotalDays         int       `json:"total_days"`
@@ -145,19 +147,17 @@ func (h *LeaveAdminHandler) CreateLeaveType(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if req.Code == "" || req.Name == "" || req.AccrualMethod == "" {
-		h.respondWithError(w, http.StatusBadRequest, "code, name, and accrual method are required")
+	if req.Code == "" || req.Name == "" {
+		h.respondWithError(w, http.StatusBadRequest, "code and name are required")
 		return
 	}
 
 	createReq := &models.LeaveTypeCreate{
-		CompanyID:         companyID,
-		Code:              req.Code,
-		Name:              req.Name,
-		IsPaid:            req.IsPaid,
-		RequiresApproval:  req.RequiresApproval,
-		AccrualMethod:     req.AccrualMethod,
-		CarryForwardLimit: req.CarryForwardLimit,
+		CompanyID:        companyID,
+		Code:             req.Code,
+		Name:             req.Name,
+		IsPaid:           req.IsPaid,
+		RequiresApproval: req.RequiresApproval,
 	}
 
 	leaveType, err := h.policyService.CreateLeaveType(ctx, companyID, createReq, actorType, actorID, metadata)
@@ -209,11 +209,9 @@ func (h *LeaveAdminHandler) UpdateLeaveType(w http.ResponseWriter, r *http.Reque
 	}
 
 	update := &models.LeaveTypeUpdate{
-		Name:              req.Name,
-		IsPaid:            req.IsPaid,
-		RequiresApproval:  req.RequiresApproval,
-		AccrualMethod:     req.AccrualMethod,
-		CarryForwardLimit: req.CarryForwardLimit,
+		Name:             req.Name,
+		IsPaid:           req.IsPaid,
+		RequiresApproval: req.RequiresApproval,
 	}
 
 	if err := h.policyService.UpdateLeaveType(ctx, leaveTypeID, update, actorType, actorID, metadata); err != nil {
@@ -684,6 +682,9 @@ func (h *LeaveAdminHandler) AddPolicyRule(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// The rule is now the source of truth for accrual_method and
+	// carry_forward_limit. This is the SAP-aligned location for the
+	// accrual schedule (Quota Type / Generation Rule).
 	accrualMethod := req.AccrualMethod
 	rule := &models.LeavePolicyRule{
 		PolicyID:          policyID,

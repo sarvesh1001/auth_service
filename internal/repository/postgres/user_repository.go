@@ -2031,3 +2031,26 @@ func (r *UserRepositoryImpl) IsUserEmployeeOfCompany(ctx context.Context, db cli
 	}
 	return exists, nil
 }
+
+// GetUserDisplayName returns only username + full_name for a given user_id.
+// Returns apperrors.ErrNotFound if the user does not exist.
+func (r *UserRepositoryImpl) GetUserDisplayName(
+	ctx context.Context,
+	db client.DBTX,
+	userID uuid.UUID,
+) (*models.UserDisplayName, error) {
+	const query = `
+        SELECT username, COALESCE(full_name, '') AS full_name
+        FROM users
+        WHERE user_id = $1`
+
+	var d models.UserDisplayName
+	err := db.QueryRowContext(ctx, query, userID).Scan(&d.Username, &d.FullName)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, apperrors.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user display name: %w", err)
+	}
+	return &d, nil
+}

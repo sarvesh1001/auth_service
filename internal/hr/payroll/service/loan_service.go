@@ -57,7 +57,7 @@ type loanService struct {
 	componentRepo    repository.ComponentRepository
 	settingsRepo     repository.CompanySettingsRepository
 	compensationSvc  CompensationService
-	employeeRepo     hrRepo.EmployeeRepository // 👈 new
+	employeeRepo     hrRepo.EmployeeRepository
 	idempotencyStore idempotency.Store
 	audit            *audit.AuditService
 	logger           *zap.Logger
@@ -68,7 +68,7 @@ func NewLoanService(
 	componentRepo repository.ComponentRepository,
 	settingsRepo repository.CompanySettingsRepository,
 	compensationSvc CompensationService,
-	employeeRepo hrRepo.EmployeeRepository, // 👈 new
+	employeeRepo hrRepo.EmployeeRepository,
 	idempotencyStore idempotency.Store,
 	audit *audit.AuditService,
 	logger *zap.Logger,
@@ -145,7 +145,6 @@ func (s *loanService) CalculateEMI(
 	interestRate *float64,
 	interestType *string,
 ) (*EMICalculationResult, error) {
-	// 👇 Location scope check
 	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
 		return nil, err
 	}
@@ -240,7 +239,6 @@ func (s *loanService) CreateLoan(
 	loan *models.EmployeeLoan,
 	maxCTCPercent float64,
 ) (*models.EmployeeLoan, error) {
-	// 👇 Location scope check
 	if err := s.ensureEmployeeInScope(ctx, loan.CompanyID, loan.UserID); err != nil {
 		return nil, err
 	}
@@ -276,16 +274,17 @@ func (s *loanService) CreateLoan(
 		return nil, errors.New("first_emi_date cannot be before disbursed_at")
 	}
 
+	// Resolve component: explicit code wins, else company default.
 	code := loan.ComponentCode
 	if code == "" {
 		settings, err := s.settingsRepo.GetPayrollSettings(ctx, loan.CompanyID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get company payroll settings: %w", err)
 		}
-		if settings.DefaultLoanComponent == nil || *settings.DefaultLoanComponent == "" {
+		if settings.DefaultLoanComponentCode == nil || *settings.DefaultLoanComponentCode == "" {
 			return nil, errors.New("no loan component provided and no company default set")
 		}
-		code = *settings.DefaultLoanComponent
+		code = *settings.DefaultLoanComponentCode
 	}
 	comp, err := s.componentRepo.GetComponent(ctx, loan.CompanyID, code)
 	if err != nil {
@@ -297,7 +296,9 @@ func (s *loanService) CreateLoan(
 	if comp.ComponentType != models.ComponentTypeDeduction {
 		return nil, fmt.Errorf("component %s is of type %s, but loan EMIs must be a deduction", code, comp.ComponentType)
 	}
-	loan.ComponentCode = code
+	componentID := comp.ComponentID
+	loan.ComponentID = &componentID
+	loan.ComponentCode = comp.ComponentCode
 
 	if maxCTCPercent <= 0 {
 		maxCTCPercent = 20
@@ -353,7 +354,7 @@ func (s *loanService) CreateLoan(
 			"principal":       loan.PrincipalAmount,
 			"emi":             loan.EmiAmount,
 			"total_emis":      loan.TotalEmis,
-			"component_code":  loan.ComponentCode,
+			"component_code":  comp.ComponentCode,
 			"within_limit":    calc.WithinLimit,
 			"max_ctc_percent": calc.MaxCTCPercent,
 			"interest_rate":   calc.InterestRate,
@@ -402,13 +403,11 @@ func (s *loanService) MarkEMIAsPaid(
 		return errors.New("EMI not found")
 	}
 
-	// Load the parent loan to find the employee
 	loan, err := s.repo.GetLoanByID(ctx, emi.LoanID)
 	if err != nil || loan == nil {
 		return errors.New("loan not found for EMI")
 	}
 
-	// 👇 Location scope check
 	if err := s.ensureEmployeeInScope(ctx, loan.CompanyID, loan.UserID); err != nil {
 		return err
 	}
@@ -476,7 +475,6 @@ func (s *loanService) CloseLoan(ctx context.Context, loanID uuid.UUID, closureDa
 		return errors.New("loan not found")
 	}
 
-	// 👇 Location scope check
 	if err := s.ensureEmployeeInScope(ctx, loan.CompanyID, loan.UserID); err != nil {
 		return err
 	}
@@ -548,7 +546,6 @@ func (s *loanService) RecordManualPayment(
 		return errors.New("loan not found")
 	}
 
-	// 👇 Location scope check
 	if err := s.ensureEmployeeInScope(ctx, loan.CompanyID, loan.UserID); err != nil {
 		return err
 	}
@@ -618,7 +615,6 @@ func (s *loanService) GetPendingEMIsForLoan(ctx context.Context, loanID uuid.UUI
 	return s.repo.GetPendingEMIsForLoan(ctx, loanID)
 }
 
-// GetPendingEMIsForPayrollRun — system call, no location filter.
 func (s *loanService) GetPendingEMIsForPayrollRun(ctx context.Context, payrollRunID uuid.UUID) ([]models.EmiTransaction, error) {
 	return s.repo.GetEMIsForPayrollRun(ctx, payrollRunID, nil)
 }

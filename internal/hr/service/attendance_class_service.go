@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"auth-service/internal/client"
 	"auth-service/internal/hr/repository"
 	"auth-service/internal/infrastructure/audit"
 	"auth-service/internal/infrastructure/idempotency"
@@ -40,6 +41,7 @@ type ClassAttendanceService interface {
 }
 
 type classAttendanceService struct {
+	pgClient         *client.PostgresClient // 👈 NEW
 	orgUnitRepo      repository.OrgUnitRepository
 	bulkService      AttendanceBulkService
 	idempotencyStore idempotency.Store
@@ -49,6 +51,7 @@ type classAttendanceService struct {
 
 // NewClassAttendanceService creates a new class attendance service.
 func NewClassAttendanceService(
+	pgClient *client.PostgresClient, // 👈 NEW
 	orgUnitRepo repository.OrgUnitRepository,
 	bulkService AttendanceBulkService,
 	idempotencyStore idempotency.Store,
@@ -56,6 +59,7 @@ func NewClassAttendanceService(
 	logger *zap.Logger,
 ) ClassAttendanceService {
 	return &classAttendanceService{
+		pgClient:         pgClient, // 👈 NEW
 		orgUnitRepo:      orgUnitRepo,
 		bulkService:      bulkService,
 		idempotencyStore: idempotencyStore,
@@ -79,7 +83,6 @@ func (s *classAttendanceService) MarkClassAttendance(
 
 	var cachedResult ClassAttendanceResult
 	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cachedResult); err == nil {
-		// Return cached result (idempotent)
 		return &cachedResult, nil
 	}
 
@@ -89,7 +92,7 @@ func (s *classAttendanceService) MarkClassAttendance(
 	}
 
 	// 3️⃣ Expand class → users
-	userIDs, err := s.orgUnitRepo.GetActiveUsersByOrgUnit(ctx, req.OrgUnitID)
+	userIDs, err := s.orgUnitRepo.GetActiveUsersByOrgUnit(ctx, s.pgClient.Pool(), req.OrgUnitID) // 👈 FIX
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +149,7 @@ func (s *classAttendanceService) MarkClassAttendance(
 			"attendance",
 			"class_mark",
 			"class_attendance",
-			nil, // entity_id (class not a single entity)
+			nil,
 			req.ActorType,
 			&actorID,
 			beforeJSON,

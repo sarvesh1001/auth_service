@@ -17,7 +17,6 @@ type attendanceRuleRepository struct {
 	client *client.PostgresClient
 }
 
-// NewAttendanceRuleRepository creates a new AttendanceRuleRepository instance.
 func NewAttendanceRuleRepository(
 	postgresClient *client.PostgresClient,
 ) AttendanceRuleRepository {
@@ -50,7 +49,7 @@ func (r *attendanceRuleRepository) Create(ctx context.Context, rule *models.Atte
 			value,
 			based_on,
 			threshold_minutes,
-			component_code,
+			component_id,
 			is_active,
 			created_at,
 			created_by,
@@ -67,7 +66,7 @@ func (r *attendanceRuleRepository) Create(ctx context.Context, rule *models.Atte
 		rule.Value,
 		rule.BasedOn,
 		rule.ThresholdMinutes,
-		rule.ComponentCode,
+		rule.ComponentID,
 		rule.IsActive,
 		rule.CreatedAt,
 		rule.CreatedBy,
@@ -92,7 +91,7 @@ func (r *attendanceRuleRepository) Update(ctx context.Context, rule *models.Atte
 			value = $3,
 			based_on = $4,
 			threshold_minutes = $5,
-			component_code = $6,
+			component_id = $6,
 			is_active = $7,
 			updated_at = $8,
 			updated_by = $9
@@ -104,7 +103,7 @@ func (r *attendanceRuleRepository) Update(ctx context.Context, rule *models.Atte
 		rule.Value,
 		rule.BasedOn,
 		rule.ThresholdMinutes,
-		rule.ComponentCode,
+		rule.ComponentID,
 		rule.IsActive,
 		rule.UpdatedAt,
 		rule.UpdatedBy,
@@ -145,21 +144,23 @@ func (r *attendanceRuleRepository) SoftDeactivate(ctx context.Context, companyID
 func (r *attendanceRuleRepository) GetByID(ctx context.Context, companyID, ruleID uuid.UUID) (*models.AttendanceRule, error) {
 	query := `
 		SELECT
-			rule_id,
-			company_id,
-			rule_type,
-			calculation_type,
-			value,
-			based_on,
-			threshold_minutes,
-			component_code,
-			is_active,
-			created_at,
-			created_by,
-			updated_at,
-			updated_by
-		FROM payroll.attendance_rule
-		WHERE rule_id = $1 AND company_id = $2
+			ar.rule_id,
+			ar.company_id,
+			ar.rule_type,
+			ar.calculation_type,
+			ar.value,
+			ar.based_on,
+			ar.threshold_minutes,
+			ar.component_id,
+			pc.component_code,
+			ar.is_active,
+			ar.created_at,
+			ar.created_by,
+			ar.updated_at,
+			ar.updated_by
+		FROM payroll.attendance_rule ar
+		JOIN payroll.payroll_component pc ON pc.component_id = ar.component_id
+		WHERE ar.rule_id = $1 AND ar.company_id = $2
 	`
 	row := r.client.QueryRow(ctx, query, ruleID, companyID)
 	var rule models.AttendanceRule
@@ -171,6 +172,7 @@ func (r *attendanceRuleRepository) GetByID(ctx context.Context, companyID, ruleI
 		&rule.Value,
 		&rule.BasedOn,
 		&rule.ThresholdMinutes,
+		&rule.ComponentID,
 		&rule.ComponentCode,
 		&rule.IsActive,
 		&rule.CreatedAt,
@@ -198,23 +200,25 @@ func (r *attendanceRuleRepository) GetActiveByCompany(
 ) ([]models.AttendanceRule, error) {
 	query := `
 		SELECT
-			rule_id,
-			company_id,
-			rule_type,
-			calculation_type,
-			value,
-			based_on,
-			threshold_minutes,
-			component_code,
-			is_active,
-			created_at,
-			created_by,
-			updated_at,
-			updated_by
-		FROM payroll.attendance_rule
-		WHERE company_id = $1
-			AND is_active = true
-			AND (created_at <= $2 OR updated_at <= $2)
+			ar.rule_id,
+			ar.company_id,
+			ar.rule_type,
+			ar.calculation_type,
+			ar.value,
+			ar.based_on,
+			ar.threshold_minutes,
+			ar.component_id,
+			pc.component_code,
+			ar.is_active,
+			ar.created_at,
+			ar.created_by,
+			ar.updated_at,
+			ar.updated_by
+		FROM payroll.attendance_rule ar
+		JOIN payroll.payroll_component pc ON pc.component_id = ar.component_id
+		WHERE ar.company_id = $1
+			AND ar.is_active = true
+			AND (ar.created_at <= $2 OR ar.updated_at <= $2)
 	`
 	rows, err := r.client.Query(ctx, query, companyID, asOf)
 	if err != nil {
@@ -233,6 +237,7 @@ func (r *attendanceRuleRepository) GetActiveByCompany(
 			&rule.Value,
 			&rule.BasedOn,
 			&rule.ThresholdMinutes,
+			&rule.ComponentID,
 			&rule.ComponentCode,
 			&rule.IsActive,
 			&rule.CreatedAt,
@@ -254,33 +259,33 @@ func (r *attendanceRuleRepository) GetByFilter(
 	ctx context.Context,
 	filter models.AttendanceRuleFilter,
 ) ([]models.AttendanceRule, int, error) {
-	whereClause := "WHERE company_id = $1"
+	whereClause := "WHERE ar.company_id = $1"
 	args := []interface{}{filter.CompanyID}
 	paramIdx := 2
 
 	if filter.RuleType != nil {
-		whereClause += fmt.Sprintf(" AND rule_type = $%d", paramIdx)
+		whereClause += fmt.Sprintf(" AND ar.rule_type = $%d", paramIdx)
 		args = append(args, *filter.RuleType)
 		paramIdx++
 	}
 	if filter.IsActive != nil {
-		whereClause += fmt.Sprintf(" AND is_active = $%d", paramIdx)
+		whereClause += fmt.Sprintf(" AND ar.is_active = $%d", paramIdx)
 		args = append(args, *filter.IsActive)
 		paramIdx++
 	}
 	if filter.BasedOn != nil {
-		whereClause += fmt.Sprintf(" AND based_on = $%d", paramIdx)
+		whereClause += fmt.Sprintf(" AND ar.based_on = $%d", paramIdx)
 		args = append(args, *filter.BasedOn)
 		paramIdx++
 	}
 	if filter.MinThreshold != nil {
-		whereClause += fmt.Sprintf(" AND threshold_minutes >= $%d", paramIdx)
+		whereClause += fmt.Sprintf(" AND ar.threshold_minutes >= $%d", paramIdx)
 		args = append(args, *filter.MinThreshold)
 		paramIdx++
 	}
 
 	// Count total
-	countQuery := `SELECT COUNT(*) FROM payroll.attendance_rule ` + whereClause
+	countQuery := `SELECT COUNT(*) FROM payroll.attendance_rule ar ` + whereClause
 	var total int
 	err := r.client.QueryRow(ctx, countQuery, args...).Scan(&total)
 	if err != nil {
@@ -293,21 +298,23 @@ func (r *attendanceRuleRepository) GetByFilter(
 	// Fetch paginated data
 	query := `
 		SELECT
-			rule_id,
-			company_id,
-			rule_type,
-			calculation_type,
-			value,
-			based_on,
-			threshold_minutes,
-			component_code,
-			is_active,
-			created_at,
-			created_by,
-			updated_at,
-			updated_by
-		FROM payroll.attendance_rule
-	` + whereClause + ` ORDER BY created_at DESC`
+			ar.rule_id,
+			ar.company_id,
+			ar.rule_type,
+			ar.calculation_type,
+			ar.value,
+			ar.based_on,
+			ar.threshold_minutes,
+			ar.component_id,
+			pc.component_code,
+			ar.is_active,
+			ar.created_at,
+			ar.created_by,
+			ar.updated_at,
+			ar.updated_by
+		FROM payroll.attendance_rule ar
+		JOIN payroll.payroll_component pc ON pc.component_id = ar.component_id
+	` + whereClause + ` ORDER BY ar.created_at DESC`
 
 	if filter.Page > 0 && filter.PageSize > 0 {
 		offset := (filter.Page - 1) * filter.PageSize
@@ -335,6 +342,7 @@ func (r *attendanceRuleRepository) GetByFilter(
 			&rule.Value,
 			&rule.BasedOn,
 			&rule.ThresholdMinutes,
+			&rule.ComponentID,
 			&rule.ComponentCode,
 			&rule.IsActive,
 			&rule.CreatedAt,
@@ -359,22 +367,24 @@ func (r *attendanceRuleRepository) GetByRuleType(
 ) ([]models.AttendanceRule, error) {
 	query := `
 		SELECT
-			rule_id,
-			company_id,
-			rule_type,
-			calculation_type,
-			value,
-			based_on,
-			threshold_minutes,
-			component_code,
-			is_active,
-			created_at,
-			created_by,
-			updated_at,
-			updated_by
-		FROM payroll.attendance_rule
-		WHERE company_id = $1 AND rule_type = $2
-		ORDER BY created_at DESC
+			ar.rule_id,
+			ar.company_id,
+			ar.rule_type,
+			ar.calculation_type,
+			ar.value,
+			ar.based_on,
+			ar.threshold_minutes,
+			ar.component_id,
+			pc.component_code,
+			ar.is_active,
+			ar.created_at,
+			ar.created_by,
+			ar.updated_at,
+			ar.updated_by
+		FROM payroll.attendance_rule ar
+		JOIN payroll.payroll_component pc ON pc.component_id = ar.component_id
+		WHERE ar.company_id = $1 AND ar.rule_type = $2
+		ORDER BY ar.created_at DESC
 	`
 	rows, err := r.client.Query(ctx, query, companyID, ruleType)
 	if err != nil {
@@ -393,6 +403,7 @@ func (r *attendanceRuleRepository) GetByRuleType(
 			&rule.Value,
 			&rule.BasedOn,
 			&rule.ThresholdMinutes,
+			&rule.ComponentID,
 			&rule.ComponentCode,
 			&rule.IsActive,
 			&rule.CreatedAt,

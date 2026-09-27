@@ -15,71 +15,35 @@ import (
 	"auth-service/internal/hr/payroll/models"
 )
 
-// LoanRepository defines methods for managing employee loans, EMIs, and loan payments.
 type LoanRepository interface {
-	// EMI methods
 	GetEMIByID(ctx context.Context, emiID uuid.UUID) (*models.EmiTransaction, error)
 	UpdateEMI(ctx context.Context, emi *models.EmiTransaction) error
 	CreateEMI(ctx context.Context, emi *models.EmiTransaction) error
 	GetPendingEMIsForLoan(ctx context.Context, loanID uuid.UUID) ([]models.EmiTransaction, error)
-
-	// GetEMIsForPayrollRun — location filter applies when locationID != nil.
-	GetEMIsForPayrollRun(
-		ctx context.Context,
-		payrollRunID uuid.UUID,
-		locationID *uuid.UUID,
-	) ([]models.EmiTransaction, error)
-
+	GetEMIsForPayrollRun(ctx context.Context, payrollRunID uuid.UUID, locationID *uuid.UUID) ([]models.EmiTransaction, error)
 	MarkEMIAsPaid(ctx context.Context, emiID uuid.UUID, paidDate time.Time, paidAmount, penalty float64, payrollRunID *uuid.UUID) error
 	BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
 
-	// Legacy method – returns only EMI data (no component code)
 	GetPendingEMIsForEmployeeInPeriod(ctx context.Context, companyID, userID uuid.UUID, startDate, endDate time.Time) ([]models.EmiTransaction, error)
-	// New method – returns EMI data together with the loan’s component code for efficient payroll processing
 	GetPendingEMIsForEmployeeInPeriodWithDetails(ctx context.Context, companyID, userID uuid.UUID, startDate, endDate time.Time) ([]LoanEmiDetail, error)
 
-	// Loan methods
 	CreateLoan(ctx context.Context, loan *models.EmployeeLoan) error
 	UpdateLoan(ctx context.Context, loan *models.EmployeeLoan) error
 	GetLoanByID(ctx context.Context, loanID uuid.UUID) (*models.EmployeeLoan, error)
 	ListLoansByUser(ctx context.Context, companyID, userID uuid.UUID, includeClosed bool) ([]models.EmployeeLoan, error)
+	ListActiveLoans(ctx context.Context, companyID uuid.UUID, asOf time.Time, locationID *uuid.UUID) ([]models.EmployeeLoan, error)
 
-	// ListActiveLoans — location filter applies when locationID != nil.
-	ListActiveLoans(
-		ctx context.Context,
-		companyID uuid.UUID,
-		asOf time.Time,
-		locationID *uuid.UUID,
-	) ([]models.EmployeeLoan, error)
-
-	// Loan Payment ledger methods
 	CreateLoanPayment(ctx context.Context, payment *models.LoanPayment) error
 	ListLoanPayments(ctx context.Context, loanID uuid.UUID) ([]models.LoanPayment, error)
 	ListLoanPaymentsByPayrollRun(ctx context.Context, payrollRunID uuid.UUID) ([]models.LoanPayment, error)
-
-	// Apply a payment to the loan (reduce outstanding balance, increment emis_paid)
 	ApplyLoanPayment(ctx context.Context, loanID uuid.UUID, amount float64) error
-
-	// Atomic processing of an EMI payment – updates EMI, creates ledger, and updates loan in one transaction
-	ProcessEMIPaymentTx(
-		ctx context.Context,
-		tx *sql.Tx,
-		emiID uuid.UUID,
-		loanID uuid.UUID,
-		paidDate time.Time,
-		paidAmount float64,
-		penalty float64,
-		payrollRunID *uuid.UUID,
-		source string,
-	) error
+	ProcessEMIPaymentTx(ctx context.Context, tx *sql.Tx, emiID uuid.UUID, loanID uuid.UUID, paidDate time.Time, paidAmount float64, penalty float64, payrollRunID *uuid.UUID, source string) error
 }
 
-// loanRepository is the Postgres implementation of LoanRepository.
 type loanRepository struct {
 	client *client.PostgresClient
 }
 
-// NewLoanRepository creates a new loan repository.
 func NewLoanRepository(postgresClient *client.PostgresClient) LoanRepository {
 	return &loanRepository{
 		client: postgresClient,
@@ -102,7 +66,7 @@ func (r *loanRepository) CreateLoan(ctx context.Context, loan *models.EmployeeLo
 			first_emi_date,
 			closure_date,
 			status,
-			component_code,
+			component_id,
 			created_at,
 			created_by
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
@@ -140,7 +104,7 @@ func (r *loanRepository) CreateLoan(ctx context.Context, loan *models.EmployeeLo
 		loan.FirstEmiDate,
 		nullTime(loan.ClosureDate),
 		loan.Status,
-		loan.ComponentCode,
+		nullUUID(loan.ComponentID),
 		loan.CreatedAt,
 		nullUUID(loan.CreatedBy),
 	)
@@ -166,7 +130,7 @@ func (r *loanRepository) UpdateLoan(ctx context.Context, loan *models.EmployeeLo
 			first_emi_date = $10,
 			closure_date = $11,
 			status = $12,
-			component_code = $13
+			component_id = $13
 		WHERE loan_id = $14
 	`
 
@@ -183,7 +147,7 @@ func (r *loanRepository) UpdateLoan(ctx context.Context, loan *models.EmployeeLo
 		loan.FirstEmiDate,
 		nullTime(loan.ClosureDate),
 		loan.Status,
-		loan.ComponentCode,
+		nullUUID(loan.ComponentID),
 		loan.LoanID,
 	)
 	if err != nil {
@@ -200,20 +164,22 @@ func (r *loanRepository) UpdateLoan(ctx context.Context, loan *models.EmployeeLo
 func (r *loanRepository) GetLoanByID(ctx context.Context, loanID uuid.UUID) (*models.EmployeeLoan, error) {
 	query := `
 		SELECT
-			loan_id, company_id, user_id, loan_type,
-			principal_amount, emi_amount, interest_rate,
-			interest_type,
-			total_emis, emis_paid,
-			outstanding_balance,
-			disbursed_at,
-			first_emi_date,
-			closure_date,
-			status,
-			component_code,
-			created_at,
-			created_by
-		FROM payroll.employee_loan
-		WHERE loan_id = $1
+			l.loan_id, l.company_id, l.user_id, l.loan_type,
+			l.principal_amount, l.emi_amount, l.interest_rate,
+			l.interest_type,
+			l.total_emis, l.emis_paid,
+			l.outstanding_balance,
+			l.disbursed_at,
+			l.first_emi_date,
+			l.closure_date,
+			l.status,
+			l.component_id,
+			pc.component_code,
+			l.created_at,
+			l.created_by
+		FROM payroll.employee_loan l
+		LEFT JOIN payroll.payroll_component pc ON pc.component_id = l.component_id
+		WHERE l.loan_id = $1
 	`
 
 	row := r.client.QueryRow(ctx, query, loanID)
@@ -230,26 +196,28 @@ func (r *loanRepository) GetLoanByID(ctx context.Context, loanID uuid.UUID) (*mo
 func (r *loanRepository) ListLoansByUser(ctx context.Context, companyID, userID uuid.UUID, includeClosed bool) ([]models.EmployeeLoan, error) {
 	query := `
 		SELECT
-			loan_id, company_id, user_id, loan_type,
-			principal_amount, emi_amount, interest_rate,
-			interest_type,
-			total_emis, emis_paid,
-			outstanding_balance,
-			disbursed_at,
-			first_emi_date,
-			closure_date,
-			status,
-			component_code,
-			created_at,
-			created_by
-		FROM payroll.employee_loan
-		WHERE company_id = $1 AND user_id = $2
+			l.loan_id, l.company_id, l.user_id, l.loan_type,
+			l.principal_amount, l.emi_amount, l.interest_rate,
+			l.interest_type,
+			l.total_emis, l.emis_paid,
+			l.outstanding_balance,
+			l.disbursed_at,
+			l.first_emi_date,
+			l.closure_date,
+			l.status,
+			l.component_id,
+			pc.component_code,
+			l.created_at,
+			l.created_by
+		FROM payroll.employee_loan l
+		LEFT JOIN payroll.payroll_component pc ON pc.component_id = l.component_id
+		WHERE l.company_id = $1 AND l.user_id = $2
 	`
 	args := []interface{}{companyID, userID}
 	if !includeClosed {
-		query += " AND status = 'active'"
+		query += " AND l.status = 'active'"
 	}
-	query += " ORDER BY disbursed_at DESC"
+	query += " ORDER BY l.disbursed_at DESC"
 
 	rows, err := r.client.Query(ctx, query, args...)
 	if err != nil {
@@ -259,10 +227,6 @@ func (r *loanRepository) ListLoansByUser(ctx context.Context, companyID, userID 
 	return r.scanLoans(rows)
 }
 
-// ListActiveLoans returns active loans for a company as of a date.
-//
-// Location: when locationID is non-nil, only loans for employees whose
-// current employment_location_id matches are returned.
 func (r *loanRepository) ListActiveLoans(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -271,28 +235,30 @@ func (r *loanRepository) ListActiveLoans(
 ) ([]models.EmployeeLoan, error) {
 	query := `
 		SELECT
-			loan_id, company_id, user_id, loan_type,
-			principal_amount, emi_amount, interest_rate,
-			interest_type,
-			total_emis, emis_paid,
-			outstanding_balance,
-			disbursed_at,
-			first_emi_date,
-			closure_date,
-			status,
-			component_code,
-			created_at,
-			created_by
-		FROM payroll.employee_loan
-		WHERE company_id = $1
-		  AND status = 'active'
-		  AND disbursed_at <= $2
-		  AND (closure_date IS NULL OR closure_date >= $2)
-		  AND ($3::uuid IS NULL OR user_id IN (
+			l.loan_id, l.company_id, l.user_id, l.loan_type,
+			l.principal_amount, l.emi_amount, l.interest_rate,
+			l.interest_type,
+			l.total_emis, l.emis_paid,
+			l.outstanding_balance,
+			l.disbursed_at,
+			l.first_emi_date,
+			l.closure_date,
+			l.status,
+			l.component_id,
+			pc.component_code,
+			l.created_at,
+			l.created_by
+		FROM payroll.employee_loan l
+		LEFT JOIN payroll.payroll_component pc ON pc.component_id = l.component_id
+		WHERE l.company_id = $1
+		  AND l.status = 'active'
+		  AND l.disbursed_at <= $2
+		  AND (l.closure_date IS NULL OR l.closure_date >= $2)
+		  AND ($3::uuid IS NULL OR l.user_id IN (
 			  SELECT user_id FROM company_employees
-			  WHERE company_id = $1 AND employment_location_id = $3 AND is_active = true
+			  WHERE company_id = $1 AND primary_location_id = $3 AND is_active = true
 		  ))
-		ORDER BY user_id, disbursed_at
+		ORDER BY l.user_id, l.disbursed_at
 	`
 
 	rows, err := r.client.Query(ctx, query, companyID, asOf, locationID)
@@ -494,10 +460,6 @@ func (r *loanRepository) GetPendingEMIsForLoan(ctx context.Context, loanID uuid.
 	return r.scanEMIs(rows)
 }
 
-// GetEMIsForPayrollRun returns pending EMIs due within the run's period.
-//
-// Location: when locationID is non-nil, only EMIs for employees whose
-// current employment_location_id matches are returned.
 func (r *loanRepository) GetEMIsForPayrollRun(
 	ctx context.Context,
 	payrollRunID uuid.UUID,
@@ -517,7 +479,7 @@ func (r *loanRepository) GetEMIsForPayrollRun(
 		  AND e.due_date BETWEEN r.period_start AND r.period_end
 		  AND ($2::uuid IS NULL OR l.user_id IN (
 			  SELECT user_id FROM company_employees
-			  WHERE company_id = l.company_id AND employment_location_id = $2 AND is_active = true
+			  WHERE company_id = l.company_id AND primary_location_id = $2 AND is_active = true
 		  ))
 	`
 
@@ -575,9 +537,10 @@ func (r *loanRepository) GetPendingEMIsForEmployeeInPeriodWithDetails(
 			e.amount,
 			e.paid_amount, e.penalty_amount, e.remaining_amount, e.payment_status,
 			e.payroll_run_id, e.status,
-			l.component_code
+			pc.component_code
 		FROM payroll.emi_transaction e
 		JOIN payroll.employee_loan l ON e.loan_id = l.loan_id
+		LEFT JOIN payroll.payroll_component pc ON pc.component_id = l.component_id
 		WHERE l.company_id = $1
 		  AND l.user_id = $2
 		  AND e.status = 'pending'
@@ -596,7 +559,7 @@ func (r *loanRepository) GetPendingEMIsForEmployeeInPeriodWithDetails(
 		var e models.EmiTransaction
 		var paidDate sql.NullTime
 		var payrollRunID uuid.NullUUID
-		var compCode string
+		var compCode sql.NullString
 		var paidAmount sql.NullFloat64
 		var penaltyAmount sql.NullFloat64
 		var remainingAmount sql.NullFloat64
@@ -641,7 +604,7 @@ func (r *loanRepository) GetPendingEMIsForEmployeeInPeriodWithDetails(
 
 		details = append(details, LoanEmiDetail{
 			Emi:           e,
-			ComponentCode: compCode,
+			ComponentCode: compCode.String,
 		})
 	}
 	if err = rows.Err(); err != nil {
@@ -903,6 +866,8 @@ func (r *loanRepository) scanLoan(row scanner) (*models.EmployeeLoan, error) {
 	var interestType sql.NullString
 	var outstandingBalance sql.NullFloat64
 	var closureDate sql.NullTime
+	var componentID uuid.NullUUID
+	var componentCode sql.NullString
 	var createdBy uuid.NullUUID
 
 	err := row.Scan(
@@ -921,7 +886,8 @@ func (r *loanRepository) scanLoan(row scanner) (*models.EmployeeLoan, error) {
 		&l.FirstEmiDate,
 		&closureDate,
 		&l.Status,
-		&l.ComponentCode,
+		&componentID,
+		&componentCode,
 		&l.CreatedAt,
 		&createdBy,
 	)
@@ -940,6 +906,13 @@ func (r *loanRepository) scanLoan(row scanner) (*models.EmployeeLoan, error) {
 	}
 	if closureDate.Valid {
 		l.ClosureDate = &closureDate.Time
+	}
+	if componentID.Valid {
+		id := componentID.UUID
+		l.ComponentID = &id
+	}
+	if componentCode.Valid {
+		l.ComponentCode = componentCode.String
 	}
 	if createdBy.Valid {
 		l.CreatedBy = &createdBy.UUID

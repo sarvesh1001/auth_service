@@ -12,7 +12,6 @@ import (
 	"auth-service/internal/attendance"
 	attendanceHandler "auth-service/internal/attendance/handler"
 	attendanceMiddleware "auth-service/internal/attendance/middleware"
-	"auth-service/internal/avatar"
 	avatarHandler "auth-service/internal/avatar/handler"
 	hrHandler "auth-service/internal/hr/handler"
 	leavehandler "auth-service/internal/hr/leave/handler"
@@ -136,6 +135,9 @@ func NewRouter(
 
 	locationService *service.LocationService,
 	companyService *service.CompanyService,
+
+	// 👇 NEW — Job catalog handler
+	jobHandler *JobHandler,
 ) chi.Router {
 	router := chi.NewRouter()
 
@@ -295,8 +297,45 @@ func NewRouter(
 		// Public student login
 		r.Post("/companies/{companyID}/academics/students/login", academicHandlers.StudentHandler.Login)
 
-		// Public avatar file
-		r.Get("/avatars/file", avatarHandler.GetFile)
+		// ==========================================================
+		// AVATAR ROUTES (inlined — full middleware control)
+		//
+		// ✅ Self-service only. NO {userId} anywhere. Identity comes
+		//    from the JWT. NO permission bitmask. NO location check
+		//    (avatars are not location-scoped).
+		//
+		//    The public /avatars/file endpoint (used for signed-URL
+		//    streaming) remains below, outside the auth group.
+		// ==========================================================
+		r.Route("/avatars", func(r chi.Router) {
+			// ---------- PUBLIC (HMAC-signed URL required) ----------
+			r.Get("/file", avatarHandler.GetFile)
+
+			// ---------- AUTHENTICATED SELF-SERVICE ----------
+			r.Group(func(r chi.Router) {
+				r.Use(authMiddleware.JWTAuthMiddlewareWithRedis(sessionService))
+				r.Use(authMiddleware.SessionValidationMiddleware(sessionService))
+
+				// Reads — no idempotency
+				r.Get("/me/primary", avatarHandler.GetUserPrimaryAvatar)
+				r.Get("/me", avatarHandler.ListAvatars)
+				r.Get("/me/inactive", avatarHandler.ListInactiveAvatars)
+				r.Get("/me/{id}", avatarHandler.GetAvatar)
+				r.Get("/signed-url", avatarHandler.GetSignedURL)
+
+				// Writes — idempotency required
+				r.Group(func(r chi.Router) {
+					r.Use(IdempotencyMiddleware)
+
+					r.Post("/me/upload-url", avatarHandler.GetUploadURL)
+					r.Post("/me/upload", avatarHandler.UploadFile)
+					r.Post("/me/confirm", avatarHandler.ConfirmUpload)
+					r.Patch("/me/{id}/primary", avatarHandler.SetPrimary)
+					r.Delete("/me/{id}", avatarHandler.DeleteAvatar)
+					r.Post("/me/{id}/reactivate", avatarHandler.ReactivateAvatar)
+				})
+			})
+		})
 
 		// Public webhook
 		r.Post("/webhooks/payment", paymentHandler.ProcessPaymentWebhook)
@@ -308,22 +347,27 @@ func NewRouter(
 
 			r.Route("/companies/{companyID}/me", func(r chi.Router) {
 				r.Use(EnhancedCompanyAccessMiddleware(jwtService))
-				r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.view")).
-					Get("/locations", locationHandler.GetMyLocations)
+				r.Get("/departments", rbacHandler.GetMyDepartments)
+				r.Get("/locations", locationHandler.GetMyLocations)
 			})
 		})
 
 		// ==========================================================
+		// 👇 USER SELF-SERVICE (user-scoped, no company context)
+		// ==========================================================
+		r.Group(func(r chi.Router) {
+			r.Use(authMiddleware.JWTAuthMiddlewareWithRedis(sessionService))
+			r.Use(authMiddleware.SessionValidationMiddleware(sessionService))
+			r.Use(IdempotencyMiddleware)
+
+			r.Patch("/users/me", rbacHandler.UpdateMyProfile)
+		})
+		// ==========================================================
+		// 👆 END USER SELF-SERVICE
+		// ==========================================================
+
+		// ==========================================================
 		// PROTECTED COMPANY-SCOPED ROUTES
-		//
-		// JWT + Session + Subscription + Idempotency are applied
-		// at this level. LocationValidationMiddleware is applied
-		// ONLY to sub-groups that need a location context, so that
-		// location-CRUD routes (which live at company scope, not
-		// location scope) don't get rejected on writes.
-		//
-		// NOTE: /companies/{companyID} is Mounted exactly ONCE.
-		// Sub-sections with different middleware use r.Group().
 		// ==========================================================
 		r.Group(func(r chi.Router) {
 			r.Use(authMiddleware.JWTAuthMiddlewareWithRedis(sessionService))
@@ -336,7 +380,9 @@ func NewRouter(
 				r.Use(authMiddleware.LocationValidationMiddleware(locationService))
 
 				authHandler.RegisterProtectedRoutes(r)
-				avatar.RegisterAvatarRoutes(r, avatarHandler)
+				// ⚠️ REMOVED: avatar.RegisterAvatarRoutes(r, avatarHandler)
+				//    Avatar routes are now registered in the dedicated
+				//    /avatars block above (self-service, JWT-only).
 
 				r.Route("/admin/subscription-plans", func(r chi.Router) {
 					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.system_config")).
@@ -375,12 +421,7 @@ func NewRouter(
 				r.Use(EnhancedCompanyAccessMiddleware(jwtService))
 
 				// ==================================================
-				// LOCATION REGISTRY  (NO LocationValidationMiddleware)
-				//
-				// These endpoints operate on the company's list of
-				// locations, not "inside" a location. When creating
-				// the first location, no X-Location-ID can exist
-				// yet, so the location middleware must not run.
+				// LOCATION REGISTRY (NO LocationValidationMiddleware)
 				// ==================================================
 				r.Route("/locations", func(r chi.Router) {
 					r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.view")).
@@ -411,7 +452,7 @@ func NewRouter(
 				})
 
 				// ==================================================
-				// EVERYTHING ELSE  (WITH LocationValidationMiddleware)
+				// EVERYTHING ELSE (WITH LocationValidationMiddleware)
 				// ==================================================
 				r.Group(func(r chi.Router) {
 					r.Use(authMiddleware.LocationValidationMiddleware(locationService))
@@ -429,9 +470,12 @@ func NewRouter(
 						Get("/stats", adminHandler.GetCompanyStats)
 					r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.view")).
 						Get("/users/{userID}/phone", authHandler.GetUserPhoneNumberInCompany)
-					// 👇 ADD THIS — one line, right below the GET phone route
 					r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.update")).
 						Put("/users/{userID}/phone", authHandler.UpdateUserPhoneNumberInCompany)
+
+					// ----- User display name -----
+					r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.view")).
+						Get("/users/{userID}/display-name", rbacHandler.GetUserDisplayName)
 
 					// ----- Employee search -----
 					r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.view")).
@@ -456,6 +500,32 @@ func NewRouter(
 						Get("/deactivated-departments", adminHandler.GetDeactivatedDepartments)
 					r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.view")).
 						Get("/active-departments-count", adminHandler.GetActiveDepartmentCount)
+
+					// ==================================================
+					// JOBS (job catalog)
+					// ==================================================
+					r.Route("/jobs", func(r chi.Router) {
+						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.position.view")).
+							Get("/", jobHandler.ListJobs)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.position.create")).
+							Post("/", jobHandler.CreateJob)
+
+						r.Route("/{jobID}", func(r chi.Router) {
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.position.view")).
+								Get("/", jobHandler.GetJob)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.position.update")).
+								Patch("/", jobHandler.UpdateJob)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.position.delete")).
+								Delete("/", jobHandler.DeleteJob)
+
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.position.update")).
+								Post("/deactivate", jobHandler.DeactivateJob)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.position.update")).
+								Post("/reactivate", jobHandler.ReactivateJob)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.position.view")).
+								Get("/positions/count", jobHandler.CountPositionsInJob)
+						})
+					})
 
 					// ----- Positions -----
 					r.Route("/positions", func(r chi.Router) {
@@ -540,7 +610,7 @@ func NewRouter(
 							Delete("/{invoiceID}", invoiceHandler.DeleteInvoice)
 					})
 
-					// ----- Analytics (operational logs) -----
+					// ----- Analytics -----
 					r.Route("/analytics", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.view")).
 							Get("/otp", analyticsHandler.GetOTPLogs)
@@ -956,7 +1026,7 @@ func NewRouter(
 
 					// ----- Leave -----
 					r.Route("/leave", func(r chi.Router) {
-						r.Route("/admin", func(r chi.Router) {
+						r.Route("/hr", func(r chi.Router) {
 							r.Route("/policy-config", func(r chi.Router) {
 								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update")).
 									Post("/", leaveAdminHandler.CreateLeavePolicy)
@@ -1016,6 +1086,8 @@ func NewRouter(
 									Post("/resolve/user/{userID}", leavePolicyResolutionHandler.ResolveSingleUser)
 								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update")).
 									Post("/resolve/batch", leavePolicyResolutionHandler.ResolveBatchUsers)
+								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update")).
+									Post("/resolve/all", leavePolicyResolutionHandler.ResolveAllUsers)
 								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view")).
 									Get("/effective/{userID}", leavePolicyResolutionHandler.GetEffectivePolicies)
 							})
@@ -1077,6 +1149,12 @@ func NewRouter(
 								Get("/stats", employeeHandler.GetEmployeeStats)
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view")).
 								Get("/export", employeeHandler.ExportEmployeeData)
+
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.search")).
+								Get("/typeahead", employeeHandler.SearchEmployees)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view")).
+								Post("/details", employeeHandler.GetEmployeeDetailsByIDs)
+
 							r.Route("/{employeeID}", func(r chi.Router) {
 								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view")).
 									Get("/", employeeHandler.GetEmployeeProfile)
@@ -1113,6 +1191,7 @@ func NewRouter(
 								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view")).
 									Get("/role-history", employeeHandler.GetRoleHistory)
 							})
+
 							r.Route("/user/{userID}", func(r chi.Router) {
 								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view")).
 									Get("/profile", employeeHandler.GetEmployeeProfileByUserID)
@@ -1185,12 +1264,12 @@ func NewRouter(
 							Get("/employees/{userID}", rbacHandler.GetEmployee)
 						r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.update")).
 							Post("/members", rbacHandler.AddMember)
+
 						r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.update")).
-							Post("/employees", rbacHandler.AddEmployee)
+							Patch("/members/{userID}", rbacHandler.UpdateMember)
+
 						r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.update")).
 							Patch("/employees/{userID}", rbacHandler.UpdateEmployee)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.update")).
-							Post("/managers", rbacHandler.AddManager)
 						r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.update")).
 							Put("/employees/{userID}/position", rbacHandler.UpdateEmployeePosition)
 
@@ -1399,6 +1478,7 @@ func NewRouter(
 							Get("/recently-active", adminHandler.GetRecentlyActiveUsers)
 						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.employee.view")).
 							Get("/banned", adminHandler.GetBannedUsers)
+
 						r.Route("/{userID}", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware("admin.employee.update")).
 								Put("/", adminHandler.UpdateUser)
@@ -1408,9 +1488,13 @@ func NewRouter(
 								Post("/ban", adminHandler.BanUser)
 							r.With(authMiddleware.BitmaskPermissionMiddleware("admin.employee.update")).
 								Post("/unban", adminHandler.UnbanUser)
+
+							r.With(authMiddleware.BitmaskPermissionMiddleware("admin.employee.view")).
+								Get("/phone", adminHandler.GetUserPhoneNumber)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("admin.employee.update")).
+								Put("/phone", adminHandler.ChangeUserPhone)
 						})
 					})
-
 					r.Route("/companies", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.create")).
 							Post("/", adminHandler.CreateCompany)
