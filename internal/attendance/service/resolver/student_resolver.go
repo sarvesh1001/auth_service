@@ -24,8 +24,8 @@ type TimetableEntry struct {
 	SubjectID uuid.UUID
 	TeacherID uuid.UUID
 	RoomID    *uuid.UUID
-	StartTime time.Time // only time part (date portion is zero)
-	EndTime   time.Time // only time part (date portion is zero)
+	StartTime time.Time
+	EndTime   time.Time
 	SlotID    uuid.UUID
 	DayOfWeek int
 }
@@ -44,7 +44,11 @@ type StudentResolver struct {
 	timetableRepo  TimetableDataProvider
 	sessionRepo    SessionDataProvider
 	workCenterRepo repository.WorkCenterRepository
-	logger         *zap.Logger
+
+	// ── NEW
+	tzProvider TimezoneProvider
+
+	logger *zap.Logger
 }
 
 func NewStudentResolver(
@@ -53,6 +57,7 @@ func NewStudentResolver(
 	timetableRepo TimetableDataProvider,
 	sessionRepo SessionDataProvider,
 	workCenterRepo repository.WorkCenterRepository,
+	tzProvider TimezoneProvider,
 	logger *zap.Logger,
 ) *StudentResolver {
 	return &StudentResolver{
@@ -61,11 +66,18 @@ func NewStudentResolver(
 		timetableRepo:  timetableRepo,
 		sessionRepo:    sessionRepo,
 		workCenterRepo: workCenterRepo,
+		tzProvider:     tzProvider,
 		logger:         logger,
 	}
 }
 
-func (r *StudentResolver) Resolve(ctx context.Context, companyID uuid.UUID, subjectType string, subjectID uuid.UUID, date time.Time) (*ResolvedSubject, error) {
+func (r *StudentResolver) Resolve(
+	ctx context.Context,
+	companyID uuid.UUID,
+	subjectType string,
+	subjectID uuid.UUID,
+	date time.Time,
+) (*ResolvedSubject, error) {
 	if subjectType != SubjectTypeStudent {
 		return nil, fmt.Errorf("student resolver called with subject_type=%s", subjectType)
 	}
@@ -75,11 +87,23 @@ func (r *StudentResolver) Resolve(ctx context.Context, companyID uuid.UUID, subj
 		return &ResolvedSubject{IsActive: active}, err
 	}
 
+	// ── NEW: resolve school tz via chain (students don't have positions,
+	//    so we walk from company default; if a section has a location,
+	//    future work should pass it in).
+	tz, tzErr := r.tzProvider.ResolveTimezone(ctx, companyID, nil, nil, nil)
+	if tzErr != nil || tz == "" {
+		r.logger.Warn("student tz resolution failed, defaulting to UTC",
+			zap.String("student_id", subjectID.String()),
+			zap.Error(tzErr),
+		)
+		tz = "UTC"
+	}
+
 	sectionID, _, err := r.enrollmentRepo.GetActiveEnrollment(ctx, companyID, subjectID, date)
 	if err != nil || sectionID == nil {
 		return &ResolvedSubject{
 			IsActive:       true,
-			Timezone:       "UTC",
+			Timezone:       tz,
 			ScheduleStatus: "not_schedulable",
 		}, nil
 	}
@@ -88,25 +112,30 @@ func (r *StudentResolver) Resolve(ctx context.Context, companyID uuid.UUID, subj
 	if err != nil || len(entries) == 0 {
 		return &ResolvedSubject{
 			IsActive:       true,
-			Timezone:       "UTC",
+			Timezone:       tz,
 			ScheduleStatus: "not_schedulable",
 		}, nil
 	}
 
-	// Combine the date from the input `date` with the time from each entry.
-	// Both are in UTC; the business date is already a UTC timestamp at midnight.
+	loc, _ := time.LoadLocation(tz)
+	if loc == nil {
+		loc = time.UTC
+	}
+
 	var earliestStart, latestEnd *time.Time
 	for _, e := range entries {
+		// ── CHANGED: build times in the school's tz, not UTC.
 		start := time.Date(date.Year(), date.Month(), date.Day(),
-			e.StartTime.Hour(), e.StartTime.Minute(), e.StartTime.Second(), e.StartTime.Nanosecond(), time.UTC)
+			e.StartTime.Hour(), e.StartTime.Minute(), e.StartTime.Second(), 0, loc)
 		end := time.Date(date.Year(), date.Month(), date.Day(),
-			e.EndTime.Hour(), e.EndTime.Minute(), e.EndTime.Second(), e.EndTime.Nanosecond(), time.UTC)
-
+			e.EndTime.Hour(), e.EndTime.Minute(), e.EndTime.Second(), 0, loc)
 		if earliestStart == nil || start.Before(*earliestStart) {
-			earliestStart = &start
+			s := start
+			earliestStart = &s
 		}
 		if latestEnd == nil || end.After(*latestEnd) {
-			latestEnd = &end
+			l := end
+			latestEnd = &l
 		}
 	}
 
@@ -118,12 +147,9 @@ func (r *StudentResolver) Resolve(ctx context.Context, companyID uuid.UUID, subj
 		}
 	}
 
-	// TODO: fetch company timezone for proper localisation, but UTC works for now.
-	timezone := "UTC"
-
 	return &ResolvedSubject{
 		IsActive:           true,
-		Timezone:           timezone,
+		Timezone:           tz,
 		ScheduleStatus:     "working",
 		ExpectedStart:      earliestStart,
 		ExpectedEnd:        latestEnd,

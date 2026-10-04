@@ -108,6 +108,32 @@ func (s *leaveRequestService) RequestLeave(
 		return nil, err
 	}
 
+	// ── Structural validation of the date range + total_days ────────────
+	// The form already computes total_days, but a direct API caller can
+	// bypass the client. These checks ensure the persisted row is always
+	// internally consistent.
+	startUTC := req.StartDate.UTC().Truncate(24 * time.Hour)
+	endUTC := req.EndDate.UTC().Truncate(24 * time.Hour)
+
+	if endUTC.Before(startUTC) {
+		return nil, fmt.Errorf("end_date must be on or after start_date")
+	}
+	if req.TotalDays <= 0 {
+		return nil, fmt.Errorf("total_days must be a positive integer")
+	}
+
+	// Inclusive span in days: 2026-10-11 → 2026-10-16 == 6 days.
+	span := int(endUTC.Sub(startUTC).Hours()/24) + 1
+	if req.TotalDays > span {
+		return nil, fmt.Errorf(
+			"total_days (%d) cannot exceed the inclusive calendar span (%d) between %s and %s",
+			req.TotalDays, span,
+			req.StartDate.Format("2006-01-02"),
+			req.EndDate.Format("2006-01-02"),
+		)
+	}
+	// ────────────────────────────────────────────────────────────────────
+
 	valid, message, err := s.repo.ValidateLeaveRequest(ctx, req, nil)
 	if err != nil {
 		return nil, err
@@ -170,7 +196,6 @@ func (s *leaveRequestService) RequestLeave(
 
 	return request, nil
 }
-
 func (s *leaveRequestService) ApproveLeave(
 	ctx context.Context,
 	requestID uuid.UUID,

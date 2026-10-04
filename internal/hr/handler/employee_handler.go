@@ -67,6 +67,24 @@ func (h *EmployeeHandler) mapLocationScopeError(w http.ResponseWriter, err error
 	return false
 }
 
+// mapLifecycleError translates the lifecycle-specific errors into HTTP codes.
+// Returns true if it wrote a response, false if the caller should keep
+// looking at the error (e.g. it's a location-scope error).
+func (h *EmployeeHandler) mapLifecycleError(w http.ResponseWriter, err error) bool {
+	switch {
+	case errors.Is(err, hrservice.ErrProbationAlreadyOpen):
+		h.respondWithError(w, http.StatusConflict, err.Error())
+		return true
+	case errors.Is(err, hrservice.ErrNoticeAlreadyActive):
+		h.respondWithError(w, http.StatusConflict, err.Error())
+		return true
+	case errors.Is(err, hrservice.ErrOnHoldAlreadyActive):
+		h.respondWithError(w, http.StatusConflict, err.Error())
+		return true
+	}
+	return false
+}
+
 // ============================================================================
 // EMPLOYEE PROFILE HANDLERS
 // ============================================================================
@@ -194,13 +212,19 @@ func (h *EmployeeHandler) GetEmployeeProfileByUserID(w http.ResponseWriter, r *h
 	})
 }
 
+// UpdateEmployeeProfileRequest — note the ABSENCE of employment_status.
+//
+// Status is not updated through this endpoint. It changes only via the
+// lifecycle endpoints (probation / notice / on-hold), which keep the
+// employee_probation / employee_notice / employee_on_hold tables in sync
+// with employee_profiles.employment_status. Allowing a bulk field update
+// here would let a caller set 'terminated' and bypass the entire flow.
 type UpdateEmployeeProfileRequest struct {
 	DateOfBirth      *time.Time `json:"date_of_birth,omitempty"`
 	Gender           *string    `json:"gender,omitempty"`
 	MaritalStatus    *string    `json:"marital_status,omitempty"`
 	Nationality      *string    `json:"nationality,omitempty"`
 	EmploymentType   *string    `json:"employment_type,omitempty"`
-	EmploymentStatus *string    `json:"employment_status,omitempty"`
 	ProbationEndDate *time.Time `json:"probation_end_date,omitempty"`
 	ConfirmationDate *time.Time `json:"confirmation_date,omitempty"`
 	JobTitle         *string    `json:"job_title,omitempty"`
@@ -251,9 +275,6 @@ func (h *EmployeeHandler) UpdateEmployeeProfile(w http.ResponseWriter, r *http.R
 	}
 	if req.EmploymentType != nil {
 		updates["employment_type"] = *req.EmploymentType
-	}
-	if req.EmploymentStatus != nil {
-		updates["employment_status"] = *req.EmploymentStatus
 	}
 	if req.ProbationEndDate != nil {
 		updates["probation_end_date"] = *req.ProbationEndDate
@@ -783,10 +804,11 @@ func (h *EmployeeHandler) GetDepartmentHistory(w http.ResponseWriter, r *http.Re
 	})
 }
 
+// CreateEmployeeExitRequest — accepts both "2026-10-31" and RFC3339.
 type CreateEmployeeExitRequest struct {
-	ExitDate          time.Time `json:"exit_date" validate:"required"`
-	ExitReason        string    `json:"exit_reason"`
-	EligibleForRehire bool      `json:"eligible_for_rehire"`
+	ExitDate          DateOnly `json:"exit_date" validate:"required"`
+	ExitReason        string   `json:"exit_reason"`
+	EligibleForRehire bool     `json:"eligible_for_rehire"`
 }
 
 func (h *EmployeeHandler) CreateEmployeeExit(w http.ResponseWriter, r *http.Request) {
@@ -828,7 +850,7 @@ func (h *EmployeeHandler) CreateEmployeeExit(w http.ResponseWriter, r *http.Requ
 		"endpoint": r.URL.Path, "request_method": r.Method,
 	}
 	exit, err := h.employeeService.CreateEmployeeExit(
-		ctx, userID, companyID, req.ExitDate, req.ExitReason,
+		ctx, userID, companyID, req.ExitDate.Time, req.ExitReason,
 		req.EligibleForRehire, actorType, actorID, metadata)
 	if err != nil {
 		if h.mapLocationScopeError(w, err) {
@@ -965,6 +987,466 @@ func (h *EmployeeHandler) GetRoleHistory(w http.ResponseWriter, r *http.Request)
 		"meta": map[string]interface{}{
 			"count": len(history), "duration": time.Since(startTime).String(),
 		},
+	})
+}
+
+// ============================================================================
+// LIFECYCLE — PROBATION / NOTICE / ON-HOLD
+// ============================================================================
+
+// POST /companies/{companyID}/employees/{employeeID}/probation/confirm
+type ConfirmProbationRequest struct {
+	Note string `json:"note,omitempty"`
+}
+
+func (h *EmployeeHandler) ConfirmProbation(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	ctx := injectCommonContext(r.Context(), r)
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+	employeeProfileID, err := uuid.Parse(chi.URLParam(r, "employeeID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid employee profile ID")
+		return
+	}
+	profile, err := h.employeeService.GetEmployeeProfileByID(ctx, employeeProfileID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, "Employee profile not found")
+		return
+	}
+	actorType, actorID, err := h.getActorInfo(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	var req ConfirmProbationRequest
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+			return
+		}
+	}
+	_ = actorType
+
+	p, err := h.employeeService.ConfirmProbation(ctx, companyID, profile.UserID, actorID, req.Note)
+	if err != nil {
+		if h.mapLocationScopeError(w, err) {
+			return
+		}
+		if h.mapLifecycleError(w, err) {
+			return
+		}
+		h.logger.Error("ConfirmProbation failed",
+			util.String("company_id", companyID.String()),
+			util.String("user_id", profile.UserID.String()), util.ErrorField(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to confirm probation")
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true, "data": p,
+		"message": "Probation confirmed",
+		"meta":    map[string]interface{}{"duration": time.Since(startTime).String()},
+	})
+}
+
+// POST /companies/{companyID}/employees/{employeeID}/probation/fail
+// Accepts termination_date as "2026-10-31" or full RFC3339.
+type FailProbationRequest struct {
+	Reason          string   `json:"reason"`
+	TerminationDate DateOnly `json:"termination_date"`
+}
+
+func (h *EmployeeHandler) FailProbation(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	ctx := injectCommonContext(r.Context(), r)
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+	employeeProfileID, err := uuid.Parse(chi.URLParam(r, "employeeID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid employee profile ID")
+		return
+	}
+	profile, err := h.employeeService.GetEmployeeProfileByID(ctx, employeeProfileID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, "Employee profile not found")
+		return
+	}
+	_, actorID, err := h.getActorInfo(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	var req FailProbationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if req.Reason == "" || req.TerminationDate.IsZero() {
+		h.respondWithError(w, http.StatusBadRequest, "reason and termination_date are required")
+		return
+	}
+	if err := h.employeeService.FailProbation(ctx, companyID, profile.UserID, actorID, req.Reason, req.TerminationDate.Time); err != nil {
+		if h.mapLocationScopeError(w, err) {
+			return
+		}
+		if h.mapLifecycleError(w, err) {
+			return
+		}
+		h.logger.Error("FailProbation failed",
+			util.String("company_id", companyID.String()),
+			util.String("user_id", profile.UserID.String()), util.ErrorField(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to fail probation")
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true, "message": "Probation marked as failed",
+		"meta": map[string]interface{}{"duration": time.Since(startTime).String()},
+	})
+}
+
+// POST /companies/{companyID}/employees/{employeeID}/probation/extend
+// Accepts new_end_date as "2026-10-31" or full RFC3339.
+type ExtendProbationRequest struct {
+	NewEndDate DateOnly `json:"new_end_date"`
+	Reason     string   `json:"reason,omitempty"`
+}
+
+func (h *EmployeeHandler) ExtendProbation(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	ctx := injectCommonContext(r.Context(), r)
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+	employeeProfileID, err := uuid.Parse(chi.URLParam(r, "employeeID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid employee profile ID")
+		return
+	}
+	profile, err := h.employeeService.GetEmployeeProfileByID(ctx, employeeProfileID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, "Employee profile not found")
+		return
+	}
+	_, actorID, err := h.getActorInfo(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	var req ExtendProbationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if req.NewEndDate.IsZero() {
+		h.respondWithError(w, http.StatusBadRequest, "new_end_date is required")
+		return
+	}
+	p, err := h.employeeService.ExtendProbation(ctx, companyID, profile.UserID, actorID, req.NewEndDate.Time, req.Reason)
+	if err != nil {
+		if h.mapLocationScopeError(w, err) {
+			return
+		}
+		if h.mapLifecycleError(w, err) {
+			return
+		}
+		h.logger.Error("ExtendProbation failed",
+			util.String("company_id", companyID.String()),
+			util.String("user_id", profile.UserID.String()), util.ErrorField(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to extend probation")
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true, "data": p,
+		"message": "Probation extended",
+		"meta":    map[string]interface{}{"duration": time.Since(startTime).String()},
+	})
+}
+
+// POST /companies/{companyID}/employees/{employeeID}/notice/start
+// Accepts end_date as "2026-10-31" or full RFC3339.
+type StartNoticeRequest struct {
+	EndDate       DateOnly `json:"end_date"`
+	Reason        string   `json:"reason"`
+	InitiatedBy   string   `json:"initiated_by"` // employee | employer
+	Served        bool     `json:"served"`
+	PayPercentage float64  `json:"pay_percentage,omitempty"`
+}
+
+func (h *EmployeeHandler) StartNotice(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	ctx := injectCommonContext(r.Context(), r)
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+	employeeProfileID, err := uuid.Parse(chi.URLParam(r, "employeeID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid employee profile ID")
+		return
+	}
+	profile, err := h.employeeService.GetEmployeeProfileByID(ctx, employeeProfileID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, "Employee profile not found")
+		return
+	}
+	_, actorID, err := h.getActorInfo(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	var req StartNoticeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if req.EndDate.IsZero() || req.InitiatedBy == "" {
+		h.respondWithError(w, http.StatusBadRequest, "end_date and initiated_by are required")
+		return
+	}
+	notice, err := h.employeeService.StartNotice(
+		ctx, companyID, profile.UserID, actorID,
+		req.EndDate.Time, req.Reason, req.InitiatedBy, req.Served, req.PayPercentage)
+	if err != nil {
+		if h.mapLocationScopeError(w, err) {
+			return
+		}
+		if h.mapLifecycleError(w, err) {
+			return
+		}
+		h.logger.Error("StartNotice failed",
+			util.String("company_id", companyID.String()),
+			util.String("user_id", profile.UserID.String()), util.ErrorField(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true, "data": notice,
+		"message": "Notice period started",
+		"meta":    map[string]interface{}{"duration": time.Since(startTime).String()},
+	})
+}
+
+// POST /companies/{companyID}/employees/{employeeID}/notice/cancel
+type CancelNoticeRequest struct {
+	Reason string `json:"reason,omitempty"`
+}
+
+func (h *EmployeeHandler) CancelNotice(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	ctx := injectCommonContext(r.Context(), r)
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+	employeeProfileID, err := uuid.Parse(chi.URLParam(r, "employeeID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid employee profile ID")
+		return
+	}
+	profile, err := h.employeeService.GetEmployeeProfileByID(ctx, employeeProfileID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, "Employee profile not found")
+		return
+	}
+	_, actorID, err := h.getActorInfo(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	var req CancelNoticeRequest
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+			return
+		}
+	}
+	if err := h.employeeService.CancelNotice(ctx, companyID, profile.UserID, actorID, req.Reason); err != nil {
+		if h.mapLocationScopeError(w, err) {
+			return
+		}
+		if h.mapLifecycleError(w, err) {
+			return
+		}
+		h.logger.Error("CancelNotice failed",
+			util.String("company_id", companyID.String()),
+			util.String("user_id", profile.UserID.String()), util.ErrorField(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to cancel notice")
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true, "message": "Notice cancelled",
+		"meta": map[string]interface{}{"duration": time.Since(startTime).String()},
+	})
+}
+
+// POST /companies/{companyID}/employees/{employeeID}/on-hold/start
+// Accepts start_date / end_date as "2026-10-31" or full RFC3339.
+type StartOnHoldRequest struct {
+	StartDate     DateOnly  `json:"start_date"`
+	EndDate       *DateOnly `json:"end_date,omitempty"`
+	Reason        string    `json:"reason"`
+	PayPercentage float64   `json:"pay_percentage,omitempty"`
+}
+
+func (h *EmployeeHandler) StartOnHold(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	ctx := injectCommonContext(r.Context(), r)
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+	employeeProfileID, err := uuid.Parse(chi.URLParam(r, "employeeID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid employee profile ID")
+		return
+	}
+	profile, err := h.employeeService.GetEmployeeProfileByID(ctx, employeeProfileID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, "Employee profile not found")
+		return
+	}
+	_, actorID, err := h.getActorInfo(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	var req StartOnHoldRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if req.Reason == "" {
+		h.respondWithError(w, http.StatusBadRequest, "reason is required")
+		return
+	}
+	if req.StartDate.IsZero() {
+		req.StartDate = DateOnly{Time: time.Now().UTC().Truncate(24 * time.Hour)}
+	}
+
+	var endTime *time.Time
+	if req.EndDate != nil {
+		t := req.EndDate.Time
+		endTime = &t
+	}
+
+	h_, err := h.employeeService.StartOnHold(
+		ctx, companyID, profile.UserID, actorID,
+		req.StartDate.Time, endTime, req.Reason, req.PayPercentage)
+	if err != nil {
+		if h.mapLocationScopeError(w, err) {
+			return
+		}
+		if h.mapLifecycleError(w, err) {
+			return
+		}
+		h.logger.Error("StartOnHold failed",
+			util.String("company_id", companyID.String()),
+			util.String("user_id", profile.UserID.String()), util.ErrorField(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true, "data": h_,
+		"message": "Employee placed on hold",
+		"meta":    map[string]interface{}{"duration": time.Since(startTime).String()},
+	})
+}
+
+// POST /companies/{companyID}/employees/{employeeID}/on-hold/end
+func (h *EmployeeHandler) EndOnHold(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	ctx := injectCommonContext(r.Context(), r)
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+	employeeProfileID, err := uuid.Parse(chi.URLParam(r, "employeeID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid employee profile ID")
+		return
+	}
+	profile, err := h.employeeService.GetEmployeeProfileByID(ctx, employeeProfileID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, "Employee profile not found")
+		return
+	}
+	_, actorID, err := h.getActorInfo(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	if err := h.employeeService.EndOnHold(ctx, companyID, profile.UserID, actorID); err != nil {
+		if h.mapLocationScopeError(w, err) {
+			return
+		}
+		if h.mapLifecycleError(w, err) {
+			return
+		}
+		h.logger.Error("EndOnHold failed",
+			util.String("company_id", companyID.String()),
+			util.String("user_id", profile.UserID.String()), util.ErrorField(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to end on-hold")
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true, "message": "On-hold ended",
+		"meta": map[string]interface{}{"duration": time.Since(startTime).String()},
+	})
+}
+
+// GET /companies/{companyID}/employees/{employeeID}/status-now
+func (h *EmployeeHandler) GetStatusNow(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	ctx := injectCommonContext(r.Context(), r)
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+	employeeProfileID, err := uuid.Parse(chi.URLParam(r, "employeeID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid employee profile ID")
+		return
+	}
+	profile, err := h.employeeService.GetEmployeeProfileByID(ctx, employeeProfileID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, "Employee profile not found")
+		return
+	}
+	status, err := h.employeeQueryService.GetStatusNow(ctx, companyID, profile.UserID)
+	if err != nil {
+		if h.mapLocationScopeError(w, err) {
+			return
+		}
+		h.logger.Error("GetStatusNow failed",
+			util.String("company_id", companyID.String()),
+			util.String("user_id", profile.UserID.String()), util.ErrorField(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to load employee status")
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true, "data": status,
+		"meta": map[string]interface{}{"duration": time.Since(startTime).String()},
 	})
 }
 
@@ -1184,6 +1666,39 @@ func (h *EmployeeHandler) dumpJSONResponse(label string, v interface{}) {
 //
 // Location scope is enforced by the service via locationctx — the handler
 // does not need to pass any location filter.
+// SearchEmployees — GET /companies/{companyID}/employees/typeahead
+//
+// Free-text employee search, optionally filtered by employment status.
+//
+// Query params:
+//
+//	q                  — search text (empty = recommendation feed)
+//	employment_status  — "" or "all" (default) → no filter
+//	                     "active" | "probation" | "notice" | "on_hold"
+//	                     | "terminated" | "resigned"
+//	page               — 1-based (default 1)
+//	page_size          — 1..100 (default 30)
+//	ids_only           — if "true", return only matched user IDs (cheap)
+//
+// Location scope is enforced by the service via locationctx.
+//
+// Response shape:
+//
+//	{
+//	  "success": true,
+//	  "data": [ ...DecryptedEmployeeDetails... ],
+//	  "meta": {
+//	    "query": "...",
+//	    "status": "terminated",
+//	    "page": 1,
+//	    "page_size": 30,
+//	    "total": 42,          // 👈 what the UI reads for "X of Y"
+//	    "total_pages": 2,
+//	    "return_count": 30,
+//	    "ids_only": false,
+//	    "duration": "12ms"
+//	  }
+//	}
 func (h *EmployeeHandler) SearchEmployees(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	ctx := injectCommonContext(r.Context(), r)
@@ -1195,6 +1710,7 @@ func (h *EmployeeHandler) SearchEmployees(w http.ResponseWriter, r *http.Request
 	}
 
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	statusFilter := strings.TrimSpace(r.URL.Query().Get("employment_status"))
 
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	if page < 1 {
@@ -1211,6 +1727,7 @@ func (h *EmployeeHandler) SearchEmployees(w http.ResponseWriter, r *http.Request
 		zap.String("company_id", companyID.String()),
 		zap.String("query", query),
 		zap.Int("query_len", len(query)),
+		zap.String("employment_status", statusFilter),
 		zap.Int("page", page),
 		zap.Int("page_size", pageSize),
 		zap.Bool("ids_only", idsOnly),
@@ -1218,12 +1735,15 @@ func (h *EmployeeHandler) SearchEmployees(w http.ResponseWriter, r *http.Request
 		zap.String("raw_query_string", r.URL.RawQuery),
 	)
 
-	// ---- Step 1: search → user IDs only (fast path) ----
-	ids, err := h.employeeQueryService.SearchEmployees(ctx, companyID, query, page, pageSize)
+	// ---- Single service call: status-aware search + hydrate ----
+	rows, total, err := h.employeeQueryService.SearchEmployeesWithStatus(
+		ctx, companyID, query, statusFilter, page, pageSize, idsOnly,
+	)
 	if err != nil {
-		h.logger.Error("handler.SearchEmployees: service.SearchEmployees failed",
+		h.logger.Error("handler.SearchEmployees: service failed",
 			zap.String("company_id", companyID.String()),
 			zap.String("query", query),
+			zap.String("status", statusFilter),
 			zap.Error(err),
 		)
 		if h.mapLocationScopeError(w, err) {
@@ -1233,20 +1753,29 @@ func (h *EmployeeHandler) SearchEmployees(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	h.logger.Info("handler.SearchEmployees: got ids from service",
+	h.logger.Info("handler.SearchEmployees: service returned",
 		zap.String("company_id", companyID.String()),
 		zap.String("query", query),
-		zap.Int("ids_count", len(ids)),
+		zap.String("status", statusFilter),
+		zap.Int("rows_count", len(rows)),
+		zap.Int("total", total),
 	)
 
+	// ---- ids_only short-circuit ----
 	if idsOnly {
+		ids := make([]uuid.UUID, 0, len(rows))
+		for _, row := range rows {
+			ids = append(ids, row.UserID)
+		}
 		h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
 			"data":    ids,
 			"meta": map[string]interface{}{
 				"query":        query,
+				"status":       statusFilter,
 				"page":         page,
 				"page_size":    pageSize,
+				"total":        total,
 				"return_count": len(ids),
 				"ids_only":     true,
 				"duration":     time.Since(startTime).String(),
@@ -1255,31 +1784,24 @@ func (h *EmployeeHandler) SearchEmployees(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// ---- Step 2: hydrate + decrypt ----
-	h.logger.Info("handler.SearchEmployees: hydrating details",
-		zap.String("company_id", companyID.String()),
-		zap.Int("ids_count", len(ids)),
-	)
+	// ---- Decrypt PII on the hydrated rows ----
+	details := make([]*hrservice.DecryptedEmployeeDetails, 0, len(rows))
+	for _, row := range rows {
+		details = append(details, h.employeeQueryService.DecryptFullDetailsExt(ctx, row))
+	}
 
-	details, err := h.employeeQueryService.GetEmployeeDetailsByIDs(ctx, companyID, ids)
-	if err != nil {
-		h.logger.Error("handler.SearchEmployees: GetEmployeeDetailsByIDs failed",
-			zap.String("company_id", companyID.String()),
-			zap.Int("ids_count", len(ids)),
-			zap.Error(err),
-		)
-		if h.mapLocationScopeError(w, err) {
-			return
-		}
-		h.respondWithError(w, http.StatusInternalServerError, "Failed to load employee details")
-		return
+	totalPages := 0
+	if pageSize > 0 {
+		totalPages = (total + pageSize - 1) / pageSize
 	}
 
 	h.logger.Info("handler.SearchEmployees success",
 		zap.String("company_id", companyID.String()),
 		zap.String("query", query),
-		zap.Int("ids_count", len(ids)),
-		zap.Int("details_count", len(details)),
+		zap.String("status", statusFilter),
+		zap.Int("returned", len(details)),
+		zap.Int("total", total),
+		zap.Int("total_pages", totalPages),
 		zap.Duration("duration", time.Since(startTime)),
 	)
 
@@ -1288,8 +1810,11 @@ func (h *EmployeeHandler) SearchEmployees(w http.ResponseWriter, r *http.Request
 		"data":    details,
 		"meta": map[string]interface{}{
 			"query":        query,
+			"status":       statusFilter,
 			"page":         page,
 			"page_size":    pageSize,
+			"total":        total,
+			"total_pages":  totalPages,
 			"return_count": len(details),
 			"ids_only":     false,
 			"duration":     time.Since(startTime).String(),
@@ -1474,5 +1999,97 @@ func (h *EmployeeHandler) CreatePosition(w http.ResponseWriter, r *http.Request)
 		"success": true, "data": createdPosition,
 		"message": "Position created successfully",
 		"meta":    map[string]interface{}{"duration": time.Since(startTime).String()},
+	})
+}
+
+// ReactivateEmployee — PATCH /companies/{companyID}/hr/employees/user/{userID}/reactivate
+//
+// Restores a terminated or resigned employee to active. Idempotent:
+// calling on an already-active employee returns 200 with a no-op.
+//
+// Keyed by user_id (not employee_profile_id) so the mobile client can
+// call it with the id it already has on every typeahead row.
+//
+// Errors:
+//
+//	400 — invalid UUID, or the status guard blocked reactivation because
+//	      the employee is currently on probation / notice / on_hold.
+//	      Those transitions need their own lifecycle path first.
+//	403 — employee outside the caller's location scope
+//	404 — employee profile not found
+//	500 — repo/tx failure
+func (h *EmployeeHandler) ReactivateEmployee(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	ctx := injectCommonContext(r.Context(), r)
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	userIDStr := chi.URLParam(r, "userID")
+
+	h.logger.Info("handler.ReactivateEmployee entry",
+		zap.String("company_id", companyIDStr),
+		zap.String("user_id", userIDStr),
+		zap.String("path", r.URL.Path),
+		zap.String("method", r.Method),
+	)
+
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
+		return
+	}
+
+	actorType, actorID, err := h.getActorInfo(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+
+	metadata := map[string]interface{}{
+		"ip_address":     r.RemoteAddr,
+		"user_agent":     r.UserAgent(),
+		"endpoint":       r.URL.Path,
+		"request_method": r.Method,
+	}
+
+	if err := h.employeeService.ReactivateEmployee(
+		ctx, companyID, userID, actorType, actorID, metadata,
+	); err != nil {
+		if h.mapLocationScopeError(w, err) {
+			return
+		}
+		if h.mapLifecycleError(w, err) {
+			return
+		}
+		// Status-guard rejections come back as plain fmt.Errorf strings;
+		// surface them as 400 so the UI can show the exact reason.
+		h.logger.Error("handler.ReactivateEmployee: service failed",
+			zap.String("company_id", companyID.String()),
+			zap.String("user_id", userID.String()),
+			zap.Error(err),
+		)
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.logger.Info("handler.ReactivateEmployee success",
+		zap.String("company_id", companyID.String()),
+		zap.String("user_id", userID.String()),
+		zap.Duration("duration", time.Since(startTime)),
+	)
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Employee reactivated",
+		"data": map[string]interface{}{
+			"user_id":    userID,
+			"company_id": companyID,
+			"status":     "active",
+		},
+		"meta": map[string]interface{}{"duration": time.Since(startTime).String()},
 	})
 }

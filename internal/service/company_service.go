@@ -1,6 +1,7 @@
 package service
 
 import (
+	"auth-service/internal/util"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -9,15 +10,15 @@ import (
 	"strings"
 	"time"
 
+	attendanceRepo "auth-service/internal/attendance/repository"
 	leaveRepo "auth-service/internal/hr/leave/repository"
 	hrEmployee "auth-service/internal/hr/models/employee"
 	hrRepo "auth-service/internal/hr/repository"
-	attendanceRepo "auth-service/internal/attendance/repository"   // 👈 ADD
-
 	hrService "auth-service/internal/hr/service"
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+	"go.uber.org/zap" // 👈 ADD THIS
 
 	"auth-service/internal/client"
 	"auth-service/internal/config"
@@ -33,8 +34,8 @@ type CompanyService struct {
 	pgClient         *client.PostgresClient
 	companyRepo      postgres.CompanyRepository
 	locationRepo     postgres.LocationRepository
-	locationService  *LocationService                  // 👈 ADD
-	workCenterRepo   attendanceRepo.WorkCenterRepository  // 👈 ADD
+	locationService  *LocationService                    // 👈 ADD
+	workCenterRepo   attendanceRepo.WorkCenterRepository // 👈 ADD
 	employeeRepo     hrRepo.EmployeeRepository
 	employeeService  *hrService.EmployeeService
 	userService      *UserService
@@ -54,8 +55,8 @@ func NewCompanyService(
 	pgClient *client.PostgresClient,
 	companyRepo postgres.CompanyRepository,
 	locationRepo postgres.LocationRepository,
-	locationService *LocationService,                    // 👈 ADD
-	workCenterRepo attendanceRepo.WorkCenterRepository,  // 👈 ADD
+	locationService *LocationService, // 👈 ADD
+	workCenterRepo attendanceRepo.WorkCenterRepository, // 👈 ADD
 	employeeRepo hrRepo.EmployeeRepository,
 	employeeService *hrService.EmployeeService,
 	userService *UserService,
@@ -74,8 +75,8 @@ func NewCompanyService(
 		pgClient:         pgClient,
 		companyRepo:      companyRepo,
 		locationRepo:     locationRepo,
-		locationService:  locationService,                    // 👈 ADD
-		workCenterRepo:   workCenterRepo,                     // 👈 ADD
+		locationService:  locationService, // 👈 ADD
+		workCenterRepo:   workCenterRepo,  // 👈 ADD
 		employeeRepo:     employeeRepo,
 		employeeService:  employeeService,
 		userService:      userService,
@@ -91,8 +92,6 @@ func NewCompanyService(
 		resolverJobs:     resolverJobs,
 	}
 }
-
-
 
 // ============================================================
 // Context-based permission helpers (unchanged)
@@ -221,7 +220,7 @@ type CreateCompanyRequest struct {
 	OwnerUsername           string   `json:"owner_username"`
 	OwnerFullName           string   `json:"owner_full_name"`
 	OwnerPositionTitle      string   `json:"owner_position_title"`
-	OwnerJobCode            string   `json:"owner_job_code,omitempty"` // 👈 NEW — defaults to slug of title
+	OwnerJobCode            string   `json:"owner_job_code,omitempty"`
 	SubscriptionTier        string   `json:"subscription_tier"`
 	SubscriptionPlanCode    string   `json:"subscription_plan_code"`
 	MaxEmployees            int      `json:"max_employees"`
@@ -232,20 +231,32 @@ type CreateCompanyRequest struct {
 	Departments             []string `json:"departments"`
 	FinancialYearStartMonth int      `json:"financial_year_start_month"`
 	TrialDays               int      `json:"trial_days"`
-	LocationCode            string   `json:"location_code"`
-	LocationName            string   `json:"location_name"`
-	AddressLine1            *string  `json:"address_line1,omitempty"`
-	AddressLine2            *string  `json:"address_line2,omitempty"`
-	City                    *string  `json:"city,omitempty"`
-	State                   *string  `json:"state,omitempty"`
-	Country                 *string  `json:"country,omitempty"`
-	Pincode                 *string  `json:"pincode,omitempty"`
-	WorkCenterCode          string   `json:"work_center_code"`
-	WorkCenterName          string   `json:"work_center_name"`
-	WorkCenterDesc          *string  `json:"work_center_desc,omitempty"`
-	WorkCenterTZ            string   `json:"work_center_timezone"`
-	WorkCenterActive        bool     `json:"work_center_active"`
-	PositionWorkCenterCode  *string  `json:"position_work_center_code,omitempty"`
+
+	// ── NEW: timezone config ─────────────────────────────────────────
+	// DefaultTimezone is required — the fallback for every subject
+	// whose position/location/work-center has no explicit tz.
+	// IANA name, e.g. 'Asia/Kolkata'.
+	DefaultTimezone string `json:"default_timezone"`
+
+	LocationCode string  `json:"location_code"`
+	LocationName string  `json:"location_name"`
+	AddressLine1 *string `json:"address_line1,omitempty"`
+	AddressLine2 *string `json:"address_line2,omitempty"`
+	City         *string `json:"city,omitempty"`
+	State        *string `json:"state,omitempty"`
+	Country      *string `json:"country,omitempty"`
+	Pincode      *string `json:"pincode,omitempty"`
+
+	// LocationTimezone is optional. When NULL, this location inherits
+	// the company default. Set only if this site is in a different tz.
+	LocationTimezone *string `json:"location_timezone,omitempty"`
+
+	WorkCenterCode         string  `json:"work_center_code"`
+	WorkCenterName         string  `json:"work_center_name"`
+	WorkCenterDesc         *string `json:"work_center_desc,omitempty"`
+	WorkCenterTZ           string  `json:"work_center_timezone"`
+	WorkCenterActive       bool    `json:"work_center_active"`
+	PositionWorkCenterCode *string `json:"position_work_center_code,omitempty"`
 
 	// Owner employee profile — all optional / nullable.
 	OwnerDateOfBirth      *time.Time `json:"owner_date_of_birth,omitempty"`
@@ -313,9 +324,27 @@ func (s *CompanyService) CreateCompany(
 		return nil, fmt.Errorf("%w: location_code and location_name are required", appErrors.ErrInvalidInput)
 	}
 
-	// 👇 Default the owner job title/code to "CEO" — this is the first
-	// creation on a brand-new company, and the owner is by definition
-	// the top-of-hierarchy seat.
+	// ── NEW: timezone validation.
+	//   • DefaultTimezone is required.
+	//   • LocationTimezone is optional; if provided it must be valid.
+	//   • WorkCenterTZ is validated by the work-center repo on insert.
+	if req.DefaultTimezone == "" {
+		return nil, fmt.Errorf("%w: default_timezone is required (IANA name, e.g. 'Asia/Kolkata')", appErrors.ErrInvalidInput)
+	}
+	if err := util.ValidateTimezone(req.DefaultTimezone); err != nil {
+		return nil, fmt.Errorf("%w: default_timezone: %v", appErrors.ErrInvalidInput, err)
+	}
+	if req.LocationTimezone != nil && *req.LocationTimezone != "" {
+		if err := util.ValidateTimezone(*req.LocationTimezone); err != nil {
+			return nil, fmt.Errorf("%w: location_timezone: %v", appErrors.ErrInvalidInput, err)
+		}
+	}
+	if req.WorkCenterTZ != "" {
+		if err := util.ValidateTimezone(req.WorkCenterTZ); err != nil {
+			return nil, fmt.Errorf("%w: work_center_timezone: %v", appErrors.ErrInvalidInput, err)
+		}
+	}
+
 	ownerJobTitle := strings.TrimSpace(req.OwnerPositionTitle)
 	if ownerJobTitle == "" {
 		ownerJobTitle = "CEO"
@@ -400,6 +429,7 @@ func (s *CompanyService) CreateCompany(
 		MaxLocations:            req.MaxLocations,
 		SubscriptionAmount:      subscriptionAmount,
 		DataRegion:              req.DataRegion,
+		DefaultTimezone:         req.DefaultTimezone, // ← NEW
 		IsActive:                true,
 		CreatedAt:               now,
 		UpdatedAt:               now,
@@ -428,8 +458,6 @@ func (s *CompanyService) CreateCompany(
 		UpdatedAt:      now,
 	}
 
-	// Position struct now uses the NEW schema.
-	// The repo creates the JOB inside the tx using ownerJobTitle.
 	position := &models.Position{
 		PositionID:     uuid.New(),
 		CompanyID:      uuid.Nil,
@@ -438,7 +466,6 @@ func (s *CompanyService) CreateCompany(
 		WorkCenterCode: positionWorkCenter,
 		CreatedAt:      now,
 		UpdatedAt:      now,
-		// JobID, LocationID, TitleOverride are all filled in by the repo.
 	}
 
 	if err := s.companyRepo.CreateCompany(
@@ -447,7 +474,7 @@ func (s *CompanyService) CreateCompany(
 		return nil, fmt.Errorf("%w: failed to create company: %v", appErrors.ErrInternal, err)
 	}
 
-	// --- default location ---
+	// ── default location — carries optional tz override ──────────────
 	location := &models.Location{
 		LocationID:   uuid.New(),
 		CompanyID:    company.CompanyID,
@@ -459,6 +486,7 @@ func (s *CompanyService) CreateCompany(
 		State:        req.State,
 		Country:      req.Country,
 		Pincode:      req.Pincode,
+		Timezone:     req.LocationTimezone, // ← NEW (nil → inherit company default)
 		IsActive:     true,
 		CreatedAt:    now,
 		UpdatedAt:    now,
@@ -467,7 +495,6 @@ func (s *CompanyService) CreateCompany(
 		return nil, fmt.Errorf("%w: failed to create default location: %v", appErrors.ErrInternal, err)
 	}
 
-	// --- link WC to location (also backfills positions.location_id) ---
 	if err := s.companyRepo.SetWorkCenterLocation(
 		ctx, s.pgClient.Pool(), company.CompanyID, req.WorkCenterCode, location.LocationID,
 	); err != nil {
@@ -484,7 +511,6 @@ func (s *CompanyService) CreateCompany(
 		}
 	}
 
-	// --- owner location access ---
 	if err := s.companyRepo.UpdateEmployeeLocationSettings(
 		ctx, s.pgClient.Pool(), company.CompanyID, ownerUser.UserID, &location.LocationID, models.LocationScopeAll,
 	); err != nil {
@@ -516,7 +542,6 @@ func (s *CompanyService) CreateCompany(
 		}
 	}
 
-	// --- owner employee profile ---
 	ownerStatus := "active"
 	if req.OwnerEmploymentStatus != nil && *req.OwnerEmploymentStatus != "" {
 		ownerStatus = *req.OwnerEmploymentStatus
@@ -561,24 +586,26 @@ func (s *CompanyService) CreateCompany(
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "company", "create_company", "admin",
 			&createdBy, "admin", &createdBy, nil, nil, map[string]interface{}{
-				"company_id":          company.CompanyID.String(),
-				"company_name":        req.CompanyName,
-				"owner_user_id":       ownerUser.UserID.String(),
-				"owner_job_title":     ownerJobTitle,
-				"subscription_tier":   req.SubscriptionTier,
-				"subscription_plan":   req.SubscriptionPlanCode,
-				"subscription_status": subscriptionStatus,
-				"subscription_months": req.SubscriptionMonths,
-				"subscription_days":   req.SubscriptionDays,
-				"trial_days":          req.TrialDays,
-				"max_locations":       req.MaxLocations,
-				"max_employees":       maxEmployees,
-				"ip_address":          ip,
+				"company_id":           company.CompanyID.String(),
+				"company_name":         req.CompanyName,
+				"owner_user_id":        ownerUser.UserID.String(),
+				"owner_job_title":      ownerJobTitle,
+				"subscription_tier":    req.SubscriptionTier,
+				"subscription_plan":    req.SubscriptionPlanCode,
+				"subscription_status":  subscriptionStatus,
+				"subscription_months":  req.SubscriptionMonths,
+				"subscription_days":    req.SubscriptionDays,
+				"trial_days":           req.TrialDays,
+				"max_locations":        req.MaxLocations,
+				"max_employees":        maxEmployees,
+				"default_timezone":     req.DefaultTimezone,  // ← NEW
+				"location_timezone":    req.LocationTimezone, // ← NEW
+				"work_center_timezone": req.WorkCenterTZ,     // ← NEW
+				"ip_address":           ip,
 			})
 	}
 	return company, nil
 }
-
 func (s *CompanyService) createOrFindUserForCompanyOwner(ctx context.Context, req *CreateCompanyRequest) (*models.User, error) {
 	user, err := s.userService.CreateUser(ctx, s.pgClient.Pool(), &UserCreateRequest{
 		Username:          req.OwnerUsername,
@@ -1017,8 +1044,6 @@ func (s *CompanyService) UpdateEmployeePosition(ctx context.Context, companyID, 
 	return nil
 }
 
-
-
 func (s *CompanyService) GetEmployeeWithPosition(ctx context.Context, companyID, userID uuid.UUID) (*models.EmployeeWithPositionDetails, error) {
 	employee, err := s.companyRepo.GetEmployeeWithPosition(ctx, s.pgClient.Pool(), companyID, userID)
 	if err != nil {
@@ -1040,7 +1065,6 @@ type UpdateEmployeeRequest struct {
 	IsActive   *bool
 	HireDate   *time.Time
 }
-
 
 func (s *CompanyService) UpdateEmployee(ctx context.Context, req *UpdateEmployeeRequest) error {
 	skipIdempotency := false
@@ -2348,7 +2372,6 @@ type UpdatePositionRequest struct {
 	WorkCenterCode *string    `json:"work_center_code,omitempty" validate:"omitempty,max=100"`
 }
 
-
 func (s *CompanyService) UpdatePosition(ctx context.Context, req *UpdatePositionRequest, updatedBy uuid.UUID) error {
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
@@ -2474,7 +2497,6 @@ func (s *CompanyService) UpdatePosition(ctx context.Context, req *UpdatePosition
 	}
 	return nil
 }
-
 
 func (s *CompanyService) UpdatePositionStatus(ctx context.Context, positionID uuid.UUID, isOpen bool, updatedBy uuid.UUID) error {
 	view, err := s.companyRepo.GetPosition(ctx, s.pgClient.Pool(), positionID)
@@ -3362,6 +3384,7 @@ func (s *CompanyService) GetRoleDepartmentsForPermissions(ctx context.Context, r
 type UpdateCompanyRequest struct {
 	CompanyName             *string `json:"company_name,omitempty"`
 	DataRegion              *string `json:"data_region,omitempty"`
+	DefaultTimezone         *string `json:"default_timezone,omitempty"` // ← NEW
 	FinancialYearStartMonth *int    `json:"financial_year_start_month,omitempty"`
 	MaxEmployees            *int    `json:"max_employees,omitempty"`
 	MaxLocations            *int    `json:"max_locations,omitempty"`
@@ -3384,12 +3407,27 @@ func (s *CompanyService) UpdateCompanyWithOptions(ctx context.Context, companyID
 	}
 	before := &models.Company{}
 	*before = *company
+
 	if req.CompanyName != nil {
 		company.CompanyName = *req.CompanyName
 	}
 	if req.DataRegion != nil {
 		company.DataRegion = *req.DataRegion
 	}
+
+	// ── NEW: DefaultTimezone update.
+	// Rejecting empty string forces the caller to either omit the field
+	// or supply a real IANA name. Never let the tz go blank.
+	if req.DefaultTimezone != nil {
+		if *req.DefaultTimezone == "" {
+			return fmt.Errorf("%w: default_timezone cannot be empty", appErrors.ErrInvalidInput)
+		}
+		if err := util.ValidateTimezone(*req.DefaultTimezone); err != nil {
+			return fmt.Errorf("%w: default_timezone: %v", appErrors.ErrInvalidInput, err)
+		}
+		company.DefaultTimezone = *req.DefaultTimezone
+	}
+
 	if req.FinancialYearStartMonth != nil {
 		if *req.FinancialYearStartMonth < 1 || *req.FinancialYearStartMonth > 12 {
 			return fmt.Errorf("%w: financial_year_start_month must be between 1 and 12", appErrors.ErrInvalidInput)
@@ -3480,22 +3518,27 @@ func (s *CompanyService) UpdateCompanyWithOptions(ctx context.Context, companyID
 		}
 		company.TrialEndDate = &t
 	}
+
 	company.UpdatedAt = time.Now().UTC()
 	if err := s.companyRepo.UpdateCompany(ctx, company); err != nil {
 		return fmt.Errorf("%w: failed to update company", appErrors.ErrInternal)
 	}
 	s.InvalidateCompanyStatusCache(ctx, companyID)
+
 	if s.auditService != nil {
 		ip, _ := ctx.Value("ip_address").(string)
 		beforeJSON, _ := json.Marshal(before)
 		afterJSON, _ := json.Marshal(company)
 		_ = s.auditService.LogAction(ctx, nil, nil, "company", "update_details", "company",
 			&companyID, "admin", &updatedBy, beforeJSON, afterJSON,
-			map[string]interface{}{"updated_by": updatedBy.String(), "ip_address": ip})
+			map[string]interface{}{
+				"updated_by":       updatedBy.String(),
+				"ip_address":       ip,
+				"timezone_changed": req.DefaultTimezone != nil && *req.DefaultTimezone != before.DefaultTimezone, // ← NEW
+			})
 	}
 	return nil
 }
-
 func pointerTime(t time.Time) *time.Time { return &t }
 
 func generateRandomString(n int) string {
@@ -3563,7 +3606,6 @@ type AddMemberRequest struct {
 	Email            *string    `json:"email,omitempty"`
 }
 
-
 func (s *CompanyService) AddMember(ctx context.Context, req *AddMemberRequest) error {
 	if req.MemberType == "" {
 		req.MemberType = "employee"
@@ -3629,7 +3671,6 @@ func (s *CompanyService) AddMember(ctx context.Context, req *AddMemberRequest) e
 	)
 
 	if effectivePositionID != nil {
-		// Validate the existing position.
 		position, err := s.companyRepo.GetPosition(ctx, s.pgClient.Pool(), *effectivePositionID)
 		if err != nil {
 			return fmt.Errorf("%w: position not found", appErrors.ErrNotFound)
@@ -3651,9 +3692,6 @@ func (s *CompanyService) AddMember(ctx context.Context, req *AddMemberRequest) e
 			return fmt.Errorf("%w: position's department not assigned to role", appErrors.ErrInvalidInput)
 		}
 
-		// If the seat already has a work center, resolve its location.
-		// The workCenterRepo.GetByCode query is scoped to (company_id, code),
-		// so cross-tenant lookups can't sneak in.
 		if position.WorkCenterCode != nil && *position.WorkCenterCode != "" {
 			wc, werr := s.workCenterRepo.GetByCode(ctx, req.CompanyID, *position.WorkCenterCode)
 			if werr != nil {
@@ -3664,7 +3702,6 @@ func (s *CompanyService) AddMember(ctx context.Context, req *AddMemberRequest) e
 			}
 		}
 	} else if req.JobID != nil {
-		// Validate job.
 		job, err := s.companyRepo.GetJobByID(ctx, *req.JobID)
 		if err != nil {
 			return fmt.Errorf("%w: job not found", appErrors.ErrNotFound)
@@ -3676,7 +3713,6 @@ func (s *CompanyService) AddMember(ctx context.Context, req *AddMemberRequest) e
 			return fmt.Errorf("%w: job is not active", appErrors.ErrInvalidState)
 		}
 
-		// Determine the department to use.
 		deptID := roleDepartments[0].DepartmentID
 		if req.DepartmentID != nil {
 			match := false
@@ -3691,8 +3727,8 @@ func (s *CompanyService) AddMember(ctx context.Context, req *AddMemberRequest) e
 				return fmt.Errorf("%w: department is not assigned to the role", appErrors.ErrInvalidInput)
 			}
 		}
+		_ = deptID
 
-		// Validate optional location.
 		if req.LocationID != nil {
 			loc, err := s.locationRepo.GetLocation(ctx, s.pgClient.Pool(), *req.LocationID)
 			if err != nil {
@@ -3706,8 +3742,6 @@ func (s *CompanyService) AddMember(ctx context.Context, req *AddMemberRequest) e
 			}
 		}
 
-		// Resolve work center → location. GetByCode returns (nil, nil) when
-		// the code doesn't exist, so we explicitly check for nil.
 		if req.WorkCenterCode != nil && *req.WorkCenterCode != "" {
 			wc, err := s.workCenterRepo.GetByCode(ctx, req.CompanyID, *req.WorkCenterCode)
 			if err != nil {
@@ -3724,7 +3758,6 @@ func (s *CompanyService) AddMember(ctx context.Context, req *AddMemberRequest) e
 			}
 			resolvedWCLoc = wc.LocationID
 
-			// If a location was also sent, they must agree.
 			if req.LocationID != nil && *req.LocationID != *resolvedWCLoc {
 				return fmt.Errorf(
 					"%w: position location does not match work center location",
@@ -3735,12 +3768,10 @@ func (s *CompanyService) AddMember(ctx context.Context, req *AddMemberRequest) e
 
 		pid := uuid.New()
 		newPositionID = &pid
-		_ = deptID // used inside tx below
 	} else {
 		return fmt.Errorf("%w: either position_id or job_id is required", appErrors.ErrInvalidInput)
 	}
 
-	// Full multi-layer location validation, before the tx.
 	primaryLoc, effectiveScope, err := s.locationService.ValidateProspectiveLocationAccess(
 		ctx, req.CompanyID, req, resolvedWCLoc,
 	)
@@ -3780,7 +3811,6 @@ func (s *CompanyService) AddMember(ctx context.Context, req *AddMemberRequest) e
 	var resolvedUser *models.User
 
 	txErr := s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
-		// -------- 1. Resolve/create user inside the tx --------
 		user, uerr := s.userService.GetUserByPhoneTx(ctx, tx, req.PhoneNumber)
 		if uerr != nil && !errors.Is(uerr, appErrors.ErrNotFound) {
 			return fmt.Errorf("%w: failed to look up user by phone: %v", appErrors.ErrInternal, uerr)
@@ -3806,7 +3836,6 @@ func (s *CompanyService) AddMember(ctx context.Context, req *AddMemberRequest) e
 			resolvedUser = created
 		}
 
-		// -------- 2. Duplicate employee check --------
 		existingEmp, err := s.companyRepo.GetEmployee(ctx, tx, req.CompanyID, resolvedUser.UserID)
 		if err == nil && existingEmp != nil && existingEmp.IsActive {
 			return fmt.Errorf("%w: user is already an active employee", appErrors.ErrDuplicate)
@@ -3815,7 +3844,6 @@ func (s *CompanyService) AddMember(ctx context.Context, req *AddMemberRequest) e
 			return fmt.Errorf("%w: failed to check existing employee: %v", appErrors.ErrInternal, err)
 		}
 
-		// -------- 3. Auto-create the position if requested --------
 		if effectivePositionID == nil && newPositionID != nil {
 			deptID := roleDepartments[0].DepartmentID
 			if req.DepartmentID != nil {
@@ -3839,7 +3867,6 @@ func (s *CompanyService) AddMember(ctx context.Context, req *AddMemberRequest) e
 			effectivePositionID = newPositionID
 		}
 
-		// -------- 4. Insert company_employees row --------
 		emp := &models.CompanyEmployee{
 			CompanyID:  req.CompanyID,
 			UserID:     resolvedUser.UserID,
@@ -3856,7 +3883,6 @@ func (s *CompanyService) AddMember(ctx context.Context, req *AddMemberRequest) e
 			return fmt.Errorf("%w: failed to add member: %v", appErrors.ErrInternal, err)
 		}
 
-		// -------- 5. Employee profile (PII encrypted) --------
 		status := "active"
 		if req.EmploymentStatus != nil && *req.EmploymentStatus != "" {
 			status = *req.EmploymentStatus
@@ -3903,14 +3929,12 @@ func (s *CompanyService) AddMember(ctx context.Context, req *AddMemberRequest) e
 			return fmt.Errorf("%w: failed to create employee profile: %v", appErrors.ErrInternal, err)
 		}
 
-		// -------- 6. Location assignment --------
 		if hasLocationInput {
 			if err := s.assignMemberLocationsTx(ctx, tx, req.CompanyID, resolvedUser.UserID, req); err != nil {
 				return fmt.Errorf("%w: %v", appErrors.ErrInvalidInput, err)
 			}
 		}
 
-		// -------- 7. Resolver job --------
 		if err := s.resolverJobs.EnqueueUserResolution(ctx, tx,
 			req.CompanyID, resolvedUser.UserID, "onboarding"); err != nil {
 			return err
@@ -3919,6 +3943,48 @@ func (s *CompanyService) AddMember(ctx context.Context, req *AddMemberRequest) e
 	})
 	if txErr != nil {
 		return txErr
+	}
+
+	// ─────────────────────────────────────────────────────────
+	// NEW: open the probation row after the tx commits.
+	//
+	// StartProbation uses the non-tx repo (it opens its own tx for the
+	// scheduled-job enqueue), so it MUST run outside this function's
+	// transaction. If the hire carries a probation_end_date, this creates
+	// the employee_probation row and enqueues the T-14/T-7/T-3/T+1 jobs
+	// that HRLifecycleWorker fires later.
+	//
+	// Non-fatal: if this fails, the member is still created. Log and
+	// continue; HR can re-open the probation window via the update path
+	// if needed.
+	// ─────────────────────────────────────────────────────────
+	if req.ProbationEndDate != nil && resolvedUser != nil {
+		if _, err := s.employeeService.StartProbation(
+			ctx,
+			req.CompanyID,
+			resolvedUser.UserID,
+			now,
+			*req.ProbationEndDate,
+			100,
+		); err != nil {
+			zap.L().Warn("AddMember: StartProbation post-commit failed",
+				zap.String("company_id", req.CompanyID.String()),
+				zap.String("user_id", resolvedUser.UserID.String()),
+				zap.Time("probation_end_date", *req.ProbationEndDate),
+				zap.Error(err),
+			)
+			if s.auditService != nil {
+				_ = s.auditService.LogAction(ctx, nil, nil,
+					"employee", "start_probation_failed", "employee",
+					&resolvedUser.UserID, "system", nil, nil, nil,
+					map[string]interface{}{
+						"company_id":         req.CompanyID.String(),
+						"user_id":            resolvedUser.UserID.String(),
+						"probation_end_date": req.ProbationEndDate,
+						"error":              err.Error(),
+					})
+			}
+		}
 	}
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
@@ -4189,6 +4255,10 @@ func (s *CompanyService) UpdateMember(
 		req.LocationAccessScope != nil ||
 		req.SelectedLocations != nil
 
+	// Captured outside the closure so we can inspect the post-update
+	// employment_status + probation_end_date after commit.
+	var finalProfile *hrEmployee.EmployeeProfile
+
 	txErr := s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
 		if req.Username != nil || req.FullName != nil {
 			if req.Username != nil {
@@ -4202,8 +4272,6 @@ func (s *CompanyService) UpdateMember(
 			}
 		}
 
-		// Snapshot the current position before the update so we can detect
-		// a change and enqueue the leave resolver only when it actually moved.
 		oldPositionID := existingEmp.PositionID
 
 		roster := *existingEmp
@@ -4221,9 +4289,6 @@ func (s *CompanyService) UpdateMember(
 			return fmt.Errorf("%w: failed to update roster: %v", appErrors.ErrInternal, err)
 		}
 
-		// Leave policies resolve against (company, position, work-center).
-		// If the position changed, enqueue a resolve_user job in the SAME tx
-		// so entitlements recompute atomically with the roster update.
 		if !uuidPtrEqual(oldPositionID, roster.PositionID) {
 			if err := s.resolverJobs.EnqueueUserResolution(
 				ctx, tx, companyID, userID, "position change",
@@ -4301,22 +4366,75 @@ func (s *CompanyService) UpdateMember(
 		if st, ok := ctx.Value("session_type").(string); ok && st != "" {
 			actorType = st
 		}
-		if _, err := s.employeeService.UpdateEmployeeProfileInTx(
+		updatedProfile, err := s.employeeService.UpdateEmployeeProfileInTx(
 			ctx, tx, &profile, actorType, actorID,
 			map[string]interface{}{"source": "update_member", "company_id": companyID.String()},
-		); err != nil {
+		)
+		if err != nil {
 			return fmt.Errorf("%w: failed to update profile: %v", appErrors.ErrInternal, err)
 		}
+		finalProfile = updatedProfile
 		return nil
 	})
 	if txErr != nil {
 		return txErr
 	}
 
+	// ─────────────────────────────────────────────────────────
+	// NEW: if this update just flipped the employee into probation
+	// with a future end date and there's no open employee_probation
+	// row, open one and enqueue the reminder jobs.
+	//
+	// Runs AFTER the tx commits because StartProbation uses the non-tx
+	// repo. The GetActiveProbation guard prevents double-opening when
+	// the caller updates an already-probationary employee.
+	// ─────────────────────────────────────────────────────────
+	if finalProfile != nil &&
+		finalProfile.EmploymentStatus != nil &&
+		*finalProfile.EmploymentStatus == "probation" &&
+		finalProfile.ProbationEndDate != nil {
+
+		hasOpenProbation := false
+		if _, perr := s.employeeRepo.GetActiveProbation(ctx, companyID, userID); perr == nil {
+			hasOpenProbation = true
+		}
+
+		if !hasOpenProbation {
+			if _, err := s.employeeService.StartProbation(
+				ctx,
+				companyID,
+				userID,
+				now,
+				*finalProfile.ProbationEndDate,
+				100,
+			); err != nil {
+				zap.L().Warn("UpdateMember: StartProbation post-commit failed",
+					zap.String("company_id", companyID.String()),
+					zap.String("user_id", userID.String()),
+					zap.Time("probation_end_date", *finalProfile.ProbationEndDate),
+					zap.Error(err),
+				)
+				if s.auditService != nil {
+					_ = s.auditService.LogAction(ctx, nil, nil,
+						"employee", "start_probation_failed", "employee",
+						&userID, "system", nil, nil, nil,
+						map[string]interface{}{
+							"company_id":         companyID.String(),
+							"user_id":            userID.String(),
+							"probation_end_date": finalProfile.ProbationEndDate,
+							"error":              err.Error(),
+						})
+				}
+			}
+		}
+	}
+
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &companyID, "employee", "update_member", "hr",
 			&updatedBy, "hr", &updatedBy, nil, nil, map[string]interface{}{
-				"company_id": companyID.String(), "user_id": userID.String(), "ip_address": ip,
+				"company_id": companyID.String(),
+				"user_id":    userID.String(),
+				"ip_address": ip,
 			})
 	}
 	return nil
@@ -4346,4 +4464,170 @@ func strPtrEqual(a, b *string) bool {
 		return false
 	}
 	return *a == *b
+}
+
+// ============================================================
+// GetEmployeeFormOptions — single-call prefetch for the HR form.
+//
+// requestedLocationHeader:
+//
+//	""       → caller's full scope (all locations they can see)
+//	"ALL"    → same as "" (explicit company-wide)
+//	<uuid>   → narrow positions & work centers to that location
+//	           (+ universal rows where location_id IS NULL)
+//
+// The caller's own scope is ALWAYS enforced first — even if the
+// header names a location outside the caller's set, we 403.
+//
+// The full scope-aware location list is returned in
+// `AllowedLocations` regardless of the filter, so the client
+// still knows what locations the new employee could be granted.
+// ============================================================
+func (s *CompanyService) GetEmployeeFormOptions(
+	ctx context.Context,
+	companyID, callerUserID uuid.UUID,
+	requestedLocationHeader string,
+) (*models.EmployeeFormOptions, error) {
+	if companyID == uuid.Nil || callerUserID == uuid.Nil {
+		return nil, fmt.Errorf(
+			"%w: company_id and caller_user_id are required",
+			appErrors.ErrInvalidInput,
+		)
+	}
+
+	// --- Caller must be an active member of this company ---------
+	callerEmp, err := s.companyRepo.GetEmployee(
+		ctx, s.pgClient.Pool(), companyID, callerUserID,
+	)
+	if err != nil {
+		if errors.Is(err, appErrors.ErrNotFound) {
+			return nil, fmt.Errorf(
+				"%w: caller is not a member of this company",
+				appErrors.ErrPermissionDenied,
+			)
+		}
+		return nil, fmt.Errorf(
+			"%w: failed to verify caller membership: %v",
+			appErrors.ErrInternal, err,
+		)
+	}
+	if !callerEmp.IsActive {
+		return nil, fmt.Errorf(
+			"%w: caller is not an active employee",
+			appErrors.ErrPermissionDenied,
+		)
+	}
+
+	// --- 1. Caller's allowed locations (scope = PRIMARY | SELECTED | ALL) ---
+	myLocs, err := s.locationService.GetMyLocations(ctx, companyID, callerUserID)
+	if err != nil {
+		return nil, err
+	}
+
+	scopeLocationIDs := make([]uuid.UUID, 0, len(myLocs.Locations))
+	for _, l := range myLocs.Locations {
+		if l == nil || l.Location.LocationID == uuid.Nil {
+			continue
+		}
+		scopeLocationIDs = append(scopeLocationIDs, l.Location.LocationID)
+	}
+
+	var primaryPtr *uuid.UUID
+	if myLocs.PrimaryLocationID != uuid.Nil {
+		id := myLocs.PrimaryLocationID
+		primaryPtr = &id
+	}
+
+	// ---------------------------------------------------------
+	// 2. Determine the effective location filter.
+	//
+	// If the client sent a concrete UUID, narrow to that one — but
+	// ONLY after verifying it's inside the caller's allowed set.
+	// Otherwise fall back to the caller's full scope (which is what
+	// an empty or "ALL" header means).
+	// ---------------------------------------------------------
+	effectiveLocationIDs := scopeLocationIDs
+
+	header := strings.TrimSpace(requestedLocationHeader)
+	if header != "" && !strings.EqualFold(header, "ALL") {
+		requested, perr := uuid.Parse(header)
+		if perr != nil || requested == uuid.Nil {
+			return nil, fmt.Errorf(
+				"%w: invalid X-Location-ID header value",
+				appErrors.ErrInvalidInput,
+			)
+		}
+
+		// The requested location must be inside the caller's scope,
+		// otherwise we'd be leaking positions the caller can't touch.
+		inScope := false
+		for _, id := range scopeLocationIDs {
+			if id == requested {
+				inScope = true
+				break
+			}
+		}
+		if !inScope {
+			return nil, fmt.Errorf(
+				"%w: location %s is not in the caller's scope",
+				appErrors.ErrPermissionDenied, requested,
+			)
+		}
+
+		effectiveLocationIDs = []uuid.UUID{requested}
+	}
+
+	// --- 3. Roles (each with its departments) ----------------
+	roles, _, err := s.companyRepo.GetRolesByCompany(ctx, companyID, 200, 0)
+	if err != nil {
+		return nil, fmt.Errorf("%w: fetch roles: %v", appErrors.ErrInternal, err)
+	}
+
+	rolesWithDeps := make([]*models.RoleWithDepartments, 0, len(roles))
+	for _, role := range roles {
+		deps, depErr := s.companyRepo.GetRoleDepartments(ctx, role.RoleID)
+		if depErr != nil {
+			deps = []*models.Department{}
+		}
+		rolesWithDeps = append(rolesWithDeps, &models.RoleWithDepartments{
+			RoleID:       role.RoleID,
+			RoleName:     role.RoleName,
+			RoleLevel:    role.RoleLevel,
+			Description:  role.Description,
+			IsSystemRole: role.IsSystemRole,
+			Departments:  deps,
+		})
+	}
+
+	// --- 4. Positions — filtered by the effective location set ----
+	positions, _, err := s.companyRepo.GetPositionsFiltered(
+		ctx, s.pgClient.Pool(), companyID,
+		effectiveLocationIDs,
+		nil,  // no department narrowing server-side; frontend filters by role
+		true, // include universal positions (location_id IS NULL)
+		500, 0,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("%w: fetch positions: %v", appErrors.ErrInternal, err)
+	}
+
+	// --- 5. Work centers — same filter -----------------------
+	workCenters, err := s.companyRepo.GetWorkCentersFiltered(
+		ctx, s.pgClient.Pool(), companyID,
+		effectiveLocationIDs,
+		true, // include universal work centers
+	)
+	if err != nil {
+		return nil, fmt.Errorf("%w: fetch work centers: %v", appErrors.ErrInternal, err)
+	}
+
+	return &models.EmployeeFormOptions{
+		PrimaryLocationID: primaryPtr,
+		LocationScope:     myLocs.LocationScope,
+		AllowedLocations:  myLocs.Locations,
+		Roles:             rolesWithDeps,
+		Positions:         positions,
+		WorkCenters:       workCenters,
+		IncludeUniversal:  true,
+	}, nil
 }

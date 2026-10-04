@@ -31,9 +31,15 @@ func NewEventRepository(pg *client.PostgresClient, logger *zap.Logger) repositor
 }
 
 // eventColumns is the canonical SELECT list. Used everywhere.
+//
+// ── CHANGED: added event_tz, event_offset_minutes, event_date_local,
+//
+//	event_country. Removed event_date (was UTC-generated, wrong for
+//	every non-UTC company).
 const eventColumns = `
 	attendance_event_id, company_id, subject_type, subject_id,
 	event_type, event_time,
+	event_tz, event_offset_minutes, event_date_local, event_country,
 	employment_location_id, geofence_id,
 	source_type, source_id,
 	device_id, device_user_code, ip_address,
@@ -48,19 +54,40 @@ func (r *eventRepository) CreateEvent(ctx context.Context, tx *sql.Tx, event *mo
 		event.CreatedAt = time.Now().UTC()
 	}
 
+	// ── Guard: the writer MUST have resolved the timezone via the chain
+	//    (position → location → work center → company). If any tz field
+	//    is missing, log loudly so we can trace it upstream.
+	if event.EventTZ == "" {
+		r.logger.Error("CreateEvent: EventTZ empty; defaulting to UTC",
+			zap.String("event_id", event.AttendanceEventID.String()),
+			zap.String("company_id", event.CompanyID.String()),
+			zap.String("subject_id", event.SubjectID.String()),
+		)
+		event.EventTZ = "UTC"
+		event.EventOffsetMinutes = 0
+	}
+	if event.EventDateLocal.IsZero() {
+		r.logger.Error("CreateEvent: EventDateLocal zero; deriving from EventTime in UTC",
+			zap.String("event_id", event.AttendanceEventID.String()),
+		)
+		event.EventDateLocal = event.EventTime.UTC().Truncate(24 * time.Hour)
+	}
+
 	query := `
 		INSERT INTO attendance.attendance_events (
 			attendance_event_id, company_id, subject_type, subject_id,
 			event_type, event_time,
+			event_tz, event_offset_minutes, event_date_local, event_country,
 			employment_location_id, geofence_id,
 			source_type, source_id,
 			device_id, device_user_code, ip_address,
 			context, metadata, raw_event_payload, created_at, created_by
 		) VALUES (
 			$1, $2, $3, $4, $5, $6,
-			$7, $8,
-			$9, $10, $11, $12, $13,
-			$14, $15, $16, $17, $18
+			$7, $8, $9, $10,
+			$11, $12,
+			$13, $14, $15, $16, $17,
+			$18, $19, $20, $21, $22
 		)
 	`
 
@@ -80,6 +107,10 @@ func (r *eventRepository) CreateEvent(ctx context.Context, tx *sql.Tx, event *mo
 		event.SubjectID,
 		event.EventType,
 		event.EventTime,
+		event.EventTZ,
+		event.EventOffsetMinutes,
+		event.EventDateLocal,
+		event.EventCountry,
 		event.EmploymentLocationID,
 		event.GeofenceID,
 		event.SourceType,
@@ -96,6 +127,8 @@ func (r *eventRepository) CreateEvent(ctx context.Context, tx *sql.Tx, event *mo
 	if err != nil {
 		r.logger.Error("failed to create event",
 			zap.String("event_id", event.AttendanceEventID.String()),
+			zap.String("company_id", event.CompanyID.String()),
+			zap.String("event_tz", event.EventTZ),
 			zap.Error(err),
 		)
 		return fmt.Errorf("create event: %w", err)
@@ -301,12 +334,15 @@ func (r *eventRepository) HealthCheck(ctx context.Context) error {
 	return err
 }
 
-// --- helpers ---
+// ──────────────────────────────────────────────────────────────
+// SCAN HELPERS
+// ──────────────────────────────────────────────────────────────
 
 func (r *eventRepository) scanEvent(row *sql.Row) (*models.AttendanceEvent, error) {
 	var e models.AttendanceEvent
 	var contextJSON, metadataJSON, rawPayloadJSON []byte
 	var employmentLocID, geofenceID sql.NullString
+	var eventCountry sql.NullString
 
 	err := row.Scan(
 		&e.AttendanceEventID,
@@ -315,6 +351,10 @@ func (r *eventRepository) scanEvent(row *sql.Row) (*models.AttendanceEvent, erro
 		&e.SubjectID,
 		&e.EventType,
 		&e.EventTime,
+		&e.EventTZ,
+		&e.EventOffsetMinutes,
+		&e.EventDateLocal,
+		&eventCountry,
 		&employmentLocID,
 		&geofenceID,
 		&e.SourceType,
@@ -334,6 +374,9 @@ func (r *eventRepository) scanEvent(row *sql.Row) (*models.AttendanceEvent, erro
 		}
 		return nil, fmt.Errorf("scan event: %w", err)
 	}
+	if eventCountry.Valid {
+		e.EventCountry = &eventCountry.String
+	}
 	r.assignEventNulls(&e, employmentLocID, geofenceID, contextJSON, metadataJSON, rawPayloadJSON)
 	return &e, nil
 }
@@ -344,6 +387,7 @@ func (r *eventRepository) scanEvents(rows *sql.Rows) ([]*models.AttendanceEvent,
 		var e models.AttendanceEvent
 		var contextJSON, metadataJSON, rawPayloadJSON []byte
 		var employmentLocID, geofenceID sql.NullString
+		var eventCountry sql.NullString
 
 		err := rows.Scan(
 			&e.AttendanceEventID,
@@ -352,6 +396,10 @@ func (r *eventRepository) scanEvents(rows *sql.Rows) ([]*models.AttendanceEvent,
 			&e.SubjectID,
 			&e.EventType,
 			&e.EventTime,
+			&e.EventTZ,
+			&e.EventOffsetMinutes,
+			&e.EventDateLocal,
+			&eventCountry,
 			&employmentLocID,
 			&geofenceID,
 			&e.SourceType,
@@ -368,6 +416,9 @@ func (r *eventRepository) scanEvents(rows *sql.Rows) ([]*models.AttendanceEvent,
 		if err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
+		if eventCountry.Valid {
+			e.EventCountry = &eventCountry.String
+		}
 		r.assignEventNulls(&e, employmentLocID, geofenceID, contextJSON, metadataJSON, rawPayloadJSON)
 		events = append(events, &e)
 	}
@@ -377,7 +428,6 @@ func (r *eventRepository) scanEvents(rows *sql.Rows) ([]*models.AttendanceEvent,
 	return events, nil
 }
 
-// assignEventNulls attaches nullable columns to the struct.
 func (r *eventRepository) assignEventNulls(
 	e *models.AttendanceEvent,
 	employmentLoc, geofenceID sql.NullString,
@@ -447,8 +497,6 @@ func (r *eventRepository) buildEventFilter(filter repository.EventFilter) (strin
 		args = append(args, *filter.DeviceID)
 		idx++
 	}
-
-	// 👇 NEW — location scope
 	if filter.LocationID != nil {
 		conditions = append(conditions, fmt.Sprintf(
 			"($%d::uuid IS NULL OR employment_location_id = $%d)", idx, idx))

@@ -35,6 +35,11 @@ const workCenterColumns = `
 `
 
 func (r *workCenterRepository) Create(ctx context.Context, tx *sql.Tx, wc *models.WorkCenter) error {
+	// ── NEW: validate IANA name before it hits the DB.
+	if err := util.ValidateTimezone(wc.Timezone); err != nil {
+		return fmt.Errorf("work center timezone: %w", err)
+	}
+
 	now := time.Now().UTC()
 	if wc.CreatedAt.IsZero() {
 		wc.CreatedAt = now
@@ -70,6 +75,7 @@ func (r *workCenterRepository) Create(ctx context.Context, tx *sql.Tx, wc *model
 	if err != nil {
 		r.logger.Error("failed to create work center",
 			util.String("work_center_code", wc.WorkCenterCode),
+			util.String("timezone", wc.Timezone),
 			util.ErrorField(err))
 		return fmt.Errorf("create work center: %w", err)
 	}
@@ -85,6 +91,11 @@ func (r *workCenterRepository) GetByCode(ctx context.Context, companyID uuid.UUI
 }
 
 func (r *workCenterRepository) Update(ctx context.Context, tx *sql.Tx, wc *models.WorkCenter) error {
+	// ── NEW: validate IANA name.
+	if err := util.ValidateTimezone(wc.Timezone); err != nil {
+		return fmt.Errorf("work center timezone: %w", err)
+	}
+
 	wc.UpdatedAt = time.Now().UTC()
 	query := `
 		UPDATE attendance.work_centers SET
@@ -133,7 +144,6 @@ func (r *workCenterRepository) Delete(ctx context.Context, companyID uuid.UUID, 
 	return nil
 }
 
-// List — locationID == nil means no filter.
 func (r *workCenterRepository) List(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, limit, offset int) ([]*models.WorkCenter, int, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
@@ -175,7 +185,6 @@ func (r *workCenterRepository) List(ctx context.Context, companyID uuid.UUID, lo
 	return wcs, total, nil
 }
 
-// Search — locationID == nil means no filter.
 func (r *workCenterRepository) Search(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, filters map[string]interface{}, limit, offset int) ([]*models.WorkCenter, int, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
@@ -240,7 +249,6 @@ func (r *workCenterRepository) Search(ctx context.Context, companyID uuid.UUID, 
 	return wcs, total, nil
 }
 
-// GetActive — locationID == nil means no filter.
 func (r *workCenterRepository) GetActive(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID) ([]*models.WorkCenter, error) {
 	var locArg interface{}
 	if locationID != nil {

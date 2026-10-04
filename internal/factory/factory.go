@@ -3,6 +3,7 @@ package factory
 
 import (
 	"context"
+	"database/sql" // 👈 NEW — for *sql.Tx in the scheduler fanout
 	"fmt"
 	"strings"
 	"sync"
@@ -28,20 +29,21 @@ import (
 	"auth-service/internal/email"
 	"auth-service/internal/encryption"
 	"auth-service/internal/handler"
-	locationhandler "auth-service/internal/handler" // 🆕 LOCATION
+	locationhandler "auth-service/internal/handler"
 	"auth-service/internal/hashing"
 	"auth-service/internal/hashing/pepperstore"
 	hrhandler "auth-service/internal/hr/handler"
 	leavehandler "auth-service/internal/hr/leave/handler"
 	leaverepo "auth-service/internal/hr/leave/repository"
 	leavesvc "auth-service/internal/hr/leave/service"
-	leaveworker "auth-service/internal/hr/leave/worker" // 👈 ADD
+	leaveworker "auth-service/internal/hr/leave/worker"
 	payrollhandler "auth-service/internal/hr/payroll/handler"
 	payrollrepo "auth-service/internal/hr/payroll/repository"
 	payrollsvc "auth-service/internal/hr/payroll/service"
 	"auth-service/internal/hr/payroll/service/pdf"
 	hrpostgres "auth-service/internal/hr/repository"
 	hrservice "auth-service/internal/hr/service"
+	hrworker "auth-service/internal/hr/worker"
 	"auth-service/internal/infrastructure/audit"
 	"auth-service/internal/infrastructure/idempotency"
 	"auth-service/internal/infrastructure/outbox"
@@ -183,10 +185,25 @@ type Factory struct {
 	payrollWorker                *payrollsvc.PayrollWorker
 	payrollWorkerCancel          context.CancelFunc
 
-	// 👇 ADD
+	// Leave resolver worker (queue-driven)
 	resolverJobRepo      leaverepo.ResolverJobRepository
 	resolverWorker       *leaveworker.ResolverWorker
 	resolverWorkerCancel context.CancelFunc
+
+	// HR LIFECYCLE — queue-driven worker + daily exit enforcer
+	scheduledJobRepo              hrpostgres.ScheduledJobRepository
+	hrLifecycleWorker             *hrworker.HRLifecycleWorker
+	hrLifecycleWorkerCancel       context.CancelFunc
+	dailyExitEnforcerCancel       context.CancelFunc
+	monthlyAccrualSchedulerCancel context.CancelFunc // 👈 NEW
+
+	// HR REMINDERS — in-app feed (equivalent of an inbox).
+	// Field names carry the "hr" prefix so they don't collide with the
+	// subscription reminder service further down (same Go type name,
+	// different package).
+	hrReminderRepo    hrpostgres.ReminderRepository
+	hrReminderService *hrservice.ReminderService
+	hrReminderHandler *hrhandler.ReminderHandler
 
 	bankExportSvc              payrollsvc.BankExportService
 	componentSvc               payrollsvc.ComponentService
@@ -231,7 +248,7 @@ type Factory struct {
 	auditConsumer       *audit.AuditClickHouseConsumer
 	auditConsumerCancel context.CancelFunc
 
-	// NEW: Audit Elasticsearch consumer
+	// Audit Elasticsearch consumer
 	auditESConsumer       *audit.AuditESConsumer
 	auditESConsumerCancel context.CancelFunc
 
@@ -248,19 +265,19 @@ type Factory struct {
 	avatarHandler *avatarHandler.AvatarHandler
 	// ===============================================
 
-	// 🆕 LOCATION ====================================
+	// ==================== LOCATION ====================
 	locationRepo    postgres.LocationRepository
 	locationService *service.LocationService
 	locationHandler *locationhandler.LocationHandler
-	// ================================================
+	// ==================================================
 
-	// 🆕 JOB =========================================
+	// ==================== JOB =========================
 	jobRepo    postgres.JobRepository
 	jobService *service.JobService
 	jobHandler *handler.JobHandler
-	// ================================================
+	// ==================================================
 
-	// 🆕 SUBSCRIPTION ====================================
+	// ==================== SUBSCRIPTION ================
 	subscriptionPlanRepo        postgres.SubscriptionPlanRepository
 	companyPaymentRepo          postgres.CompanyPaymentRepository
 	subscriptionInvoiceRepo     postgres.SubscriptionInvoiceRepository
@@ -512,11 +529,13 @@ func NewFactory() (*Factory, error) {
 	}
 
 	f.initializePayrollWorker()
-	f.initializeResolverWorker() // 👈 ADD
+	f.initializeResolverWorker()
+	f.initializeHRLifecycleWorker()
+	f.startDailyExitEnforcer(ctx2)
+	f.startMonthlyAccrualScheduler(ctx2) // 👈 NEW
 
 	// Start Kafka consumers
 	if f.kafkaProducer != nil && len(f.config.Kafka.Brokers) > 0 {
-		// --- Existing consumers (analytics, student, accounting, inventory, sales, subscription) ---
 		analyticsTopic := "academics-events"
 		analyticsKafkaConsumer, err := client.NewKafkaConsumer(
 			f.config,
@@ -661,7 +680,7 @@ func NewFactory() (*Factory, error) {
 				f.salesConsumer.Start(ctx)
 				f.logger.Info("Sales consumer stopped")
 			}()
-			f.logger.Info("✅ Sales consumer started", zap.String("topic", salesTopic))
+			f.logger.Info("Sales consumer started", zap.String("topic", salesTopic))
 		}
 
 		subscriptionTopic := "subscription-events"
@@ -688,12 +707,9 @@ func NewFactory() (*Factory, error) {
 				f.subscriptionConsumer.Start(ctx)
 				f.logger.Info("Subscription consumer stopped")
 			}()
-			f.logger.Info("✅ Subscription consumer started (product sync)", zap.String("topic", subscriptionTopic))
+			f.logger.Info("Subscription consumer started (product sync)", zap.String("topic", subscriptionTopic))
 		}
 
-		// ============================================================
-		// AUDIT CLICKHOUSE CONSUMER
-		// ============================================================
 		auditTopic := "audit-logs"
 		auditKafkaConsumer, err := client.NewKafkaConsumer(
 			f.config,
@@ -717,17 +733,14 @@ func NewFactory() (*Factory, error) {
 				auditConsumer.Start(ctx)
 				f.logger.Info("Audit ClickHouse consumer stopped")
 			}()
-			f.logger.Info("✅ Audit ClickHouse consumer started", zap.String("topic", auditTopic))
+			f.logger.Info("Audit ClickHouse consumer started", zap.String("topic", auditTopic))
 		}
 
-		// ============================================================
-		// NEW: AUDIT ELASTICSEARCH CONSUMER
-		// ============================================================
 		if f.config.Elasticsearch.URL != "" && f.esClient != nil {
 			auditESConsumer, err := client.NewKafkaConsumer(
 				f.config,
 				"audit-logs",
-				"audit-es-consumer-group", // separate group
+				"audit-es-consumer-group",
 				f.logger,
 			)
 			if err != nil {
@@ -746,7 +759,7 @@ func NewFactory() (*Factory, error) {
 					esConsumer.Start(ctx)
 					f.logger.Info("Audit ES consumer stopped")
 				}()
-				f.logger.Info("✅ Audit ES consumer started", zap.String("topic", "audit-logs"))
+				f.logger.Info("Audit ES consumer started", zap.String("topic", "audit-logs"))
 			}
 		} else {
 			f.logger.Warn("Elasticsearch not available – audit ES consumer disabled")
@@ -787,7 +800,6 @@ func (f *Factory) Close() error {
 			}
 		}
 
-		// Shutdown audit ClickHouse consumer
 		if f.auditConsumerCancel != nil {
 			f.logger.Info("Stopping audit ClickHouse consumer...")
 			f.auditConsumerCancel()
@@ -798,7 +810,6 @@ func (f *Factory) Close() error {
 			}
 		}
 
-		// NEW: Shutdown audit ES consumer
 		if f.auditESConsumerCancel != nil {
 			f.logger.Info("Stopping audit ES consumer...")
 			f.auditESConsumerCancel()
@@ -814,10 +825,23 @@ func (f *Factory) Close() error {
 			f.payrollWorkerCancel()
 		}
 
-		// 👈 ADD
 		if f.resolverWorkerCancel != nil {
 			f.logger.Info("Stopping leave resolver worker...")
 			f.resolverWorkerCancel()
+		}
+
+		if f.hrLifecycleWorkerCancel != nil {
+			f.logger.Info("Stopping HR lifecycle worker...")
+			f.hrLifecycleWorkerCancel()
+		}
+
+		if f.dailyExitEnforcerCancel != nil {
+			f.logger.Info("Stopping daily exit enforcer...")
+			f.dailyExitEnforcerCancel()
+		}
+		if f.monthlyAccrualSchedulerCancel != nil {
+			f.logger.Info("Stopping monthly accrual scheduler...")
+			f.monthlyAccrualSchedulerCancel()
 		}
 
 		if f.analyticsConsumerCancel != nil {
@@ -946,7 +970,7 @@ func (f *Factory) AnalyticsService() *service.AnalyticsService {
 			f.clickhouseClient,
 			f.esClient.Client,
 			f.logger,
-			f.GetCompanyService(), // optional, for multi-tenant validation
+			f.GetCompanyService(),
 		)
 	}
 	return f.analyticsService
@@ -1164,14 +1188,14 @@ func (f *Factory) PayrollEngineService() payrollsvc.PayrollEngineService {
 			f.StatutoryEngine(),
 			f.GetAttendancePayrollBridge(),
 			f.GetAuditService(),
-			f.idempotencyStore, // ✅ position 7
+			f.idempotencyStore,
 			f.AttendanceRuleRepository(),
 			f.EmployeeFineRepository(),
 			f.ArrearsRepository(),
 			f.LoanRepository(),
 			f.ComponentRepository(),
 			f.CompanySettingsRepository(),
-			f.logger, // ✅ position 14
+			f.logger,
 		)
 	}
 	return f.payrollEngineSvc
@@ -1538,12 +1562,50 @@ func (f *Factory) LeaveRepository() leaverepo.LeaveRepository {
 	return f.leaveRepository
 }
 
-// 👈 ADD — placed next to LeaveRepository()
 func (f *Factory) ResolverJobRepository() leaverepo.ResolverJobRepository {
 	if f.resolverJobRepo == nil {
 		f.resolverJobRepo = leaverepo.NewResolverJobRepository(f.PostgresClient())
 	}
 	return f.resolverJobRepo
+}
+
+// HR lifecycle queue repository
+func (f *Factory) ScheduledJobRepository() hrpostgres.ScheduledJobRepository {
+	if f.scheduledJobRepo == nil {
+		f.scheduledJobRepo = hrpostgres.NewScheduledJobRepository(f.PostgresClient())
+	}
+	return f.scheduledJobRepo
+}
+
+// ----- HR reminders (in-app feed) -----
+
+func (f *Factory) HRReminderRepository() hrpostgres.ReminderRepository {
+	if f.hrReminderRepo == nil {
+		f.hrReminderRepo = hrpostgres.NewReminderRepository(f.PostgresClient())
+	}
+	return f.hrReminderRepo
+}
+
+func (f *Factory) GetHRReminderService() *hrservice.ReminderService {
+	if f.hrReminderService == nil {
+		f.hrReminderService = hrservice.NewReminderService(
+			f.HRReminderRepository(),
+			hrservice.NewHRRecipientResolver(f.PostgresClient()),
+			f.GetAuditService(),
+			f.logger,
+		)
+	}
+	return f.hrReminderService
+}
+
+func (f *Factory) GetHRReminderHandler() *hrhandler.ReminderHandler {
+	if f.hrReminderHandler == nil {
+		f.hrReminderHandler = hrhandler.NewReminderHandler(
+			f.GetHRReminderService(),
+			f.logger,
+		)
+	}
+	return f.hrReminderHandler
 }
 
 // ----- Services -----
@@ -1552,6 +1614,8 @@ func (f *Factory) GetEmployeeService() *hrservice.EmployeeService {
 	if f.employeeService == nil {
 		f.employeeService = hrservice.NewEmployeeService(
 			f.HREmployeeRepository(),
+			f.ScheduledJobRepository(),
+			f.GetHRReminderService(), // 👈 HR reminder service (NOT subscription)
 			f.GetAuditService(),
 			f.idempotencyStore,
 			hrservice.EmployeeServiceConfig{
@@ -1559,8 +1623,8 @@ func (f *Factory) GetEmployeeService() *hrservice.EmployeeService {
 				DocumentStorage:   f.DocumentStorage(),
 				EncryptionMgr:     f.EncryptionManager(),
 			},
-			f.PostgresClient(),        // 👈 ADD
-			f.ResolverJobRepository(), // 👈 ADD
+			f.PostgresClient(),
+			f.ResolverJobRepository(),
 		)
 	}
 	return f.employeeService
@@ -1571,7 +1635,7 @@ func (f *Factory) GetEmployeeQueryService() *hrservice.EmployeeQueryService {
 			f.HREmployeeRepository(),
 			f.DocumentStorage(),
 			f.GetAuditService(),
-			f.EncryptionManager(), // 👈 ADD THIS LINE (fixes the compiler error)
+			f.EncryptionManager(),
 		)
 	}
 	return f.employeeQueryService
@@ -1580,9 +1644,9 @@ func (f *Factory) GetEmployeeQueryService() *hrservice.EmployeeQueryService {
 func (f *Factory) GetOrgUnitService() *hrservice.OrgUnitService {
 	if f.orgUnitService == nil {
 		f.orgUnitService = hrservice.NewOrgUnitService(
-			f.PostgresClient(),     // ✅
-			f.OrgUnitRepository(),  // ✅
-			f.LocationRepository(), // ✅ NEW — added
+			f.PostgresClient(),
+			f.OrgUnitRepository(),
+			f.LocationRepository(),
 			f.GetAuditService(),
 			f.idempotencyStore,
 		)
@@ -1592,8 +1656,7 @@ func (f *Factory) GetOrgUnitService() *hrservice.OrgUnitService {
 func (f *Factory) GetOrgUnitQueryService() *hrservice.OrgUnitQueryService {
 	if f.orgUnitQueryService == nil {
 		f.orgUnitQueryService = hrservice.NewOrgUnitQueryService(
-			f.PostgresClient(), // ✅ FIX
-
+			f.PostgresClient(),
 			f.OrgUnitRepository(),
 			f.GetAuditService(),
 		)
@@ -1640,8 +1703,8 @@ func (f *Factory) LeavePolicyConfigService() leavesvc.LeavePolicyConfigService {
 			f.LeaveRepository(),
 			f.idempotencyStore,
 			f.GetAuditService(),
-			f.PostgresClient(),        // 👈 ADD
-			f.ResolverJobRepository(), // 👈 ADD
+			f.PostgresClient(),
+			f.ResolverJobRepository(),
 		)
 	}
 	return f.leavePolicyConfigService
@@ -1697,9 +1760,8 @@ func (f *Factory) GetLeavePolicyResolutionService() leavesvc.LeavePolicyResoluti
 	if f.leavePolicyResolutionService == nil {
 		f.leavePolicyResolutionService = leavesvc.NewLeavePolicyResolutionService(
 			f.LeaveRepository(),
-			f.ResolverJobRepository(), // ← NEW
-			f.PostgresClient(),        // ← NEW
-
+			f.ResolverJobRepository(),
+			f.PostgresClient(),
 			f.idempotencyStore,
 			f.GetAuditService(),
 		)
@@ -1800,7 +1862,6 @@ func (f *Factory) initializePayrollWorker() {
 	)
 }
 
-// 👈 ADD — placed next to initializePayrollWorker
 func (f *Factory) initializeResolverWorker() {
 	if f.resolverWorker != nil {
 		return
@@ -1819,6 +1880,209 @@ func (f *Factory) initializeResolverWorker() {
 	f.resolverWorkerCancel = cancel
 	go f.resolverWorker.Start(ctx)
 	f.logger.Info("leave resolver worker started", zap.Duration("interval", interval))
+}
+
+// HR lifecycle queue-driven worker.
+//
+// Polls hr.scheduled_job and handles:
+//   - probation_reminder       → in-app reminder (no status change)
+//   - probation_end_reached    → in-app reminder (no status change)
+//   - notice_reminder          → in-app reminder (no status change)
+//   - on_hold_reminder         → in-app reminder (no status change)
+//   - on_hold_expiry           → restore employee_profiles.employment_status
+//
+// Notice expiry (notice → terminated) is NOT handled here — the daily exit
+// enforcer below calls the DB function enforce_scheduled_employee_exits.
+func (f *Factory) initializeHRLifecycleWorker() {
+	if f.hrLifecycleWorker != nil {
+		return
+	}
+	interval := 30 * time.Second
+	if !f.config.IsProduction() {
+		interval = 5 * time.Second
+	}
+
+	notifier := hrworker.NewLifecycleNotifier(
+		f.GetHRReminderService(),
+		f.HRReminderRepository(), // 👈 NEW
+		f.logger,
+	)
+
+	f.hrLifecycleWorker = hrworker.NewHRLifecycleWorker(
+		f.ScheduledJobRepository(),
+		notifier,
+		f.LeaveAccrualService(), // 👈 NEW — 3rd arg, satisfies AccrualRunner
+		f.logger,
+		interval,
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	f.hrLifecycleWorkerCancel = cancel
+	go f.hrLifecycleWorker.Start(ctx)
+	f.logger.Info("hr lifecycle worker started", zap.Duration("interval", interval))
+}
+
+// Daily exit enforcer.
+//
+// Runs at boot (catch-up) and every 24h. Calls
+// EmployeeService.EnforceScheduledEmployeeExits, which:
+//  1. flips employee_exit.exit_state 'scheduled' → 'effective' for any row
+//     whose exit_date <= today
+//  2. flips employee_profiles.employment_status → 'terminated'
+//  3. enqueues leave end_entitlements for each affected user
+//
+// The trg_close_notice_on_exit DB trigger automatically closes the matching
+// employee_notice row when the exit flips.
+func (f *Factory) startDailyExitEnforcer(parentCtx context.Context) {
+	if f.dailyExitEnforcerCancel != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(parentCtx)
+	f.dailyExitEnforcerCancel = cancel
+
+	go func() {
+		logger := f.logger.Named("daily_exit_enforcer")
+
+		time.Sleep(15 * time.Second)
+		f.runDailyExitEnforcement(ctx, logger)
+
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				logger.Info("daily exit enforcer stopped")
+				return
+			case <-ticker.C:
+				f.runDailyExitEnforcement(ctx, logger)
+			}
+		}
+	}()
+
+	f.logger.Info("daily exit enforcer started (runs once at boot + every 24h)")
+}
+
+func (f *Factory) runDailyExitEnforcement(ctx context.Context, logger *zap.Logger) {
+	svc := f.GetEmployeeService()
+	if svc == nil {
+		logger.Warn("daily exit enforcer: employee service unavailable, skipping")
+		return
+	}
+	count, err := svc.EnforceScheduledEmployeeExits(ctx, time.Now().UTC(), uuid.Nil)
+	if err != nil {
+		logger.Error("daily exit enforcement failed", zap.Error(err))
+		return
+	}
+	if count > 0 {
+		logger.Info("daily exit enforcement completed", zap.Int("affected_count", count))
+	} else {
+		logger.Info("daily exit enforcement: no due exits")
+	}
+}
+
+// ============================================================
+// Monthly accrual scheduler
+// ============================================================
+//
+// Fires once per month. On each firing:
+//  1. Enumerates every active company.
+//  2. Enqueues one leave.accrual.monthly job per company.
+//
+// The HRLifecycleWorker drains them at its own cadence.
+//
+// Runs every 6h, plus once at boot. The enqueue is idempotent per
+// (company, month) via uq_scheduled_job_monthly_accrual, so multiple
+// ticks within the same day are harmless.
+//
+// Test mode: the `now.Day() != 3` gate keeps the scheduler firing only
+// on the 3rd of each month (for verifying without waiting a full cycle).
+// REVERT to `now.Day() != 1` before production.
+func (f *Factory) startMonthlyAccrualScheduler(parentCtx context.Context) {
+	if f.monthlyAccrualSchedulerCancel != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(parentCtx)
+	f.monthlyAccrualSchedulerCancel = cancel
+
+	go func() {
+		logger := f.logger.Named("monthly_accrual_scheduler")
+
+		// Boot-time catch-up. Covers process restarts on or after the
+		// firing day. The enqueue is idempotent, so running this on a
+		// non-firing day is a no-op unless the current month has never
+		// been enqueued — which is exactly the case we want to cover.
+		time.Sleep(20 * time.Second)
+		f.runMonthlyAccrualIfDue(ctx, logger)
+
+		ticker := time.NewTicker(6 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				logger.Info("monthly accrual scheduler stopped")
+				return
+			case <-ticker.C:
+				f.runMonthlyAccrualIfDue(ctx, logger)
+			}
+		}
+	}()
+
+	f.logger.Info("monthly accrual scheduler started (checks every 6h, fires on the 1st)")
+}
+
+// runMonthlyAccrualIfDue fans out one accrual job per active company
+// when the current day matches the firing gate. Idempotent per
+// (company, month) via the partial unique index on hr.scheduled_job.
+func (f *Factory) runMonthlyAccrualIfDue(ctx context.Context, logger *zap.Logger) {
+	now := time.Now().UTC()
+
+	// ── TEST MODE ──
+	// Change to `!= 1` before production.
+	if now.Day() != 1 {
+		return
+	}
+
+	// Anchor to the first of the current month. The repo posts accruals
+	// keyed off this date, and is idempotent per (entitlement, date),
+	// so re-running on any day of the same month posts for the same
+	// period exactly once.
+	accrualDate := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+
+	logger.Info("running monthly accrual fanout",
+		zap.Time("accrual_date", accrualDate),
+		zap.Time("tick_at", now),
+	)
+
+	companyIDs, err := f.CompanyRepository().ListActiveCompanyIDs(ctx)
+	if err != nil {
+		logger.Error("list active companies failed", zap.Error(err))
+		return
+	}
+	if len(companyIDs) == 0 {
+		logger.Info("monthly accrual fanout: no active companies")
+		return
+	}
+
+	enqueued := 0
+	for _, companyID := range companyIDs {
+		err := f.PostgresClient().WithTx(ctx, func(tx *sql.Tx) error {
+			return f.ScheduledJobRepository().
+				EnqueueMonthlyAccrual(ctx, tx, companyID, accrualDate)
+		})
+		if err != nil {
+			logger.Warn("enqueue monthly accrual failed",
+				zap.String("company_id", companyID.String()),
+				zap.Error(err),
+			)
+			continue
+		}
+		enqueued++
+	}
+
+	logger.Info("monthly accrual fanout complete",
+		zap.Int("companies", len(companyIDs)),
+		zap.Int("enqueued", enqueued),
+		zap.Time("accrual_date", accrualDate),
+	)
 }
 
 // ----- Kafka logging -----
@@ -1964,8 +2228,6 @@ func (f *Factory) CompanyRepository() postgres.CompanyRepository {
 	return f.postgresCompanyRepository
 }
 
-// 🆕 JOB REPOSITORY =============================================
-// Reuses the same CompanyRepositoryImpl concrete type (see postgres package).
 func (f *Factory) JobRepository() postgres.JobRepository {
 	if f.jobRepo == nil {
 		f.jobRepo = postgres.NewJobRepository(f.PostgresClient())
@@ -1973,7 +2235,6 @@ func (f *Factory) JobRepository() postgres.JobRepository {
 	return f.jobRepo
 }
 
-// 🆕 JOB SERVICE ================================================
 func (f *Factory) JobService() *service.JobService {
 	if f.jobService == nil {
 		f.jobService = service.NewJobService(
@@ -1987,7 +2248,6 @@ func (f *Factory) JobService() *service.JobService {
 	return f.jobService
 }
 
-// 🆕 JOB HANDLER ================================================
 func (f *Factory) JobHandler() *handler.JobHandler {
 	if f.jobHandler == nil {
 		f.jobHandler = handler.NewJobHandler(
@@ -2072,13 +2332,10 @@ func (f *Factory) AdminRepository() postgres.AdminRepository {
 	return f.adminRepository
 }
 
-// ============================================================
-// ✅ FIX #1 — NewJWTService now takes *client.PostgresClient first
-// ============================================================
 func (f *Factory) GetJWTService() *service.JWTService {
 	if f.jwtService == nil {
 		f.jwtService = service.NewJWTService(
-			f.PostgresClient(), // ✅ FIX #1
+			f.PostgresClient(),
 			f.Config(),
 			f.CompanyRepository(),
 			f.AdminRepository(),
@@ -2101,7 +2358,7 @@ func (f *Factory) GetRBACInitService() *service.RBACInitService {
 func (f *Factory) ServiceFactory() *service.ServiceFactory {
 	if f.serviceFactory == nil {
 		f.serviceFactory = service.NewServiceFactory(
-			f.PostgresClient(), // ← new first arg
+			f.PostgresClient(),
 			f.UserRepository(),
 			f.Hasher(),
 			f.EncryptionManager(),
@@ -2122,7 +2379,7 @@ func (f *Factory) GetUserService() *service.UserService {
 			distCache = service.NewDistributedCache(f.redisClient.Client(), f.logger)
 		}
 		f.userService = service.NewUserServiceWithCache(
-			f.PostgresClient(), // ← new first arg
+			f.PostgresClient(),
 			repo, hasher, encMgr, distCache,
 			f.GetAuditService(),
 			f.idempotencyStore,
@@ -2174,18 +2431,12 @@ func (f *Factory) GetOTPService() *service.OTPService {
 	return f.otpService
 }
 
-// ============================================================
-// ✅ FIX #2 — NewAdminService now takes *client.PostgresClient
-//
-//	right after CompanyRepository
-//
-// ============================================================
 func (f *Factory) GetAdminService() *service.AdminService {
 	if f.adminService == nil {
 		f.adminService = service.NewAdminService(
 			f.AdminRepository(),
 			f.CompanyRepository(),
-			f.PostgresClient(), // ✅ FIX #2
+			f.PostgresClient(),
 			f.GetSessionService(),
 			f.GetOTPService(),
 			f.GetMPINService(),
@@ -2215,7 +2466,7 @@ func (f *Factory) GetMPINService() *service.MPINService {
 		}
 		logProducer := f.GetLogProducerService()
 		f.mpinService = service.NewMPINService(
-			f.PostgresClient(), // ← new first arg
+			f.PostgresClient(),
 			mpinRepo,
 			userRepo,
 			deviceTrustRepo,
@@ -2234,12 +2485,6 @@ func (f *Factory) GetMPINService() *service.MPINService {
 	return f.mpinService
 }
 
-// ============================================================
-// ✅ FIX #3 — NewSessionService now takes *client.PostgresClient
-//
-//	as the final argument
-//
-// ============================================================
 func (f *Factory) GetSessionService() *service.SessionService {
 	if f.sessionService == nil {
 		sessionRepo := f.SessionRepository()
@@ -2253,7 +2498,7 @@ func (f *Factory) GetSessionService() *service.SessionService {
 			companyRepo,
 			f.GetAuditService(),
 			f.LocationRepository(),
-			f.PostgresClient(), // ✅ FIX #3
+			f.PostgresClient(),
 		)
 	}
 	return f.sessionService
@@ -2294,20 +2539,14 @@ func (f *Factory) GetDeviceService() *service.DeviceService {
 	return f.deviceService
 }
 
-// ============================================================
-// ✅ FIX #4 — NewCompanyService now takes *client.PostgresClient
-//
-//	as the first argument
-//
-// ============================================================
 func (f *Factory) GetCompanyService() *service.CompanyService {
 	if f.companyService == nil {
 		f.companyService = service.NewCompanyService(
 			f.PostgresClient(),
 			f.CompanyRepository(),
 			f.LocationRepository(),
-			f.LocationService(),                        // 👈 ADD — locationService
-			f.attendanceFactory.WorkCenterRepository(), // 👈 ADD — workCenterRepo (Case A: reuse AttendanceFactory instance)
+			f.LocationService(),
+			f.attendanceFactory.WorkCenterRepository(),
 			f.HREmployeeRepository(),
 			f.GetEmployeeService(),
 			f.GetUserService(),
@@ -2670,9 +2909,8 @@ func (f *Factory) AvatarHandler() *avatarHandler.AvatarHandler {
 
 // ==================== END AVATAR GETTERS ====================
 
-// 🆕 LOCATION GETTERS ========================================
+// LOCATION GETTERS ========================================
 
-// LocationRepository returns the location repository.
 func (f *Factory) LocationRepository() postgres.LocationRepository {
 	if f.locationRepo == nil {
 		f.locationRepo = postgres.NewLocationRepository(f.PostgresClient())
@@ -2680,17 +2918,11 @@ func (f *Factory) LocationRepository() postgres.LocationRepository {
 	return f.locationRepo
 }
 
-// ============================================================
-// ✅ FIX #5 — NewLocationService now takes *client.PostgresClient
-//
-//	as the first argument
-//
-// ============================================================
 func (f *Factory) LocationService() *service.LocationService {
 	if f.locationService == nil {
 		cfg := service.DefaultLocationConfig()
 		f.locationService = service.NewLocationService(
-			f.PostgresClient(), // ✅ FIX #5
+			f.PostgresClient(),
 			f.LocationRepository(),
 			f.CompanyRepository(),
 			f.GetAuditService(),
@@ -2702,7 +2934,6 @@ func (f *Factory) LocationService() *service.LocationService {
 	return f.locationService
 }
 
-// LocationHandler returns the location HTTP handler.
 func (f *Factory) LocationHandler() *locationhandler.LocationHandler {
 	if f.locationHandler == nil {
 		f.locationHandler = locationhandler.NewLocationHandler(
@@ -2714,9 +2945,8 @@ func (f *Factory) LocationHandler() *locationhandler.LocationHandler {
 
 // ============================================================
 
-// 🆕 SUBSCRIPTION GETTERS =====================================
+// SUBSCRIPTION GETTERS =====================================
 
-// SubscriptionPlanRepository returns the subscription plan repository.
 func (f *Factory) SubscriptionPlanRepository() postgres.SubscriptionPlanRepository {
 	if f.subscriptionPlanRepo == nil {
 		f.subscriptionPlanRepo = postgres.NewSubscriptionPlanRepository(f.PostgresClient())
@@ -2724,7 +2954,6 @@ func (f *Factory) SubscriptionPlanRepository() postgres.SubscriptionPlanReposito
 	return f.subscriptionPlanRepo
 }
 
-// CompanyPaymentRepository returns the company payment repository.
 func (f *Factory) CompanyPaymentRepository() postgres.CompanyPaymentRepository {
 	if f.companyPaymentRepo == nil {
 		f.companyPaymentRepo = postgres.NewCompanyPaymentRepository(f.PostgresClient())
@@ -2732,7 +2961,6 @@ func (f *Factory) CompanyPaymentRepository() postgres.CompanyPaymentRepository {
 	return f.companyPaymentRepo
 }
 
-// SubscriptionInvoiceRepository returns the subscription invoice repository.
 func (f *Factory) SubscriptionInvoiceRepository() postgres.SubscriptionInvoiceRepository {
 	if f.subscriptionInvoiceRepo == nil {
 		f.subscriptionInvoiceRepo = postgres.NewSubscriptionInvoiceRepository(f.PostgresClient())
@@ -2740,7 +2968,6 @@ func (f *Factory) SubscriptionInvoiceRepository() postgres.SubscriptionInvoiceRe
 	return f.subscriptionInvoiceRepo
 }
 
-// SubscriptionInvoiceItemRepository returns the invoice item repository.
 func (f *Factory) SubscriptionInvoiceItemRepository() postgres.SubscriptionInvoiceItemRepository {
 	if f.subscriptionInvoiceItemRepo == nil {
 		f.subscriptionInvoiceItemRepo = postgres.NewSubscriptionInvoiceItemRepository(f.PostgresClient())
@@ -2748,7 +2975,6 @@ func (f *Factory) SubscriptionInvoiceItemRepository() postgres.SubscriptionInvoi
 	return f.subscriptionInvoiceItemRepo
 }
 
-// SubscriptionReminderRepository returns the reminder repository.
 func (f *Factory) SubscriptionReminderRepository() postgres.SubscriptionReminderRepository {
 	if f.subscriptionReminderRepo == nil {
 		f.subscriptionReminderRepo = postgres.NewSubscriptionReminderRepository(f.PostgresClient())
@@ -2756,20 +2982,18 @@ func (f *Factory) SubscriptionReminderRepository() postgres.SubscriptionReminder
 	return f.subscriptionReminderRepo
 }
 
-// SubscriptionPlanService returns the subscription plan service.
 func (f *Factory) SubscriptionPlanService() *service.SubscriptionPlanService {
 	if f.subscriptionPlanService == nil {
 		f.subscriptionPlanService = service.NewSubscriptionPlanService(
 			f.SubscriptionPlanRepository(),
 			f.GetAuditService(),
 			f.idempotencyStore,
-			nil, // use defaults
+			nil,
 		)
 	}
 	return f.subscriptionPlanService
 }
 
-// InvoiceService returns the subscription invoice service.
 func (f *Factory) InvoiceService() *service.SubscriptionInvoiceService {
 	if f.invoiceService == nil {
 		cfg := service.DefaultInvoiceConfig()
@@ -2785,7 +3009,6 @@ func (f *Factory) InvoiceService() *service.SubscriptionInvoiceService {
 	return f.invoiceService
 }
 
-// PaymentService returns the payment service.
 func (f *Factory) PaymentService() *service.PaymentService {
 	if f.paymentService == nil {
 		cfg := service.DefaultPaymentConfig()
@@ -2803,7 +3026,9 @@ func (f *Factory) PaymentService() *service.PaymentService {
 	return f.paymentService
 }
 
-// ReminderService returns the reminder service.
+// NOTE: this is the SUBSCRIPTION reminder service. Not to be confused with
+// the HR reminder service (GetHRReminderService above), which is a different
+// type entirely (`*hrservice.ReminderService`).
 func (f *Factory) ReminderService() *service.ReminderService {
 	if f.reminderService == nil {
 		cfg := service.DefaultReminderConfig()
@@ -2822,7 +3047,6 @@ func (f *Factory) ReminderService() *service.ReminderService {
 	return f.reminderService
 }
 
-// LifecycleService returns the subscription lifecycle service.
 func (f *Factory) LifecycleService() *service.SubscriptionLifecycleService {
 	if f.lifecycleService == nil {
 		cfg := service.DefaultLifecycleConfig()
@@ -2837,7 +3061,6 @@ func (f *Factory) LifecycleService() *service.SubscriptionLifecycleService {
 	return f.lifecycleService
 }
 
-// SubscriptionPlanHandler returns the subscription plan HTTP handler.
 func (f *Factory) SubscriptionPlanHandler() *handler.SubscriptionPlanHandler {
 	if f.planHandler == nil {
 		f.planHandler = handler.NewSubscriptionPlanHandler(
@@ -2848,7 +3071,6 @@ func (f *Factory) SubscriptionPlanHandler() *handler.SubscriptionPlanHandler {
 	return f.planHandler
 }
 
-// PaymentHandler returns the payment HTTP handler.
 func (f *Factory) PaymentHandler() *handler.PaymentHandler {
 	if f.paymentHandler == nil {
 		f.paymentHandler = handler.NewPaymentHandler(
@@ -2859,7 +3081,6 @@ func (f *Factory) PaymentHandler() *handler.PaymentHandler {
 	return f.paymentHandler
 }
 
-// InvoiceHandler returns the invoice HTTP handler.
 func (f *Factory) InvoiceHandler() *handler.InvoiceHandler {
 	if f.invoiceHandler == nil {
 		f.invoiceHandler = handler.NewInvoiceHandler(
@@ -2870,7 +3091,6 @@ func (f *Factory) InvoiceHandler() *handler.InvoiceHandler {
 	return f.invoiceHandler
 }
 
-// ReminderHandler returns the reminder HTTP handler.
 func (f *Factory) ReminderHandler() *handler.ReminderHandler {
 	if f.reminderHandler == nil {
 		f.reminderHandler = handler.NewReminderHandler(
@@ -2881,7 +3101,6 @@ func (f *Factory) ReminderHandler() *handler.ReminderHandler {
 	return f.reminderHandler
 }
 
-// LifecycleHandler returns the lifecycle HTTP handler.
 func (f *Factory) LifecycleHandler() *handler.SubscriptionLifecycleHandler {
 	if f.lifecycleHandler == nil {
 		f.lifecycleHandler = handler.NewSubscriptionLifecycleHandler(
@@ -2894,7 +3113,7 @@ func (f *Factory) LifecycleHandler() *handler.SubscriptionLifecycleHandler {
 
 // ============================================================
 
-// InitializeHandlers – updated to include KYC, avatar, location, job and subscription handlers.
+// InitializeHandlers — wires the HR reminder handler into the router.
 func (f *Factory) InitializeHandlers() error {
 	logger := f.logger
 
@@ -2998,7 +3217,7 @@ func (f *Factory) InitializeHandlers() error {
 		AccountingSettingsHandler: f.accountingInfra.AccountingSettingsHandler(),
 		AnalyticsHandler:          f.accountingInfra.AnalyticsHandler(),
 		PeriodLockHandler:         f.accountingInfra.PeriodLockHandler(),
-		CostCenterHandler:         f.accountingInfra.CostCenterHandler(), // 👈 ADD
+		CostCenterHandler:         f.accountingInfra.CostCenterHandler(),
 	}
 	inventoryHandlers := f.GetInventoryHandlers()
 
@@ -3060,9 +3279,10 @@ func (f *Factory) InitializeHandlers() error {
 	avatarHandler := f.AvatarHandler()
 	locationHandler := f.LocationHandler()
 
-	// 🆕 JOB HANDLER ============================================
 	jobHandler := f.JobHandler()
-	// ===========================================================
+
+	// HR reminder handler — mobile / web in-app feed
+	hrReminderHandler := f.GetHRReminderHandler()
 
 	planHandler := f.SubscriptionPlanHandler()
 	paymentHandler := f.PaymentHandler()
@@ -3138,10 +3358,11 @@ func (f *Factory) InitializeHandlers() error {
 		f.AnalyticsHandler(),
 		f.LocationService(),
 		companyService,
-		jobHandler, // 🆕 JOB HANDLER — final argument
+		jobHandler,
+		hrReminderHandler, // NEW — final argument; see NewRouter signature
 	)
 
-	logger.Info("Handlers and router initialized with JWT, bitmask, QR web login, attendance, leave, payroll, biometric, accounting, inventory, subscription, sales, KYC, avatar, location, job and subscription lifecycle systems")
+	logger.Info("Handlers and router initialized with JWT, bitmask, QR web login, attendance, leave, payroll, biometric, accounting, inventory, subscription, sales, KYC, avatar, location, job, HR reminders and subscription lifecycle systems")
 	return nil
 }
 
@@ -3192,6 +3413,11 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 	if f.leaveRepository != nil {
 		if err := f.leaveRepository.HealthCheck(ctx); err != nil {
 			errs["leave_repository"] = err
+		}
+	}
+	if f.hrReminderRepo != nil {
+		if err := f.hrReminderRepo.HealthCheck(ctx); err != nil {
+			errs["hr_reminder_repository"] = err
 		}
 	}
 	return errs
@@ -3250,7 +3476,7 @@ func (f *Factory) GetHREmployeeHandler() *hrhandler.EmployeeHandler {
 		f.hrEmployeeHandler = hrhandler.NewEmployeeHandler(
 			f.GetEmployeeService(),
 			f.GetEmployeeQueryService(),
-			f.GetCompanyService(), // 👈 ADD — CompanyService
+			f.GetCompanyService(),
 			f.GetAuditService(),
 			f.logger,
 			f.config.HR.Documents.MaxSizeMB,

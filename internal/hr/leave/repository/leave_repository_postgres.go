@@ -600,6 +600,7 @@ func (r *leaveRepository) GetLeaveTypeByCode(ctx context.Context, companyID uuid
 	}
 	return &leaveType, nil
 }
+
 func (r *leaveRepository) GetLeaveTypesByCompany(ctx context.Context, companyID uuid.UUID) ([]*models.LeaveType, error) {
 	query := `
 		SELECT
@@ -689,6 +690,7 @@ func (r *leaveRepository) UpdateLeaveType(ctx context.Context, leaveTypeID uuid.
 	}
 	return nil
 }
+
 func (r *leaveRepository) DeleteLeaveType(ctx context.Context, leaveTypeID uuid.UUID) error {
 	query := `
 		DELETE FROM leave.leave_type
@@ -729,6 +731,14 @@ func (r *leaveRepository) IsLeaveTypeInUse(ctx context.Context, leaveTypeID uuid
 // LEAVE ENTITLEMENT
 // ============================================================================
 
+// CreateLeaveEntitlement inserts a manual (non-policy) entitlement and writes
+// its opening grant entry to the ledger in the same transaction.
+//
+// Rationale: an entitlement header is a promise — "this employee is entitled
+// to X days". Without a matching ledger row, that promise is invisible to the
+// balance query, which reads the ledger, not the header. Manual entitlements
+// are always granted upfront (there is no accrual schedule on a manual grant),
+// so the opening entry is a single positive grant of TotalDays.
 func (r *leaveRepository) CreateLeaveEntitlement(ctx context.Context, entitlement *models.LeaveEntitlement) error {
 	if entitlement.EntitlementID == uuid.Nil {
 		entitlement.EntitlementID = uuid.New()
@@ -743,6 +753,17 @@ func (r *leaveRepository) CreateLeaveEntitlement(ctx context.Context, entitlemen
 		now := time.Now().UTC()
 		entitlement.UpdatedAt = &now
 	}
+
+	tx, err := r.client.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	// Unconditional rollback. Safe to call after Commit (returns sql.ErrTxDone,
+	// which we ignore). The previous conditional `if err != nil` form was
+	// vulnerable to err-shadowing: an inner `if err := ...` block would not
+	// update the outer err, so the rollback never fired and the tx hung open
+	// with locks held until the connection died.
+	defer tx.Rollback()
 
 	query := `
 		INSERT INTO leave.leave_entitlement (
@@ -767,7 +788,7 @@ func (r *leaveRepository) CreateLeaveEntitlement(ctx context.Context, entitlemen
 		)
 	`
 
-	_, err := r.client.Exec(ctx, query,
+	_, err = tx.ExecContext(ctx, query,
 		entitlement.EntitlementID,
 		entitlement.CompanyID,
 		entitlement.UserID,
@@ -782,13 +803,27 @@ func (r *leaveRepository) CreateLeaveEntitlement(ctx context.Context, entitlemen
 		entitlement.WorkCenterCode,
 		entitlement.UpdatedAt,
 	)
-
 	if err != nil {
 		return fmt.Errorf("failed to create leave entitlement: %w", err)
 	}
+
+	// Opening grant — the promise, made visible.
+	if entitlement.TotalDays > 0 {
+		if err = r.writeGrantEntryTx(
+			ctx, tx,
+			entitlement.EntitlementID,
+			entitlement.TotalDays,
+			entitlement.EffectiveFrom,
+		); err != nil {
+			return err
+		}
+	}
+
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
 	return nil
 }
-
 func (r *leaveRepository) GetLeaveEntitlementByID(ctx context.Context, entitlementID uuid.UUID) (*models.LeaveEntitlement, error) {
 	query := `
 		SELECT
@@ -1015,10 +1050,6 @@ func (r *leaveRepository) GetLeaveEntitlementsByUser(
 	return entitlements, nil
 }
 
-// GetLeaveEntitlementsByCompany returns a page of entitlements for a company.
-//
-// Location: when locationID is non-nil, only entitlements for employees whose
-// company_employees.primary_location_id matches are returned.
 func (r *leaveRepository) GetLeaveEntitlementsByCompany(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1139,8 +1170,6 @@ func (r *leaveRepository) GetLeaveEntitlementsByCompany(
 	return entitlements, total, nil
 }
 
-// GetLeaveEntitlementsByCompanyAndUser returns a page of entitlements for a
-// company, optionally scoped to a specific user and/or a location.
 func (r *leaveRepository) GetLeaveEntitlementsByCompanyAndUser(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1354,14 +1383,6 @@ func (r *leaveRepository) GetActiveLeaveEntitlement(
 	return &entitlement, nil
 }
 
-// GetActivePolicyEntitlement returns the currently-open policy entitlement for
-// (company, user, leave_type), regardless of which position it was created for.
-//
-// Position is intentionally NOT filtered. When a user moves between positions,
-// the resolver wants to see the existing entitlement so it can decide "does
-// this need to change?" — filtering by the new position would hide the old
-// row and cause a fresh insert, leaking the previous entitlement as
-// permanently-open.
 func (r *leaveRepository) GetActivePolicyEntitlement(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1369,7 +1390,7 @@ func (r *leaveRepository) GetActivePolicyEntitlement(
 	leaveTypeID uuid.UUID,
 	positionID *uuid.UUID,
 ) (*models.LeaveEntitlement, error) {
-	_ = positionID // ignored on purpose — see comment above
+	_ = positionID
 
 	query := `
 		SELECT
@@ -1423,10 +1444,6 @@ func (r *leaveRepository) GetActivePolicyEntitlement(
 
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			// No matching row is a valid outcome — the caller treats
-			// (nil, nil) as "no existing entitlement" and proceeds to
-			// create one. Returning ErrLeaveEntitlementNotFound here
-			// breaks the very first resolve for any new hire.
 			return nil, nil
 		}
 		return nil, fmt.Errorf("failed to get active policy entitlement: %w", err)
@@ -1455,17 +1472,21 @@ func (r *leaveRepository) GetActivePolicyEntitlement(
 	}
 	return &entitlement, nil
 }
-// CreatePolicyLeaveEntitlement writes a policy-sourced entitlement. If an open
-// row already exists for (company, user, leave_type), the row is reused and
-// its fields are refreshed in place — including position_id and
-// work_center_code, which get moved to the new position atomically with the
-// policy/total_days update.
+
+// CreatePolicyLeaveEntitlement inserts or updates a policy-sourced entitlement
+// and writes the opening grant entry to the ledger in the same transaction.
 //
-// The existence check no longer filters by position. Position is metadata on
-// the row (for audit and for the service-layer "is this still applicable?"
-// check), not part of the entitlement's uniqueness key. Filtering by position
-// caused old-position rows to leak as permanently-open duplicates whenever a
-// user moved between seats.
+// Grant logic:
+//   - accrual_method = 'none'  → write a grant for the full total_days.
+//   - accrual methods (monthly/quarterly/yearly) → do NOT write a grant.
+//     Those leave types are earned period-by-period by ProcessLeaveAccruals.
+//
+// Update path: if an open policy entitlement already exists and the new
+// total_days differs, we write a signed delta grant (positive for a raise,
+// negative for a reduction) so the ledger's net grant stays equal to the
+// header's declared quota.
+//
+// Position is metadata for audit; it is NOT part of the uniqueness key.
 func (r *leaveRepository) CreatePolicyLeaveEntitlement(
 	ctx context.Context,
 	entitlement *models.LeaveEntitlement,
@@ -1484,8 +1505,24 @@ func (r *leaveRepository) CreatePolicyLeaveEntitlement(
 		entitlement.UpdatedAt = &now
 	}
 
+	tx, err := r.client.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	// Unconditional rollback — see CreateLeaveEntitlement for the reasoning.
+	defer tx.Rollback()
+
+	// Determine whether this leave type grants upfront or accrues.
+	accrualMethod, err := r.lookupAccrualMethodTx(
+		ctx, tx, entitlement.PolicyID, entitlement.LeaveTypeID,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Reuse the open row if one exists for (company, user, leave_type, policy).
 	checkQuery := `
-		SELECT entitlement_id
+		SELECT entitlement_id, total_days
 		FROM leave.leave_entitlement
 		WHERE company_id = $1
 		  AND user_id = $2
@@ -1493,17 +1530,20 @@ func (r *leaveRepository) CreatePolicyLeaveEntitlement(
 		  AND effective_to IS NULL
 		  AND source = 'policy'
 		LIMIT 1
+		FOR UPDATE
 	`
-
-	row := r.client.QueryRow(ctx, checkQuery,
+	row := tx.QueryRowContext(ctx, checkQuery,
 		entitlement.CompanyID,
 		entitlement.UserID,
 		entitlement.LeaveTypeID,
 	)
 
 	var existingID uuid.UUID
-	err := row.Scan(&existingID)
-	if err == nil {
+	var existingTotal int
+	err = row.Scan(&existingID, &existingTotal)
+
+	switch {
+	case err == nil:
 		updateQuery := `
 			UPDATE leave.leave_entitlement
 			SET total_days = $1,
@@ -1514,7 +1554,7 @@ func (r *leaveRepository) CreatePolicyLeaveEntitlement(
 				updated_at = NOW()
 			WHERE entitlement_id = $6
 		`
-		_, err := r.client.Exec(ctx, updateQuery,
+		_, err = tx.ExecContext(ctx, updateQuery,
 			entitlement.TotalDays,
 			entitlement.EffectiveFrom,
 			entitlement.PolicyID,
@@ -1525,52 +1565,78 @@ func (r *leaveRepository) CreatePolicyLeaveEntitlement(
 		if err != nil {
 			return fmt.Errorf("failed to update existing policy entitlement: %w", err)
 		}
-		return nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
+
+		// 'none' method — reconcile the ledger with the new quota by
+		// writing the delta. A quota change from 18 → 24 writes +6.
+		if accrualMethod == "none" && entitlement.TotalDays != existingTotal {
+			delta := entitlement.TotalDays - existingTotal
+			if err = r.writeGrantEntryTx(
+				ctx, tx, existingID, delta, time.Now(),
+			); err != nil {
+				return err
+			}
+		}
+
+	case errors.Is(err, sql.ErrNoRows):
+		insertQuery := `
+			INSERT INTO leave.leave_entitlement (
+				entitlement_id,
+				company_id,
+				user_id,
+				leave_type_id,
+				total_days,
+				effective_from,
+				effective_to,
+				created_at,
+				policy_id,
+				source,
+				position_id,
+				work_center_code,
+				updated_at
+			) VALUES (
+				$1, $2, $3, $4,
+				$5, $6, NULL, $7,
+				$8, $9,
+				$10, $11, $12
+			)
+		`
+		_, err = tx.ExecContext(ctx, insertQuery,
+			entitlement.EntitlementID,
+			entitlement.CompanyID,
+			entitlement.UserID,
+			entitlement.LeaveTypeID,
+			entitlement.TotalDays,
+			entitlement.EffectiveFrom,
+			entitlement.CreatedAt,
+			entitlement.PolicyID,
+			entitlement.Source,
+			entitlement.PositionID,
+			entitlement.WorkCenterCode,
+			entitlement.UpdatedAt,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to create policy leave entitlement: %w", err)
+		}
+
+		// 'none' method — grant the full quota on the effective date.
+		// Accrual methods stay empty until ProcessLeaveAccruals runs.
+		if accrualMethod == "none" && entitlement.TotalDays > 0 {
+			if err = r.writeGrantEntryTx(
+				ctx, tx,
+				entitlement.EntitlementID,
+				entitlement.TotalDays,
+				entitlement.EffectiveFrom,
+			); err != nil {
+				return err
+			}
+		}
+
+	default:
 		return fmt.Errorf("failed to check existing policy entitlement: %w", err)
 	}
 
-	insertQuery := `
-		INSERT INTO leave.leave_entitlement (
-			entitlement_id,
-			company_id,
-			user_id,
-			leave_type_id,
-			total_days,
-			effective_from,
-			effective_to,
-			created_at,
-			policy_id,
-			source,
-			position_id,
-			work_center_code,
-			updated_at
-		) VALUES (
-			$1, $2, $3, $4,
-			$5, $6, NULL, $7,
-			$8, $9,
-			$10, $11, $12
-		)
-	`
-
-	_, err = r.client.Exec(ctx, insertQuery,
-		entitlement.EntitlementID,
-		entitlement.CompanyID,
-		entitlement.UserID,
-		entitlement.LeaveTypeID,
-		entitlement.TotalDays,
-		entitlement.EffectiveFrom,
-		entitlement.CreatedAt,
-		entitlement.PolicyID,
-		entitlement.Source,
-		entitlement.PositionID,
-		entitlement.WorkCenterCode,
-		entitlement.UpdatedAt,
-	)
-
-	if err != nil {
-		return fmt.Errorf("failed to create policy leave entitlement: %w", err)
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 	return nil
 }
@@ -1598,18 +1664,6 @@ func (r *leaveRepository) EndActivePolicyEntitlements(
 	return nil
 }
 
-// EndActivePolicyEntitlementsByLeaveType closes every open policy entitlement
-// for this (company, user, leave_type), regardless of position.
-//
-// The position filter was removed because the resolver calls this before
-// writing a new entitlement, and the caller's position is the NEW one — the
-// entitlements being replaced carry the OLD position_id. Keeping the filter
-// meant old-position rows were never closed and leaked as permanently-open
-// duplicates whenever a user moved between seats.
-//
-// positionID is kept in the signature for interface compatibility but is
-// no longer used. Position is metadata on the row (for audit and for the
-// service-layer dedup check), not part of the entitlement's uniqueness key.
 func (r *leaveRepository) EndActivePolicyEntitlementsByLeaveType(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1618,7 +1672,7 @@ func (r *leaveRepository) EndActivePolicyEntitlementsByLeaveType(
 	endDate time.Time,
 	positionID *uuid.UUID,
 ) error {
-	_ = positionID // ignored on purpose — see comment above
+	_ = positionID
 
 	query := `
 		UPDATE leave.leave_entitlement
@@ -1636,6 +1690,7 @@ func (r *leaveRepository) EndActivePolicyEntitlementsByLeaveType(
 	}
 	return nil
 }
+
 // ============================================================================
 // LEAVE REQUEST
 // ============================================================================
@@ -1891,13 +1946,13 @@ func (r *leaveRepository) ProcessLeaveRequest(
 				lr.approved_by,
 				lr.requested_at,
 				lr.approved_at,
-				(SELECT position_id 
-				 FROM company_employees 
-				 WHERE user_id = lr.user_id 
-				   AND company_id = lr.company_id 
+				(SELECT position_id
+				 FROM company_employees
+				 WHERE user_id = lr.user_id
+				   AND company_id = lr.company_id
 				   AND is_active = true
 				   AND hire_date <= lr.start_date
-				 ORDER BY hire_date DESC 
+				 ORDER BY hire_date DESC
 				 LIMIT 1) as user_position_id
 			FROM leave.leave_request lr
 			WHERE lr.leave_request_id = $1
@@ -2000,13 +2055,22 @@ func (r *leaveRepository) ProcessLeaveRequest(
 				created_at
 			) VALUES ($1, $2, $3, 'consumption', $4, $5, $6)
 		`
+		// ── Model A: reserve on approval ────────────────────────────────
+		// The consumption is dated the moment of approval, NOT the request's
+		// start_date. This way the balance screen reflects the reservation
+		// immediately, and the user cannot double-book against the same pool
+		// before the leave actually starts.
+		//
+		// Cancel path (CancelLeaveRequest) writes a 'reversal' dated NOW(),
+		// which pairs cleanly with this entry.
+		now := time.Now().UTC()
 		_, err = tx.ExecContext(ctx, ledgerQuery,
 			ledgerID,
 			entitlementID,
 			requestID,
 			request.TotalDays,
-			request.StartDate.UTC(),
-			time.Now().UTC(),
+			now, // entry_date — approval moment (Model A)
+			now, // created_at
 		)
 		if err != nil {
 			return fmt.Errorf("failed to create ledger entry: %w", err)
@@ -2018,7 +2082,6 @@ func (r *leaveRepository) ProcessLeaveRequest(
 	}
 	return nil
 }
-
 func (r *leaveRepository) GetLeaveRequestsByUser(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time) ([]*models.LeaveRequest, error) {
 	query := `
 		SELECT
@@ -2091,9 +2154,6 @@ func (r *leaveRepository) GetLeaveRequestsByUser(ctx context.Context, userID uui
 	return requests, nil
 }
 
-// GetLeaveRequestsByCompany returns a page of leave requests for a company.
-//
-// Location: filtered by filter.LocationID when non-nil.
 func (r *leaveRepository) GetLeaveRequestsByCompany(ctx context.Context, filter models.LeaveRequestFilter) ([]*models.LeaveRequest, int64, error) {
 	var conditions []string
 	var args []interface{}
@@ -2124,7 +2184,6 @@ func (r *leaveRepository) GetLeaveRequestsByCompany(ctx context.Context, filter 
 		argIdx += 2
 	}
 
-	// 👇 Location filter
 	if filter.LocationID != nil {
 		conditions = append(conditions, fmt.Sprintf(
 			"lr.user_id IN (SELECT user_id FROM company_employees WHERE company_id = $1 AND primary_location_id = $%d AND is_active = true)",
@@ -2215,10 +2274,6 @@ func (r *leaveRepository) GetLeaveRequestsByCompany(ctx context.Context, filter 
 	return requests, total, nil
 }
 
-// GetPendingLeaveRequests returns pending leave requests for approval.
-//
-// Location: when locationID is non-nil, only requests for employees whose
-// primary_location_id matches are returned.
 func (r *leaveRepository) GetPendingLeaveRequests(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -2696,6 +2751,15 @@ func (r *leaveRepository) GetLeaveLedgerEntriesByRequest(ctx context.Context, re
 
 // ============================================================================
 // LEAVE BALANCE & QUOTA
+//
+// Balance math reads the LEDGER (leave_ledger) as the single source of truth.
+//
+//   grant, accrual, reversal, adjustment  → add to accrued (and balance)
+//   consumption, lapse                    → subtract from balance
+//   balance = accrued - consumed
+//
+// The entitlement header's total_days is the DECLARED quota (a ceiling),
+// not the current balance. It is exposed separately as total_entitled.
 // ============================================================================
 
 func (r *leaveRepository) GetLeaveBalance(
@@ -2723,22 +2787,28 @@ func (r *leaveRepository) GetLeaveBalance(
 			SELECT
 				COALESCE(SUM(
 					CASE entry_type
+						WHEN 'grant' THEN days
 						WHEN 'accrual' THEN days
 						WHEN 'reversal' THEN days
+						WHEN 'adjustment' THEN days
 						WHEN 'consumption' THEN -days
+						WHEN 'lapse' THEN -days
 						ELSE 0
 					END
 				), 0) AS balance,
 				COALESCE(SUM(
 					CASE entry_type
+						WHEN 'grant' THEN days
 						WHEN 'accrual' THEN days
 						WHEN 'reversal' THEN days
+						WHEN 'adjustment' THEN days
 						ELSE 0
 					END
 				), 0) AS accrued,
 				COALESCE(SUM(
 					CASE entry_type
 						WHEN 'consumption' THEN days
+						WHEN 'lapse' THEN days
 						ELSE 0
 					END
 				), 0) AS consumed
@@ -2831,22 +2901,28 @@ func (r *leaveRepository) CalculateLeaveBalance(
 			SELECT
 				COALESCE(SUM(
 					CASE entry_type
+						WHEN 'grant' THEN days
 						WHEN 'accrual' THEN days
 						WHEN 'reversal' THEN days
+						WHEN 'adjustment' THEN days
 						WHEN 'consumption' THEN -days
+						WHEN 'lapse' THEN -days
 						ELSE 0
 					END
 				), 0) AS balance,
 				COALESCE(SUM(
 					CASE entry_type
+						WHEN 'grant' THEN days
 						WHEN 'accrual' THEN days
 						WHEN 'reversal' THEN days
+						WHEN 'adjustment' THEN days
 						ELSE 0
 					END
 				), 0) AS accrued,
 				COALESCE(SUM(
 					CASE entry_type
 						WHEN 'consumption' THEN days
+						WHEN 'lapse' THEN days
 						ELSE 0
 					END
 				), 0) AS consumed
@@ -2913,6 +2989,7 @@ func (r *leaveRepository) CalculateLeaveBalance(
 	}
 	return &balance, nil
 }
+
 func (r *leaveRepository) GetLeaveBalancesByUser(
 	ctx context.Context,
 	userID uuid.UUID,
@@ -2949,22 +3026,28 @@ func (r *leaveRepository) GetLeaveBalancesByUser(
 				ce.leave_type_id,
 				COALESCE(SUM(
 					CASE ll.entry_type
+						WHEN 'grant' THEN ll.days
 						WHEN 'accrual' THEN ll.days
 						WHEN 'reversal' THEN ll.days
+						WHEN 'adjustment' THEN ll.days
 						WHEN 'consumption' THEN -ll.days
+						WHEN 'lapse' THEN -ll.days
 						ELSE 0
 					END
 				), 0) AS balance,
 				COALESCE(SUM(
 					CASE ll.entry_type
+						WHEN 'grant' THEN ll.days
 						WHEN 'accrual' THEN ll.days
 						WHEN 'reversal' THEN ll.days
+						WHEN 'adjustment' THEN ll.days
 						ELSE 0
 					END
 				), 0) AS accrued,
 				COALESCE(SUM(
 					CASE ll.entry_type
 						WHEN 'consumption' THEN ll.days
+						WHEN 'lapse' THEN ll.days
 						ELSE 0
 					END
 				), 0) AS consumed
@@ -3036,6 +3119,7 @@ func (r *leaveRepository) GetLeaveBalancesByUser(
 	}
 	return balances, nil
 }
+
 func (r *leaveRepository) CheckLeaveAvailability(
 	ctx context.Context,
 	userID, leaveTypeID uuid.UUID,
@@ -3062,9 +3146,12 @@ func (r *leaveRepository) GetLeaveQuota(
 			COALESCE(le.total_days, 0) as total_days,
 			COALESCE(SUM(
 				CASE ll.entry_type
+					WHEN 'grant' THEN ll.days
 					WHEN 'accrual' THEN ll.days
 					WHEN 'reversal' THEN ll.days
+					WHEN 'adjustment' THEN ll.days
 					WHEN 'consumption' THEN -ll.days
+					WHEN 'lapse' THEN -ll.days
 					ELSE 0
 				END
 			), 0) as available_days
@@ -3262,15 +3349,13 @@ func (r *leaveRepository) ResolveUserPolicyRules(
 ) ([]*models.LeavePolicyRuleResolution, error) {
 	query := `
 		SELECT
-			pr.policy_id,
-			pr.leave_type_id,
-			pr.total_days,
-			pr.accrual_method,
-			pr.carry_forward_limit
+			ep.policy_id,
+			ep.rule_leave_type_id        AS leave_type_id,
+			ep.rule_total_days           AS total_days,
+			ep.rule_accrual_method       AS accrual_method,
+			ep.rule_carry_forward_limit  AS carry_forward_limit
 		FROM leave.get_user_effective_policy($1, $2, $3) ep
-		JOIN leave.leave_policy_rule pr
-		  ON ep.policy_id = pr.policy_id
-		ORDER BY pr.leave_type_id, pr.created_at
+		ORDER BY ep.rule_leave_type_id
 	`
 
 	rows, err := r.client.Query(ctx, query, companyID, userID, asOf)
@@ -3358,24 +3443,86 @@ func (r *leaveRepository) ProcessLeaveAccruals(
 	companyID uuid.UUID,
 	accrualDate time.Time,
 ) (int, error) {
+	const chunkSize = 500
+	const maxIterations = 1000
+
 	fyStartMonth, err := r.GetCompanyFinancialYearStartMonth(ctx, companyID)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get financial year start: %w", err)
+		return 0, fmt.Errorf("get financial year start: %w", err)
 	}
 
+	// ── Financial-year rollover ───────────────────────────────────────────
+	// Fires ONLY on the 1st of the FY-start month (e.g. April 1 for an
+	// April-start company). Runs BEFORE this month's accrual slices so:
+	//   a) prior-year balances above the carry cap are lapsed,
+	//   b) 'none' accrual types get their fresh annual grant for the new FY,
+	//   c) then normal monthly/quarterly/yearly accrual adds this month's slice.
+	//
+	// Idempotent per ledger entry: re-running on the same day is a no-op.
+	if accrualDate.Day() == 1 && int(accrualDate.Month()) == fyStartMonth {
+		yearEnd := accrualDate.AddDate(0, 0, -1) // last day of prior FY
+		if err := r.processYearEndCarryForward(ctx, companyID, yearEnd); err != nil {
+			return 0, fmt.Errorf("year-end carry forward: %w", err)
+		}
+	}
+	// ──────────────────────────────────────────────────────────────────────
+
+	totalProcessed := 0
+	offset := 0
+	for i := 0; i < maxIterations; i++ {
+		processed, err := r.processAccrualChunk(
+			ctx, companyID, accrualDate, fyStartMonth, chunkSize, offset,
+		)
+		if err != nil {
+			return totalProcessed, err
+		}
+		totalProcessed += processed
+		if processed < chunkSize {
+			break
+		}
+		offset += chunkSize
+	}
+	return totalProcessed, nil
+}
+
+// processAccrualChunk posts this period's accrual for one page of
+// accruing entitlements.
+//
+// Two correctness rules applied here:
+//
+//  1. Only the CURRENTLY-OPEN entitlement is considered
+//     (`effective_to IS NULL`). Re-resolved users have closed rows on
+//     the old policy that would otherwise double-post for the same
+//     period. The pre-flip day or two of accrual under the old policy
+//     is deliberately foregone — its value is a rounding error, and
+//     posting both sides would silently inflate the balance.
+//
+//  2. Fractional remainders accumulate across periods. Every monthly
+//     entitlement is truncated to int days when first posted; the
+//     sub-day remainder is stored on leave_accrual.fractional_days
+//     and, from this version onward, represents the RUNNING remainder
+//     after that period (not the period's own fraction). The next
+//     period reads the latest row's remainder, adds this period's
+//     fraction, and promotes any whole day that emerges into the
+//     ledger.
+//
+//     Without this, an 18-day/year EL loses 0.5 days every month
+//     (6/year) and a 10-day/year SL accrues nothing at all
+//     (10/12 = 0.83 → truncates to 0 every month).
+func (r *leaveRepository) processAccrualChunk(
+	ctx context.Context,
+	companyID uuid.UUID,
+	accrualDate time.Time,
+	fyStartMonth int,
+	limit, offset int,
+) (int, error) {
 	tx, err := r.client.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+		return 0, err
 	}
-	defer func() {
-		if err != nil {
-			tx.Rollback()
-		}
-	}()
+	defer tx.Rollback()
 
-	// Accrual schedule comes from the effective policy rule for each
-	// entitlement's user, not from leave_type.
-	query := `
+	rows, err := tx.QueryContext(ctx, `
 		SELECT
 			le.entitlement_id,
 			ep.rule_accrual_method AS accrual_method,
@@ -3387,54 +3534,52 @@ func (r *leaveRepository) ProcessLeaveAccruals(
 		WHERE le.company_id = $1
 		  AND le.leave_type_id = ep.rule_leave_type_id
 		  AND le.effective_from <= $2
-		  AND (le.effective_to IS NULL OR le.effective_to >= $2)
+		  AND le.effective_to IS NULL                    -- 👈 Bug 1 fix
 		  AND ep.rule_accrual_method != 'none'
-	`
-	rows, err := tx.QueryContext(ctx, query, companyID, accrualDate)
+		ORDER BY le.entitlement_id
+		LIMIT $3 OFFSET $4
+	`, companyID, accrualDate, limit, offset)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get entitlements for accrual: %w", err)
+		return 0, fmt.Errorf("load accrual chunk: %w", err)
 	}
 	defer rows.Close()
 
-	type entitlementRow struct {
+	type row struct {
 		id            uuid.UUID
 		accrualMethod string
 		totalDays     int
 	}
-	var entitlements []entitlementRow
+	var batch []row
 	for rows.Next() {
-		var e entitlementRow
+		var e row
 		if err := rows.Scan(&e.id, &e.accrualMethod, &e.totalDays); err != nil {
-			return 0, fmt.Errorf("failed to scan entitlement: %w", err)
+			return 0, err
 		}
-		entitlements = append(entitlements, e)
+		batch = append(batch, e)
 	}
-	if err = rows.Err(); err != nil {
+	if err := rows.Err(); err != nil {
 		return 0, err
 	}
 
-	processedCount := 0
 	month := accrualDate.Month()
-	day := accrualDate.Day()
+	chunkProcessed := 0
 
-	for _, e := range entitlements {
+	for _, e := range batch {
 		var daysToAccrue float64
 		shouldAccrue := false
 
 		switch e.accrualMethod {
 		case "monthly":
-			if day == 1 {
-				shouldAccrue = true
-				daysToAccrue = float64(e.totalDays) / 12.0
-			}
+			shouldAccrue = true
+			daysToAccrue = float64(e.totalDays) / 12.0
 		case "quarterly":
 			monthDiff := (int(month) - fyStartMonth + 12) % 12
-			if monthDiff%3 == 0 && day == 1 {
+			if monthDiff%3 == 0 {
 				shouldAccrue = true
 				daysToAccrue = float64(e.totalDays) / 4.0
 			}
 		case "yearly":
-			if month == time.Month(fyStartMonth) && day == 1 {
+			if int(month) == fyStartMonth {
 				shouldAccrue = true
 				daysToAccrue = float64(e.totalDays)
 			}
@@ -3444,80 +3589,88 @@ func (r *leaveRepository) ProcessLeaveAccruals(
 			continue
 		}
 
-		daysAccrued := int(daysToAccrue)
-		fractionalDays := daysToAccrue - float64(daysAccrued)
+		// ── Bug 2 fix: read the running remainder from the latest
+		// accrual row for this entitlement. If this is the first
+		// period, the subquery returns no row and COALESCE gives 0.
+		var priorFractional float64
+		qErr := tx.QueryRowContext(ctx, `
+			SELECT COALESCE(
+				(SELECT fractional_days
+				 FROM leave.leave_accrual
+				 WHERE entitlement_id = $1
+				 ORDER BY accrual_date DESC
+				 LIMIT 1),
+				0
+			)
+		`, e.id).Scan(&priorFractional)
+		if qErr != nil {
+			return chunkProcessed, fmt.Errorf("read prior fractional: %w", qErr)
+		}
 
-		accrualQuery := `
+		daysAccrued := int(daysToAccrue)                         // whole part
+		currentFractional := daysToAccrue - float64(daysAccrued) // sub-day part
+
+		// Promote any whole day that has accumulated across periods.
+		totalFractional := priorFractional + currentFractional
+		extraWholeDays := int(totalFractional)
+		newFractional := totalFractional - float64(extraWholeDays)
+
+		// Days to post to the ledger this period: this period's whole
+		// days plus any whole day promoted from the running remainder.
+		ledgerDays := daysAccrued + extraWholeDays
+
+		res, err := tx.ExecContext(ctx, `
 			INSERT INTO leave.leave_accrual (
-				accrual_id,
-				entitlement_id,
-				accrual_date,
-				days_accrued,
-				fractional_days,
-				created_at
-			) VALUES ($1, $2, $3, $4, $5, $6)
+				accrual_id, entitlement_id, accrual_date,
+				days_accrued, fractional_days, created_at
+			) VALUES ($1, $2, $3, $4, $5, NOW())
 			ON CONFLICT (entitlement_id, accrual_date) DO NOTHING
-		`
-		result, err := tx.ExecContext(
-			ctx,
-			accrualQuery,
+		`,
 			uuid.New(),
 			e.id,
 			accrualDate,
 			daysAccrued,
-			fractionalDays,
-			time.Now().UTC(),
+			newFractional, // running remainder after this period
 		)
 		if err != nil {
-			return 0, fmt.Errorf("failed to insert accrual: %w", err)
+			return chunkProcessed, fmt.Errorf("insert accrual: %w", err)
 		}
-		rowsAffected, _ := result.RowsAffected()
-		if rowsAffected == 0 {
-			continue
+		if n, _ := res.RowsAffected(); n == 0 {
+			continue // already posted for this period
 		}
 
-		if daysAccrued > 0 {
-			ledgerQuery := `
+		// Post whole days only. If ledgerDays is 0 — e.g. the first
+		// SL accrual on a 10-day/year entitlement, where 10/12 = 0.83
+		// truncates to zero — nothing goes to the ledger this period,
+		// but the 0.83 remainder is stored and will promote on a
+		// future run.
+		if ledgerDays > 0 {
+			if _, err := tx.ExecContext(ctx, `
 				INSERT INTO leave.leave_ledger (
-					ledger_id,
-					entitlement_id,
-					leave_request_id,
-					entry_type,
-					days,
-					entry_date,
-					created_at
-				) VALUES ($1, $2, NULL, 'accrual', $3, $4, $5)
-			`
-			_, err = tx.ExecContext(
-				ctx,
-				ledgerQuery,
-				uuid.New(),
-				e.id,
-				daysAccrued,
-				accrualDate,
-				time.Now().UTC(),
-			)
-			if err != nil {
-				return 0, fmt.Errorf("failed to create ledger entry: %w", err)
+					ledger_id, entitlement_id, leave_request_id,
+					entry_type, days, entry_date, created_at
+				) VALUES ($1, $2, NULL, 'accrual', $3, $4, NOW())
+				ON CONFLICT (entitlement_id, (entry_date::date))
+					WHERE entry_type = 'accrual'
+					DO NOTHING
+			`, uuid.New(), e.id, ledgerDays, accrualDate); err != nil {
+				return chunkProcessed, fmt.Errorf("insert ledger: %w", err)
 			}
 		}
-		processedCount++
+
+		chunkProcessed++
 	}
 
-	if err = tx.Commit(); err != nil {
-		return 0, fmt.Errorf("failed to commit transaction: %w", err)
+	if err := tx.Commit(); err != nil {
+		return chunkProcessed, fmt.Errorf("commit chunk: %w", err)
 	}
-	return processedCount, nil
+	return chunkProcessed, nil
 }
 
 // ============================================================================
 // REPORTS & FORECAST
 // ============================================================================
 
-// GetLeaveUtilizationReport returns leave utilization across a company.
-//
-// Location: when locationID is non-nil, only employees whose
-// primary_location_id matches are included.
 func (r *leaveRepository) GetLeaveUtilizationReport(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -3549,7 +3702,7 @@ func (r *leaveRepository) GetLeaveUtilizationReport(
 				le.source,
 				COALESCE(SUM(
 					CASE
-						WHEN ll.entry_type IN ('accrual', 'reversal')
+						WHEN ll.entry_type IN ('grant', 'accrual', 'reversal', 'adjustment')
 						 AND ll.entry_date BETWEEN $2 AND $3
 						THEN ll.days
 						ELSE 0
@@ -3557,7 +3710,7 @@ func (r *leaveRepository) GetLeaveUtilizationReport(
 				), 0) as accrued_days,
 				COALESCE(SUM(
 					CASE
-						WHEN ll.entry_type = 'consumption'
+						WHEN ll.entry_type IN ('consumption', 'lapse')
 						 AND ll.entry_date BETWEEN $2 AND $3
 						THEN ll.days
 						ELSE 0
@@ -3644,9 +3797,12 @@ func (r *leaveRepository) GetLeaveForecast(
 				ce.leave_type_id,
 				COALESCE(SUM(
 					CASE ll.entry_type
+						WHEN 'grant' THEN ll.days
 						WHEN 'accrual' THEN ll.days
 						WHEN 'reversal' THEN ll.days
+						WHEN 'adjustment' THEN ll.days
 						WHEN 'consumption' THEN -ll.days
+						WHEN 'lapse' THEN -ll.days
 						ELSE 0
 					END
 				), 0) as current_balance
@@ -3744,6 +3900,7 @@ func (r *leaveRepository) GetLeaveTransactionHistory(ctx context.Context, userID
 				ELSE NULL
 			END as reference_type,
 			CASE
+				WHEN ll.entry_type = 'grant' THEN 'Leave Granted'
 				WHEN ll.entry_type = 'accrual' THEN 'Leave Accrual'
 				WHEN ll.entry_type = 'consumption' AND lr.leave_request_id IS NOT NULL THEN 'Leave Taken (' || lt.code || ')'
 				WHEN ll.entry_type = 'reversal' AND lr.leave_request_id IS NOT NULL THEN 'Leave Reversal (' || lt.code || ')'
@@ -3885,8 +4042,6 @@ func (r *leaveRepository) HealthCheck(ctx context.Context) error {
 // RESOLVER WORKER HELPERS
 // ============================================================================
 
-// ListActiveEmployeeUserIDs returns every active employee's user_id for a
-// company. Used by the resolver worker for company-wide fan-out jobs.
 func (r *leaveRepository) ListActiveEmployeeUserIDs(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -3918,9 +4073,6 @@ func (r *leaveRepository) ListActiveEmployeeUserIDs(
 	return userIDs, nil
 }
 
-// ListActiveEmployeeUserIDsByPosition returns active employees' user_ids
-// currently sitting at a given position. Used by the resolver worker for
-// position-scoped fan-out jobs (work-center change, position edit, etc.).
 func (r *leaveRepository) ListActiveEmployeeUserIDsByPosition(
 	ctx context.Context,
 	companyID, positionID uuid.UUID,
@@ -3951,4 +4103,259 @@ func (r *leaveRepository) ListActiveEmployeeUserIDsByPosition(
 		return nil, fmt.Errorf("rows iteration error: %w", err)
 	}
 	return userIDs, nil
+}
+
+// ============================================================================
+// LEDGER HELPERS
+// ============================================================================
+
+// writeGrantEntryTx inserts a single 'grant' ledger row inside the caller's
+// transaction. Signed days: positive for a grant, negative for a
+// reconciliation that lowers a previously-promised amount.
+//
+// The unique partial index on (entitlement_id, entry_date) WHERE
+// entry_type = 'grant' makes the same-day insert idempotent — a retry
+// that lands the same day is a no-op.
+func (r *leaveRepository) writeGrantEntryTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	entitlementID uuid.UUID,
+	days int,
+	entryDate time.Time,
+) error {
+	if days == 0 {
+		return nil
+	}
+	const q = `
+		INSERT INTO leave.leave_ledger (
+			ledger_id, entitlement_id, leave_request_id,
+			entry_type, days, entry_date, created_at
+		) VALUES ($1, $2, NULL, 'grant', $3, $4, NOW())
+		ON CONFLICT (entitlement_id, (entry_date::date))
+			WHERE entry_type = 'grant'
+			DO NOTHING`
+
+	if _, err := tx.ExecContext(ctx, q,
+		uuid.New(),
+		entitlementID,
+		days,
+		entryDate.UTC().Truncate(24*time.Hour),
+	); err != nil {
+		return fmt.Errorf("write grant entry: %w", err)
+	}
+	return nil
+}
+
+// lookupAccrualMethodTx returns the accrual_method for the given
+// (policy_id, leave_type_id) pair. Defaults to 'none' when the policy
+// rule is missing or the column is null.
+func (r *leaveRepository) lookupAccrualMethodTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	policyID *uuid.UUID,
+	leaveTypeID uuid.UUID,
+) (string, error) {
+	if policyID == nil {
+		// Manual entitlements have no policy — treat them as a one-shot
+		// grant of the whole amount.
+		return "none", nil
+	}
+	var method sql.NullString
+	err := tx.QueryRowContext(ctx, `
+		SELECT accrual_method
+		FROM leave.leave_policy_rule
+		WHERE policy_id = $1 AND leave_type_id = $2
+		LIMIT 1
+	`, *policyID, leaveTypeID).Scan(&method)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "none", nil
+		}
+		return "", fmt.Errorf("lookup accrual method: %w", err)
+	}
+	if !method.Valid || method.String == "" {
+		return "none", nil
+	}
+	return method.String, nil
+}
+
+// processYearEndCarryForward rolls active policy entitlements over the
+// financial-year boundary at `yearEnd` (the LAST day of the outgoing FY).
+//
+// For each active policy entitlement:
+//  1. Compute balance as of yearEnd from the ledger.
+//  2. If balance > carry_forward_limit, write a 'lapse' entry for the
+//     excess. If carry_forward_limit is NULL/0, everything lapses.
+//  3. If accrual_method = 'none', write a 'grant' for the full annual
+//     amount on the first day of the new FY (yearEnd + 1 day).
+//
+// Idempotent per (entitlement_id, entry_type, entry_date::date).
+// The entitlement row itself is not ended — the same entitlement_id rolls
+// forward, and the ledger records everything.
+func (r *leaveRepository) processYearEndCarryForward(
+	ctx context.Context,
+	companyID uuid.UUID,
+	yearEnd time.Time,
+) error {
+	const chunkSize = 500
+	const maxIterations = 1000
+
+	offset := 0
+	for i := 0; i < maxIterations; i++ {
+		n, err := r.processYearEndChunk(ctx, companyID, yearEnd, chunkSize, offset)
+		if err != nil {
+			return err
+		}
+		if n < chunkSize {
+			return nil
+		}
+		offset += chunkSize
+	}
+	return nil
+}
+
+func (r *leaveRepository) processYearEndChunk(
+	ctx context.Context,
+	companyID uuid.UUID,
+	yearEnd time.Time,
+	limit, offset int,
+) (int, error) {
+	tx, err := r.client.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT
+			le.entitlement_id,
+			le.total_days,
+			COALESCE(ep.rule_accrual_method, 'none')  AS accrual_method,
+			COALESCE(ep.rule_carry_forward_limit, 0)  AS carry_forward_limit
+		FROM leave.leave_entitlement le
+		CROSS JOIN LATERAL leave.get_user_effective_policy(
+			le.company_id, le.user_id, $2
+		) ep
+		WHERE le.company_id = $1
+		  AND le.leave_type_id = ep.rule_leave_type_id
+		  AND le.source        = 'policy'
+		  AND le.effective_from <= $2
+		  AND (le.effective_to IS NULL OR le.effective_to >= $2)
+		ORDER BY le.entitlement_id
+		LIMIT $3 OFFSET $4
+	`, companyID, yearEnd, limit, offset)
+	if err != nil {
+		return 0, fmt.Errorf("load year-end chunk: %w", err)
+	}
+	defer rows.Close()
+
+	type row struct {
+		id              uuid.UUID
+		totalDays       int
+		accrualMethod   string
+		carryForwardCap int
+	}
+	var batch []row
+	for rows.Next() {
+		var e row
+		if err := rows.Scan(
+			&e.id, &e.totalDays, &e.accrualMethod, &e.carryForwardCap,
+		); err != nil {
+			return 0, err
+		}
+		batch = append(batch, e)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	newFYStart := yearEnd.AddDate(0, 0, 1) // day 1 of the new FY
+
+	for _, e := range batch {
+		// 1) Balance at FY close.
+		var balance float64
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COALESCE(SUM(
+				CASE entry_type
+					WHEN 'grant'       THEN days
+					WHEN 'accrual'     THEN days
+					WHEN 'reversal'    THEN days
+					WHEN 'adjustment'  THEN days
+					WHEN 'consumption' THEN -days
+					WHEN 'lapse'       THEN -days
+					ELSE 0
+				END
+			), 0)
+			FROM leave.leave_ledger
+			WHERE entitlement_id = $1
+			  AND entry_date <= $2
+		`, e.id, yearEnd).Scan(&balance); err != nil {
+			return 0, fmt.Errorf("year-end balance: %w", err)
+		}
+
+		// 2) Lapse the excess (or everything when cap is 0/NULL).
+		var lapse float64
+		if balance > 0 {
+			cap := float64(e.carryForwardCap)
+			switch {
+			case cap <= 0:
+				lapse = balance // no carry-forward configured
+			case balance > cap:
+				lapse = balance - cap
+			}
+		}
+		if lapse > 0 {
+			var exists bool
+			if err := tx.QueryRowContext(ctx, `
+				SELECT EXISTS (
+					SELECT 1 FROM leave.leave_ledger
+					WHERE entitlement_id = $1
+					  AND entry_type = 'lapse'
+					  AND entry_date::date = $2::date
+				)
+			`, e.id, yearEnd).Scan(&exists); err != nil {
+				return 0, fmt.Errorf("check existing lapse: %w", err)
+			}
+			if !exists {
+				if _, err := tx.ExecContext(ctx, `
+					INSERT INTO leave.leave_ledger (
+						ledger_id, entitlement_id, leave_request_id,
+						entry_type, days, entry_date, created_at
+					) VALUES ($1, $2, NULL, 'lapse', $3, $4, NOW())
+				`, uuid.New(), e.id, lapse, yearEnd); err != nil {
+					return 0, fmt.Errorf("insert lapse: %w", err)
+				}
+			}
+		}
+
+		// 3) Re-grant the fresh annual amount for non-accruing types.
+		if e.accrualMethod == "none" && e.totalDays > 0 {
+			var exists bool
+			if err := tx.QueryRowContext(ctx, `
+				SELECT EXISTS (
+					SELECT 1 FROM leave.leave_ledger
+					WHERE entitlement_id = $1
+					  AND entry_type = 'grant'
+					  AND entry_date::date = $2::date
+				)
+			`, e.id, newFYStart).Scan(&exists); err != nil {
+				return 0, fmt.Errorf("check existing year-start grant: %w", err)
+			}
+			if !exists {
+				if _, err := tx.ExecContext(ctx, `
+					INSERT INTO leave.leave_ledger (
+						ledger_id, entitlement_id, leave_request_id,
+						entry_type, days, entry_date, created_at
+					) VALUES ($1, $2, NULL, 'grant', $3, $4, NOW())
+				`, uuid.New(), e.id, e.totalDays, newFYStart); err != nil {
+					return 0, fmt.Errorf("insert year-start grant: %w", err)
+				}
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit year-end chunk: %w", err)
+	}
+	return len(batch), nil
 }

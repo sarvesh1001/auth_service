@@ -213,7 +213,19 @@ func (r *batchRepository) GetByRef(ctx context.Context, companyID uuid.UUID, dev
 	}
 	return &status, nil
 }
-func (r *batchRepository) ListFailuresByBatchRef(ctx context.Context, batchRef string) ([]*repository.AttendancePunchFailureView, error) {
+
+// ListFailuresByBatchRef returns failures for a single batch, scoped to the
+// caller's company. The company filter is applied in SQL via the JOIN on the
+// batches table, so cross-tenant rows never leave the database.
+//
+// FIX: previous signature was (ctx, batchRef) which allowed any caller to
+// enumerate failures from another tenant's batch by guessing/knowing the
+// batchRef. Now requires companyID and constrains the WHERE clause by it.
+func (r *batchRepository) ListFailuresByBatchRef(
+	ctx context.Context,
+	companyID uuid.UUID,
+	batchRef string,
+) ([]*repository.AttendancePunchFailureView, error) {
 	query := `
 		SELECT
 			f.failure_id,
@@ -226,10 +238,11 @@ func (r *batchRepository) ListFailuresByBatchRef(ctx context.Context, batchRef s
 		FROM attendance.attendance_device_punch_failures f
 		JOIN attendance.attendance_device_punch_batches b
 			ON b.batch_id = f.batch_id
-		WHERE b.batch_ref = $1
+		WHERE b.company_id = $1
+		  AND b.batch_ref = $2
 		ORDER BY f.created_at ASC
 	`
-	rows, err := r.client.Query(ctx, query, batchRef)
+	rows, err := r.client.Query(ctx, query, companyID, batchRef)
 	if err != nil {
 		return nil, fmt.Errorf("list failures by ref: %w", err)
 	}

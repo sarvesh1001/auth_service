@@ -1375,3 +1375,271 @@ func (qs *EmployeeQueryService) decryptFullDetails(
 
 	return out
 }
+
+// ============================================================================
+// STATUS NOW — merged lifecycle view for a single employee
+// ============================================================================
+
+// EmployeeStatusNow is the read model backing GET .../status-now.
+//
+// employment_status is the cached rollup from employee_profiles.
+// The three sub-objects expose the *detail* rows from the lifecycle tables,
+// each present only while its phase is active:
+//
+//   - Probation is non-nil while employee_probation.status IN ('pending','extended')
+//   - Notice    is non-nil while employee_notice.status = 'active'
+//   - OnHold    is non-nil while employee_on_hold.status = 'active'
+//   - Exit      is non-nil for any employee_exit row (scheduled/effective/cancelled/rehired)
+//
+// Day counters on Notice are computed here so the client never has to do
+// date math (timezones, half-days, etc.).
+type EmployeeStatusNow struct {
+	UserID           uuid.UUID                   `json:"user_id"`
+	CompanyID        uuid.UUID                   `json:"company_id"`
+	EmploymentStatus string                      `json:"employment_status"`
+	Probation        *employee.EmployeeProbation `json:"probation,omitempty"`
+	Notice           *employee.EmployeeNotice    `json:"notice,omitempty"`
+	OnHold           *employee.EmployeeOnHold    `json:"on_hold,omitempty"`
+	Exit             *employee.EmployeeExit      `json:"exit,omitempty"`
+}
+
+// GetStatusNow returns the merged lifecycle state for one employee.
+//
+// Every sub-fetch is best-effort: a missing row is simply omitted from the
+// response. Only the profile fetch is treated as required (an employee
+// without a profile row is a real error, not "no lifecycle in progress").
+func (qs *EmployeeQueryService) GetStatusNow(
+	ctx context.Context,
+	companyID, userID uuid.UUID,
+) (*EmployeeStatusNow, error) {
+	startTime := time.Now()
+	ip, _ := ctx.Value("ip_address").(string)
+
+	if err := qs.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
+		return nil, err
+	}
+
+	out := &EmployeeStatusNow{
+		UserID:    userID,
+		CompanyID: companyID,
+	}
+
+	// ---- Required: the profile row ----
+	prof, err := qs.employeeRepo.GetEmployeeProfileByUserID(ctx, userID, companyID)
+	if err != nil {
+		return nil, fmt.Errorf("get profile: %w", err)
+	}
+	if prof.EmploymentStatus != nil {
+		out.EmploymentStatus = *prof.EmploymentStatus
+	}
+
+	// ---- Optional: the lifecycle sub-rows ----
+	if p, err := qs.employeeRepo.GetActiveProbation(ctx, companyID, userID); err == nil {
+		out.Probation = p
+	}
+	if n, err := qs.employeeRepo.GetActiveNotice(ctx, companyID, userID); err == nil {
+		qs.populateNoticeCounts(n)
+		out.Notice = n
+	}
+	if h, err := qs.employeeRepo.GetActiveOnHold(ctx, companyID, userID); err == nil {
+		out.OnHold = h
+	}
+	if e, err := qs.employeeRepo.GetEmployeeExitByUserID(ctx, userID, companyID); err == nil {
+		out.Exit = e
+	}
+
+	_ = qs.auditService.LogAction(
+		ctx, nil, &companyID, "hr", "employee.status.read",
+		"employee", &userID, "system", nil, nil, nil,
+		map[string]interface{}{
+			"ip":          ip,
+			"user_id":     userID.String(),
+			"company_id":  companyID.String(),
+			"status":      out.EmploymentStatus,
+			"has_prob":    out.Probation != nil,
+			"has_notice":  out.Notice != nil,
+			"has_on_hold": out.OnHold != nil,
+			"has_exit":    out.Exit != nil,
+			"duration_ms": time.Since(startTime).Milliseconds(),
+		},
+	)
+	return out, nil
+}
+
+// populateNoticeCounts fills the computed day counters on a notice row.
+// Kept local to the query service so read paths don't have to reach into the
+// write-side service just to render a response.
+func (qs *EmployeeQueryService) populateNoticeCounts(n *employee.EmployeeNotice) {
+	if n == nil {
+		return
+	}
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	n.DaysTotal = int(n.EndDate.Sub(n.StartDate).Hours()/24) + 1
+	served := int(today.Sub(n.StartDate).Hours()/24) + 1
+	if served < 0 {
+		served = 0
+	}
+	if served > n.DaysTotal {
+		served = n.DaysTotal
+	}
+	n.DaysServed = served
+	n.DaysRemaining = n.DaysTotal - served
+}
+
+// SearchEmployeesWithStatus is the status-aware sibling of SearchEmployees.
+//
+// status semantics:
+//
+//	""        -> no filter (same as SearchEmployees)
+//	"all"     -> no filter
+//	"active"  -> employment_status = 'active'
+//	"probation" | "notice" | "on_hold" | "terminated" | "resigned" -> exact match
+//
+// Location scope flows through resolveLocationScopeIDs, same as the base
+// method — mode=ALL → nil, mode=LOCATION → single location, mode=SELECTED
+// → caller's selected set.
+//
+// Returns (rows, total, err). Total is computed by the count function so
+// the HTTP layer can populate pagination meta even when the LIMIT trims
+// the page.
+// SearchEmployeesWithStatus is the status-aware sibling of SearchEmployees.
+//
+// status semantics:
+//
+//	""        -> no filter (same as SearchEmployees)
+//	"all"     -> no filter
+//	"active" | "probation" | "notice" | "on_hold" | "terminated" | "resigned"
+//	          -> exact match against employee_profiles.employment_status
+//
+// Location scope flows through resolveLocationScopeIDs, same as the base
+// method — mode=ALL → nil, mode=LOCATION → single location, mode=SELECTED
+// → caller's selected set.
+//
+// Returns (rows, total, err). Total is computed by the count function so
+// the HTTP layer can populate pagination meta even when LIMIT trims the
+// page.
+func (s *EmployeeQueryService) SearchEmployeesWithStatus(
+	ctx context.Context,
+	companyID uuid.UUID,
+	query string,
+	status string,
+	page, pageSize int,
+	idsOnly bool,
+) ([]*employee.EmployeeFullDetailsExt, int, error) {
+	logger := zap.L().With(
+		zap.String("component", "employee_query_service"),
+		zap.String("op", "search_employees_with_status"),
+		zap.String("company_id", companyID.String()),
+		zap.String("query", query),
+		zap.String("status", status),
+		zap.Int("page", page),
+		zap.Int("page_size", pageSize),
+		zap.Bool("ids_only", idsOnly),
+	)
+	logger.Info("SearchEmployeesWithStatus entry")
+
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 200 {
+		pageSize = 30
+	}
+	offset := (page - 1) * pageSize
+
+	locationIDs, err := s.resolveLocationScopeIDs(ctx, companyID)
+	if err != nil {
+		logger.Error("resolveLocationScopeIDs failed", zap.Error(err))
+		return nil, 0, err
+	}
+	logger.Info("resolved location scope", zap.Int("location_ids_count", len(locationIDs)))
+
+	total, err := s.employeeRepo.CountEmployeeIDsByStatus(
+		ctx, companyID, query, locationIDs, status,
+	)
+	if err != nil {
+		logger.Error("CountEmployeeIDsByStatus failed", zap.Error(err))
+		return nil, 0, fmt.Errorf("count employees: %w", err)
+	}
+	logger.Info("count done", zap.Int("total", total))
+
+	if total == 0 {
+		return []*employee.EmployeeFullDetailsExt{}, 0, nil
+	}
+
+	ids, err := s.employeeRepo.SearchEmployeeIDsByStatus(
+		ctx, companyID, query, locationIDs, status, pageSize, offset,
+	)
+	if err != nil {
+		logger.Error("SearchEmployeeIDsByStatus failed", zap.Error(err))
+		return nil, 0, fmt.Errorf("search employees: %w", err)
+	}
+	logger.Info("id search done", zap.Int("ids_count", len(ids)))
+
+	if len(ids) == 0 {
+		return []*employee.EmployeeFullDetailsExt{}, total, nil
+	}
+
+	// Hydrate unconditionally. The previous ids-only stub optimization
+	// tried to construct EmployeeFullDetailsExt via struct literal, but
+	// CompanyID/UserID are *promoted* fields (embedded CompanyEmployee),
+	// and Go doesn't permit setting promoted fields in a composite literal.
+	// Hydration is cheap and the response shape stays consistent, so just
+	// always hydrate.
+	//
+	// If idsOnly becomes a real performance need, do the light path in the
+	// repo (a dedicated SearchEmployeeIDs-lite query) rather than
+	// reconstructing the DTO in the service.
+	_ = idsOnly
+
+	rows, err := s.employeeRepo.GetEmployeeFullDetailsByIDs(
+		ctx, companyID, ids, locationIDs,
+	)
+	if err != nil {
+		logger.Error("GetEmployeeFullDetailsByIDs failed", zap.Error(err))
+		return nil, 0, fmt.Errorf("hydrate employees: %w", err)
+	}
+	logger.Info("hydration done",
+		zap.Int("requested", len(ids)),
+		zap.Int("returned", len(rows)))
+
+	return rows, total, nil
+}
+
+// GetTerminatedEmployees returns terminated (and resigned) employees for
+// a company, scoped to the caller's location context.
+//
+// This is a thin convenience wrapper over SearchEmployeesWithStatus so the
+// UI's "Terminated" filter can be served without a caller-side status
+// string. Prefer SearchEmployeesWithStatus for a generic list endpoint.
+func (s *EmployeeQueryService) GetTerminatedEmployees(
+	ctx context.Context,
+	companyID uuid.UUID,
+	query string,
+	page, pageSize int,
+) ([]*employee.EmployeeFullDetailsExt, int, error) {
+	// The two "gone" statuses. If your schema only uses 'terminated',
+	// drop the 'resigned' call or union them at the SQL layer.
+	//
+	// NOTE: search_company_employee_ids_by_status matches ONE status value
+	// per call. If you need both terminated + resigned in one response,
+	// either:
+	//   - call twice and merge (loses pagination accuracy), or
+	//   - extend the SQL function to accept text[] for status, or
+	//   - pick one canonical status for 'left the company'.
+	//
+	// For now we assume the app uses 'terminated' exclusively.
+	return s.SearchEmployeesWithStatus(
+		ctx, companyID, query, "terminated", page, pageSize, false,
+	)
+}
+
+// DecryptFullDetailsExt is the exported wrapper around decryptFullDetails.
+// The HTTP handler lives in a different package and needs to post-process
+// the rows returned by SearchEmployeesWithStatus / GetTerminatedEmployees
+// without duplicating the decryption loop.
+func (qs *EmployeeQueryService) DecryptFullDetailsExt(
+	ctx context.Context,
+	d *employee.EmployeeFullDetailsExt,
+) *DecryptedEmployeeDetails {
+	return qs.decryptFullDetails(ctx, d)
+}

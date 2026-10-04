@@ -1,4 +1,3 @@
-// internal/attendance/handler/report_handler.go
 package handler
 
 import (
@@ -16,14 +15,12 @@ import (
 	"auth-service/internal/locationctx"
 )
 
-// AttendanceReportHandler handles report generation and streaming.
 type AttendanceReportHandler struct {
 	reportService report.ReportService
 	queryService  query.QueryService
 	logger        *zap.Logger
 }
 
-// NewAttendanceReportHandler creates a new report handler.
 func NewAttendanceReportHandler(
 	reportService report.ReportService,
 	queryService query.QueryService,
@@ -36,18 +33,42 @@ func NewAttendanceReportHandler(
 	}
 }
 
-// GenerateReport generates a report (CSV or JSON) for events or summaries.
-//
-// Location scope: reads X-Location-ID from the request context.
+// statusCapturingWriter wraps http.ResponseWriter and remembers whether
+// WriteHeader has already been called. The report handler uses it to detect
+// a partial-body situation where we can no longer set a 500.
+type statusCapturingWriter struct {
+	http.ResponseWriter
+	statusCode  int
+	wroteHeader bool
+}
+
+func (s *statusCapturingWriter) WriteHeader(code int) {
+	if !s.wroteHeader {
+		s.statusCode = code
+		s.wroteHeader = true
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusCapturingWriter) Write(p []byte) (int, error) {
+	if !s.wroteHeader {
+		s.statusCode = http.StatusOK
+		s.wroteHeader = true
+	}
+	return s.ResponseWriter.Write(p)
+}
+
+func (s *statusCapturingWriter) Header() http.Header {
+	return s.ResponseWriter.Header()
+}
+
 func (h *AttendanceReportHandler) GenerateReport(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
 	reportType := r.URL.Query().Get("type")
 	if reportType == "" {
 		reportType = "csv"
@@ -56,13 +77,11 @@ func (h *AttendanceReportHandler) GenerateReport(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusBadRequest, "unsupported report type, use 'csv' or 'json'")
 		return
 	}
-
 	startDate, endDate, err := parseDateRange(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	subjectType := r.URL.Query().Get("subject_type")
 	var subjectID *uuid.UUID
 	if v := r.URL.Query().Get("subject_id"); v != "" {
@@ -73,9 +92,7 @@ func (h *AttendanceReportHandler) GenerateReport(w http.ResponseWriter, r *http.
 		}
 		subjectID = &id
 	}
-
 	includeEvents := r.URL.Query().Get("include_events") == "true"
-
 	req := &report.ReportRequest{
 		CompanyID:     companyID,
 		SubjectType:   &subjectType,
@@ -84,11 +101,8 @@ func (h *AttendanceReportHandler) GenerateReport(w http.ResponseWriter, r *http.
 		EndDate:       endDate,
 		ReportType:    reportType,
 		IncludeEvents: includeEvents,
-
-		// 👇 Location scope from the request context.
-		LocationID: locationctx.Filter(ctx),
+		LocationID:    locationctx.Filter(ctx),
 	}
-
 	data, contentType, err := h.reportService.GenerateReport(ctx, req)
 	if err != nil {
 		h.logger.Error("Failed to generate report",
@@ -97,7 +111,6 @@ func (h *AttendanceReportHandler) GenerateReport(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusInternalServerError, "failed to generate report")
 		return
 	}
-
 	filename := fmt.Sprintf(
 		"attendance_report_%s_%s_to_%s.%s",
 		companyID.String()[:8],
@@ -105,25 +118,26 @@ func (h *AttendanceReportHandler) GenerateReport(w http.ResponseWriter, r *http.
 		endDate.Format("20060102"),
 		reportType,
 	)
-
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", "attachment; filename="+filename)
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	_, _ = w.Write(data)
 }
 
-// StreamEvents streams attendance events in CSV or JSONL format.
+// StreamEvents streams attendance events as CSV or JSONL.
 //
-// Location scope: reads X-Location-ID from the request context.
+// FIX (Handler hygiene): the previous implementation called http.Error on
+// failure, which does nothing if StreamEvents already wrote a 200 and some
+// bytes. We now wrap the ResponseWriter in a status tracker. If the first
+// byte was already emitted, the only honest thing to do is log the failure
+// and stop — the client will see a truncated stream, which is detectable.
 func (h *AttendanceReportHandler) StreamEvents(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
 	format := r.URL.Query().Get("format")
 	if format == "" {
 		format = "csv"
@@ -132,13 +146,11 @@ func (h *AttendanceReportHandler) StreamEvents(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusBadRequest, "unsupported format, use 'csv' or 'jsonl'")
 		return
 	}
-
 	startDate, endDate, err := parseDateRange(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	filter := query.EventFilter{
 		CompanyID: companyID,
 		StartDate: startDate,
@@ -146,7 +158,6 @@ func (h *AttendanceReportHandler) StreamEvents(w http.ResponseWriter, r *http.Re
 		Page:      1,
 		PageSize:  1000,
 	}
-
 	if v := r.URL.Query().Get("subject_type"); v != "" {
 		filter.SubjectType = &v
 	}
@@ -167,7 +178,6 @@ func (h *AttendanceReportHandler) StreamEvents(w http.ResponseWriter, r *http.Re
 	if v := r.URL.Query().Get("device_id"); v != "" {
 		filter.DeviceID = &v
 	}
-
 	if format == "csv" {
 		w.Header().Set("Content-Type", "text/csv")
 		filename := fmt.Sprintf("attendance_events_%s_to_%s.csv", startDate.Format("20060102"), endDate.Format("20060102"))
@@ -176,27 +186,29 @@ func (h *AttendanceReportHandler) StreamEvents(w http.ResponseWriter, r *http.Re
 		w.Header().Set("Content-Type", "application/x-ndjson")
 	}
 
-	// 👇 Location scope from the request context.
+	sw := &statusCapturingWriter{ResponseWriter: w}
 	locFilter := locationctx.Filter(ctx)
-
-	if err := h.reportService.StreamEvents(ctx, companyID, locFilter, filter, w, format); err != nil {
+	if err := h.reportService.StreamEvents(ctx, companyID, locFilter, filter, sw, format); err != nil {
 		h.logger.Error("Failed to stream events",
 			zap.String("company_id", companyID.String()),
+			zap.Int("status_code", sw.statusCode),
+			zap.Bool("headers_flushed", sw.wroteHeader),
 			zap.Error(err))
-		http.Error(w, "failed to stream events", http.StatusInternalServerError)
+		if !sw.wroteHeader {
+			// Safe to signal failure — nothing has been sent yet.
+			http.Error(w, "failed to stream events", http.StatusInternalServerError)
+			return
+		}
+		// Partial response already on the wire. Log and stop.
 		return
 	}
 }
 
-// ---- Helpers ----
-
 func parseDateRange(r *http.Request) (time.Time, time.Time, error) {
 	startStr := r.URL.Query().Get("start_date")
 	endStr := r.URL.Query().Get("end_date")
-
 	start := time.Now().AddDate(0, 0, -30)
 	end := time.Now()
-
 	var err error
 	if startStr != "" {
 		start, err = time.Parse("2006-01-02", startStr)

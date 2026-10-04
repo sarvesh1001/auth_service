@@ -136,7 +136,7 @@ func (h *AttendanceQueryHandler) SearchEvents(w http.ResponseWriter, r *http.Req
 		filter.DeviceID = &v
 	}
 
-	// 👇 Location scope from the request context.
+	// Location scope from the request context.
 	locFilter := locationctx.Filter(ctx)
 
 	events, total, err := h.queryService.ListEvents(ctx, filter, locFilter)
@@ -208,6 +208,19 @@ func (h *AttendanceQueryHandler) GetDailySummary(w http.ResponseWriter, r *http.
 		return
 	}
 
+	// Defensive: query service already scopes by company, but never trust
+	// the lower layer to have done the right thing. Reject cross-tenant rows.
+	if summary.CompanyID != companyID {
+		h.logger.Warn("Cross-tenant daily summary access blocked",
+			zap.String("summary_id", summary.AttendanceSummaryID.String()),
+			zap.String("caller_company", companyID.String()),
+			zap.String("row_company", summary.CompanyID.String()),
+			zap.String("subject_id", subjectID.String()),
+		)
+		h.respondWithError(w, http.StatusForbidden, "access denied")
+		return
+	}
+
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    summary,
@@ -250,11 +263,31 @@ func (h *AttendanceQueryHandler) GetSubjectSummaries(w http.ResponseWriter, r *h
 		return
 	}
 
+	// Defensive cross-tenant filter: drop (and log) any row whose company
+	// doesn't match the caller. Should never trigger if the query service
+	// is doing its job.
+	filtered := make([]interface{}, 0, len(summaries))
+	for _, s := range summaries {
+		if s == nil {
+			continue
+		}
+		if s.CompanyID != companyID {
+			h.logger.Warn("Cross-tenant summary hidden in list",
+				zap.String("summary_id", s.AttendanceSummaryID.String()),
+				zap.String("caller_company", companyID.String()),
+				zap.String("row_company", s.CompanyID.String()),
+				zap.String("subject_id", subjectID.String()),
+			)
+			continue
+		}
+		filtered = append(filtered, s)
+	}
+
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data": map[string]interface{}{
-			"summaries": summaries,
-			"total":     len(summaries),
+			"summaries": filtered,
+			"total":     len(filtered),
 		},
 	})
 }
@@ -278,7 +311,6 @@ func (h *AttendanceQueryHandler) GetCompanyStats(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// 👇 Location scope from the request context.
 	locFilter := locationctx.Filter(ctx)
 
 	stats, err := h.queryService.GetCompanyStats(ctx, companyID, locFilter, startDate, endDate)
@@ -297,6 +329,10 @@ func (h *AttendanceQueryHandler) GetCompanyStats(w http.ResponseWriter, r *http.
 }
 
 // GetSubjectStats returns attendance statistics for a single subject.
+//
+// Note: the underlying UserAttendanceStats aggregate does not carry a
+// CompanyID. Company scoping is enforced inside the query service, which
+// receives companyID and hands it to the repo.
 func (h *AttendanceQueryHandler) GetSubjectStats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -461,8 +497,6 @@ func (h *AttendanceQueryHandler) ListSessionSummaries(w http.ResponseWriter, r *
 
 	filter := repository.SessionSummaryFilter{}
 	filter.CompanyID = &companyID
-
-	// 👇 Location scope: populate the filter field.
 	filter.LocationID = locationctx.Filter(ctx)
 
 	if v := r.URL.Query().Get("subject_type"); v != "" {
@@ -565,11 +599,6 @@ func (h *AttendanceQueryHandler) GetExemptionsForSubject(w http.ResponseWriter, 
 }
 
 // ListExemptions returns paginated exemptions with filters.
-//
-// Note: exemptions derive their location from the subject, so no
-// location filter is applied here — the ExemptionFilter has no
-// LocationID field. Per-subject access is enforced via the subject
-// lookups.
 func (h *AttendanceQueryHandler) ListExemptions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)

@@ -17,6 +17,7 @@ var (
 	ErrOrgUnitAlreadyExists  = errors.New("org unit: already exists")
 	ErrOrgUnitMemberNotFound = errors.New("org unit member: not found")
 	ErrOrgUnitRoleNotFound   = errors.New("org unit role: not found")
+	errMissingUserID         = errors.New("user_id missing from context")
 
 	// Leave management
 	ErrLeavePolicyNotFound          = errors.New("leave policy: not found")

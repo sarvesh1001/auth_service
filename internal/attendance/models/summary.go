@@ -38,9 +38,15 @@ type SummaryMetadata struct {
 
 // AttendanceDailySummary represents one day of attendance for one subject.
 //
-// EmploymentLocationID is a snapshot at generation time, sourced from
-// SubjectLocationResolver. It lets location-scoped list queries filter
-// without joining company_employees or academics.students.
+// # TIMEZONE MODEL
+//
+// AttendanceDate is NOT a UTC date. It is the calendar day in the subject's
+// resolved timezone (walked via position → location → work center →
+// company). Timezone and OffsetMinutes are snapshotted at write time so
+// historical rows can be audited even if the resolution chain changes later.
+//
+// Never compare AttendanceDate against time.Now().UTC(). Always filter by
+// equality against a date computed in the same tz.
 type AttendanceDailySummary struct {
 	AttendanceSummaryID uuid.UUID `json:"attendance_summary_id" db:"attendance_summary_id"`
 	CompanyID           uuid.UUID `json:"company_id" db:"company_id"`
@@ -50,7 +56,16 @@ type AttendanceDailySummary struct {
 	// Snapshot at generation time.
 	EmploymentLocationID *uuid.UUID `json:"employment_location_id,omitempty" db:"employment_location_id"`
 
-	AttendanceDate  time.Time       `json:"attendance_date" db:"attendance_date"`
+	// Local calendar day in Timezone. Never UTC.
+	AttendanceDate time.Time `json:"attendance_date" db:"attendance_date"`
+
+	// ── Timezone snapshot (required) ────────────────────────────────
+	// IANA name, e.g. 'Asia/Kolkata'.
+	Timezone string `json:"timezone" db:"timezone"`
+
+	// DST-aware offset in minutes at AttendanceDate. Range: -720..840.
+	OffsetMinutes int16 `json:"offset_minutes" db:"offset_minutes"`
+
 	Status          string          `json:"status" db:"status"`
 	WorkedMinutes   *int            `json:"worked_minutes" db:"worked_minutes"`
 	ExpectedMinutes *int            `json:"expected_minutes" db:"expected_minutes"`

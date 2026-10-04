@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
 	"auth-service/internal/hr/leave/models"
 	"auth-service/internal/hr/leave/service"
@@ -500,36 +501,91 @@ func (h *LeaveAdminHandler) RecalculateEntitlement(w http.ResponseWriter, r *htt
 	ctx := injectCommonContext(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
+	entitlementIDStr := chi.URLParam(r, "entitlementID")
+
+	logger := zap.L().With(
+		zap.String("component", "leave_admin_handler"),
+		zap.String("op", "recalculate_entitlement"),
+		zap.String("company_id", companyIDStr),
+		zap.String("entitlement_id", entitlementIDStr),
+		zap.String("method", r.Method),
+		zap.String("path", r.URL.Path),
+		zap.String("x_company_header", r.Header.Get("X-Company-ID")),
+		zap.String("x_location_header", r.Header.Get("X-Location-ID")),
+		zap.String("x_device_header", r.Header.Get("X-Device-ID")),
+	)
+
+	logger.Info("recalculate entitlement — entry")
+
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
+		logger.Error("recalculate entitlement — invalid company ID", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
 		return
 	}
 
-	entitlementIDStr := chi.URLParam(r, "entitlementID")
 	entitlementID, err := uuid.Parse(entitlementIDStr)
 	if err != nil {
+		logger.Error("recalculate entitlement — invalid entitlement ID", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, "invalid entitlement ID")
 		return
 	}
 
 	if !h.hasPermission(ctx, companyID, "leave:entitlement:recalculate") {
+		logger.Warn("recalculate entitlement — permission denied")
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
 	actorType, actorID, err := h.getActor(ctx)
 	if err != nil {
+		logger.Warn("recalculate entitlement — no actor in context", zap.Error(err))
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
 	metadata := h.getMetadata(ctx)
 
+	logger.Info("recalculate entitlement — invoking service",
+		zap.String("actor_type", actorType),
+		zap.String("actor_id", actorID.String()),
+	)
+
+	started := time.Now()
 	balance, err := h.accrualService.RecalculateEntitlement(ctx, entitlementID, actorType, actorID, metadata)
+	elapsed := time.Since(started)
+
 	if err != nil {
+		logger.Error("recalculate entitlement — service failed",
+			zap.Duration("elapsed", elapsed),
+			zap.Error(err),
+		)
 		h.respondWithError(w, http.StatusInternalServerError, "failed to recalculate entitlement: "+err.Error())
 		return
 	}
+
+	if balance == nil {
+		logger.Warn("recalculate entitlement — service returned nil balance",
+			zap.Duration("elapsed", elapsed),
+		)
+		h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"data":    nil,
+			"message": "Entitlement recalculated successfully (no balance)",
+		})
+		return
+	}
+
+	logger.Info("recalculate entitlement — done",
+		zap.Duration("elapsed", elapsed),
+		zap.String("user_id", balance.UserID.String()),
+		zap.String("leave_type_id", balance.LeaveTypeID.String()),
+		zap.String("leave_type_code", balance.LeaveTypeCode),
+		zap.String("leave_type_name", balance.LeaveTypeName),
+		zap.Float64("total_entitled", balance.TotalEntitled),
+		zap.Float64("accrued", balance.Accrued),
+		zap.Float64("consumed", balance.Consumed),
+		zap.Float64("balance", balance.Balance),
+	)
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,

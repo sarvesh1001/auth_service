@@ -39,7 +39,6 @@ func (s *workcenterService) CreateWorkCenter(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) (*models.WorkCenter, error) {
-	// Validate
 	if wc.WorkCenterCode == "" {
 		return nil, fmt.Errorf("work center code is required")
 	}
@@ -53,7 +52,6 @@ func (s *workcenterService) CreateWorkCenter(
 		return nil, fmt.Errorf("company ID is required")
 	}
 
-	// Check existence by code
 	exists, err := s.repo.Exists(ctx, wc.CompanyID, wc.WorkCenterCode)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check work center existence: %w", err)
@@ -62,7 +60,6 @@ func (s *workcenterService) CreateWorkCenter(
 		return nil, fmt.Errorf("work center with code %s already exists", wc.WorkCenterCode)
 	}
 
-	// Check name uniqueness
 	nameExists, err := s.repo.ExistsByName(ctx, wc.CompanyID, wc.Name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check name uniqueness: %w", err)
@@ -74,25 +71,32 @@ func (s *workcenterService) CreateWorkCenter(
 	now := time.Now().UTC()
 	wc.CreatedAt = now
 	wc.UpdatedAt = now
-	wc.IsActive = true // default
+	wc.IsActive = true
 
 	if err := s.repo.Create(ctx, nil, wc); err != nil {
 		return nil, fmt.Errorf("failed to create work center: %w", err)
 	}
 
-	// Audit (pass nil for resource UUID, include code in metadata)
 	if s.auditService != nil {
 		afterJSON, _ := json.Marshal(wc)
 		if metadata == nil {
 			metadata = make(map[string]interface{})
 		}
 		metadata["work_center_code"] = wc.WorkCenterCode
-		_ = s.auditService.LogAction(ctx, nil, &wc.CompanyID, "workcenter", "create", "workcenter", nil, actorType, &actorID, nil, afterJSON, metadata)
+		_ = s.auditService.LogAction(ctx, nil, &wc.CompanyID,
+			"workcenter", "create", "workcenter", nil,
+			actorType, &actorID, nil, afterJSON, metadata)
 	}
 
 	return wc, nil
 }
 
+// UpdateWorkCenter updates an existing work center.
+//
+// FIX (Tier 1): the previous implementation marshaled `beforeJSON` AFTER
+// applying mutations, so every audit row showed before == after and the
+// audit trail could not answer "what changed?". The snapshot is now
+// captured before any field is touched.
 func (s *workcenterService) UpdateWorkCenter(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -118,7 +122,10 @@ func (s *workcenterService) UpdateWorkCenter(
 		return nil, fmt.Errorf("work center not found")
 	}
 
-	// Check name uniqueness if name is being changed
+	// Snapshot the "before" state BEFORE any mutation.
+	beforeJSON, _ := json.Marshal(existing)
+
+	// Check name uniqueness if name is being changed.
 	if name != nil && *name != existing.Name {
 		nameExists, err := s.repo.ExistsByName(ctx, companyID, *name)
 		if err != nil {
@@ -129,36 +136,40 @@ func (s *workcenterService) UpdateWorkCenter(
 		}
 	}
 
-	// Apply updates
+	// Apply updates to a copy so `existing` stays a clean "before" reference
+	// if we ever need it downstream.
+	updated := *existing
 	if name != nil {
-		existing.Name = *name
+		updated.Name = *name
 	}
 	if description != nil {
-		existing.Description = description
+		updated.Description = description
 	}
 	if timezone != nil {
-		existing.Timezone = *timezone
+		updated.Timezone = *timezone
 	}
 	if isActive != nil {
-		existing.IsActive = *isActive
+		updated.IsActive = *isActive
 	}
-	existing.UpdatedAt = time.Now().UTC()
+	updated.UpdatedAt = time.Now().UTC()
 
-	beforeJSON, _ := json.Marshal(existing)
-	if err := s.repo.Update(ctx, nil, existing); err != nil {
+	if err := s.repo.Update(ctx, nil, &updated); err != nil {
 		return nil, fmt.Errorf("failed to update work center: %w", err)
 	}
-	afterJSON, _ := json.Marshal(existing)
+
+	afterJSON, _ := json.Marshal(&updated)
 
 	if s.auditService != nil {
 		if metadata == nil {
 			metadata = make(map[string]interface{})
 		}
 		metadata["work_center_code"] = code
-		_ = s.auditService.LogAction(ctx, nil, &companyID, "workcenter", "update", "workcenter", nil, actorType, &actorID, beforeJSON, afterJSON, metadata)
+		_ = s.auditService.LogAction(ctx, nil, &companyID,
+			"workcenter", "update", "workcenter", nil,
+			actorType, &actorID, beforeJSON, afterJSON, metadata)
 	}
 
-	return existing, nil
+	return &updated, nil
 }
 
 func (s *workcenterService) DeleteWorkCenter(
@@ -194,7 +205,9 @@ func (s *workcenterService) DeleteWorkCenter(
 			metadata = make(map[string]interface{})
 		}
 		metadata["work_center_code"] = code
-		_ = s.auditService.LogAction(ctx, nil, &companyID, "workcenter", "delete", "workcenter", nil, actorType, &actorID, beforeJSON, nil, metadata)
+		_ = s.auditService.LogAction(ctx, nil, &companyID,
+			"workcenter", "delete", "workcenter", nil,
+			actorType, &actorID, beforeJSON, nil, metadata)
 	}
 
 	return nil

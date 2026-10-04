@@ -14,13 +14,11 @@ import (
 	"auth-service/internal/attendance/service/resolver"
 )
 
-// AttendanceCorrectionHandler handles attendance correction requests.
 type AttendanceCorrectionHandler struct {
 	correctionSvc admin.CorrectionService
 	logger        *zap.Logger
 }
 
-// NewAttendanceCorrectionHandler creates a new handler.
 func NewAttendanceCorrectionHandler(
 	correctionSvc admin.CorrectionService,
 	logger *zap.Logger,
@@ -31,9 +29,9 @@ func NewAttendanceCorrectionHandler(
 	}
 }
 
-// CorrectionRequest represents the HTTP request for creating a correction.
 type CorrectionRequest struct {
 	TargetUserID   uuid.UUID `json:"target_user_id"`
+	SubjectType    string    `json:"subject_type,omitempty"`
 	BusinessDate   string    `json:"business_date"`
 	CorrectionType string    `json:"correction_type"`
 	EventTime      string    `json:"event_time,omitempty"`
@@ -41,8 +39,6 @@ type CorrectionRequest struct {
 	Reason         string    `json:"reason"`
 }
 
-// mapCorrectionError converts subject-scope errors from the correction
-// service into the appropriate HTTP status.
 func (h *AttendanceCorrectionHandler) mapCorrectionError(w http.ResponseWriter, err error) bool {
 	switch {
 	case errors.Is(err, resolver.ErrSubjectOutsideScope):
@@ -57,29 +53,32 @@ func (h *AttendanceCorrectionHandler) mapCorrectionError(w http.ResponseWriter, 
 	return false
 }
 
-// CreateCorrection creates a new attendance correction.
+// CreateCorrection creates an attendance correction.
+//
+// FIX (Handler hygiene):
+//   - Accepts `subject_type` from the body (previously hardcoded to
+//     "employee"). Defaults to "employee" when empty for backward compat.
+//   - Removed the naive `businessDate.After(time.Now().UTC())` check. The
+//     service already validates that event_time belongs to business_date
+//     in the subject's timezone — a UTC comparison here rejected valid
+//     corrections near local midnight for non-UTC subjects.
 func (h *AttendanceCorrectionHandler) CreateCorrection(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
 	actorType, actorID, err := h.getActorInfo(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var req CorrectionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
-	// Validations
 	if req.TargetUserID == uuid.Nil {
 		h.respondWithError(w, http.StatusBadRequest, "target_user_id is required")
 		return
@@ -96,17 +95,11 @@ func (h *AttendanceCorrectionHandler) CreateCorrection(w http.ResponseWriter, r 
 		h.respondWithError(w, http.StatusBadRequest, "reason is required")
 		return
 	}
-
 	businessDate, err := time.Parse("2006-01-02", req.BusinessDate)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid business_date format, use YYYY-MM-DD")
 		return
 	}
-	if businessDate.After(time.Now().UTC()) {
-		h.respondWithError(w, http.StatusBadRequest, "cannot correct future dates")
-		return
-	}
-
 	var eventTime *time.Time
 	if req.EventTime != "" {
 		parsedTime, err := time.Parse(time.RFC3339, req.EventTime)
@@ -116,12 +109,15 @@ func (h *AttendanceCorrectionHandler) CreateCorrection(w http.ResponseWriter, r 
 		}
 		eventTime = &parsedTime
 	}
-
+	subjectType := req.SubjectType
+	if subjectType == "" {
+		subjectType = "employee"
+	}
 	corrReq := &admin.CorrectionRequest{
 		CompanyID:      companyID,
 		ActorID:        actorID,
 		ActorType:      actorType,
-		SubjectType:    "employee", // HR employees; can be parameterized later
+		SubjectType:    subjectType,
 		SubjectID:      req.TargetUserID,
 		BusinessDate:   businessDate,
 		CorrectionType: req.CorrectionType,
@@ -129,7 +125,6 @@ func (h *AttendanceCorrectionHandler) CreateCorrection(w http.ResponseWriter, r 
 		OverrideStatus: req.OverrideStatus,
 		Reason:         req.Reason,
 	}
-
 	if err := h.correctionSvc.CreateCorrection(ctx, corrReq); err != nil {
 		if h.mapCorrectionError(w, err) {
 			return
@@ -137,19 +132,20 @@ func (h *AttendanceCorrectionHandler) CreateCorrection(w http.ResponseWriter, r 
 		h.logger.Error("Failed to create attendance correction",
 			zap.String("company_id", companyID.String()),
 			zap.String("target_user_id", req.TargetUserID.String()),
+			zap.String("subject_type", subjectType),
 			zap.String("actor_id", actorID.String()),
 			zap.Error(err),
 		)
-		h.respondWithError(w, http.StatusInternalServerError, "failed to create attendance correction")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
 		"message": "Attendance correction created successfully",
 		"data": map[string]interface{}{
 			"company_id":      companyID,
 			"target_user_id":  req.TargetUserID,
+			"subject_type":    subjectType,
 			"business_date":   req.BusinessDate,
 			"correction_type": req.CorrectionType,
 			"created_by":      actorID,

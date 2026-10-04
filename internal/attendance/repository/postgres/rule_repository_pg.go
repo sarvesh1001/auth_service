@@ -66,6 +66,11 @@ func (r *ruleRepository) GetCompanyRules(ctx context.Context, companyID uuid.UUI
 }
 
 func (r *ruleRepository) UpsertCompanyRules(ctx context.Context, tx *sql.Tx, rules *models.CompanyAttendanceRules) error {
+	// ── NEW: validate IANA name.
+	if err := util.ValidateTimezone(rules.Timezone); err != nil {
+		return fmt.Errorf("company rules timezone: %w", err)
+	}
+
 	if rules.CreatedAt.IsZero() {
 		rules.CreatedAt = time.Now().UTC()
 	}
@@ -98,6 +103,7 @@ func (r *ruleRepository) UpsertCompanyRules(ctx context.Context, tx *sql.Tx, rul
 	if err != nil {
 		r.logger.Error("failed to upsert company attendance rules",
 			util.String("company_id", rules.CompanyID.String()),
+			util.String("timezone", rules.Timezone),
 			util.ErrorField(err))
 		return fmt.Errorf("upsert company rules: %w", err)
 	}
@@ -105,7 +111,7 @@ func (r *ruleRepository) UpsertCompanyRules(ctx context.Context, tx *sql.Tx, rul
 }
 
 // ──────────────────────────────────────────────────────────────
-// DEPARTMENT RULES
+// DEPARTMENT RULES (no tz — inherits company)
 // ──────────────────────────────────────────────────────────────
 
 func (r *ruleRepository) GetDepartmentRules(ctx context.Context, companyID, departmentID uuid.UUID) (*models.DepartmentAttendanceRules, error) {
@@ -195,7 +201,7 @@ func (r *ruleRepository) UpsertDepartmentRules(ctx context.Context, tx *sql.Tx, 
 }
 
 // ──────────────────────────────────────────────────────────────
-// USER ATTENDANCE PROFILE
+// USER ATTENDANCE PROFILE (no tz)
 // ──────────────────────────────────────────────────────────────
 
 func (r *ruleRepository) GetUserProfile(ctx context.Context, userID uuid.UUID) (*models.UserAttendanceProfile, error) {
@@ -266,10 +272,6 @@ func (r *ruleRepository) UpsertUserProfile(ctx context.Context, tx *sql.Tx, prof
 	}
 	return nil
 }
-
-// ──────────────────────────────────────────────────────────────
-// HEALTH CHECK
-// ──────────────────────────────────────────────────────────────
 
 func (r *ruleRepository) HealthCheck(ctx context.Context) error {
 	query := `SELECT 1 FROM attendance.company_attendance_rules LIMIT 1`

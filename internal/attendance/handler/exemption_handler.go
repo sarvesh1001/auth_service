@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
@@ -9,184 +10,156 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
-	"auth-service/internal/attendance/models"
-	"auth-service/internal/attendance/repository"
+	"auth-service/internal/attendance/service/exemption"
+	"auth-service/internal/attendance/service/resolver"
 )
 
-// AttendanceExemptionHandler handles exemption CRUD operations.
 type AttendanceExemptionHandler struct {
-	exemptionRepo repository.AttendanceExemptionRepository
-	logger        *zap.Logger
+	exemptionService exemption.ExemptionService
+	logger           *zap.Logger
 }
 
-// NewAttendanceExemptionHandler creates a new handler.
 func NewAttendanceExemptionHandler(
-	exemptionRepo repository.AttendanceExemptionRepository,
+	exemptionService exemption.ExemptionService,
 	logger *zap.Logger,
 ) *AttendanceExemptionHandler {
 	return &AttendanceExemptionHandler{
-		exemptionRepo: exemptionRepo,
-		logger:        logger,
+		exemptionService: exemptionService,
+		logger:           logger,
 	}
 }
 
-// CreateExemptionRequest defines the payload for creating an exemption.
-type CreateExemptionRequest struct {
-	CompanyID   uuid.UUID  `json:"company_id"`
+// ---------------------------------------------------------------------------
+// Request DTOs — note the ABSENCE of company_id / created_by.
+// ---------------------------------------------------------------------------
+
+type createExemptionRequest struct {
 	SubjectType string     `json:"subject_type"`
 	SubjectID   uuid.UUID  `json:"subject_id"`
 	FromDate    time.Time  `json:"from_date"`
 	ToDate      time.Time  `json:"to_date"`
-	Reason      *string    `json:"reason"`
-	ApprovedBy  *uuid.UUID `json:"approved_by"`
-	CreatedBy   *uuid.UUID `json:"created_by"`
+	Reason      *string    `json:"reason,omitempty"`
+	ApprovedBy  *uuid.UUID `json:"approved_by,omitempty"`
 }
 
-// CreateExemption creates a new attendance exemption.
+type updateExemptionRequest struct {
+	FromDate   *time.Time `json:"from_date,omitempty"`
+	ToDate     *time.Time `json:"to_date,omitempty"`
+	Reason     *string    `json:"reason,omitempty"`
+	ApprovedBy *uuid.UUID `json:"approved_by,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
 func (h *AttendanceExemptionHandler) CreateExemption(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	var req CreateExemptionRequest
+
+	companyID, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	actorID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	actorType := getSessionTypeFromContext(ctx)
+
+	var req createExemptionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	// Validate
-	if req.CompanyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "company_id is required")
-		return
-	}
-	if req.SubjectType == "" {
-		h.respondWithError(w, http.StatusBadRequest, "subject_type is required")
-		return
-	}
-	if req.SubjectID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "subject_id is required")
-		return
-	}
-	if req.FromDate.IsZero() || req.ToDate.IsZero() {
-		h.respondWithError(w, http.StatusBadRequest, "from_date and to_date are required")
-		return
-	}
-	if req.FromDate.After(req.ToDate) {
-		h.respondWithError(w, http.StatusBadRequest, "from_date must be before or equal to to_date")
-		return
-	}
-
-	exemption := &models.AttendanceExemption{
-		CompanyID:   req.CompanyID,
+	created, err := h.exemptionService.Create(ctx, companyID, &exemption.CreateExemptionInput{
 		SubjectType: req.SubjectType,
 		SubjectID:   req.SubjectID,
 		FromDate:    req.FromDate,
 		ToDate:      req.ToDate,
 		Reason:      req.Reason,
 		ApprovedBy:  req.ApprovedBy,
-		CreatedBy:   req.CreatedBy,
-	}
-
-	if err := h.exemptionRepo.Create(ctx, nil, exemption); err != nil {
-		h.logger.Error("Failed to create exemption", zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, "failed to create exemption")
+	}, actorType, actorID)
+	if err != nil {
+		h.writeServiceError(w, err, "create exemption")
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
-		"data":    exemption,
+		"data":    created,
 	})
 }
 
-// UpdateExemptionRequest defines the payload for updating an exemption.
-type UpdateExemptionRequest struct {
-	FromDate   *time.Time `json:"from_date"`
-	ToDate     *time.Time `json:"to_date"`
-	Reason     *string    `json:"reason"`
-	ApprovedBy *uuid.UUID `json:"approved_by"`
-}
-
-// UpdateExemption updates an existing exemption.
 func (h *AttendanceExemptionHandler) UpdateExemption(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
+	companyID, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	actorID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	actorType := getSessionTypeFromContext(ctx)
+
 	exemptionID, err := uuid.Parse(chi.URLParam(r, "exemptionID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid exemption ID")
 		return
 	}
 
-	var req UpdateExemptionRequest
+	var req updateExemptionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	// Fetch existing
-	existing, err := h.exemptionRepo.GetByID(ctx, nil, exemptionID)
+	updated, err := h.exemptionService.Update(ctx, companyID, exemptionID, &exemption.UpdateExemptionInput{
+		FromDate:   req.FromDate,
+		ToDate:     req.ToDate,
+		Reason:     req.Reason,
+		ApprovedBy: req.ApprovedBy,
+	}, actorType, actorID)
 	if err != nil {
-		h.logger.Error("Failed to get exemption", zap.String("exemption_id", exemptionID.String()), zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve exemption")
-		return
-	}
-	if existing == nil {
-		h.respondWithError(w, http.StatusNotFound, "exemption not found")
-		return
-	}
-
-	// Apply updates
-	if req.FromDate != nil {
-		existing.FromDate = *req.FromDate
-	}
-	if req.ToDate != nil {
-		existing.ToDate = *req.ToDate
-	}
-	if req.Reason != nil {
-		existing.Reason = req.Reason
-	}
-	if req.ApprovedBy != nil {
-		existing.ApprovedBy = req.ApprovedBy
-	}
-
-	// Validate dates after update
-	if existing.FromDate.After(existing.ToDate) {
-		h.respondWithError(w, http.StatusBadRequest, "from_date must be before or equal to to_date")
-		return
-	}
-
-	if err := h.exemptionRepo.Update(ctx, nil, existing); err != nil {
-		h.logger.Error("Failed to update exemption", zap.String("exemption_id", exemptionID.String()), zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, "failed to update exemption")
+		h.writeServiceError(w, err, "update exemption")
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
-		"data":    existing,
+		"data":    updated,
 	})
 }
 
-// DeleteExemption deletes an exemption by ID.
 func (h *AttendanceExemptionHandler) DeleteExemption(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
+	companyID, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	actorID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	actorType := getSessionTypeFromContext(ctx)
+
 	exemptionID, err := uuid.Parse(chi.URLParam(r, "exemptionID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid exemption ID")
 		return
 	}
 
-	// Check if exists
-	existing, err := h.exemptionRepo.GetByID(ctx, nil, exemptionID)
-	if err != nil {
-		h.logger.Error("Failed to get exemption", zap.String("exemption_id", exemptionID.String()), zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve exemption")
-		return
-	}
-	if existing == nil {
-		h.respondWithError(w, http.StatusNotFound, "exemption not found")
-		return
-	}
-
-	if err := h.exemptionRepo.Delete(ctx, nil, exemptionID); err != nil {
-		h.logger.Error("Failed to delete exemption", zap.String("exemption_id", exemptionID.String()), zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, "failed to delete exemption")
+	if err := h.exemptionService.Delete(ctx, companyID, exemptionID, actorType, actorID); err != nil {
+		h.writeServiceError(w, err, "delete exemption")
 		return
 	}
 
@@ -196,7 +169,36 @@ func (h *AttendanceExemptionHandler) DeleteExemption(w http.ResponseWriter, r *h
 	})
 }
 
-// ---- Helpers ----
+// ---------------------------------------------------------------------------
+// Error mapping
+// ---------------------------------------------------------------------------
+
+func (h *AttendanceExemptionHandler) writeServiceError(w http.ResponseWriter, err error, op string) {
+	switch {
+	case errors.Is(err, exemption.ErrExemptionNotFound):
+		h.respondWithError(w, http.StatusNotFound, "exemption not found")
+	case errors.Is(err, exemption.ErrInvalidSubject):
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, exemption.ErrInvalidDateRange):
+		h.respondWithError(w, http.StatusBadRequest, "from_date must be on or before to_date")
+	case errors.Is(err, exemption.ErrOverlap):
+		h.respondWithError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, resolver.ErrSubjectOutsideScope):
+		h.respondWithError(w, http.StatusForbidden,
+			"subject belongs to a different location than your current scope")
+	case errors.Is(err, resolver.ErrSubjectHasNoLocation):
+		h.respondWithError(w, http.StatusBadRequest,
+			"target subject has no employment location assigned")
+	case errors.Is(err, exemption.ErrUnauthorized):
+		h.respondWithError(w, http.StatusForbidden, "not authorized")
+	default:
+		h.logger.Error("Exemption service error",
+			zap.String("op", op),
+			zap.Error(err),
+		)
+		h.respondWithError(w, http.StatusInternalServerError, "internal error")
+	}
+}
 
 func (h *AttendanceExemptionHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")

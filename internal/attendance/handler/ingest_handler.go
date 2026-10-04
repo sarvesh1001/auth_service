@@ -15,13 +15,11 @@ import (
 	"auth-service/internal/attendance/service/resolver"
 )
 
-// AttendanceIngestHandler handles attendance punch ingestion.
 type AttendanceIngestHandler struct {
 	ingestService ingest.IngestService
 	logger        *zap.Logger
 }
 
-// NewAttendanceIngestHandler creates a new handler.
 func NewAttendanceIngestHandler(
 	ingestService ingest.IngestService,
 	logger *zap.Logger,
@@ -32,7 +30,6 @@ func NewAttendanceIngestHandler(
 	}
 }
 
-// PunchHTTPRequest is the common request for user/admin punches.
 type PunchHTTPRequest struct {
 	TargetUserID uuid.UUID  `json:"target_user_id"`
 	SubjectType  string     `json:"subject_type,omitempty"`
@@ -47,7 +44,6 @@ type PunchHTTPRequest struct {
 	Context *models.EventContext `json:"context,omitempty"`
 }
 
-// PunchAttendance is the main entry point; it routes to device or user handler.
 func (h *AttendanceIngestHandler) PunchAttendance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	sessionType := getSessionTypeFromContext(ctx)
@@ -58,7 +54,6 @@ func (h *AttendanceIngestHandler) PunchAttendance(w http.ResponseWriter, r *http
 	h.handleUserPunch(w, r, ctx)
 }
 
-// handleDevicePunch rejects device requests (use dedicated endpoint).
 func (h *AttendanceIngestHandler) handleDevicePunch(w http.ResponseWriter, r *http.Request, ctx context.Context) {
 	h.respondWithError(
 		w,
@@ -67,10 +62,6 @@ func (h *AttendanceIngestHandler) handleDevicePunch(w http.ResponseWriter, r *ht
 	)
 }
 
-// mapIngestError converts subject-scope errors from the ingest service into
-// the appropriate HTTP status.
-//
-// Returns true if the error was recognised and written.
 func (h *AttendanceIngestHandler) mapIngestError(w http.ResponseWriter, err error) bool {
 	switch {
 	case errors.Is(err, resolver.ErrSubjectOutsideScope):
@@ -85,26 +76,22 @@ func (h *AttendanceIngestHandler) mapIngestError(w http.ResponseWriter, err erro
 	return false
 }
 
-// handleUserPunch processes punches from authenticated users (including admins).
 func (h *AttendanceIngestHandler) handleUserPunch(w http.ResponseWriter, r *http.Request, ctx context.Context) {
 	actorID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "company context required")
 		return
 	}
-
 	var req PunchHTTPRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
 	if req.TargetUserID == uuid.Nil {
 		h.respondWithError(w, http.StatusBadRequest, "target_user_id is required")
 		return
@@ -117,18 +104,15 @@ func (h *AttendanceIngestHandler) handleUserPunch(w http.ResponseWriter, r *http
 		h.respondWithError(w, http.StatusBadRequest, "source_type is required")
 		return
 	}
-
 	subjectType := req.SubjectType
 	if subjectType == "" {
 		subjectType = "employee"
 	}
-
 	ip := req.Source.IPAddress
 	if ip == nil || *ip == "" {
-		resolvedIP := h.getClientIP(r)
+		resolvedIP := clientIP(r)
 		ip = &resolvedIP
 	}
-
 	punchReq := &ingest.PunchRequest{
 		CompanyID:   companyID,
 		ActorID:     actorID,
@@ -144,7 +128,6 @@ func (h *AttendanceIngestHandler) handleUserPunch(w http.ResponseWriter, r *http
 		},
 		Context: req.Context,
 	}
-
 	event, err := h.ingestService.IngestPunch(ctx, punchReq)
 	if err != nil {
 		if h.mapIngestError(w, err) {
@@ -153,29 +136,24 @@ func (h *AttendanceIngestHandler) handleUserPunch(w http.ResponseWriter, r *http
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
 		"data":    event,
 	})
 }
 
-// DevicePunchAttendance handles device-only punches (uses device auth context).
 func (h *AttendanceIngestHandler) DevicePunchAttendance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	sessionType := getSessionTypeFromContext(ctx)
 	if sessionType != "device" {
 		h.respondWithError(w, http.StatusUnauthorized, "device authentication required")
 		return
 	}
-
 	authCtx, ok := ctx.Value("device_auth_context").(*models.DeviceAuthContext)
 	if !ok || authCtx == nil {
 		h.respondWithError(w, http.StatusUnauthorized, "device authentication required")
 		return
 	}
-
 	var req struct {
 		EventType      string               `json:"event_type"`
 		EventTime      *time.Time           `json:"event_time,omitempty"`
@@ -186,7 +164,6 @@ func (h *AttendanceIngestHandler) DevicePunchAttendance(w http.ResponseWriter, r
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
 	if req.EventType == "" {
 		h.respondWithError(w, http.StatusBadRequest, "event_type required")
 		return
@@ -195,7 +172,6 @@ func (h *AttendanceIngestHandler) DevicePunchAttendance(w http.ResponseWriter, r
 		h.respondWithError(w, http.StatusBadRequest, "device_user_code required")
 		return
 	}
-
 	ctxObj := req.Context
 	if ctxObj == nil {
 		ctxObj = &models.EventContext{}
@@ -203,10 +179,8 @@ func (h *AttendanceIngestHandler) DevicePunchAttendance(w http.ResponseWriter, r
 	if authCtx.WorkCenterID != nil && ctxObj.WorkCenterCode == nil {
 		ctxObj.WorkCenterCode = authCtx.WorkCenterID
 	}
-
-	ip := h.getClientIP(r)
+	ip := clientIP(r)
 	deviceID := authCtx.DeviceID
-
 	punchReq := &ingest.PunchRequest{
 		CompanyID:      authCtx.CompanyID,
 		EventType:      req.EventType,
@@ -219,7 +193,6 @@ func (h *AttendanceIngestHandler) DevicePunchAttendance(w http.ResponseWriter, r
 		},
 		Context: ctxObj,
 	}
-
 	event, err := h.ingestService.IngestPunch(ctx, punchReq)
 	if err != nil {
 		if h.mapIngestError(w, err) {
@@ -228,35 +201,29 @@ func (h *AttendanceIngestHandler) DevicePunchAttendance(w http.ResponseWriter, r
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
 		"data":    event,
 	})
 }
 
-// SelfPunchAttendance allows a user to punch for themselves.
 func (h *AttendanceIngestHandler) SelfPunchAttendance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	sessionType := getSessionTypeFromContext(ctx)
 	if sessionType == "device" {
 		h.respondWithError(w, http.StatusUnauthorized, "user authentication required")
 		return
 	}
-
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "company context required")
 		return
 	}
-
 	var req struct {
 		EventType   string `json:"event_type"`
 		SubjectType string `json:"subject_type,omitempty"`
@@ -271,7 +238,6 @@ func (h *AttendanceIngestHandler) SelfPunchAttendance(w http.ResponseWriter, r *
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
 	if req.EventType == "" {
 		h.respondWithError(w, http.StatusBadRequest, "event_type required")
 		return
@@ -280,25 +246,22 @@ func (h *AttendanceIngestHandler) SelfPunchAttendance(w http.ResponseWriter, r *
 		h.respondWithError(w, http.StatusBadRequest, "source_type required")
 		return
 	}
-
 	subjectType := req.SubjectType
 	if subjectType == "" {
 		subjectType = "employee"
 	}
-
 	ip := req.Source.IPAddress
 	if ip == nil || *ip == "" {
-		resolvedIP := h.getClientIP(r)
+		resolvedIP := clientIP(r)
 		ip = &resolvedIP
 	}
-
 	punchReq := &ingest.PunchRequest{
 		CompanyID:   companyID,
 		ActorID:     userID,
 		SubjectType: subjectType,
 		SubjectID:   userID,
 		EventType:   req.EventType,
-		EventTime:   nil, // server time
+		EventTime:   nil,
 		Source: ingest.PunchSource{
 			SourceType: req.Source.SourceType,
 			DeviceID:   req.Source.DeviceID,
@@ -306,36 +269,20 @@ func (h *AttendanceIngestHandler) SelfPunchAttendance(w http.ResponseWriter, r *
 		},
 		Context: req.Context,
 	}
-
 	event, err := h.ingestService.IngestPunch(ctx, punchReq)
 	if err != nil {
-		// Self punches never hit ErrSubjectOutsideScope (actor == subject),
-		// but the mapping is harmless and keeps behavior uniform.
 		if h.mapIngestError(w, err) {
 			return
 		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
 		"data":    event,
 	})
 }
 
-// getClientIP extracts the client IP from the request.
-func (h *AttendanceIngestHandler) getClientIP(r *http.Request) string {
-	if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
-		return ip
-	}
-	if ip := r.Header.Get("X-Real-IP"); ip != "" {
-		return ip
-	}
-	return r.RemoteAddr
-}
-
-// response helpers
 func (h *AttendanceIngestHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

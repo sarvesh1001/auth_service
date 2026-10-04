@@ -18,7 +18,6 @@ import (
 	"auth-service/internal/infrastructure/audit"
 )
 
-// AttendanceAdminHandler handles attendance policy, rules, and assignment endpoints.
 type AttendanceAdminHandler struct {
 	adminService admin.AdminService
 	queryService query.QueryService
@@ -26,7 +25,6 @@ type AttendanceAdminHandler struct {
 	logger       *zap.Logger
 }
 
-// NewAttendanceAdminHandler creates a new handler instance.
 func NewAttendanceAdminHandler(
 	adminService admin.AdminService,
 	queryService query.QueryService,
@@ -41,8 +39,6 @@ func NewAttendanceAdminHandler(
 	}
 }
 
-// ---- Request/Response DTOs ----
-
 type PolicyRequest struct {
 	PolicyCode     string             `json:"policy_code"`
 	PolicyType     string             `json:"policy_type"`
@@ -53,17 +49,13 @@ type PolicyRequest struct {
 	Description    *string            `json:"description,omitempty"`
 }
 
-// AssignPolicyRequest now supports polymorphic subjects.
 type AssignPolicyRequest struct {
-	// Legacy employee assignment (backward compatible)
 	UserID        uuid.UUID  `json:"user_id,omitempty"`
 	PolicyID      uuid.UUID  `json:"policy_id"`
 	EffectiveFrom time.Time  `json:"effective_from"`
 	EffectiveTo   *time.Time `json:"effective_to,omitempty"`
-
-	// NEW: Polymorphic subject fields (for students, teachers, etc.)
-	SubjectType string     `json:"subject_type,omitempty"` // "employee", "student", "teacher", etc.
-	SubjectID   *uuid.UUID `json:"subject_id,omitempty"`   // ID of the subject
+	SubjectType   string     `json:"subject_type,omitempty"`
+	SubjectID     *uuid.UUID `json:"subject_id,omitempty"`
 }
 
 type CompanyRulesRequest struct {
@@ -72,8 +64,6 @@ type CompanyRulesRequest struct {
 	Timezone              string   `json:"timezone"`
 }
 
-// ---- Handlers ----
-
 func (h *AttendanceAdminHandler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -81,20 +71,16 @@ func (h *AttendanceAdminHandler) CreatePolicy(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
 	actorType, actorID, err := h.getActorInfo(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var req PolicyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
-	// Validate assignment
 	if req.PositionID != nil && req.WorkCenterCode != nil && *req.WorkCenterCode != "" {
 		h.respondWithError(w, http.StatusBadRequest,
 			"policy can be assigned to either position or work center, not both")
@@ -113,7 +99,6 @@ func (h *AttendanceAdminHandler) CreatePolicy(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusBadRequest, "policy type is required")
 		return
 	}
-
 	policy := &models.AttendancePolicy{
 		PolicyID:       uuid.New(),
 		CompanyID:      companyID,
@@ -126,14 +111,12 @@ func (h *AttendanceAdminHandler) CreatePolicy(w http.ResponseWriter, r *http.Req
 		CreatedAt:      time.Now().UTC(),
 		UpdatedAt:      time.Now().UTC(),
 	}
-
 	metadata := map[string]interface{}{
 		"ip_address":     r.RemoteAddr,
 		"user_agent":     r.UserAgent(),
 		"endpoint":       r.URL.Path,
 		"request_method": r.Method,
 	}
-
 	createdPolicy, err := h.adminService.CreateAttendancePolicy(ctx, policy, actorType, actorID, metadata)
 	if err != nil {
 		h.logger.Error("Failed to create attendance policy",
@@ -142,7 +125,6 @@ func (h *AttendanceAdminHandler) CreatePolicy(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusInternalServerError, "failed to create policy")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
 		"data":    createdPolicy,
@@ -150,21 +132,23 @@ func (h *AttendanceAdminHandler) CreatePolicy(w http.ResponseWriter, r *http.Req
 	})
 }
 
+// GetPolicy returns a single attendance policy.
+//
+// FIX (Handler hygiene): previously returned the policy without verifying
+// that it belonged to the caller's company. Now enforces that check and
+// returns 404 for cross-tenant IDs (so existence isn't leaked).
 func (h *AttendanceAdminHandler) GetPolicy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	_, err := getCompanyIDFromContext(ctx)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
-	policyIDStr := chi.URLParam(r, "policyID")
-	policyID, err := uuid.Parse(policyIDStr)
+	policyID, err := uuid.Parse(chi.URLParam(r, "policyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid policy ID")
 		return
 	}
-
 	policy, err := h.queryService.GetAttendancePolicyByID(ctx, policyID)
 	if err != nil {
 		h.logger.Error("Failed to get attendance policy",
@@ -173,11 +157,10 @@ func (h *AttendanceAdminHandler) GetPolicy(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve policy")
 		return
 	}
-	if policy == nil {
+	if policy == nil || policy.CompanyID != companyID {
 		h.respondWithError(w, http.StatusNotFound, "policy not found")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    policy,
@@ -191,15 +174,12 @@ func (h *AttendanceAdminHandler) ListPolicies(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
 	activeOnly := true
 	if r.URL.Query().Get("include_inactive") == "true" {
 		activeOnly = false
 	}
-
 	positionIDStr := r.URL.Query().Get("position_id")
 	workCenterCode := r.URL.Query().Get("work_center_code")
-
 	policies, err := h.queryService.GetAttendancePoliciesByCompany(ctx, companyID, activeOnly)
 	if err != nil {
 		h.logger.Error("Failed to list attendance policies",
@@ -208,8 +188,6 @@ func (h *AttendanceAdminHandler) ListPolicies(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusInternalServerError, "failed to list policies")
 		return
 	}
-
-	// Apply filters
 	var filteredPolicies []*models.AttendancePolicy
 	for _, policy := range policies {
 		if positionIDStr != "" {
@@ -228,7 +206,6 @@ func (h *AttendanceAdminHandler) ListPolicies(w http.ResponseWriter, r *http.Req
 		}
 		filteredPolicies = append(filteredPolicies, policy)
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data": map[string]interface{}{
@@ -243,21 +220,23 @@ func (h *AttendanceAdminHandler) ListPolicies(w http.ResponseWriter, r *http.Req
 	})
 }
 
+// UpdatePolicy updates an existing attendance policy.
+//
+// FIX (Handler hygiene): previously fetched the policy by ID and applied
+// the caller-supplied fields without checking that the policy belonged to
+// the caller's company. Cross-tenant update is now rejected with 404.
 func (h *AttendanceAdminHandler) UpdatePolicy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	_, err := getCompanyIDFromContext(ctx)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
-	policyIDStr := chi.URLParam(r, "policyID")
-	policyID, err := uuid.Parse(policyIDStr)
+	policyID, err := uuid.Parse(chi.URLParam(r, "policyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid policy ID")
 		return
 	}
-
 	existingPolicy, err := h.queryService.GetAttendancePolicyByID(ctx, policyID)
 	if err != nil {
 		h.logger.Error("Failed to get existing policy",
@@ -266,17 +245,15 @@ func (h *AttendanceAdminHandler) UpdatePolicy(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve policy")
 		return
 	}
-	if existingPolicy == nil {
+	if existingPolicy == nil || existingPolicy.CompanyID != companyID {
 		h.respondWithError(w, http.StatusNotFound, "policy not found")
 		return
 	}
-
 	var req PolicyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
 	if req.PositionID != nil && req.WorkCenterCode != nil && *req.WorkCenterCode != "" {
 		h.respondWithError(w, http.StatusBadRequest,
 			"policy can be assigned to either position or work center, not both")
@@ -287,7 +264,6 @@ func (h *AttendanceAdminHandler) UpdatePolicy(w http.ResponseWriter, r *http.Req
 			"either position_id or work_center_code is required")
 		return
 	}
-
 	existingPolicy.PolicyCode = req.PolicyCode
 	existingPolicy.PolicyType = req.PolicyType
 	existingPolicy.PositionID = req.PositionID
@@ -295,7 +271,6 @@ func (h *AttendanceAdminHandler) UpdatePolicy(w http.ResponseWriter, r *http.Req
 	existingPolicy.Rules = req.Rules
 	existingPolicy.IsActive = req.IsActive
 	existingPolicy.UpdatedAt = time.Now().UTC()
-
 	if err := h.adminService.UpdateAttendancePolicy(ctx, existingPolicy); err != nil {
 		h.logger.Error("Failed to update attendance policy",
 			zap.String("policy_id", policyID.String()),
@@ -303,7 +278,6 @@ func (h *AttendanceAdminHandler) UpdatePolicy(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusInternalServerError, "failed to update policy")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    existingPolicy,
@@ -311,21 +285,34 @@ func (h *AttendanceAdminHandler) UpdatePolicy(w http.ResponseWriter, r *http.Req
 	})
 }
 
+// DeletePolicy deletes an attendance policy.
+//
+// FIX (Handler hygiene): previously deleted by ID without a company check.
+// Now returns 404 for cross-tenant IDs.
 func (h *AttendanceAdminHandler) DeletePolicy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	_, err := getCompanyIDFromContext(ctx)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
-	policyIDStr := chi.URLParam(r, "policyID")
-	policyID, err := uuid.Parse(policyIDStr)
+	policyID, err := uuid.Parse(chi.URLParam(r, "policyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid policy ID")
 		return
 	}
-
+	existingPolicy, err := h.queryService.GetAttendancePolicyByID(ctx, policyID)
+	if err != nil {
+		h.logger.Error("Failed to get policy before delete",
+			zap.String("policy_id", policyID.String()),
+			zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve policy")
+		return
+	}
+	if existingPolicy == nil || existingPolicy.CompanyID != companyID {
+		h.respondWithError(w, http.StatusNotFound, "policy not found")
+		return
+	}
 	if err := h.adminService.DeleteAttendancePolicy(ctx, policyID); err != nil {
 		h.logger.Error("Failed to delete attendance policy",
 			zap.String("policy_id", policyID.String()),
@@ -337,14 +324,12 @@ func (h *AttendanceAdminHandler) DeletePolicy(w http.ResponseWriter, r *http.Req
 		}
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "Policy deleted successfully",
 	})
 }
 
-// AssignPolicyToUser handles both legacy employee assignments and polymorphic subject assignments.
 func (h *AttendanceAdminHandler) AssignPolicyToUser(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -352,19 +337,16 @@ func (h *AttendanceAdminHandler) AssignPolicyToUser(w http.ResponseWriter, r *ht
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
 	actorType, actorID, err := h.getActorInfo(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var req AssignPolicyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
 	if req.PolicyID == uuid.Nil {
 		h.respondWithError(w, http.StatusBadRequest, "policy_id is required")
 		return
@@ -372,11 +354,7 @@ func (h *AttendanceAdminHandler) AssignPolicyToUser(w http.ResponseWriter, r *ht
 	if req.EffectiveFrom.IsZero() {
 		req.EffectiveFrom = time.Now().UTC()
 	}
-
-	// Determine which assignment method to use
-	// Case 1: Polymorphic assignment (subject_type and subject_id provided)
 	if req.SubjectType != "" && req.SubjectID != nil && *req.SubjectID != uuid.Nil {
-		// Use the new polymorphic method
 		err = h.adminService.AssignPolicyToSubject(
 			ctx,
 			req.SubjectType,
@@ -395,7 +373,6 @@ func (h *AttendanceAdminHandler) AssignPolicyToUser(w http.ResponseWriter, r *ht
 			h.respondWithError(w, http.StatusInternalServerError, "failed to assign policy")
 			return
 		}
-
 		h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
 			"message": "Policy assigned to subject successfully",
@@ -409,22 +386,17 @@ func (h *AttendanceAdminHandler) AssignPolicyToUser(w http.ResponseWriter, r *ht
 		})
 		return
 	}
-
-	// Case 2: Legacy employee assignment (user_id provided)
 	if req.UserID == uuid.Nil {
 		h.respondWithError(w, http.StatusBadRequest, "either user_id or (subject_type + subject_id) is required")
 		return
 	}
-
 	userPolicy := &models.UserAttendancePolicy{
 		UserID:        req.UserID,
 		PolicyID:      req.PolicyID,
 		EffectiveFrom: req.EffectiveFrom,
 		EffectiveTo:   req.EffectiveTo,
 		CreatedAt:     time.Now().UTC(),
-		// The service will populate SubjectType='employee' and SubjectID=userID
 	}
-
 	metadata := map[string]interface{}{
 		"ip_address":     r.RemoteAddr,
 		"user_agent":     r.UserAgent(),
@@ -432,7 +404,6 @@ func (h *AttendanceAdminHandler) AssignPolicyToUser(w http.ResponseWriter, r *ht
 		"request_method": r.Method,
 		"company_id":     companyID,
 	}
-
 	if err := h.adminService.AssignUserAttendancePolicy(ctx, userPolicy, actorType, actorID, metadata); err != nil {
 		h.logger.Error("Failed to assign policy to user",
 			zap.String("user_id", req.UserID.String()),
@@ -441,7 +412,6 @@ func (h *AttendanceAdminHandler) AssignPolicyToUser(w http.ResponseWriter, r *ht
 		h.respondWithError(w, http.StatusInternalServerError, "failed to assign policy")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "Policy assigned to user successfully",
@@ -456,14 +426,19 @@ func (h *AttendanceAdminHandler) AssignPolicyToUser(w http.ResponseWriter, r *ht
 
 func (h *AttendanceAdminHandler) GetCompanyRules(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	pathCompany, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
 		return
 	}
-
+	if !assertPathCompany(w, companyID, pathCompany, h.logger) {
+		return
+	}
 	rules, err := h.adminService.GetCompanyAttendanceRules(ctx, companyID)
 	if err != nil {
 		h.logger.Error("Failed to get company attendance rules",
@@ -472,7 +447,6 @@ func (h *AttendanceAdminHandler) GetCompanyRules(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve company rules")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    rules,
@@ -482,14 +456,19 @@ func (h *AttendanceAdminHandler) GetCompanyRules(w http.ResponseWriter, r *http.
 func (h *AttendanceAdminHandler) UpdateCompanyRules(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	ctx := r.Context()
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+	pathCompany, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
-
+	companyID, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if !assertPathCompany(w, companyID, pathCompany, h.logger) {
+		return
+	}
 	actorType, actorID, err := h.getActorInfo(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
@@ -499,7 +478,6 @@ func (h *AttendanceAdminHandler) UpdateCompanyRules(w http.ResponseWriter, r *ht
 		h.respondWithError(w, http.StatusForbidden, "only admins can update company attendance rules")
 		return
 	}
-
 	var req CompanyRulesRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
@@ -508,14 +486,12 @@ func (h *AttendanceAdminHandler) UpdateCompanyRules(w http.ResponseWriter, r *ht
 	if req.Timezone == "" {
 		req.Timezone = "UTC"
 	}
-
 	rules := &models.CompanyAttendanceRules{
 		CompanyID:             companyID,
 		AllowedSourceTypes:    req.AllowedSourceTypes,
 		AllowMultipleCheckins: req.AllowMultipleCheckins,
 		Timezone:              req.Timezone,
 	}
-
 	if err := h.adminService.UpdateCompanyAttendanceRules(ctx, rules, actorID); err != nil {
 		h.logger.Error("Failed to update company attendance rules",
 			zap.String("company_id", companyID.String()),
@@ -524,7 +500,6 @@ func (h *AttendanceAdminHandler) UpdateCompanyRules(w http.ResponseWriter, r *ht
 		h.respondWithError(w, http.StatusInternalServerError, "Failed to update company rules")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    rules,
@@ -535,19 +510,21 @@ func (h *AttendanceAdminHandler) UpdateCompanyRules(w http.ResponseWriter, r *ht
 	})
 }
 
-// ---------------------------------------------------------------------
-// CHANGED: GetResolvedRules now accepts subject_type query param
-// ---------------------------------------------------------------------
 func (h *AttendanceAdminHandler) GetResolvedRules(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+	pathCompany, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
 		return
 	}
-
+	companyID, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if !assertPathCompany(w, companyID, pathCompany, h.logger) {
+		return
+	}
 	userIDStr := r.URL.Query().Get("user_id")
 	var userID uuid.UUID
 	if userIDStr != "" {
@@ -579,12 +556,10 @@ func (h *AttendanceAdminHandler) GetResolvedRules(w http.ResponseWriter, r *http
 		}
 		positionID = &parsedID
 	}
-
 	subjectType := r.URL.Query().Get("subject_type")
 	if subjectType == "" {
 		subjectType = "employee"
 	}
-
 	rules, err := h.adminService.ResolveAttendanceRules(ctx, userID, companyID, subjectType, workCenterCode, positionID, date)
 	if err != nil {
 		h.logger.Error("Failed to resolve attendance rules",
@@ -595,14 +570,11 @@ func (h *AttendanceAdminHandler) GetResolvedRules(w http.ResponseWriter, r *http
 		h.respondWithError(w, http.StatusInternalServerError, "failed to resolve attendance rules")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    rules,
 	})
 }
-
-// ---- Helper functions ----
 
 func (h *AttendanceAdminHandler) getActorInfo(ctx context.Context) (string, uuid.UUID, error) {
 	actorID, err := getUserIDFromContext(ctx)
@@ -613,7 +585,6 @@ func (h *AttendanceAdminHandler) getActorInfo(ctx context.Context) (string, uuid
 	return actorType, actorID, nil
 }
 
-// getCompanyIDFromContext extracts the company UUID from the context.
 func getCompanyIDFromContext(ctx context.Context) (uuid.UUID, error) {
 	if v := ctx.Value("company_id"); v != nil {
 		if id, ok := v.(uuid.UUID); ok {
@@ -624,7 +595,6 @@ func getCompanyIDFromContext(ctx context.Context) (uuid.UUID, error) {
 	return uuid.Nil, errors.New("company_id not found in context")
 }
 
-// getUserIDFromContext extracts the user UUID from context.
 func getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
 	if v := ctx.Value("current_user_id"); v != nil {
 		if id, ok := v.(uuid.UUID); ok {
@@ -652,8 +622,6 @@ func getSessionTypeFromContext(ctx context.Context) string {
 	}
 	return "user"
 }
-
-// ---- Response helpers ----
 
 func (h *AttendanceAdminHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")

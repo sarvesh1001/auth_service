@@ -702,18 +702,25 @@ func (h *AdminHandler) GetOpenPositions(w http.ResponseWriter, r *http.Request) 
 // CreateCompany — handler
 // Add owner_job_code passthrough (optional). Service defaults to "CEO".
 // ============================================================
+
 type CreateCompanyRequest struct {
-	CompanyName             string   `json:"company_name" validate:"required,max=255"`
-	OwnerPhone              string   `json:"owner_phone" validate:"required"`
-	OwnerUsername           string   `json:"owner_username" validate:"required,min=3,max=100,alphanum"`
-	OwnerFullName           string   `json:"owner_full_name" validate:"required,max=255"`
-	OwnerPositionTitle      string   `json:"owner_position_title"`
-	OwnerJobCode            string   `json:"owner_job_code,omitempty"` // 👈 NEW — optional; service derives from title
-	SubscriptionTier        string   `json:"subscription_tier"`
-	SubscriptionPlanCode    string   `json:"subscription_plan_code"`
-	MaxEmployees            int      `json:"max_employees" validate:"required,min=1,max=2000"`
-	MaxLocations            int      `json:"max_locations" validate:"required,min=1,max=500"`
-	DataRegion              string   `json:"data_region"   validate:"required"`
+	CompanyName          string `json:"company_name" validate:"required,max=255"`
+	OwnerPhone           string `json:"owner_phone" validate:"required"`
+	OwnerUsername        string `json:"owner_username" validate:"required,min=3,max=100,alphanum"`
+	OwnerFullName        string `json:"owner_full_name" validate:"required,max=255"`
+	OwnerPositionTitle   string `json:"owner_position_title"`
+	OwnerJobCode         string `json:"owner_job_code,omitempty"`
+	SubscriptionTier     string `json:"subscription_tier"`
+	SubscriptionPlanCode string `json:"subscription_plan_code"`
+	MaxEmployees         int    `json:"max_employees" validate:"required,min=1,max=2000"`
+	MaxLocations         int    `json:"max_locations" validate:"required,min=1,max=500"`
+	DataRegion           string `json:"data_region"   validate:"required"`
+
+	// ── NEW: timezone config ─────────────────────────────────────────
+	// Required. IANA name, e.g. 'Asia/Kolkata'. Fallback for every
+	// subject whose position/location/work-center has no explicit tz.
+	DefaultTimezone string `json:"default_timezone"`
+
 	SubscriptionMonths      int      `json:"subscription_months" validate:"min=0,max=36"`
 	SubscriptionDays        int      `json:"subscription_days"   validate:"min=0,max=30"`
 	TrialDays               int      `json:"trial_days"          validate:"min=0"`
@@ -733,6 +740,10 @@ type CreateCompanyRequest struct {
 	State                   *string  `json:"state,omitempty"`
 	Country                 *string  `json:"country,omitempty"`
 	Pincode                 *string  `json:"pincode,omitempty"`
+
+	// ── NEW: optional per-location tz override.
+	// nil / "" → inherit company.default_timezone.
+	LocationTimezone *string `json:"location_timezone,omitempty"`
 
 	OwnerDateOfBirth      *time.Time `json:"owner_date_of_birth,omitempty"`
 	OwnerGender           *string    `json:"owner_gender,omitempty"`
@@ -783,6 +794,34 @@ func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
 		req.OwnerPositionTitle = "CEO"
 	}
 
+	// ── NEW: validate timezone at the boundary so we return 400 (not 500)
+	//    for a typo'd IANA name. The service and repo also validate; this
+	//    is the first line of defence and produces the nicest error.
+	if strings.TrimSpace(req.DefaultTimezone) == "" {
+		h.respondWithError(w, http.StatusBadRequest,
+			customErrors.ErrInvalidInput, "default_timezone is required")
+		return
+	}
+	if err := util.ValidateTimezone(req.DefaultTimezone); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err,
+			"default_timezone: "+err.Error())
+		return
+	}
+	if req.LocationTimezone != nil && strings.TrimSpace(*req.LocationTimezone) != "" {
+		if err := util.ValidateTimezone(*req.LocationTimezone); err != nil {
+			h.respondWithError(w, http.StatusBadRequest, err,
+				"location_timezone: "+err.Error())
+			return
+		}
+	}
+	if strings.TrimSpace(req.WorkCenterTZ) != "" {
+		if err := util.ValidateTimezone(req.WorkCenterTZ); err != nil {
+			h.respondWithError(w, http.StatusBadRequest, err,
+				"work_center_timezone: "+err.Error())
+			return
+		}
+	}
+
 	if err := validateCreateCompanyRequest(req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Validation failed")
 		return
@@ -810,12 +849,13 @@ func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
 		OwnerUsername:           req.OwnerUsername,
 		OwnerFullName:           req.OwnerFullName,
 		OwnerPositionTitle:      req.OwnerPositionTitle,
-		OwnerJobCode:            req.OwnerJobCode, // 👈 NEW passthrough
+		OwnerJobCode:            req.OwnerJobCode,
 		SubscriptionTier:        req.SubscriptionTier,
 		SubscriptionPlanCode:    req.SubscriptionPlanCode,
 		MaxEmployees:            req.MaxEmployees,
 		MaxLocations:            req.MaxLocations,
 		DataRegion:              req.DataRegion,
+		DefaultTimezone:         req.DefaultTimezone, // ← NEW
 		SubscriptionMonths:      req.SubscriptionMonths,
 		SubscriptionDays:        req.SubscriptionDays,
 		TrialDays:               req.TrialDays,
@@ -835,6 +875,7 @@ func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
 		State:                   req.State,
 		Country:                 req.Country,
 		Pincode:                 req.Pincode,
+		LocationTimezone:        req.LocationTimezone, // ← NEW
 		OwnerDateOfBirth:        ownerDOB,
 		OwnerGender:             req.OwnerGender,
 		OwnerMaritalStatus:      req.OwnerMaritalStatus,
@@ -893,7 +934,13 @@ func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
 			"max_employees":       company.MaxEmployees,
 			"departments_created": len(req.Departments) + 1,
 			"owner_job_title":     req.OwnerPositionTitle,
-			"created_at":          company.CreatedAt,
+
+			// ── NEW: timezone echo
+			"default_timezone":     company.DefaultTimezone, // actual value persisted
+			"location_timezone":    req.LocationTimezone,    // null when inheriting
+			"work_center_timezone": req.WorkCenterTZ,
+
+			"created_at": company.CreatedAt,
 		},
 	})
 }
@@ -7593,6 +7640,23 @@ func validateCreateCompanyRequest(req CreateCompanyRequest) error {
 	if req.OwnerTaxID != nil && len(*req.OwnerTaxID) > 64 {
 		return fmt.Errorf("owner_tax_id must be at most 64 characters")
 	}
+	if strings.TrimSpace(req.DefaultTimezone) == "" {
+		return fmt.Errorf("default_timezone is required")
+	}
+	if err := util.ValidateTimezone(req.DefaultTimezone); err != nil {
+		return fmt.Errorf("default_timezone: %w", err)
+	}
+	if req.LocationTimezone != nil && strings.TrimSpace(*req.LocationTimezone) != "" {
+		if err := util.ValidateTimezone(*req.LocationTimezone); err != nil {
+			return fmt.Errorf("location_timezone: %w", err)
+		}
+	}
+	if strings.TrimSpace(req.WorkCenterTZ) == "" {
+		return fmt.Errorf("work_center_timezone is required")
+	}
+	if err := util.ValidateTimezone(req.WorkCenterTZ); err != nil {
+		return fmt.Errorf("work_center_timezone: %w", err)
+	}
 
 	// Social security ID — bound the length.
 	if req.OwnerSocialSecurityID != nil && len(*req.OwnerSocialSecurityID) > 64 {
@@ -7736,26 +7800,41 @@ func (h *AdminHandler) GetCompanySubscription(w http.ResponseWriter, r *http.Req
 // @Failure 403 {object} map[string]interface{} "Permission denied"
 // @Failure 404 {object} map[string]interface{} "Company not found"
 // @Router /api/v1/admin/companies/{companyID}/details [put]
+
 func (h *AdminHandler) UpdateCompanyDetailsHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := h.injectIdempotencyKey(h.injectClientIP(r.Context(), r), r)
-
 	adminID, err := h.getRequesterAdminID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
 		return
 	}
-
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
 		return
 	}
-
 	var req service.UpdateCompanyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
+	}
+
+	// ── NEW: timezone validation at the boundary.
+	//   nil       → preserve current tz
+	//   ""        → reject (company must always have a tz)
+	//   valid IANA → set
+	if req.DefaultTimezone != nil {
+		if strings.TrimSpace(*req.DefaultTimezone) == "" {
+			h.respondWithError(w, http.StatusBadRequest, customErrors.ErrInvalidInput,
+				"default_timezone cannot be empty")
+			return
+		}
+		if err := util.ValidateTimezone(*req.DefaultTimezone); err != nil {
+			h.respondWithError(w, http.StatusBadRequest, err,
+				"default_timezone: "+err.Error())
+			return
+		}
 	}
 
 	if err := h.companyService.UpdateCompanyWithOptions(ctx, companyID, &req, adminID); err != nil {
@@ -7763,7 +7842,6 @@ func (h *AdminHandler) UpdateCompanyDetailsHandler(w http.ResponseWriter, r *htt
 		h.respondWithError(w, status, err, msg)
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Company updated successfully"))
 }
 

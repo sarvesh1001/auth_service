@@ -1557,3 +1557,14 @@ func (r *scheduleRepository) scanScheduleOverrideFromRows(rows *sql.Rows) (*mode
 	}
 	return &ov, nil
 }
+
+// BeginTx starts a transaction on the underlying Postgres client.
+//
+// Required by callers that need to batch multiple writes atomically —
+// e.g. schedulingServiceImpl.BulkCreateScheduleInstances and
+// GenerateScheduleForCompany. The returned *sql.Tx is passed down into
+// repo methods that accept a tx parameter (CreateScheduleInstance,
+// UpdateScheduleInstanceStatus, etc.).
+func (r *scheduleRepository) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
+	return r.client.BeginTx(ctx, opts)
+}

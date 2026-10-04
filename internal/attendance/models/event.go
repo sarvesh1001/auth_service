@@ -29,15 +29,38 @@ type EventMetadata struct {
 
 // AttendanceEvent is the canonical attendance event row.
 //
-// Two location dimensions, both snapshots at write time:
+// # TIMEZONE MODEL
 //
-//	EmploymentLocationID → the subject's org unit when the event occurred.
-//	                       Populated from SubjectLocationResolver.
-//	GeofenceID           → the physical fence the punch happened inside.
-//	                       Populated from the device's geofence, or GPS for
-//	                       mobile punches. NULL for admin/manual entries.
+// EventTime is the absolute UTC instant. The business meaning of that
+// instant — which local day it belongs to, at which offset — is captured
+// by three columns filled at write time by the ingest pipeline. The
+// resolution chain walks position → location → work center → company:
 //
-// See docs/location-architecture.md for the full model.
+//	Position.LocationID           → Location.Timezone
+//	Position.WorkCenterCode       → WorkCenter.Timezone
+//	WorkCenter.LocationID         → Location.Timezone (fallback)
+//	Company.DefaultTimezone       (last resort)
+//
+// Column semantics:
+//
+//	EventTZ             IANA name, e.g. 'Asia/Kolkata'. Snapshot on the row
+//	                    so future config changes don't retroactively
+//	                    rewrite history.
+//
+//	EventOffsetMinutes  DST-aware offset in minutes at EventTime for EventTZ.
+//	                    +330 for IST, -240 for EDT, -300 for EST. Audit-only.
+//	                    Never use for display.
+//
+//	EventDateLocal      Local business date (YYYY-MM-DD) computed as
+//	                    (EventTime AT TIME ZONE EventTZ)::date.
+//	                    Pre-computed and indexed — this is what every
+//	                    "today's punches at location X" query filters on.
+//
+//	EventCountry        ISO-3166 alpha-2 code ('IN', 'US'), resolved from
+//	                    locations.country. Used for tax-residency reports.
+//
+// Never compute a business date at read time. Never trust the client's
+// device timezone. Never use the server's local timezone.
 type AttendanceEvent struct {
 	AttendanceEventID uuid.UUID `json:"attendance_event_id" db:"attendance_event_id"`
 	CompanyID         uuid.UUID `json:"company_id" db:"company_id"`
@@ -45,6 +68,24 @@ type AttendanceEvent struct {
 	SubjectID         uuid.UUID `json:"subject_id" db:"subject_id"`
 	EventType         string    `json:"event_type" db:"event_type"`
 	EventTime         time.Time `json:"event_time" db:"event_time"`
+
+	// ── Timezone columns (all required, populated at write time) ──────
+	// IANA name, e.g. 'Asia/Kolkata'. Resolved via the chain:
+	//   position.location → location.timezone
+	//   position.work_center → work_center.timezone
+	//   work_center.location → location.timezone
+	//   company.default_timezone
+	EventTZ string `json:"event_tz" db:"event_tz"`
+
+	// DST-aware offset in minutes at EventTime for EventTZ.
+	// +330 for IST, -240 for EDT, -300 for EST. Range: -720..840.
+	EventOffsetMinutes int16 `json:"event_offset_minutes" db:"event_offset_minutes"`
+
+	// Local business date in EventTZ. Pre-computed, indexed, immutable.
+	EventDateLocal time.Time `json:"event_date_local" db:"event_date_local"`
+
+	// Optional ISO-3166 alpha-2 code. Populated from locations.country.
+	EventCountry *string `json:"event_country,omitempty" db:"event_country"`
 
 	// Two location dimensions (snapshots)
 	EmploymentLocationID *uuid.UUID `json:"employment_location_id,omitempty" db:"employment_location_id"`
@@ -62,5 +103,4 @@ type AttendanceEvent struct {
 
 	CreatedAt time.Time  `json:"created_at" db:"created_at"`
 	CreatedBy *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
-	EventDate time.Time  `json:"event_date" db:"event_date"` // generated column
 }

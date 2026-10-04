@@ -2,6 +2,7 @@ package scheduling
 
 import (
 	"context"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -87,6 +88,10 @@ type ScheduleInstanceSummary struct {
 	WorkCenterCode string     `json:"work_center_code,omitempty"`
 }
 
+// maxUpcomingSchedules caps the size of the UpcomingSchedules list returned
+// by GetScheduleStats so responses stay bounded regardless of window size.
+const maxUpcomingSchedules = 50
+
 // Implementation
 type schedulingQueryServiceImpl struct {
 	schedulingRepo  repository.ScheduleRepository
@@ -112,7 +117,6 @@ func (qs *schedulingQueryServiceImpl) GetWorkCalendarByID(ctx context.Context, c
 	return qs.schedulingRepo.GetWorkCalendarByID(ctx, calendarID)
 }
 
-// GetWorkCalendarsByCompany — locationID == nil means no filter (ALL scope).
 func (qs *schedulingQueryServiceImpl) GetWorkCalendarsByCompany(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -121,32 +125,56 @@ func (qs *schedulingQueryServiceImpl) GetWorkCalendarsByCompany(
 	return qs.schedulingRepo.GetWorkCalendarsByCompany(ctx, companyID, locationID)
 }
 
-func (qs *schedulingQueryServiceImpl) GetWorkCalendarAvailability(ctx context.Context, calendarID uuid.UUID, startDate, endDate time.Time) ([]CalendarAvailability, error) {
+// GetWorkCalendarAvailability returns day-by-day working/holiday info.
+//
+// FIX (Tier 1): the previous implementation shadowed the outer `holidayMap`
+// inside the loop, so entries were never added to the map and `IsHoliday`
+// was always false. The map is now built directly from cal.Holidays, which
+// is already keyed by "YYYY-MM-DD" (see AddHolidayToCalendar and
+// UpdateWorkCalendar). Values are stored as `map[string]interface{}`
+// containing "date" and "name".
+func (qs *schedulingQueryServiceImpl) GetWorkCalendarAvailability(
+	ctx context.Context,
+	calendarID uuid.UUID,
+	startDate, endDate time.Time,
+) ([]CalendarAvailability, error) {
 	cal, err := qs.schedulingRepo.GetWorkCalendarByID(ctx, calendarID)
 	if err != nil {
 		return nil, err
 	}
-	holidayMap := make(map[string]string)
-	for _, h := range cal.Holidays {
-		if holidayMap, ok := h.(map[string]interface{}); ok {
-			if date, ok := holidayMap["date"].(string); ok {
-				if name, ok := holidayMap["name"].(string); ok {
-					holidayMap[date] = name
-				}
+
+	// Build the holiday lookup: date-string -> holiday name.
+	// cal.Holidays is already keyed by date, so we don't need to parse the
+	// inner "date" field. We only read "name" from the value.
+	holidayMap := make(map[string]string, len(cal.Holidays))
+	for dateKey, raw := range cal.Holidays {
+		switch v := raw.(type) {
+		case map[string]interface{}:
+			if name, ok := v["name"].(string); ok {
+				holidayMap[dateKey] = name
+			} else {
+				holidayMap[dateKey] = "" // exists but unnamed
 			}
+		case string:
+			// Some legacy rows may have stored the name as the raw value.
+			holidayMap[dateKey] = v
+		default:
+			holidayMap[dateKey] = ""
 		}
 	}
+
+	// Precompute working days as a set for O(1) lookup.
+	working := make(map[int]struct{}, len(cal.WorkingDays))
+	for _, wd := range cal.WorkingDays {
+		working[wd] = struct{}{}
+	}
+
 	var avail []CalendarAvailability
 	for d := startDate; !d.After(endDate); d = d.AddDate(0, 0, 1) {
 		dateStr := d.Format("2006-01-02")
-		isWorking := false
-		for _, wd := range cal.WorkingDays {
-			if int(d.Weekday()) == wd {
-				isWorking = true
-				break
-			}
-		}
+		_, isWorking := working[int(d.Weekday())]
 		holidayName, isHoliday := holidayMap[dateStr]
+
 		avail = append(avail, CalendarAvailability{
 			Date:         d,
 			IsWorkingDay: isWorking,
@@ -163,7 +191,6 @@ func (qs *schedulingQueryServiceImpl) GetScheduleTemplateByID(ctx context.Contex
 	return qs.schedulingRepo.GetScheduleTemplate(ctx, templateID)
 }
 
-// GetScheduleTemplatesByCompany — locationID == nil means no filter (ALL scope).
 func (qs *schedulingQueryServiceImpl) GetScheduleTemplatesByCompany(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -187,7 +214,6 @@ func (qs *schedulingQueryServiceImpl) GetScheduleInstancesByUser(ctx context.Con
 	return qs.schedulingRepo.GetScheduleInstancesByUser(ctx, userID, startDate, endDate)
 }
 
-// GetScheduleInstancesByCompany — locationID == nil means no filter (ALL scope).
 func (qs *schedulingQueryServiceImpl) GetScheduleInstancesByCompany(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -210,6 +236,10 @@ func (qs *schedulingQueryServiceImpl) GetScheduleInstancesByPosition(ctx context
 	for _, uid := range users {
 		insts, err := qs.schedulingRepo.GetScheduleInstancesByUser(ctx, uid, startDate, endDate)
 		if err != nil {
+			qs.logger.Warn("Failed to fetch instances for user in position query",
+				zap.String("position_id", positionID.String()),
+				zap.String("user_id", uid.String()),
+				zap.Error(err))
 			continue
 		}
 		all = append(all, insts...)
@@ -262,7 +292,11 @@ func (qs *schedulingQueryServiceImpl) GetScheduleOverrideByUserDate(ctx context.
 
 // ---- Stats ----
 
-// GetScheduleStats — locationID == nil means no filter (ALL scope).
+// GetScheduleStats aggregates statistics for a company/location.
+//
+// FIX (Tier 1): previously issued one GetScheduleTemplate call per
+// instance (N+1). Now fetches each unique template exactly once and
+// populates UpcomingSchedules (which the struct declared but never set).
 func (qs *schedulingQueryServiceImpl) GetScheduleStats(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -270,32 +304,89 @@ func (qs *schedulingQueryServiceImpl) GetScheduleStats(
 	startDate, endDate time.Time,
 ) (*ScheduleStats, error) {
 	stats := &ScheduleStats{
-		ByTemplateType: make(map[string]int64),
-		ByDate:         make(map[string]int64),
-		ByWorkCenter:   make(map[string]int64),
+		ByTemplateType:    make(map[string]int64),
+		ByDate:            make(map[string]int64),
+		ByWorkCenter:      make(map[string]int64),
+		UpcomingSchedules: []ScheduleInstanceSummary{},
 	}
+
 	instances, err := qs.schedulingRepo.GetScheduleInstancesByCompany(ctx, companyID, locationID, startDate, endDate)
 	if err != nil {
 		return nil, err
 	}
 	stats.TotalInstances = int64(len(instances))
-	userMap := make(map[uuid.UUID]bool)
-	templateMap := make(map[uuid.UUID]bool)
+
+	// --- Pass 1: collect unique template IDs ---
+	userSet := make(map[uuid.UUID]struct{})
+	templateSet := make(map[uuid.UUID]struct{})
 	for _, inst := range instances {
-		userMap[inst.UserID] = true
-		templateMap[inst.ScheduleTemplateID] = true
-		tmpl, err := qs.schedulingRepo.GetScheduleTemplate(ctx, inst.ScheduleTemplateID)
-		if err == nil && tmpl != nil {
+		userSet[inst.UserID] = struct{}{}
+		templateSet[inst.ScheduleTemplateID] = struct{}{}
+	}
+	stats.TotalUsers = int64(len(userSet))
+	stats.TotalTemplates = int64(len(templateSet))
+
+	// --- Pass 2: fetch each unique template exactly once ---
+	templates := make(map[uuid.UUID]*models.ScheduleTemplate, len(templateSet))
+	for tplID := range templateSet {
+		tmpl, err := qs.schedulingRepo.GetScheduleTemplate(ctx, tplID)
+		if err != nil || tmpl == nil {
+			qs.logger.Warn("Failed to load schedule template for stats",
+				zap.String("template_id", tplID.String()),
+				zap.Error(err))
+			continue
+		}
+		templates[tplID] = tmpl
+	}
+
+	// --- Pass 3: aggregate ---
+	for _, inst := range instances {
+		if tmpl, ok := templates[inst.ScheduleTemplateID]; ok {
 			stats.ByTemplateType[tmpl.TemplateType]++
 		}
-		dateStr := inst.ScheduleDate.Format("2006-01-02")
-		stats.ByDate[dateStr]++
+		stats.ByDate[inst.ScheduleDate.Format("2006-01-02")]++
 		if inst.WorkCenterCode != nil {
 			stats.ByWorkCenter[*inst.WorkCenterCode]++
 		}
 	}
-	stats.TotalUsers = int64(len(userMap))
-	stats.TotalTemplates = int64(len(templateMap))
+
+	// --- Pass 4: UpcomingSchedules — the next N instances by date ---
+	// Only include instances at or after "now" in the queried window.
+	now := time.Now().UTC()
+	upcoming := make([]*models.ScheduleInstance, 0, len(instances))
+	for _, inst := range instances {
+		if inst.ScheduleDate.Before(now) {
+			continue
+		}
+		if inst.Status != "" && inst.Status != "active" {
+			continue
+		}
+		upcoming = append(upcoming, inst)
+	}
+	sort.Slice(upcoming, func(i, j int) bool {
+		return upcoming[i].ScheduleDate.Before(upcoming[j].ScheduleDate)
+	})
+	if len(upcoming) > maxUpcomingSchedules {
+		upcoming = upcoming[:maxUpcomingSchedules]
+	}
+	for _, inst := range upcoming {
+		summary := ScheduleInstanceSummary{
+			InstanceID:    inst.ScheduleInstanceID,
+			UserID:        inst.UserID,
+			ScheduleDate:  inst.ScheduleDate,
+			ExpectedStart: inst.ExpectedStart,
+			ExpectedEnd:   inst.ExpectedEnd,
+		}
+		if tmpl, ok := templates[inst.ScheduleTemplateID]; ok {
+			summary.TemplateName = tmpl.Name
+			summary.TemplateType = tmpl.TemplateType
+		}
+		if inst.WorkCenterCode != nil {
+			summary.WorkCenterCode = *inst.WorkCenterCode
+		}
+		stats.UpcomingSchedules = append(stats.UpcomingSchedules, summary)
+	}
+
 	return stats, nil
 }
 

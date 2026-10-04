@@ -34,17 +34,24 @@ func (r *LocationRepositoryImpl) CreateLocation(
 		INSERT INTO locations (
 			location_id, company_id, location_code, location_name,
 			address_line1, address_line2, city, state, country, pincode,
+			timezone,
 			is_active, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 	`
 	_, err := db.ExecContext(ctx, query,
 		loc.LocationID, loc.CompanyID, loc.LocationCode, loc.LocationName,
 		loc.AddressLine1, loc.AddressLine2, loc.City, loc.State, loc.Country, loc.Pincode,
+		loc.Timezone, // ← NEW (nullable IANA name; NULL = inherit company default)
 		loc.IsActive, loc.CreatedAt, loc.UpdatedAt,
 	)
 	if err != nil {
-		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23505" { // unique violation
-			return apperrors.ErrDuplicate
+		if pgErr, ok := err.(*pq.Error); ok {
+			if pgErr.Code == "23505" { // unique violation
+				return apperrors.ErrDuplicate
+			}
+			if pgErr.Code == "23514" { // check violation (chk_locations_tz_format)
+				return apperrors.ErrInvalidInput
+			}
 		}
 		return fmt.Errorf("failed to create location: %w", err)
 	}
@@ -59,13 +66,16 @@ func (r *LocationRepositoryImpl) GetLocation(
 	query := `
 		SELECT location_id, company_id, location_code, location_name,
 			address_line1, address_line2, city, state, country, pincode,
+			timezone,
 			is_active, created_at, updated_at
 		FROM locations WHERE location_id = $1
 	`
 	var loc models.Location
+	var timezone sql.NullString
 	err := db.QueryRowContext(ctx, query, locationID).Scan(
 		&loc.LocationID, &loc.CompanyID, &loc.LocationCode, &loc.LocationName,
 		&loc.AddressLine1, &loc.AddressLine2, &loc.City, &loc.State, &loc.Country, &loc.Pincode,
+		&timezone, // ← NEW
 		&loc.IsActive, &loc.CreatedAt, &loc.UpdatedAt,
 	)
 	if err != nil {
@@ -73,6 +83,9 @@ func (r *LocationRepositoryImpl) GetLocation(
 			return nil, apperrors.ErrNotFound
 		}
 		return nil, fmt.Errorf("failed to get location: %w", err)
+	}
+	if timezone.Valid && timezone.String != "" {
+		loc.Timezone = &timezone.String
 	}
 	return &loc, nil
 }
@@ -87,18 +100,25 @@ func (r *LocationRepositoryImpl) UpdateLocation(
 			location_code = $1, location_name = $2,
 			address_line1 = $3, address_line2 = $4, city = $5,
 			state = $6, country = $7, pincode = $8,
-			is_active = $9, updated_at = $10
-		WHERE location_id = $11
+			timezone = $9,
+			is_active = $10, updated_at = $11
+		WHERE location_id = $12
 	`
 	result, err := db.ExecContext(ctx, query,
 		loc.LocationCode, loc.LocationName,
 		loc.AddressLine1, loc.AddressLine2, loc.City,
 		loc.State, loc.Country, loc.Pincode,
+		loc.Timezone, // ← NEW ($9)
 		loc.IsActive, loc.UpdatedAt, loc.LocationID,
 	)
 	if err != nil {
-		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23505" {
-			return apperrors.ErrDuplicate
+		if pgErr, ok := err.(*pq.Error); ok {
+			if pgErr.Code == "23505" {
+				return apperrors.ErrDuplicate
+			}
+			if pgErr.Code == "23514" {
+				return apperrors.ErrInvalidInput
+			}
 		}
 		return fmt.Errorf("failed to update location: %w", err)
 	}
@@ -150,6 +170,7 @@ func (r *LocationRepositoryImpl) ListLocations(
 	query := `
 		SELECT location_id, company_id, location_code, location_name,
 			address_line1, address_line2, city, state, country, pincode,
+			timezone,
 			is_active, created_at, updated_at
 		FROM locations
 		WHERE company_id = $1 AND is_active = true
@@ -165,13 +186,18 @@ func (r *LocationRepositoryImpl) ListLocations(
 	locations := make([]*models.Location, 0, limit)
 	for rows.Next() {
 		var loc models.Location
+		var timezone sql.NullString
 		err := rows.Scan(
 			&loc.LocationID, &loc.CompanyID, &loc.LocationCode, &loc.LocationName,
 			&loc.AddressLine1, &loc.AddressLine2, &loc.City, &loc.State, &loc.Country, &loc.Pincode,
+			&timezone, // ← NEW
 			&loc.IsActive, &loc.CreatedAt, &loc.UpdatedAt,
 		)
 		if err != nil {
 			return nil, 0, fmt.Errorf("failed to scan location: %w", err)
+		}
+		if timezone.Valid && timezone.String != "" {
+			loc.Timezone = &timezone.String
 		}
 		locations = append(locations, &loc)
 	}
@@ -257,6 +283,7 @@ func (r *LocationRepositoryImpl) GetEmployeeLocationsWithAccess(
 		SELECT
 			l.location_id, l.company_id, l.location_code, l.location_name,
 			l.address_line1, l.address_line2, l.city, l.state, l.country, l.pincode,
+			l.timezone,
 			l.is_active, l.created_at, l.updated_at,
 			COALESCE(ela.access_level, '') AS access_level
 		FROM locations l
@@ -274,15 +301,20 @@ func (r *LocationRepositoryImpl) GetEmployeeLocationsWithAccess(
 	var result []*models.LocationWithAccess
 	for rows.Next() {
 		var loc models.Location
+		var timezone sql.NullString
 		var accessLevel string
 		err := rows.Scan(
 			&loc.LocationID, &loc.CompanyID, &loc.LocationCode, &loc.LocationName,
 			&loc.AddressLine1, &loc.AddressLine2, &loc.City, &loc.State, &loc.Country, &loc.Pincode,
+			&timezone, // ← NEW
 			&loc.IsActive, &loc.CreatedAt, &loc.UpdatedAt,
 			&accessLevel,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan location with access: %w", err)
+		}
+		if timezone.Valid && timezone.String != "" {
+			loc.Timezone = &timezone.String
 		}
 		result = append(result, &models.LocationWithAccess{
 			Location:    loc,

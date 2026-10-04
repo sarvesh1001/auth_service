@@ -43,7 +43,9 @@ func (r *CompanyRepositoryImpl) GetCompany(ctx context.Context, companyID uuid.U
 		SELECT
 			company_id, company_name, owner_user_id, subscription_tier,
 			subscription_status, max_employees, max_locations, subscription_amount,
-			data_region, is_active, created_at, updated_at,
+			data_region,
+			default_timezone,
+			is_active, created_at, updated_at,
 			subscription_start_date, subscription_end_date,
 			financial_year_start_month,
 			grace_period_days,
@@ -69,6 +71,7 @@ func (r *CompanyRepositoryImpl) GetCompany(ctx context.Context, companyID uuid.U
 		&company.MaxLocations,
 		&company.SubscriptionAmount,
 		&company.DataRegion,
+		&company.DefaultTimezone, // ← NEW
 		&company.IsActive,
 		&company.CreatedAt,
 		&company.UpdatedAt,
@@ -127,7 +130,6 @@ func (r *CompanyRepositoryImpl) GetCompany(ctx context.Context, companyID uuid.U
 	}
 	return &company, nil
 }
-
 func (r *CompanyRepositoryImpl) GetCompaniesByOwner(ctx context.Context, ownerUserID uuid.UUID) ([]*models.Company, error) {
 	query := `
 		SELECT
@@ -225,21 +227,22 @@ func (r *CompanyRepositoryImpl) UpdateCompany(ctx context.Context, company *mode
 			max_locations = $5,
 			subscription_amount = $6,
 			data_region = $7,
-			is_active = $8,
-			updated_at = $9,
-			subscription_start_date = $10,
-			subscription_end_date = $11,
-			grace_period_days = $12,
-			stripe_customer_id = $13,
-			razorpay_subscription_id = $14,
-			payment_provider_txn_id = $15,
-			trial_start_date = $16,
-			trial_end_date = $17,
-			subscription_plan_id = $18,
-			subscription_gateway_customer_id = $19,
-			subscription_gateway_subscription_id = $20,
-			subscription_trial_ends = $21
-		WHERE company_id = $22`
+			default_timezone = $8,
+			is_active = $9,
+			updated_at = $10,
+			subscription_start_date = $11,
+			subscription_end_date = $12,
+			grace_period_days = $13,
+			stripe_customer_id = $14,
+			razorpay_subscription_id = $15,
+			payment_provider_txn_id = $16,
+			trial_start_date = $17,
+			trial_end_date = $18,
+			subscription_plan_id = $19,
+			subscription_gateway_customer_id = $20,
+			subscription_gateway_subscription_id = $21,
+			subscription_trial_ends = $22
+		WHERE company_id = $23`
 	result, err := r.client.Exec(ctx, query,
 		company.CompanyName,
 		company.SubscriptionTier,
@@ -248,6 +251,7 @@ func (r *CompanyRepositoryImpl) UpdateCompany(ctx context.Context, company *mode
 		company.MaxLocations,
 		company.SubscriptionAmount,
 		company.DataRegion,
+		company.DefaultTimezone, // ← NEW
 		company.IsActive,
 		company.UpdatedAt,
 		company.SubscriptionStartDate,
@@ -273,7 +277,6 @@ func (r *CompanyRepositoryImpl) UpdateCompany(ctx context.Context, company *mode
 	}
 	return nil
 }
-
 func (r *CompanyRepositoryImpl) UpdateCompanyStatus(ctx context.Context, companyID uuid.UUID, isActive bool) error {
 	query := `UPDATE companies SET is_active = $1, updated_at = $2 WHERE company_id = $3`
 	result, err := r.client.Exec(ctx, query, isActive, time.Now().UTC(), companyID)
@@ -323,7 +326,9 @@ func (r *CompanyRepositoryImpl) GetCompaniesByStatus(ctx context.Context, status
 		SELECT
 			company_id, company_name, owner_user_id, subscription_tier,
 			subscription_status, max_employees, max_locations, subscription_amount,
-			data_region, is_active, created_at, updated_at,
+			data_region,
+			default_timezone,
+			is_active, created_at, updated_at,
 			grace_period_days,
 			stripe_customer_id, razorpay_subscription_id, payment_provider_txn_id,
 			trial_start_date, trial_end_date,
@@ -356,6 +361,7 @@ func (r *CompanyRepositoryImpl) GetCompaniesByStatus(ctx context.Context, status
 			&company.MaxLocations,
 			&company.SubscriptionAmount,
 			&company.DataRegion,
+			&company.DefaultTimezone, // ← NEW
 			&company.IsActive,
 			&company.CreatedAt,
 			&company.UpdatedAt,
@@ -407,7 +413,6 @@ func (r *CompanyRepositoryImpl) GetCompaniesByStatus(ctx context.Context, status
 	}
 	return companies, totalCount, nil
 }
-
 func (r *CompanyRepositoryImpl) GetCompaniesByTier(ctx context.Context, tier string, limit, offset int) ([]*models.Company, int, error) {
 	if limit <= 0 || limit > DefaultCompanyPageSize {
 		limit = DefaultCompanyPageSize
@@ -425,7 +430,9 @@ func (r *CompanyRepositoryImpl) GetCompaniesByTier(ctx context.Context, tier str
 		SELECT
 			company_id, company_name, owner_user_id, subscription_tier,
 			subscription_status, max_employees, max_locations, subscription_amount,
-			data_region, is_active, created_at, updated_at,
+			data_region,
+			default_timezone,
+			is_active, created_at, updated_at,
 			grace_period_days,
 			stripe_customer_id, razorpay_subscription_id, payment_provider_txn_id,
 			trial_start_date, trial_end_date,
@@ -458,6 +465,7 @@ func (r *CompanyRepositoryImpl) GetCompaniesByTier(ctx context.Context, tier str
 			&company.MaxLocations,
 			&company.SubscriptionAmount,
 			&company.DataRegion,
+			&company.DefaultTimezone, // ← NEW
 			&company.IsActive,
 			&company.CreatedAt,
 			&company.UpdatedAt,
@@ -519,6 +527,7 @@ func (r *CompanyRepositoryImpl) GetCompaniesWithExpiringSubscription(ctx context
 		SELECT
 			company_id, company_name, subscription_tier, subscription_status,
 			max_employees, max_locations, subscription_amount,
+			default_timezone,
 			subscription_end_date, grace_period_days, created_at,
 			stripe_customer_id, razorpay_subscription_id, payment_provider_txn_id,
 			trial_start_date, trial_end_date,
@@ -550,6 +559,7 @@ func (r *CompanyRepositoryImpl) GetCompaniesWithExpiringSubscription(ctx context
 			&company.MaxEmployees,
 			&company.MaxLocations,
 			&company.SubscriptionAmount,
+			&company.DefaultTimezone, // ← NEW
 			&subEndDate,
 			&company.GracePeriodDays,
 			&company.CreatedAt,
@@ -644,19 +654,21 @@ func (r *CompanyRepositoryImpl) ListCompanies(ctx context.Context, limit, offset
 		return nil, 0, fmt.Errorf("failed to count companies: %w", err)
 	}
 	query := `
-        SELECT
+		SELECT
 			company_id, company_name, owner_user_id, subscription_tier,
 			subscription_status, max_employees, max_locations, subscription_amount,
-			data_region, is_active, created_at, updated_at,
+			data_region,
+			default_timezone,
+			is_active, created_at, updated_at,
 			grace_period_days,
 			stripe_customer_id, razorpay_subscription_id, payment_provider_txn_id,
 			trial_start_date, trial_end_date,
 			subscription_plan_id,
 			subscription_gateway_customer_id, subscription_gateway_subscription_id,
 			subscription_trial_ends
-        FROM companies
-        ORDER BY created_at DESC
-        LIMIT $1 OFFSET $2`
+		FROM companies
+		ORDER BY created_at DESC
+		LIMIT $1 OFFSET $2`
 	rows, err := r.client.Query(ctx, query, limit, offset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to query companies: %w", err)
@@ -679,6 +691,7 @@ func (r *CompanyRepositoryImpl) ListCompanies(ctx context.Context, limit, offset
 			&company.MaxLocations,
 			&company.SubscriptionAmount,
 			&company.DataRegion,
+			&company.DefaultTimezone, // ← NEW
 			&company.IsActive,
 			&company.CreatedAt,
 			&company.UpdatedAt,
@@ -730,7 +743,6 @@ func (r *CompanyRepositoryImpl) ListCompanies(ctx context.Context, limit, offset
 	}
 	return companies, totalCount, nil
 }
-
 func (r *CompanyRepositoryImpl) CheckCompanyExists(ctx context.Context, companyName string, ownerUserID uuid.UUID) (bool, error) {
 	query := `SELECT COUNT(*) > 0 FROM companies WHERE company_name = $1 AND owner_user_id = $2 AND is_active = true`
 	var exists bool
@@ -2700,12 +2712,15 @@ func (r *CompanyRepositoryImpl) SearchCompaniesByName(
 	if offset < 0 {
 		offset = 0
 	}
+
 	var totalCount int
 	var companies []*models.Company
 	var err error
+
 	conditions := []string{}
 	args := []interface{}{}
 	argCounter := 1
+
 	if searchType == "autocomplete" || len(searchQuery) < 3 {
 		conditions = append(conditions,
 			fmt.Sprintf("company_name ILIKE $%d", argCounter))
@@ -2717,6 +2732,7 @@ func (r *CompanyRepositoryImpl) SearchCompaniesByName(
 		args = append(args, searchQuery)
 		argCounter++
 	}
+
 	if filters != nil {
 		if filters.OwnerID != uuid.Nil {
 			conditions = append(conditions,
@@ -2749,62 +2765,70 @@ func (r *CompanyRepositoryImpl) SearchCompaniesByName(
 			argCounter++
 		}
 	}
+
 	whereClause := ""
 	if len(conditions) > 0 {
 		whereClause = "WHERE " + strings.Join(conditions, " AND ")
 	}
+
 	countQuery := fmt.Sprintf(`
-        SELECT COUNT(*)
-        FROM companies
-        %s`, whereClause)
+		SELECT COUNT(*)
+		FROM companies
+		%s`, whereClause)
 	err = r.client.QueryRow(ctx, countQuery, args...).Scan(&totalCount)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to count search results: %w", err)
 	}
+
 	var searchQueryStr string
 	if searchType == "autocomplete" || len(searchQuery) < 3 {
 		searchQueryStr = fmt.Sprintf(`
-            SELECT
-                company_id, company_name, owner_user_id,
-                subscription_tier, subscription_status, max_employees,
-                max_locations, subscription_amount,
-                data_region, is_active, created_at, updated_at,
-                subscription_start_date, subscription_end_date,
-                grace_period_days,
-                stripe_customer_id, razorpay_subscription_id, payment_provider_txn_id,
-                trial_start_date, trial_end_date,
-                subscription_plan_id,
-                subscription_gateway_customer_id, subscription_gateway_subscription_id,
-                subscription_trial_ends,
-                similarity(company_name, $1) as relevance_score
-            FROM companies
-            %s
-            ORDER BY relevance_score DESC, company_name ASC
-            LIMIT $%d OFFSET $%d`,
+			SELECT
+				company_id, company_name, owner_user_id,
+				subscription_tier, subscription_status, max_employees,
+				max_locations, subscription_amount,
+				data_region,
+				default_timezone,
+				is_active, created_at, updated_at,
+				subscription_start_date, subscription_end_date,
+				grace_period_days,
+				stripe_customer_id, razorpay_subscription_id, payment_provider_txn_id,
+				trial_start_date, trial_end_date,
+				subscription_plan_id,
+				subscription_gateway_customer_id, subscription_gateway_subscription_id,
+				subscription_trial_ends,
+				similarity(company_name, $1) as relevance_score
+			FROM companies
+			%s
+			ORDER BY relevance_score DESC, company_name ASC
+			LIMIT $%d OFFSET $%d`,
 			whereClause, argCounter, argCounter+1)
 		args = append(args, searchQuery, limit, offset)
 	} else {
 		searchQueryStr = fmt.Sprintf(`
-            SELECT
-                company_id, company_name, owner_user_id,
-                subscription_tier, subscription_status, max_employees,
-                max_locations, subscription_amount,
-                data_region, is_active, created_at, updated_at,
-                subscription_start_date, subscription_end_date,
-                grace_period_days,
-                stripe_customer_id, razorpay_subscription_id, payment_provider_txn_id,
-                trial_start_date, trial_end_date,
-                subscription_plan_id,
-                subscription_gateway_customer_id, subscription_gateway_subscription_id,
-                subscription_trial_ends,
-                ts_rank(company_name_tsv, plainto_tsquery('simple', $1)) as relevance_score
-            FROM companies
-            %s
-            ORDER BY relevance_score DESC, company_name ASC
-            LIMIT $%d OFFSET $%d`,
+			SELECT
+				company_id, company_name, owner_user_id,
+				subscription_tier, subscription_status, max_employees,
+				max_locations, subscription_amount,
+				data_region,
+				default_timezone,
+				is_active, created_at, updated_at,
+				subscription_start_date, subscription_end_date,
+				grace_period_days,
+				stripe_customer_id, razorpay_subscription_id, payment_provider_txn_id,
+				trial_start_date, trial_end_date,
+				subscription_plan_id,
+				subscription_gateway_customer_id, subscription_gateway_subscription_id,
+				subscription_trial_ends,
+				ts_rank(company_name_tsv, plainto_tsquery('simple', $1)) as relevance_score
+			FROM companies
+			%s
+			ORDER BY relevance_score DESC, company_name ASC
+			LIMIT $%d OFFSET $%d`,
 			whereClause, argCounter, argCounter+1)
 		args = append(args, limit, offset)
 	}
+
 	rows, err := r.client.Query(ctx, searchQueryStr, args...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to search companies: %w", err)
@@ -2823,7 +2847,9 @@ func (r *CompanyRepositoryImpl) SearchCompaniesByName(
 			&company.CompanyID, &company.CompanyName, &company.OwnerUserID,
 			&company.SubscriptionTier, &company.SubscriptionStatus, &company.MaxEmployees,
 			&company.MaxLocations, &company.SubscriptionAmount,
-			&company.DataRegion, &company.IsActive, &company.CreatedAt, &company.UpdatedAt,
+			&company.DataRegion,
+			&company.DefaultTimezone, // ← NEW
+			&company.IsActive, &company.CreatedAt, &company.UpdatedAt,
 			&subStartDate, &subEndDate,
 			&company.GracePeriodDays,
 			&stripeCust, &razorpaySub, &provTxn,
@@ -2890,9 +2916,11 @@ func (r *CompanyRepositoryImpl) SearchCompaniesByOwnerAndName(
 	if offset < 0 {
 		offset = 0
 	}
+
 	conditions := []string{"owner_user_id = $1"}
 	args := []interface{}{ownerID}
 	paramCount := 1
+
 	if searchQuery != "" {
 		paramCount++
 		if len(searchQuery) < 3 {
@@ -2911,10 +2939,12 @@ func (r *CompanyRepositoryImpl) SearchCompaniesByOwnerAndName(
 			fmt.Sprintf("is_active = $%d", paramCount))
 		args = append(args, *isActive)
 	}
+
 	whereClause := ""
 	if len(conditions) > 0 {
 		whereClause = "WHERE " + strings.Join(conditions, " AND ")
 	}
+
 	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM companies %s", whereClause)
 	var totalCount int
 	err := r.client.QueryRow(ctx, countQuery, args...).Scan(&totalCount)
@@ -2924,41 +2954,46 @@ func (r *CompanyRepositoryImpl) SearchCompaniesByOwnerAndName(
 	if totalCount == 0 || offset >= totalCount {
 		return []*models.Company{}, totalCount, nil
 	}
+
 	paramCount++
 	paramCount++
 	orderBy := ""
 	if searchQuery != "" && len(searchQuery) >= 3 {
 		orderBy = fmt.Sprintf(`
-            ORDER BY
-                ts_rank(company_name_tsv, plainto_tsquery('simple', $%d)) DESC,
-                company_name ASC`, 2)
+			ORDER BY
+				ts_rank(company_name_tsv, plainto_tsquery('simple', $%d)) DESC,
+				company_name ASC`, 2)
 	} else if searchQuery != "" {
 		orderBy = fmt.Sprintf(`
-            ORDER BY
-                similarity(company_name, $%d) DESC,
-                company_name ASC`, 2)
+			ORDER BY
+				similarity(company_name, $%d) DESC,
+				company_name ASC`, 2)
 	} else {
 		orderBy = "ORDER BY created_at DESC"
 	}
+
 	searchQueryStr := fmt.Sprintf(`
-        SELECT
-            company_id, company_name, owner_user_id,
-            subscription_tier, subscription_status, max_employees,
-            max_locations, subscription_amount,
-            data_region, is_active, created_at, updated_at,
-            subscription_start_date, subscription_end_date,
-            grace_period_days,
-            stripe_customer_id, razorpay_subscription_id, payment_provider_txn_id,
-            trial_start_date, trial_end_date,
-            subscription_plan_id,
-            subscription_gateway_customer_id, subscription_gateway_subscription_id,
-            subscription_trial_ends
-        FROM companies
-        %s
-        %s
-        LIMIT $%d OFFSET $%d`,
+		SELECT
+			company_id, company_name, owner_user_id,
+			subscription_tier, subscription_status, max_employees,
+			max_locations, subscription_amount,
+			data_region,
+			default_timezone,
+			is_active, created_at, updated_at,
+			subscription_start_date, subscription_end_date,
+			grace_period_days,
+			stripe_customer_id, razorpay_subscription_id, payment_provider_txn_id,
+			trial_start_date, trial_end_date,
+			subscription_plan_id,
+			subscription_gateway_customer_id, subscription_gateway_subscription_id,
+			subscription_trial_ends
+		FROM companies
+		%s
+		%s
+		LIMIT $%d OFFSET $%d`,
 		whereClause, orderBy, paramCount-1, paramCount)
 	args = append(args, limit, offset)
+
 	rows, err := r.client.Query(ctx, searchQueryStr, args...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to search companies: %w", err)
@@ -2976,7 +3011,9 @@ func (r *CompanyRepositoryImpl) SearchCompaniesByOwnerAndName(
 			&company.CompanyID, &company.CompanyName, &company.OwnerUserID,
 			&company.SubscriptionTier, &company.SubscriptionStatus, &company.MaxEmployees,
 			&company.MaxLocations, &company.SubscriptionAmount,
-			&company.DataRegion, &company.IsActive, &company.CreatedAt, &company.UpdatedAt,
+			&company.DataRegion,
+			&company.DefaultTimezone, // ← NEW
+			&company.IsActive, &company.CreatedAt, &company.UpdatedAt,
 			&subStartDate, &subEndDate,
 			&company.GracePeriodDays,
 			&stripeCust, &razorpaySub, &provTxn,
@@ -3028,7 +3065,6 @@ func (r *CompanyRepositoryImpl) SearchCompaniesByOwnerAndName(
 	}
 	return companies, totalCount, nil
 }
-
 func (r *CompanyRepositoryImpl) GetCompanySuggestions(
 	ctx context.Context,
 	prefix string,
@@ -4903,6 +4939,7 @@ func (r *CompanyRepositoryImpl) WorkCenterExists(
 // calls SetWorkCenterLocation(), which backfills positions.location_id
 // via the trig_enforce_position_location trigger.
 // ============================================================
+
 func (r *CompanyRepositoryImpl) CreateCompany(
 	ctx context.Context,
 	company *models.Company,
@@ -4926,6 +4963,11 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 	if company.GracePeriodDays == 0 {
 		company.GracePeriodDays = 3
 	}
+	// ── NEW: safety net if caller forgets. Should already be validated
+	//    at the handler. Never leave companies.default_timezone empty.
+	if company.DefaultTimezone == "" {
+		company.DefaultTimezone = "UTC"
+	}
 
 	// ------------------------------------------------------------
 	// 1. companies
@@ -4934,7 +4976,7 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 		INSERT INTO companies (
 			company_id, company_name, owner_user_id, subscription_tier,
 			subscription_status, max_employees, max_locations, subscription_amount,
-			data_region, is_active, created_at, updated_at, subscription_start_date,
+			data_region, default_timezone, is_active, created_at, updated_at, subscription_start_date,
 			subscription_end_date, financial_year_start_month,
 			grace_period_days,
 			stripe_customer_id, razorpay_subscription_id, payment_provider_txn_id,
@@ -4942,12 +4984,14 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 			subscription_plan_id,
 			subscription_gateway_customer_id, subscription_gateway_subscription_id,
 			subscription_trial_ends
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)`
 	_, err = tx.ExecContext(ctx, companyQuery,
 		company.CompanyID, company.CompanyName, company.OwnerUserID,
 		company.SubscriptionTier, company.SubscriptionStatus,
 		company.MaxEmployees, company.MaxLocations, company.SubscriptionAmount,
-		company.DataRegion, company.IsActive,
+		company.DataRegion,
+		company.DefaultTimezone, // ← NEW ($10)
+		company.IsActive,
 		company.CreatedAt, company.UpdatedAt,
 		company.SubscriptionStartDate, company.SubscriptionEndDate,
 		company.FinancialYearStartMonth, company.GracePeriodDays,
@@ -4966,7 +5010,6 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 
 	// ------------------------------------------------------------
 	// 2. attendance.work_centers (optional)
-	//    location_id is NULL — SetWorkCenterLocation() links it later.
 	// ------------------------------------------------------------
 	if workCenterDetails != nil && workCenterDetails.WorkCenterCode != "" {
 		const wcQuery = `
@@ -5031,18 +5074,7 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 	}
 
 	// ------------------------------------------------------------
-	// 5. jobs — the owner's job catalog entry  👈 NEW
-	//
-	// One row per distinct (company_id, job_code). This is what
-	// makes "the owner is a CEO" a *definition* separate from the
-	// seat they occupy.
-	//
-	// Flags default to:
-	//   is_schedulable      = TRUE
-	//   attendance_required = TRUE
-	//   overtime_allowed    = FALSE
-	//
-	// The caller can override afterwards via UpdateJob().
+	// 5. jobs — the owner's job catalog entry
 	// ------------------------------------------------------------
 	var ownerJobID uuid.UUID
 	{
@@ -5063,16 +5095,7 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 	}
 
 	// ------------------------------------------------------------
-	// 6. positions — the owner's seat  👈 CHANGED
-	//
-	//   job_id         → the job we just created
-	//   location_id    → NULL (SetWorkCenterLocation backfills)
-	//   title_override → NULL (job_title is authoritative)
-	//   is_open        → positionDetails.IsOpen
-	//   work_center    → positionDetails.WorkCenterCode (optional)
-	//
-	// is_schedulable / attendance_required / overtime_allowed live
-	// on jobs now — they are NOT columns on positions.
+	// 6. positions — the owner's seat
 	// ------------------------------------------------------------
 	ownerPositionID := uuid.New()
 	const positionQuery = `
@@ -5087,8 +5110,8 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 		company.CompanyID,
 		adminDeptID,
 		ownerJobID,
-		nil, // location_id — set by SetWorkCenterLocation after location is created
-		nil, // title_override — NULL → effective title comes from jobs.job_title
+		nil,
+		nil,
 		positionDetails.IsOpen,
 		positionDetails.WorkCenterCode,
 		company.CreatedAt,
@@ -5122,7 +5145,6 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 			systemDeptID, true, company.CreatedAt, company.UpdatedAt,
 		)
 		if err != nil {
-			// skip silently — same as before
 			continue
 		}
 
@@ -5135,7 +5157,7 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 	}
 
 	// ------------------------------------------------------------
-	// 8. role_departments — link owner role to all its departments
+	// 8. role_departments
 	// ------------------------------------------------------------
 	for _, deptID := range ownerAccessDeptIDs {
 		_, _ = tx.ExecContext(ctx,
@@ -5145,8 +5167,7 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 	}
 
 	// ------------------------------------------------------------
-	// 9. role_permissions — grant every permission matching the
-	//    owner's accessible modules.
+	// 9. role_permissions
 	// ------------------------------------------------------------
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO role_permissions (role_id, permission_id, granted_by, granted_at)
@@ -5161,14 +5182,7 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 	}
 
 	// ------------------------------------------------------------
-	// 10. company_employees — the owner as an employee.
-	//
-	//    Note: this INSERT fires the AFTER INSERT trigger
-	//    trg_sync_work_center_assignment on company_employees.
-	//    That trigger reads positions.work_center_code via the
-	//    ownerPositionID we just inserted. If a work center was
-	//    set on the position and it belongs to the company, a
-	//    user_work_center_assignments row is created here in tx.
+	// 10. company_employees
 	// ------------------------------------------------------------
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO company_employees (
@@ -5194,6 +5208,7 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 	}
 	return nil
 }
+
 func (r *CompanyRepositoryImpl) AddRoleDepartments(
 	ctx context.Context, db client.DBTX,
 	roleID uuid.UUID, departmentIDs []uuid.UUID,
@@ -6158,4 +6173,217 @@ func (r *CompanyRepositoryImpl) UpdateJob(ctx context.Context, j *models.Job) er
 		return apperrors.ErrNotFound
 	}
 	return nil
+}
+
+// ============================================================
+// GetPositionsFiltered — positions scoped by location + department
+//
+// Semantics:
+//
+//	locationIDs == []       → no location restriction
+//	includeUniversal == true→ include rows where location_id IS NULL
+//	departmentIDs == []     → no department restriction
+//
+// ============================================================
+func (r *CompanyRepositoryImpl) GetPositionsFiltered(
+	ctx context.Context, db client.DBTX,
+	companyID uuid.UUID,
+	locationIDs []uuid.UUID,
+	departmentIDs []uuid.UUID,
+	includeUniversal bool,
+	limit, offset int,
+) ([]*models.PositionView, int, error) {
+	if limit <= 0 || limit > DefaultCompanyPageSize {
+		limit = DefaultCompanyPageSize
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	locStrs := make([]string, len(locationIDs))
+	for i, id := range locationIDs {
+		locStrs[i] = id.String()
+	}
+	deptStrs := make([]string, len(departmentIDs))
+	for i, id := range departmentIDs {
+		deptStrs[i] = id.String()
+	}
+
+	const where = `
+		WHERE p.company_id = $1
+		  AND p.is_open = true
+		  AND d.is_active = true
+		  AND (
+		      cardinality($2::uuid[]) = 0
+		      OR ($3::bool AND p.location_id IS NULL)
+		      OR p.location_id = ANY($2::uuid[])
+		  )
+		  AND (
+		      cardinality($4::uuid[]) = 0
+		      OR p.department_id = ANY($4::uuid[])
+		  )`
+
+	countQuery := `SELECT COUNT(*)
+		FROM positions p
+		INNER JOIN departments d ON d.department_id = p.department_id ` + where
+
+	var totalCount int
+	if err := db.QueryRowContext(ctx, countQuery,
+		companyID, pq.Array(locStrs), includeUniversal, pq.Array(deptStrs),
+	).Scan(&totalCount); err != nil {
+		return nil, 0, fmt.Errorf("count filtered positions: %w", err)
+	}
+
+	query := `
+		SELECT
+			p.position_id, p.company_id, p.department_id,
+			p.job_id, p.location_id, p.title_override,
+			p.is_open, p.work_center_code,
+			p.created_at, p.updated_at,
+			j.job_code, j.job_title,
+			j.is_schedulable, j.attendance_required, j.overtime_allowed,
+			d.department_name,
+			l.location_name,
+			wc.name AS work_center_name
+		FROM positions p
+		INNER JOIN jobs j        ON j.job_id = p.job_id
+		INNER JOIN departments d ON d.department_id = p.department_id
+		LEFT JOIN locations l    ON l.location_id = p.location_id
+		LEFT JOIN attendance.work_centers wc
+		       ON wc.company_id = p.company_id
+		      AND wc.work_center_code = p.work_center_code ` + where + `
+		ORDER BY p.created_at DESC
+		LIMIT $5 OFFSET $6`
+
+	rows, err := db.QueryContext(ctx, query,
+		companyID, pq.Array(locStrs), includeUniversal, pq.Array(deptStrs),
+		limit, offset,
+	)
+	if err != nil {
+		return nil, 0, fmt.Errorf("query filtered positions: %w", err)
+	}
+	defer rows.Close()
+
+	positions := make([]*models.PositionView, 0, limit)
+	for rows.Next() {
+		var pv models.PositionView
+		var locationID uuid.NullUUID
+		var titleOverride, wcCode, deptName, locName, wcName sql.NullString
+
+		if err := rows.Scan(
+			&pv.PositionID, &pv.CompanyID, &pv.DepartmentID,
+			&pv.JobID, &locationID, &titleOverride,
+			&pv.IsOpen, &wcCode,
+			&pv.CreatedAt, &pv.UpdatedAt,
+			&pv.JobCode, &pv.JobTitle,
+			&pv.IsSchedulable, &pv.AttendanceRequired, &pv.OvertimeAllowed,
+			&deptName, &locName, &wcName,
+		); err != nil {
+			continue
+		}
+		if locationID.Valid {
+			pv.LocationID = &locationID.UUID
+		}
+		if titleOverride.Valid {
+			pv.TitleOverride = &titleOverride.String
+		}
+		if wcCode.Valid {
+			pv.WorkCenterCode = &wcCode.String
+		}
+		if deptName.Valid {
+			pv.DepartmentName = &deptName.String
+		}
+		if locName.Valid {
+			pv.LocationName = &locName.String
+		}
+		if wcName.Valid {
+			pv.WorkCenterName = &wcName.String
+		}
+		positions = append(positions, &pv)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("iterate filtered positions: %w", err)
+	}
+	return positions, totalCount, nil
+}
+
+// ============================================================
+// GetWorkCentersFiltered — active WCs scoped by location
+// ============================================================
+func (r *CompanyRepositoryImpl) GetWorkCentersFiltered(
+	ctx context.Context, db client.DBTX,
+	companyID uuid.UUID,
+	locationIDs []uuid.UUID,
+	includeUniversal bool,
+) ([]*models.WorkCenterView, error) {
+	locStrs := make([]string, len(locationIDs))
+	for i, id := range locationIDs {
+		locStrs[i] = id.String()
+	}
+
+	const query = `
+		SELECT work_center_code, company_id, location_id, name,
+		       description, timezone, is_active,
+		       (location_id IS NULL) AS is_universal
+		FROM attendance.work_centers
+		WHERE company_id = $1
+		  AND is_active = true
+		  AND (
+		      cardinality($2::uuid[]) = 0
+		      OR ($3::bool AND location_id IS NULL)
+		      OR location_id = ANY($2::uuid[])
+		  )
+		ORDER BY name ASC`
+
+	rows, err := db.QueryContext(ctx, query,
+		companyID, pq.Array(locStrs), includeUniversal,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query filtered work centers: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]*models.WorkCenterView, 0, 16)
+	for rows.Next() {
+		var wc models.WorkCenterView
+		var locID uuid.NullUUID
+		var desc sql.NullString
+
+		if err := rows.Scan(
+			&wc.WorkCenterCode, &wc.CompanyID, &locID, &wc.Name,
+			&desc, &wc.Timezone, &wc.IsActive, &wc.IsUniversal,
+		); err != nil {
+			continue
+		}
+		if locID.Valid {
+			wc.LocationID = &locID.UUID
+		}
+		if desc.Valid {
+			wc.Description = &desc.String
+		}
+		out = append(out, &wc)
+	}
+	return out, rows.Err()
+}
+
+func (r *CompanyRepositoryImpl) ListActiveCompanyIDs(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := r.client.Query(ctx, `
+        SELECT company_id FROM companies
+        WHERE is_active = true
+        ORDER BY company_id
+    `)
+	if err != nil {
+		return nil, fmt.Errorf("list active companies: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }

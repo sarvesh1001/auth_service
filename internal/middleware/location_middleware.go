@@ -16,7 +16,7 @@ import (
 // AllLocationsSentinel is the reserved value for X-Location-ID that requests
 // the company-wide (consolidated) view instead of a single physical location.
 // Only users with location_scope == "ALL" are permitted to send it, and only
-// for read operations.
+// for read operations — with the explicit exceptions listed below.
 const AllLocationsSentinel = "ALL"
 
 // Deprecated: use locationctx.* directly.
@@ -39,7 +39,29 @@ const (
 // /api/v1/companies/{companyID} prefix in front of the route.
 var readOnlyPOSTSuffixes = []string{
 	"/hr/employees/details",
+	"/hr/employees",        // 👈 ADD THIS
+
 	// add more here as batch-read endpoints are introduced
+}
+
+// allScopeWritePOSTSuffixes lists URL path suffixes for POST endpoints that
+// are permitted to run under the company-wide ("ALL") scope even though they
+// mutate state.
+//
+// These endpoints perform their OWN per-target location validation in the
+// service layer, so the middleware does not need to block them. The caller's
+// ALL scope grants them the authority to target any location in the company.
+//
+// AddMember is the canonical example: the request body carries the target
+// employee's location(s), and the service validates each against the
+// caller's allowed set — which, under ALL scope, is the entire company.
+//
+// RULE OF THUMB: only add an entry here if the endpoint's service layer
+// re-validates every location it writes to. Never add a blanket "any write"
+// allowance — each entry is a deliberate security decision.
+var allScopeWritePOSTSuffixes = []string{
+	"/rbac/members",
+	// add more here as per-target-validating write endpoints are introduced
 }
 
 // isReadOnlyPost reports whether r is a POST that should be treated as a read
@@ -57,13 +79,31 @@ func isReadOnlyPost(r *http.Request) bool {
 	return false
 }
 
+// isAllScopeWritePost reports whether r is a POST that is explicitly allowed
+// to run under the company-wide ("ALL") scope, despite mutating state.
+func isAllScopeWritePost(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	p := r.URL.Path
+	for _, suffix := range allScopeWritePOSTSuffixes {
+		if strings.HasSuffix(p, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 // LocationValidationMiddleware normalizes X-Location-ID into a well-defined
 // organizational context and enforces access control.
 //
 // Contract:
 //   - Non-admin requests MUST send X-Location-ID.
 //   - Value is either a location UUID, or the literal "ALL".
-//   - "ALL" requires location_scope == ALL, and is rejected for writes.
+//   - "ALL" requires location_scope == ALL.
+//   - "ALL" is rejected for writes, UNLESS the endpoint's path suffix
+//     appears in allScopeWritePOSTSuffixes — in which case the endpoint is
+//     trusted to re-validate every target location itself.
 //   - On success, the request context gains:
 //     location_mode          → "LOCATION" | "ALL"
 //     validated_location_id  → uuid.UUID (uuid.Nil when mode == "ALL")
@@ -147,7 +187,12 @@ func LocationValidationMiddleware(locationService *service.LocationService) func
 						"company-wide view not permitted for this user")
 					return
 				}
-				if isWrite {
+
+				// Writes are rejected UNLESS the endpoint is explicitly
+				// allow-listed as a per-target-validating write. The
+				// endpoint's service layer is responsible for validating
+				// every location it writes to against the caller's scope.
+				if isWrite && !isAllScopeWritePost(r) {
 					util.JSONError(w, http.StatusBadRequest,
 						"company-wide context cannot be used for write operations")
 					return

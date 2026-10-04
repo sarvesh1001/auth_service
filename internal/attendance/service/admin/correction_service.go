@@ -15,9 +15,9 @@ import (
 	"auth-service/internal/attendance/service/resolver"
 	auditservice "auth-service/internal/infrastructure/audit"
 	"auth-service/internal/locationctx"
+	"auth-service/internal/util"
 )
 
-// CorrectionRequest is the input for creating an attendance correction.
 type CorrectionRequest struct {
 	CompanyID      uuid.UUID
 	ActorID        uuid.UUID
@@ -25,13 +25,12 @@ type CorrectionRequest struct {
 	SubjectType    string
 	SubjectID      uuid.UUID
 	BusinessDate   time.Time
-	CorrectionType string // manual_check_in, manual_check_out, attendance_adjustment, manual_override
+	CorrectionType string
 	EventTime      *time.Time
-	OverrideStatus string // present, absent, late, half_day, etc.
+	OverrideStatus string
 	Reason         string
 }
 
-// CorrectionService handles creation of attendance corrections.
 type CorrectionService interface {
 	CreateCorrection(ctx context.Context, req *CorrectionRequest) error
 }
@@ -45,9 +44,11 @@ type correctionService struct {
 	resolution       ResolutionService
 	logger           *zap.Logger
 	audit            *auditservice.AuditService
+
+	// ── NEW: canonical timezone resolver
+	tzProvider resolver.TimezoneProvider
 }
 
-// ResolutionService is a minimal interface for recalculating a day.
 type ResolutionService interface {
 	RecalculateDay(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) error
 }
@@ -61,6 +62,7 @@ func NewCorrectionService(
 	resolution ResolutionService,
 	logger *zap.Logger,
 	audit *auditservice.AuditService,
+	tzProvider resolver.TimezoneProvider, // ── NEW
 ) CorrectionService {
 	return &correctionService{
 		eventRepo:        eventRepo,
@@ -71,18 +73,16 @@ func NewCorrectionService(
 		resolution:       resolution,
 		logger:           logger,
 		audit:            audit,
+		tzProvider:       tzProvider,
 	}
 }
 
 func (s *correctionService) CreateCorrection(ctx context.Context, req *CorrectionRequest) error {
 	startTime := time.Now()
 
-	// 1. Validate correction type
 	if !isValidCorrectionType(req.CorrectionType) {
 		return fmt.Errorf("invalid correction type: %s", req.CorrectionType)
 	}
-
-	// 2. Required fields based on type
 	if req.CorrectionType == "manual_check_in" || req.CorrectionType == "manual_check_out" {
 		if req.EventTime == nil {
 			return fmt.Errorf("event_time required for %s", req.CorrectionType)
@@ -97,21 +97,33 @@ func (s *correctionService) CreateCorrection(ctx context.Context, req *Correctio
 		}
 	}
 
-	// 3. Ensure event_time belongs to business_date (if provided)
+	// ── NEW: resolve subject tz via the canonical chain.
+	subjectTZ := s.resolveSubjectTimezone(ctx, req.CompanyID, req.SubjectType, req.SubjectID)
+
+	loc, err := time.LoadLocation(subjectTZ)
+	if err != nil {
+		loc = time.UTC
+	}
+
 	var eventTime time.Time
 	if req.EventTime != nil {
 		eventTime = *req.EventTime
-		if eventTime.UTC().Format("2006-01-02") != req.BusinessDate.UTC().Format("2006-01-02") {
-			return fmt.Errorf("event_time %s does not belong to business_date %s",
-				eventTime.Format("2006-01-02"), req.BusinessDate.Format("2006-01-02"))
+		evtLocal := eventTime.In(loc).Format("2006-01-02")
+		bizLocal := req.BusinessDate.In(loc).Format("2006-01-02")
+		if evtLocal != bizLocal {
+			return fmt.Errorf("event_time %s does not belong to business_date %s (subject tz %s)",
+				eventTime.In(loc).Format(time.RFC3339),
+				req.BusinessDate.In(loc).Format("2006-01-02"),
+				subjectTZ)
 		}
 	} else {
-		// Default to midnight on business date
-		eventTime = time.Date(req.BusinessDate.Year(), req.BusinessDate.Month(), req.BusinessDate.Day(),
-			0, 0, 0, 0, req.BusinessDate.Location())
+		// No explicit event time — use midnight of the business date in subject tz.
+		eventTime = time.Date(
+			req.BusinessDate.Year(), req.BusinessDate.Month(), req.BusinessDate.Day(),
+			0, 0, 0, 0, loc,
+		).UTC()
 	}
 
-	// 4. Idempotency: check if correction already exists for this event_time and subject
 	existing, err := s.eventRepo.FindCorrection(ctx, req.CompanyID, req.SubjectID, req.SubjectType, req.CorrectionType, eventTime)
 	if err != nil {
 		return fmt.Errorf("check existing correction: %w", err)
@@ -120,7 +132,6 @@ func (s *correctionService) CreateCorrection(ctx context.Context, req *Correctio
 		return fmt.Errorf("correction already exists for this event")
 	}
 
-	// 5. Row-level authorization — the target subject must be in the caller's scope.
 	if err := s.ensureSubjectInScope(ctx, req.CompanyID, req.SubjectType, req.SubjectID); err != nil {
 		s.logger.Warn("Correction target outside caller scope",
 			zap.String("subject_type", req.SubjectType),
@@ -130,27 +141,30 @@ func (s *correctionService) CreateCorrection(ctx context.Context, req *Correctio
 		return err
 	}
 
-	// 5b. Resolve and stamp the subject's location (snapshot).
 	subjectLocation, err := s.locationResolver.ResolveLocation(ctx, req.CompanyID, req.SubjectType, req.SubjectID)
 	if err != nil {
 		return fmt.Errorf("resolve subject location: %w", err)
 	}
 
-	// 6. Create event
+	// ── NEW: compute tz-derived columns for the correction event.
+	offsetMinutes := util.OffsetMinutes(eventTime, subjectTZ)
+	eventDateLocal := util.CalendarDateInTz(eventTime, subjectTZ)
+
 	event := &models.AttendanceEvent{
-		AttendanceEventID: uuid.New(),
-		CompanyID:         req.CompanyID,
-		SubjectType:       req.SubjectType,
-		SubjectID:         req.SubjectID,
-		EventType:         req.CorrectionType,
-		EventTime:         eventTime,
-
+		AttendanceEventID:    uuid.New(),
+		CompanyID:            req.CompanyID,
+		SubjectType:          req.SubjectType,
+		SubjectID:            req.SubjectID,
+		EventType:            req.CorrectionType,
+		EventTime:            eventTime,
+		EventTZ:              subjectTZ,
+		EventOffsetMinutes:   int16(offsetMinutes),
+		EventDateLocal:       eventDateLocal,
 		EmploymentLocationID: subjectLocation,
-
-		SourceType: "correction",
-		SourceID:   nil,
-		DeviceID:   nil,
-		IPAddress:  nil,
+		SourceType:           "correction",
+		SourceID:             nil,
+		DeviceID:             nil,
+		IPAddress:            nil,
 		Context: models.EventContext{
 			CorrectionReason: &req.Reason,
 		},
@@ -176,7 +190,6 @@ func (s *correctionService) CreateCorrection(ctx context.Context, req *Correctio
 		return fmt.Errorf("commit tx: %w", err)
 	}
 
-	// 7. Recalculate attendance for that day
 	if s.resolution != nil {
 		if err := s.resolution.RecalculateDay(ctx, req.CompanyID, req.SubjectID, req.SubjectType, req.BusinessDate); err != nil {
 			s.logger.Warn("Correction created but recalculation failed",
@@ -185,7 +198,6 @@ func (s *correctionService) CreateCorrection(ctx context.Context, req *Correctio
 		}
 	}
 
-	// 8. Audit
 	s.logAudit(ctx, req.CompanyID, "attendance.correction.create", event.AttendanceEventID,
 		req.ActorType, req.ActorID, nil, event, map[string]interface{}{
 			"correction_type": req.CorrectionType,
@@ -193,25 +205,52 @@ func (s *correctionService) CreateCorrection(ctx context.Context, req *Correctio
 			"event_time":      eventTime.Format(time.RFC3339),
 			"override_status": req.OverrideStatus,
 			"reason":          req.Reason,
+			"event_tz":        subjectTZ,
 		})
-
 	s.logger.Info("Attendance correction created",
 		zap.String("event_id", event.AttendanceEventID.String()),
 		zap.String("subject_type", req.SubjectType),
 		zap.String("subject_id", req.SubjectID.String()),
 		zap.String("correction_type", req.CorrectionType),
-		zap.Time("business_date", req.BusinessDate),
+		zap.String("tz", subjectTZ),
 		zap.Duration("duration", time.Since(startTime)),
 	)
 	return nil
 }
 
-// ensureSubjectInScope verifies the target subject is within the caller's
-// current location scope.
-//
-//   - ScopeAll      → permitted
-//   - ScopeLocation → target's employment location must match the scope
-//   - No location context → error (correction routes are always wrapped)
+// resolveSubjectTimezone uses the TimezoneProvider chain. Falls back to
+// "UTC" only if the chain itself errors.
+func (s *correctionService) resolveSubjectTimezone(
+	ctx context.Context,
+	companyID uuid.UUID,
+	subjectType string,
+	subjectID uuid.UUID,
+) string {
+	// Fetch the subject once to get position + work center hints.
+	resolved, err := s.resolver.Resolve(ctx, companyID, subjectType, subjectID, time.Now())
+	if err == nil && resolved != nil && resolved.Timezone != "" {
+		return resolved.Timezone
+	}
+
+	// Fall back to provider with what we have.
+	var positionID *uuid.UUID
+	var workCenterCode *string
+	if resolved != nil {
+		positionID = resolved.PositionID
+		workCenterCode = resolved.WorkCenterCode
+	}
+	tz, err := s.tzProvider.ResolveTimezone(ctx, companyID, positionID, workCenterCode, nil)
+	if err == nil && tz != "" {
+		return tz
+	}
+
+	s.logger.Warn("correction tz resolution failed, defaulting to UTC",
+		zap.String("company_id", companyID.String()),
+		zap.String("subject_id", subjectID.String()),
+	)
+	return "UTC"
+}
+
 func (s *correctionService) ensureSubjectInScope(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -225,7 +264,9 @@ func (s *correctionService) ensureSubjectInScope(
 	if locCtx.Mode == locationctx.ScopeAll {
 		return nil
 	}
-
+	if s.locationResolver == nil {
+		return nil
+	}
 	subjectLoc, err := s.locationResolver.ResolveLocation(ctx, companyID, subjectType, subjectID)
 	if err != nil {
 		return err
@@ -233,13 +274,12 @@ func (s *correctionService) ensureSubjectInScope(
 	if subjectLoc == nil {
 		return resolver.ErrSubjectHasNoLocation
 	}
-	if *subjectLoc != *locCtx.LocationID {
+	if locCtx.LocationID == nil || *subjectLoc != *locCtx.LocationID {
 		return resolver.ErrSubjectOutsideScope
 	}
 	return nil
 }
 
-// helpers
 func isValidCorrectionType(t string) bool {
 	valid := map[string]bool{
 		"manual_check_in":       true,

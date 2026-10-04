@@ -48,6 +48,7 @@ type ScheduleRepository interface {
 	DeleteScheduleInstance(ctx context.Context, instanceID uuid.UUID) error
 	CancelScheduleInstance(ctx context.Context, instanceID uuid.UUID, reason string) error
 	HasActiveSchedule(ctx context.Context, companyID, userID uuid.UUID, date time.Time) (bool, error)
+	BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
 
 	// ── Schedule Overrides ──
 	CreateScheduleOverride(ctx context.Context, override *models.ScheduleOverride) error

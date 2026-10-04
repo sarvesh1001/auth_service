@@ -7,10 +7,9 @@ import (
 	"github.com/google/uuid"
 )
 
-// ScheduleSubjectInfo provides all schedule-related data for a subject.
 type ScheduleSubjectInfo struct {
 	SubjectID          uuid.UUID
-	SubjectType        string // "employee", "student", etc.
+	SubjectType        string
 	IsActive           bool
 	PositionID         *uuid.UUID
 	PositionTitle      string
@@ -21,14 +20,26 @@ type ScheduleSubjectInfo struct {
 	DepartmentName     string
 	WorkCenterCode     *string
 	WorkCenterName     string
+
+	// ── NEW: timezone inputs for the resolution chain ──────────────────
+	//
+	// WorkCenterTimezone is the tz declared on the work center record.
+	// CompanyTimezone is the ultimate fallback.
+	//
+	// The resolver populates these so callers (scheduling, ingest) can
+	// compute the effective tz without an extra DB round-trip.
+	//
+	// If either is empty, the caller MUST still call TimezoneProvider.
+	// These are hints, not guarantees.
 	WorkCenterTimezone string
-	CompanyID          uuid.UUID
+	CompanyTimezone    string
+
+	CompanyID uuid.UUID
 }
 
-// ScheduleOverrideInfo provides override/leave info.
 type ScheduleOverrideInfo struct {
 	IsOverride     bool
-	OverrideType   string // "off", "force_work", "holiday_override"
+	OverrideType   string
 	Reason         *string
 	IsOnLeave      bool
 	LeaveTypeID    *uuid.UUID
@@ -36,17 +47,9 @@ type ScheduleOverrideInfo struct {
 	LeaveRequestID *uuid.UUID
 }
 
-// ScheduleSubjectResolver resolves schedule-related info for a subject.
 type ScheduleSubjectResolver interface {
-	// ResolveSubject returns schedule-relevant data for a subject on a given date.
 	ResolveSubject(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) (*ScheduleSubjectInfo, error)
-
-	// ResolveOverride returns override/leave info for a subject on a given date.
 	ResolveOverride(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) (*ScheduleOverrideInfo, error)
-
-	// GetUsersByPosition returns subject IDs assigned to a given position.
 	GetUsersByPosition(ctx context.Context, positionID uuid.UUID) ([]uuid.UUID, error)
-
-	// GetActiveSubjectsByCompany returns active subject IDs for a company (optionally filtered by position/work center).
 	GetActiveSubjectsByCompany(ctx context.Context, companyID uuid.UUID, filters map[string]interface{}) ([]uuid.UUID, error)
 }

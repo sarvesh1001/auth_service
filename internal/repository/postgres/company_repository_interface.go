@@ -285,6 +285,7 @@ type CompanyRepository interface {
 	) (bool, error)
 
 	WorkCenterExists(ctx context.Context, db client.DBTX, companyID uuid.UUID, workCenterCode string) (bool, error)
+	ListActiveCompanyIDs(ctx context.Context) ([]uuid.UUID, error)
 
 	// ============================================================
 	// Employee Location Settings
@@ -296,7 +297,26 @@ type CompanyRepository interface {
 	// center and still has NULL location_id. Both writes happen so the
 	// enforce_position_location_matches_work_center trigger stays happy.
 	SetWorkCenterLocation(ctx context.Context, db client.DBTX, companyID uuid.UUID, workCenterCode string, locationID uuid.UUID) error
+	// GetPositionsFiltered returns open positions filtered by location and (optionally)
+	// department. Universal rows (location_id IS NULL) are included when
+	// includeUniversal=true.
+	GetPositionsFiltered(
+		ctx context.Context, db client.DBTX,
+		companyID uuid.UUID,
+		locationIDs []uuid.UUID,
+		departmentIDs []uuid.UUID,
+		includeUniversal bool,
+		limit, offset int,
+	) ([]*models.PositionView, int, error)
 
+	// GetWorkCentersFiltered returns active work centers filtered by location.
+	// Universal rows (location_id IS NULL) are included when includeUniversal=true.
+	GetWorkCentersFiltered(
+		ctx context.Context, db client.DBTX,
+		companyID uuid.UUID,
+		locationIDs []uuid.UUID,
+		includeUniversal bool,
+	) ([]*models.WorkCenterView, error)
 	// ============================================================
 	// Utility
 	// ============================================================

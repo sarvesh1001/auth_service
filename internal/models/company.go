@@ -174,18 +174,34 @@ type LoginAttempt struct {
 
 // =============================================================================
 // COMPANIES
+//
+// TIMEZONE MODEL
+//
+// DefaultTimezone is the ultimate fallback in the attendance resolution
+// chain (position.location → position.work_center → work_center.location
+// → company.default_timezone). It's an IANA name, never an offset.
+//
+// Required. NULL not allowed. The app must supply a real value at creation.
+// See internal/constants/timezones.go for the curated list.
 // =============================================================================
 
 type Company struct {
-	CompanyID               uuid.UUID  `db:"company_id" json:"company_id"`
-	CompanyName             string     `db:"company_name" json:"company_name"`
-	OwnerUserID             uuid.UUID  `db:"owner_user_id" json:"owner_user_id"`
-	SubscriptionTier        string     `db:"subscription_tier" json:"subscription_tier"`
-	SubscriptionStatus      string     `db:"subscription_status" json:"subscription_status"`
-	MaxEmployees            int        `db:"max_employees" json:"max_employees"`
-	MaxLocations            int        `db:"max_locations" json:"max_locations"`
-	SubscriptionAmount      float64    `db:"subscription_amount" json:"subscription_amount"`
-	DataRegion              string     `db:"data_region" json:"data_region"`
+	CompanyID          uuid.UUID `db:"company_id" json:"company_id"`
+	CompanyName        string    `db:"company_name" json:"company_name"`
+	OwnerUserID        uuid.UUID `db:"owner_user_id" json:"owner_user_id"`
+	SubscriptionTier   string    `db:"subscription_tier" json:"subscription_tier"`
+	SubscriptionStatus string    `db:"subscription_status" json:"subscription_status"`
+	MaxEmployees       int       `db:"max_employees" json:"max_employees"`
+	MaxLocations       int       `db:"max_locations" json:"max_locations"`
+	SubscriptionAmount float64   `db:"subscription_amount" json:"subscription_amount"`
+	DataRegion         string    `db:"data_region" json:"data_region"`
+
+	// ── NEW ─────────────────────────────────────────────────────────
+	// IANA timezone name, e.g. 'Asia/Kolkata'. Required.
+	// Fallback for all subjects whose position/location/work_center
+	// have no explicit timezone.
+	DefaultTimezone string `db:"default_timezone" json:"default_timezone"`
+
 	IsActive                bool       `db:"is_active" json:"is_active"`
 	CreatedAt               time.Time  `db:"created_at" json:"created_at"`
 	UpdatedAt               time.Time  `db:"updated_at" json:"updated_at"`
@@ -214,6 +230,7 @@ type CompanySearchResult struct {
 	MaxEmployees       int       `db:"max_employees" json:"max_employees"`
 	IsActive           bool      `db:"is_active" json:"is_active"`
 	DataRegion         string    `db:"data_region" json:"data_region"`
+	DefaultTimezone    string    `db:"default_timezone" json:"default_timezone"` // ── NEW
 	CreatedAt          time.Time `db:"created_at" json:"created_at"`
 	RelevanceScore     float64   `db:"relevance_score" json:"relevance_score"`
 	MatchType          string    `db:"match_type" json:"match_type"`
@@ -266,6 +283,11 @@ type CompanyCreateRequest struct {
 	SubscriptionTier string    `json:"subscription_tier" validate:"oneof=basic premium enterprise"`
 	DataRegion       string    `json:"data_region" validate:"oneof=us eu as"`
 	MaxEmployees     int       `json:"max_employees" validate:"min=1,max=10000"`
+
+	// ── NEW ─────────────────────────────────────────────────────────
+	// IANA timezone. If empty, service layer defaults based on DataRegion.
+	// Never accept offsets like '+05:30'. Validation happens in the handler.
+	DefaultTimezone string `json:"default_timezone" validate:"required"`
 }
 
 // =============================================================================
@@ -315,17 +337,6 @@ type RoleWithPermissions struct {
 	Role        Role         `json:"role"`
 	Permissions []Permission `json:"permissions"`
 }
-
-// =============================================================================
-// SYSTEM DEPARTMENTS (optional)
-// =============================================================================
-
-// type SystemDepartment struct {
-// 	SystemDepartmentID uuid.UUID `json:"system_department_id" db:"system_department_id"`
-// 	Name               string    `json:"name" db:"name"`
-// 	ModuleCode         string    `json:"module_code" db:"module_code"`
-// 	Description        string    `json:"description" db:"description"`
-// }
 
 // =============================================================================
 // DEPARTMENTS
@@ -466,9 +477,7 @@ type UserPermissionSummary struct {
 }
 
 // =============================================================================
-// JOBS  👈 NEW
-// Job catalog — one row per distinct role per company.
-// Carries NO location and NO work center; those live on `positions`.
+// JOBS
 // =============================================================================
 
 type Job struct {
@@ -504,31 +513,22 @@ type UpdateJobRequest struct {
 }
 
 // =============================================================================
-// POSITIONS  👈 CHANGED
-// A "seat": one row per headcount slot. References a job (definition),
-// a location (site), and optionally a work center (sub-area at that site).
+// POSITIONS
 // =============================================================================
 
 type Position struct {
 	PositionID     uuid.UUID  `db:"position_id"     json:"position_id"`
 	CompanyID      uuid.UUID  `db:"company_id"      json:"company_id"`
 	DepartmentID   uuid.UUID  `db:"department_id"   json:"department_id"`
-	JobID          uuid.UUID  `db:"job_id"          json:"job_id"`                   // 👈 NEW
-	LocationID     *uuid.UUID `db:"location_id"     json:"location_id,omitempty"`    // 👈 NEW
-	TitleOverride  *string    `db:"title_override"  json:"title_override,omitempty"` // 👈 CHANGED (was Title)
+	JobID          uuid.UUID  `db:"job_id"          json:"job_id"`
+	LocationID     *uuid.UUID `db:"location_id"     json:"location_id,omitempty"`
+	TitleOverride  *string    `db:"title_override"  json:"title_override,omitempty"`
 	IsOpen         bool       `db:"is_open"         json:"is_open"`
 	WorkCenterCode *string    `db:"work_center_code" json:"work_center_code,omitempty"`
 	CreatedAt      time.Time  `db:"created_at"      json:"created_at"`
 	UpdatedAt      time.Time  `db:"updated_at"      json:"updated_at"`
-
-	// ❌ REMOVED (now on Job):
-	//   Title              string
-	//   IsSchedulable      bool
-	//   AttendanceRequired bool
-	//   OvertimeAllowed    bool
 }
 
-// PositionView is a read model with the joined fields the API needs.
 type PositionView struct {
 	Position
 	JobCode            string  `db:"job_code"            json:"job_code"`
@@ -541,7 +541,6 @@ type PositionView struct {
 	WorkCenterName     *string `db:"work_center_name"    json:"work_center_name,omitempty"`
 }
 
-// EffectiveTitle returns the display title for the seat.
 func (p *PositionView) EffectiveTitle() string {
 	if p.TitleOverride != nil && *p.TitleOverride != "" {
 		return *p.TitleOverride
@@ -595,7 +594,6 @@ type CompanyEmployeeWithPosition struct {
 	IsOpen        *bool      `db:"is_open" json:"is_open,omitempty"`
 }
 
-// PositionResponse  👈 CHANGED — reflects job_id / location_id / title_override
 type PositionResponse struct {
 	PositionID     string    `json:"position_id"`
 	CompanyID      string    `json:"company_id"`
@@ -625,17 +623,29 @@ type PositionsByDepartmentRequest struct {
 	Offset       *int      `json:"offset,omitempty"`
 }
 
-// WorkCenter  👈 CHANGED — added LocationID
+// WorkCenter — unchanged (already has Timezone).
 type WorkCenter struct {
 	WorkCenterCode string     `json:"work_center_code" db:"work_center_code"`
 	CompanyID      uuid.UUID  `json:"company_id" db:"company_id"`
-	LocationID     *uuid.UUID `json:"location_id,omitempty" db:"location_id"` // 👈 NEW
+	LocationID     *uuid.UUID `json:"location_id,omitempty" db:"location_id"`
 	Name           string     `json:"name" db:"name"`
 	Description    *string    `json:"description" db:"description"`
 	Timezone       string     `json:"timezone" db:"timezone"`
 	IsActive       bool       `json:"is_active" db:"is_active"`
 	CreatedAt      time.Time  `json:"created_at" db:"created_at"`
 	UpdatedAt      time.Time  `json:"updated_at" db:"updated_at"`
+}
+
+// WorkCenterView — read model with is_universal flag.
+type WorkCenterView struct {
+	WorkCenterCode string     `json:"work_center_code" db:"work_center_code"`
+	CompanyID      uuid.UUID  `json:"company_id" db:"company_id"`
+	LocationID     *uuid.UUID `json:"location_id,omitempty" db:"location_id"`
+	Name           string     `json:"name" db:"name"`
+	Description    *string    `json:"description" db:"description"`
+	Timezone       string     `json:"timezone" db:"timezone"`
+	IsActive       bool       `json:"is_active" db:"is_active"`
+	IsUniversal    bool       `json:"is_universal" db:"is_universal"`
 }
 
 type EmployeeWithPositionDetails struct {
@@ -676,6 +686,14 @@ type CompanyEmployeeSearchResult struct {
 
 // =============================================================================
 // LOCATIONS
+//
+// TIMEZONE MODEL
+//
+// Timezone is optional (nullable). When NULL, callers fall back to
+// company.default_timezone. When set, it overrides the company default
+// for every position bound to this location.
+//
+// Sales/attendance at this site use this tz to compute business dates.
 // =============================================================================
 
 type Location struct {
@@ -689,9 +707,15 @@ type Location struct {
 	State        *string   `db:"state" json:"state,omitempty"`
 	Country      *string   `db:"country" json:"country,omitempty"`
 	Pincode      *string   `db:"pincode" json:"pincode,omitempty"`
-	IsActive     bool      `db:"is_active" json:"is_active"`
-	CreatedAt    time.Time `db:"created_at" json:"created_at"`
-	UpdatedAt    time.Time `db:"updated_at" json:"updated_at"`
+
+	// ── NEW ─────────────────────────────────────────────────────────
+	// IANA timezone name. NULL = inherit company.default_timezone.
+	// Example: 'Asia/Kolkata'. Never an offset.
+	Timezone *string `db:"timezone" json:"timezone,omitempty"`
+
+	IsActive  bool      `db:"is_active" json:"is_active"`
+	CreatedAt time.Time `db:"created_at" json:"created_at"`
+	UpdatedAt time.Time `db:"updated_at" json:"updated_at"`
 }
 
 type EmployeeLocationAccess struct {
@@ -729,6 +753,10 @@ type CreateLocationRequest struct {
 	State        *string   `json:"state,omitempty"`
 	Country      *string   `json:"country,omitempty"`
 	Pincode      *string   `json:"pincode,omitempty"`
+
+	// ── NEW ─────────────────────────────────────────────────────────
+	// Optional. Validated as IANA name in the handler if non-empty.
+	Timezone *string `json:"timezone,omitempty"`
 }
 
 type UpdateLocationRequest struct {
@@ -740,7 +768,13 @@ type UpdateLocationRequest struct {
 	State        *string `json:"state,omitempty"`
 	Country      *string `json:"country,omitempty"`
 	Pincode      *string `json:"pincode,omitempty"`
-	IsActive     *bool   `json:"is_active,omitempty"`
+
+	// ── NEW ─────────────────────────────────────────────────────────
+	// Set to change the tz. Leave nil to preserve. Set to pointer-to-empty
+	// is rejected by the handler — use a real IANA name.
+	Timezone *string `json:"timezone,omitempty"`
+
+	IsActive *bool `json:"is_active,omitempty"`
 }
 
 // =============================================================================
@@ -933,6 +967,9 @@ const (
 	MatchTypeAutocomplete = "autocomplete"
 )
 
+// DefaultTimezone fallback
+const DefaultTimezoneUTC = "UTC"
+
 type EmployeeLocationDetails struct {
 	PrimaryLocationID uuid.UUID
 	LocationScope     string
@@ -958,9 +995,13 @@ type CompanyDetailView struct {
 	CompanyName string    `json:"company_name"`
 	OwnerUserID uuid.UUID `json:"owner_user_id"`
 	DataRegion  string    `json:"data_region"`
-	IsActive    bool      `json:"is_active"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+
+	// ── NEW ─────────────────────────────────────────────────────────
+	DefaultTimezone string `json:"default_timezone"`
+
+	IsActive  bool      `json:"is_active"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 
 	SubscriptionTier   string     `json:"subscription_tier"`
 	SubscriptionStatus string     `json:"subscription_status"`
@@ -998,6 +1039,7 @@ func NewCompanyDetailView(c *Company) *CompanyDetailView {
 		CompanyName:                       c.CompanyName,
 		OwnerUserID:                       c.OwnerUserID,
 		DataRegion:                        c.DataRegion,
+		DefaultTimezone:                   c.DefaultTimezone,
 		IsActive:                          c.IsActive,
 		CreatedAt:                         c.CreatedAt,
 		UpdatedAt:                         c.UpdatedAt,

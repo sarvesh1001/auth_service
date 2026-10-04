@@ -118,11 +118,12 @@ func RegisterAttendanceRoutes(
 		r.With(bitmaskPermissionMiddleware("hr.attendance.view"), companyAccessMiddleware).
 			Get("/reports/stream", reportHandler.StreamEvents)
 
-		// ----- Admin (policies, rules, sources) -----
+		// ----- Admin (policies, rules, sources, biometric) -----
 		r.Route("/admin", func(r chi.Router) {
 			r.Use(bitmaskPermissionMiddleware("attendance.configure"))
 			r.Use(companyAccessMiddleware)
 
+			// ---- Policies ----
 			r.Post("/policies", adminHandler.CreatePolicy)
 			r.Get("/policies", adminHandler.ListPolicies)
 			r.Get("/policies/{policyID}", adminHandler.GetPolicy)
@@ -130,13 +131,53 @@ func RegisterAttendanceRoutes(
 			r.Delete("/policies/{policyID}", adminHandler.DeletePolicy)
 			r.Post("/assign-policy", adminHandler.AssignPolicyToUser)
 
+			// ---- Company rules ----
 			r.Get("/rules/company", adminHandler.GetCompanyRules)
 			r.Put("/rules/company", adminHandler.UpdateCompanyRules)
 			r.Get("/rules/resolve", adminHandler.GetResolvedRules)
 
+			// ---- Sources ----
 			r.Get("/sources", sourceAdminHandler.ListSources)
 			r.Post("/sources", sourceAdminHandler.CreateSource)
 			r.Put("/sources/{sourceType}", sourceAdminHandler.UpdateSourceStatus)
+
+			// ============================================================
+			// 🆕 BIOMETRIC ADMIN
+			//
+			// These are the SAME handlers used by devices under
+			// /attendance-device/biometric/*. They only reject
+			// non-trusted DEVICE sessions:
+			//
+			//     if getSessionTypeFromContext(ctx) == "device" &&
+			//        !isTrustedDevice(ctx) {
+			//         return 403 "device not trusted"
+			//     }
+			//
+			// For an admin session that branch is skipped, and both
+			// getCompanyIDFromContext and getUserIDFromContext work
+			// off the admin JWT. RotateEmbeddingModel additionally
+			// hard-rejects device sessions — it's admin-only by design.
+			// ============================================================
+
+			// ---- Writes ----
+			r.Post("/biometric/enroll", biometricEnrollmentHandler.EnrollFace)
+			r.Post("/biometric/re-enroll", biometricEnrollmentHandler.ReEnrollFace)
+			r.Post("/biometric/deactivate", biometricEnrollmentHandler.DeactivateFace)
+			r.Post("/biometric/activate", biometricEnrollmentHandler.ActivateFace)
+			r.Post("/biometric/rotate", biometricEnrollmentHandler.RotateEmbeddingModel)
+
+			// ---- Reads ----
+			r.Get("/biometric/embeddings", biometricEnrollmentHandler.ListActiveFaceEmbeddings)
+			r.Get(
+				"/biometric/embedding/{subjectType}/{subjectID}",
+				biometricEnrollmentHandler.GetFaceEmbedding,
+			)
+
+			// ---- Force device resync ----
+			r.Post(
+				"/biometric/force-resync/{deviceID}",
+				biometricSyncHandler.ForceDeviceResync,
+			)
 		})
 
 		// ----- Device management -----

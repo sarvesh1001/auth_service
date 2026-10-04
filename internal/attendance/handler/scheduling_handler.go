@@ -1,4 +1,3 @@
-// internal/attendance/handler/scheduling_handler.go
 package handler
 
 import (
@@ -16,14 +15,12 @@ import (
 	"auth-service/internal/locationctx"
 )
 
-// SchedulingHandler handles all scheduling-related HTTP endpoints.
 type SchedulingHandler struct {
 	schedulingService      scheduling.SchedulingService
 	schedulingQueryService scheduling.SchedulingQueryService
 	logger                 *zap.Logger
 }
 
-// NewSchedulingHandler creates a new scheduling handler.
 func NewSchedulingHandler(
 	schedulingService scheduling.SchedulingService,
 	schedulingQueryService scheduling.SchedulingQueryService,
@@ -35,8 +32,6 @@ func NewSchedulingHandler(
 		logger:                 logger,
 	}
 }
-
-// ---- Helper functions ----
 
 func normalizeBusinessDateFromString(dateStr, tz string) (time.Time, error) {
 	loc, err := time.LoadLocation(tz)
@@ -59,7 +54,6 @@ func normalizeBusinessDate(t time.Time, tz string) (time.Time, error) {
 	return time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, loc), nil
 }
 
-// getUserTimezone attempts to resolve a user's timezone from their schedule.
 func (h *SchedulingHandler) getUserTimezone(ctx context.Context, userID uuid.UUID) string {
 	today := time.Now().UTC().Truncate(24 * time.Hour)
 	instances, err := h.schedulingQueryService.GetScheduleInstancesByUser(ctx, userID, today, today)
@@ -69,9 +63,6 @@ func (h *SchedulingHandler) getUserTimezone(ctx context.Context, userID uuid.UUI
 	return "UTC"
 }
 
-// getCompanyDefaultTimezone returns the timezone of the newest work calendar
-// for the company. Passes nil for locationID because this is a fallback —
-// it looks for any calendar, not a specific location's calendar.
 func (h *SchedulingHandler) getCompanyDefaultTimezone(ctx context.Context, companyID uuid.UUID) string {
 	calendars, err := h.schedulingQueryService.GetWorkCalendarsByCompany(ctx, companyID, nil)
 	if err != nil || len(calendars) == 0 {
@@ -80,7 +71,30 @@ func (h *SchedulingHandler) getCompanyDefaultTimezone(ctx context.Context, compa
 	return calendars[0].Timezone
 }
 
-// ---- Work Calendar Handlers ----
+// pathCompanyMatchesContext fetches the caller's company from context and
+// compares it to the company in the URL path. Returns (companyID, true) on
+// success; writes the appropriate error and returns (uuid.Nil, false) on
+// failure.
+func (h *SchedulingHandler) pathCompanyMatchesContext(
+	w http.ResponseWriter,
+	r *http.Request,
+) (uuid.UUID, bool) {
+	ctx := r.Context()
+	pathCompany, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return uuid.Nil, false
+	}
+	ctxCompany, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return uuid.Nil, false
+	}
+	if !assertPathCompany(w, ctxCompany, pathCompany, h.logger) {
+		return uuid.Nil, false
+	}
+	return pathCompany, true
+}
 
 func (h *SchedulingHandler) CreateWorkCalendar(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -95,14 +109,12 @@ func (h *SchedulingHandler) CreateWorkCalendar(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var calendar models.WorkCalendar
 	if err := json.NewDecoder(r.Body).Decode(&calendar); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
 	calendar.CompanyID = companyID
-
 	result, err := h.schedulingService.CreateWorkCalendar(ctx, &calendar, actorType, actorID, nil)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -113,8 +125,7 @@ func (h *SchedulingHandler) CreateWorkCalendar(w http.ResponseWriter, r *http.Re
 
 func (h *SchedulingHandler) GetWorkCalendar(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	calendarIDStr := chi.URLParam(r, "calendarID")
-	calendarID, err := uuid.Parse(calendarIDStr)
+	calendarID, err := uuid.Parse(chi.URLParam(r, "calendarID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid calendar ID")
 		return
@@ -129,8 +140,7 @@ func (h *SchedulingHandler) GetWorkCalendar(w http.ResponseWriter, r *http.Reque
 
 func (h *SchedulingHandler) UpdateWorkCalendar(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	calendarIDStr := chi.URLParam(r, "calendarID")
-	calendarID, err := uuid.Parse(calendarIDStr)
+	calendarID, err := uuid.Parse(chi.URLParam(r, "calendarID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid calendar ID")
 		return
@@ -141,13 +151,11 @@ func (h *SchedulingHandler) UpdateWorkCalendar(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var update scheduling.WorkCalendarUpdate
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
-
 	result, err := h.schedulingService.UpdateWorkCalendar(ctx, calendarID, update, actorType, actorID, nil)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -158,8 +166,7 @@ func (h *SchedulingHandler) UpdateWorkCalendar(w http.ResponseWriter, r *http.Re
 
 func (h *SchedulingHandler) DeleteWorkCalendar(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	calendarIDStr := chi.URLParam(r, "calendarID")
-	calendarID, err := uuid.Parse(calendarIDStr)
+	calendarID, err := uuid.Parse(chi.URLParam(r, "calendarID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid calendar ID")
 		return
@@ -170,7 +177,6 @@ func (h *SchedulingHandler) DeleteWorkCalendar(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if err := h.schedulingService.DeleteWorkCalendar(ctx, calendarID, actorType, actorID, nil); err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -178,19 +184,13 @@ func (h *SchedulingHandler) DeleteWorkCalendar(w http.ResponseWriter, r *http.Re
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Work calendar deleted successfully"})
 }
 
-// ListWorkCalendars — location scope read from X-Location-ID.
 func (h *SchedulingHandler) ListWorkCalendars(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	companyID, ok := h.pathCompanyMatchesContext(w, r)
+	if !ok {
 		return
 	}
-
-	// 👇 Location scope from the request context.
 	locFilter := locationctx.Filter(ctx)
-
 	result, err := h.schedulingQueryService.GetWorkCalendarsByCompany(ctx, companyID, locFilter)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -201,8 +201,7 @@ func (h *SchedulingHandler) ListWorkCalendars(w http.ResponseWriter, r *http.Req
 
 func (h *SchedulingHandler) GetCalendarAvailability(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	calendarIDStr := chi.URLParam(r, "calendarID")
-	calendarID, err := uuid.Parse(calendarIDStr)
+	calendarID, err := uuid.Parse(chi.URLParam(r, "calendarID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid calendar ID")
 		return
@@ -236,8 +235,6 @@ func (h *SchedulingHandler) GetCalendarAvailability(w http.ResponseWriter, r *ht
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// ---- Schedule Template Handlers ----
-
 func (h *SchedulingHandler) CreateScheduleTemplate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -251,14 +248,12 @@ func (h *SchedulingHandler) CreateScheduleTemplate(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var template models.ScheduleTemplate
 	if err := json.NewDecoder(r.Body).Decode(&template); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
 	template.CompanyID = companyID
-
 	result, err := h.schedulingService.CreateScheduleTemplate(ctx, &template, actorType, actorID, nil)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -269,8 +264,7 @@ func (h *SchedulingHandler) CreateScheduleTemplate(w http.ResponseWriter, r *htt
 
 func (h *SchedulingHandler) GetScheduleTemplate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	templateIDStr := chi.URLParam(r, "templateID")
-	templateID, err := uuid.Parse(templateIDStr)
+	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid template ID")
 		return
@@ -285,8 +279,7 @@ func (h *SchedulingHandler) GetScheduleTemplate(w http.ResponseWriter, r *http.R
 
 func (h *SchedulingHandler) UpdateScheduleTemplate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	templateIDStr := chi.URLParam(r, "templateID")
-	templateID, err := uuid.Parse(templateIDStr)
+	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid template ID")
 		return
@@ -297,13 +290,11 @@ func (h *SchedulingHandler) UpdateScheduleTemplate(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var update scheduling.ScheduleTemplateUpdate
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
-
 	result, err := h.schedulingService.UpdateScheduleTemplate(ctx, templateID, update, actorType, actorID, nil)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -314,8 +305,7 @@ func (h *SchedulingHandler) UpdateScheduleTemplate(w http.ResponseWriter, r *htt
 
 func (h *SchedulingHandler) DeleteScheduleTemplate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	templateIDStr := chi.URLParam(r, "templateID")
-	templateID, err := uuid.Parse(templateIDStr)
+	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid template ID")
 		return
@@ -326,7 +316,6 @@ func (h *SchedulingHandler) DeleteScheduleTemplate(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if err := h.schedulingService.DeleteScheduleTemplate(ctx, templateID, actorType, actorID, nil); err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -334,20 +323,14 @@ func (h *SchedulingHandler) DeleteScheduleTemplate(w http.ResponseWriter, r *htt
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Schedule template deleted successfully"})
 }
 
-// ListScheduleTemplates — location scope read from X-Location-ID.
 func (h *SchedulingHandler) ListScheduleTemplates(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	companyID, ok := h.pathCompanyMatchesContext(w, r)
+	if !ok {
 		return
 	}
 	activeOnly := r.URL.Query().Get("active_only") != "false"
-
-	// 👇 Location scope from the request context.
 	locFilter := locationctx.Filter(ctx)
-
 	result, err := h.schedulingQueryService.GetScheduleTemplatesByCompany(ctx, companyID, locFilter, activeOnly)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -355,8 +338,6 @@ func (h *SchedulingHandler) ListScheduleTemplates(w http.ResponseWriter, r *http
 	}
 	h.respondWithJSON(w, http.StatusOK, result)
 }
-
-// ---- Schedule Instance Handlers ----
 
 type CreateScheduleInstanceRequest struct {
 	UserID             uuid.UUID                `json:"user_id"`
@@ -379,7 +360,6 @@ func (h *SchedulingHandler) CreateScheduleInstance(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var req CreateScheduleInstanceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
@@ -430,7 +410,6 @@ func (h *SchedulingHandler) CreateScheduleInstanceFromPosition(w http.ResponseWr
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var req struct {
 		UserID   string `json:"user_id"`
 		Date     string `json:"date"`
@@ -472,8 +451,7 @@ func (h *SchedulingHandler) CreateScheduleInstanceFromPosition(w http.ResponseWr
 
 func (h *SchedulingHandler) GetScheduleInstance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	instanceIDStr := chi.URLParam(r, "instanceID")
-	instanceID, err := uuid.Parse(instanceIDStr)
+	instanceID, err := uuid.Parse(chi.URLParam(r, "instanceID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid instance ID")
 		return
@@ -488,8 +466,7 @@ func (h *SchedulingHandler) GetScheduleInstance(w http.ResponseWriter, r *http.R
 
 func (h *SchedulingHandler) UpdateScheduleInstance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	instanceIDStr := chi.URLParam(r, "instanceID")
-	instanceID, err := uuid.Parse(instanceIDStr)
+	instanceID, err := uuid.Parse(chi.URLParam(r, "instanceID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid instance ID")
 		return
@@ -500,7 +477,6 @@ func (h *SchedulingHandler) UpdateScheduleInstance(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var update scheduling.ScheduleInstanceUpdate
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
@@ -516,8 +492,7 @@ func (h *SchedulingHandler) UpdateScheduleInstance(w http.ResponseWriter, r *htt
 
 func (h *SchedulingHandler) DeleteScheduleInstance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	instanceIDStr := chi.URLParam(r, "instanceID")
-	instanceID, err := uuid.Parse(instanceIDStr)
+	instanceID, err := uuid.Parse(chi.URLParam(r, "instanceID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid instance ID")
 		return
@@ -528,7 +503,6 @@ func (h *SchedulingHandler) DeleteScheduleInstance(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if err := h.schedulingService.DeleteScheduleInstance(ctx, instanceID, actorType, actorID, nil); err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -536,15 +510,10 @@ func (h *SchedulingHandler) DeleteScheduleInstance(w http.ResponseWriter, r *htt
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Schedule instance deleted successfully"})
 }
 
-// ListScheduleInstances — location scope applies only to the company-wide
-// branch (default case). Per-user, per-template, per-position, and
-// per-work-center lookups are already narrow enough.
 func (h *SchedulingHandler) ListScheduleInstances(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	companyID, ok := h.pathCompanyMatchesContext(w, r)
+	if !ok {
 		return
 	}
 	userIDStr := r.URL.Query().Get("user_id")
@@ -553,12 +522,10 @@ func (h *SchedulingHandler) ListScheduleInstances(w http.ResponseWriter, r *http
 	workCenterCode := r.URL.Query().Get("work_center_code")
 	startDateStr := r.URL.Query().Get("start_date")
 	endDateStr := r.URL.Query().Get("end_date")
-
 	if startDateStr == "" || endDateStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "start_date and end_date are required")
 		return
 	}
-
 	timezone := "UTC"
 	if userIDStr != "" {
 		userID, err := uuid.Parse(userIDStr)
@@ -579,7 +546,6 @@ func (h *SchedulingHandler) ListScheduleInstances(w http.ResponseWriter, r *http
 	} else {
 		timezone = h.getCompanyDefaultTimezone(ctx, companyID)
 	}
-
 	startDate, err := normalizeBusinessDateFromString(startDateStr, timezone)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid start date format")
@@ -590,7 +556,6 @@ func (h *SchedulingHandler) ListScheduleInstances(w http.ResponseWriter, r *http
 		h.respondWithError(w, http.StatusBadRequest, "Invalid end date format")
 		return
 	}
-
 	var result []*models.ScheduleInstance
 	switch {
 	case userIDStr != "":
@@ -617,7 +582,6 @@ func (h *SchedulingHandler) ListScheduleInstances(w http.ResponseWriter, r *http
 	case workCenterCode != "":
 		result, err = h.schedulingQueryService.GetScheduleInstancesByWorkCenter(ctx, companyID, workCenterCode, startDate, endDate)
 	default:
-		// 👇 Location scope applies only to the company-wide branch.
 		locFilter := locationctx.Filter(ctx)
 		result, err = h.schedulingQueryService.GetScheduleInstancesByCompany(ctx, companyID, locFilter, startDate, endDate)
 	}
@@ -627,8 +591,6 @@ func (h *SchedulingHandler) ListScheduleInstances(w http.ResponseWriter, r *http
 	}
 	h.respondWithJSON(w, http.StatusOK, result)
 }
-
-// ---- Schedule Generation Handlers ----
 
 type GenerateScheduleRequest struct {
 	StartDate       string `json:"start_date"`
@@ -641,8 +603,7 @@ type GenerateScheduleRequest struct {
 
 func (h *SchedulingHandler) GenerateScheduleForUser(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
+	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
 		return
@@ -658,7 +619,6 @@ func (h *SchedulingHandler) GenerateScheduleForUser(w http.ResponseWriter, r *ht
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var req GenerateScheduleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
@@ -688,7 +648,6 @@ func (h *SchedulingHandler) GenerateScheduleForUser(w http.ResponseWriter, r *ht
 	if req.BatchSize <= 0 {
 		req.BatchSize = 100
 	}
-
 	config := scheduling.ScheduleGenerationConfig{
 		StartDate:       startDate,
 		EndDate:         endDate,
@@ -711,10 +670,8 @@ func (h *SchedulingHandler) GenerateScheduleForUser(w http.ResponseWriter, r *ht
 
 func (h *SchedulingHandler) GenerateScheduleForCompany(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	companyID, ok := h.pathCompanyMatchesContext(w, r)
+	if !ok {
 		return
 	}
 	actorType := getSessionTypeFromContext(ctx)
@@ -723,7 +680,6 @@ func (h *SchedulingHandler) GenerateScheduleForCompany(w http.ResponseWriter, r 
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var req GenerateScheduleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
@@ -773,8 +729,6 @@ func (h *SchedulingHandler) GenerateScheduleForCompany(w http.ResponseWriter, r 
 	})
 }
 
-// ---- Schedule Override Handlers ----
-
 type CreateScheduleOverrideRequest struct {
 	UserID       uuid.UUID `json:"user_id"`
 	OverrideDate string    `json:"override_date"`
@@ -795,7 +749,6 @@ func (h *SchedulingHandler) CreateScheduleOverride(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var req CreateScheduleOverrideRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
@@ -840,17 +793,14 @@ func (h *SchedulingHandler) CreateScheduleOverride(w http.ResponseWriter, r *htt
 
 func (h *SchedulingHandler) GetScheduleOverrides(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	companyID, ok := h.pathCompanyMatchesContext(w, r)
+	if !ok {
 		return
 	}
 	userIDStr := r.URL.Query().Get("user_id")
 	startDateStr := r.URL.Query().Get("start_date")
 	endDateStr := r.URL.Query().Get("end_date")
 	overrideType := r.URL.Query().Get("override_type")
-
 	if startDateStr == "" || endDateStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "start_date and end_date are required")
 		return
@@ -876,7 +826,6 @@ func (h *SchedulingHandler) GetScheduleOverrides(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusBadRequest, "Invalid end date format")
 		return
 	}
-
 	var overrideTypePtr *string
 	if overrideType != "" {
 		overrideTypePtr = &overrideType
@@ -889,20 +838,23 @@ func (h *SchedulingHandler) GetScheduleOverrides(w http.ResponseWriter, r *http.
 			return
 		}
 		result, err = h.schedulingQueryService.GetScheduleOverridesByUser(ctx, userID, startDate, endDate, overrideTypePtr)
+		if err != nil {
+			h.respondWithError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	} else {
 		result, err = h.schedulingQueryService.GetScheduleOverridesByCompany(ctx, companyID, startDate, endDate, overrideTypePtr)
-	}
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
-		return
+		if err != nil {
+			h.respondWithError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
 func (h *SchedulingHandler) GetScheduleOverrideByID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	overrideIDStr := chi.URLParam(r, "overrideID")
-	overrideID, err := uuid.Parse(overrideIDStr)
+	overrideID, err := uuid.Parse(chi.URLParam(r, "overrideID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid override ID")
 		return
@@ -917,8 +869,7 @@ func (h *SchedulingHandler) GetScheduleOverrideByID(w http.ResponseWriter, r *ht
 
 func (h *SchedulingHandler) UpdateScheduleOverride(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	overrideIDStr := chi.URLParam(r, "overrideID")
-	overrideID, err := uuid.Parse(overrideIDStr)
+	overrideID, err := uuid.Parse(chi.URLParam(r, "overrideID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid override ID")
 		return
@@ -929,7 +880,6 @@ func (h *SchedulingHandler) UpdateScheduleOverride(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var update scheduling.ScheduleOverrideUpdate
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
@@ -952,8 +902,7 @@ func (h *SchedulingHandler) UpdateScheduleOverride(w http.ResponseWriter, r *htt
 
 func (h *SchedulingHandler) DeleteScheduleOverride(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	overrideIDStr := chi.URLParam(r, "overrideID")
-	overrideID, err := uuid.Parse(overrideIDStr)
+	overrideID, err := uuid.Parse(chi.URLParam(r, "overrideID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid override ID")
 		return
@@ -971,14 +920,10 @@ func (h *SchedulingHandler) DeleteScheduleOverride(w http.ResponseWriter, r *htt
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Schedule override deleted successfully"})
 }
 
-// ---- Work Center Handlers ----
-
 func (h *SchedulingHandler) GetWorkCenter(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	companyID, ok := h.pathCompanyMatchesContext(w, r)
+	if !ok {
 		return
 	}
 	workCenterCode := chi.URLParam(r, "workCenterCode")
@@ -992,10 +937,8 @@ func (h *SchedulingHandler) GetWorkCenter(w http.ResponseWriter, r *http.Request
 
 func (h *SchedulingHandler) ListWorkCenters(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	companyID, ok := h.pathCompanyMatchesContext(w, r)
+	if !ok {
 		return
 	}
 	activeOnly := r.URL.Query().Get("active_only") != "false"
@@ -1009,10 +952,8 @@ func (h *SchedulingHandler) ListWorkCenters(w http.ResponseWriter, r *http.Reque
 
 func (h *SchedulingHandler) GetWorkCenterShifts(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	companyID, ok := h.pathCompanyMatchesContext(w, r)
+	if !ok {
 		return
 	}
 	workCenterCode := r.URL.Query().Get("work_center_code")
@@ -1044,8 +985,6 @@ func (h *SchedulingHandler) GetWorkCenterShifts(w http.ResponseWriter, r *http.R
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// ---- Work Center Shift Mapping Handlers ----
-
 func (h *SchedulingHandler) CreateWorkCenterShiftMapping(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -1059,7 +998,6 @@ func (h *SchedulingHandler) CreateWorkCenterShiftMapping(w http.ResponseWriter, 
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var mapping models.WorkCenterShift
 	if err := json.NewDecoder(r.Body).Decode(&mapping); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
@@ -1086,7 +1024,6 @@ func (h *SchedulingHandler) UpdateWorkCenterShiftMapping(w http.ResponseWriter, 
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var req struct {
 		WorkCenterCode string    `json:"work_center_code"`
 		EffectiveTo    time.Time `json:"effective_to"`
@@ -1109,12 +1046,9 @@ func (h *SchedulingHandler) UpdateWorkCenterShiftMapping(w http.ResponseWriter, 
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Work center shift mapping updated successfully"})
 }
 
-// ---- Position & Assignment Handlers ----
-
 func (h *SchedulingHandler) GetUserScheduledPosition(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
+	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
 		return
@@ -1154,8 +1088,7 @@ func (h *SchedulingHandler) GetUserScheduledPosition(w http.ResponseWriter, r *h
 
 func (h *SchedulingHandler) GetUserCurrentAssignment(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
+	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
 		return
@@ -1192,14 +1125,9 @@ func (h *SchedulingHandler) GetUserCurrentAssignment(w http.ResponseWriter, r *h
 	})
 }
 
-// ---- Holiday Handlers ----
-
 func (h *SchedulingHandler) AddHolidayToCalendar(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	_, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	if _, ok := h.pathCompanyMatchesContext(w, r); !ok {
 		return
 	}
 	actorType := getSessionTypeFromContext(ctx)
@@ -1208,7 +1136,6 @@ func (h *SchedulingHandler) AddHolidayToCalendar(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var req struct {
 		CalendarID uuid.UUID `json:"calendar_id"`
 		Date       string    `json:"date"`
@@ -1227,10 +1154,8 @@ func (h *SchedulingHandler) AddHolidayToCalendar(w http.ResponseWriter, r *http.
 
 func (h *SchedulingHandler) ProcessHolidayForDate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	companyID, ok := h.pathCompanyMatchesContext(w, r)
+	if !ok {
 		return
 	}
 	actorType := getSessionTypeFromContext(ctx)
@@ -1258,15 +1183,16 @@ func (h *SchedulingHandler) ProcessHolidayForDate(w http.ResponseWriter, r *http
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Holiday processed successfully"})
 }
 
-// ---- Stats & Query Handlers ----
-
-// GetScheduleStats — location scope read from X-Location-ID.
+// GetScheduleStats returns aggregated scheduling statistics.
+//
+// FIX (Handler hygiene):
+//   - previously discarded the errors from normalizeBusinessDate, silently
+//     falling back to zero-value time.Time on a bad timezone.
+//   - path company is now asserted against the caller's company.
 func (h *SchedulingHandler) GetScheduleStats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	companyID, ok := h.pathCompanyMatchesContext(w, r)
+	if !ok {
 		return
 	}
 	startDateStr := r.URL.Query().Get("start_date")
@@ -1274,6 +1200,8 @@ func (h *SchedulingHandler) GetScheduleStats(w http.ResponseWriter, r *http.Requ
 	timezone := h.getCompanyDefaultTimezone(ctx, companyID)
 
 	var startDate, endDate time.Time
+	var err error
+
 	if startDateStr != "" {
 		startDate, err = normalizeBusinessDateFromString(startDateStr, timezone)
 		if err != nil {
@@ -1281,8 +1209,13 @@ func (h *SchedulingHandler) GetScheduleStats(w http.ResponseWriter, r *http.Requ
 			return
 		}
 	} else {
-		startDate, _ = normalizeBusinessDate(time.Now().AddDate(0, -1, 0), timezone)
+		startDate, err = normalizeBusinessDate(time.Now().AddDate(0, -1, 0), timezone)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "Invalid default start date")
+			return
+		}
 	}
+
 	if endDateStr != "" {
 		endDate, err = normalizeBusinessDateFromString(endDateStr, timezone)
 		if err != nil {
@@ -1290,12 +1223,14 @@ func (h *SchedulingHandler) GetScheduleStats(w http.ResponseWriter, r *http.Requ
 			return
 		}
 	} else {
-		endDate, _ = normalizeBusinessDate(time.Now(), timezone)
+		endDate, err = normalizeBusinessDate(time.Now(), timezone)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "Invalid default end date")
+			return
+		}
 	}
 
-	// 👇 Location scope from the request context.
 	locFilter := locationctx.Filter(ctx)
-
 	result, err := h.schedulingQueryService.GetScheduleStats(ctx, companyID, locFilter, startDate, endDate)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -1403,8 +1338,6 @@ func (h *SchedulingHandler) ValidateScheduleConflict(w http.ResponseWriter, r *h
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{"has_conflict": hasConflict})
 }
 
-// ---- Health Check ----
-
 func (h *SchedulingHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	if err := h.schedulingQueryService.HealthCheck(ctx); err != nil {
@@ -1413,8 +1346,6 @@ func (h *SchedulingHandler) HealthCheck(w http.ResponseWriter, r *http.Request) 
 	}
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"status": "healthy", "service": "scheduling"})
 }
-
-// ---- Response Helpers ----
 
 func (h *SchedulingHandler) respondWithJSON(w http.ResponseWriter, status int, payload interface{}) {
 	w.Header().Set("Content-Type", "application/json")

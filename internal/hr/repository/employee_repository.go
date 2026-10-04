@@ -107,7 +107,33 @@ type EmployeeRepository interface {
 	// GetActiveEmployeesByCompany returns all active employee user IDs for a company.
 	GetActiveEmployeesByCompany(ctx context.Context, companyID uuid.UUID) ([]uuid.UUID, error)
 	GetCompanyEmployeeByUserID(ctx context.Context, userID uuid.UUID) (*employee.CompanyEmployee, error)
+	// Existing interface — add these three:
 
+	// ReactivateEmployee flips employment_status back to 'active', re-enables
+	// the roster row, and marks the last exit record as 'rehired'. Idempotent:
+	// calling on an already-active employee is a no-op and returns nil.
+	ReactivateEmployee(ctx context.Context, companyID, userID uuid.UUID) error
+
+	// SearchEmployeeIDsByStatus is the status-aware sibling of
+	// SearchEmployeeIDs. Pass status = "" or "all" for the old behavior.
+	SearchEmployeeIDsByStatus(
+		ctx context.Context,
+		companyID uuid.UUID,
+		query string,
+		locationIDs []uuid.UUID,
+		status string,
+		limit, offset int,
+	) ([]uuid.UUID, error)
+
+	// CountEmployeeIDsByStatus returns the total row count for the same filters
+	// so the HTTP layer can populate pagination metadata.
+	CountEmployeeIDsByStatus(
+		ctx context.Context,
+		companyID uuid.UUID,
+		query string,
+		locationIDs []uuid.UUID,
+		status string,
+	) (int, error)
 	SearchEmployeeIDs(
 		ctx context.Context,
 		companyID uuid.UUID,
@@ -115,7 +141,37 @@ type EmployeeRepository interface {
 		locationIDs []uuid.UUID,
 		limit, offset int,
 	) ([]uuid.UUID, error)
+	// ── Probation ──────────────────────────────────────────────
+	CreateProbation(ctx context.Context, p *employee.EmployeeProbation) error
+	GetActiveProbation(ctx context.Context, companyID, userID uuid.UUID) (*employee.EmployeeProbation, error)
+	UpdateProbationStatus(ctx context.Context, p *employee.EmployeeProbation) error
+	ListProbationsDueOn(ctx context.Context, asOf time.Time) ([]*employee.EmployeeProbation, error)
 
+	// ── Notice ─────────────────────────────────────────────────
+	CreateNotice(ctx context.Context, n *employee.EmployeeNotice) error
+	GetActiveNotice(ctx context.Context, companyID, userID uuid.UUID) (*employee.EmployeeNotice, error)
+	UpdateNoticeStatus(ctx context.Context, noticeID uuid.UUID, status string) error
+	AttachNoticeToExit(ctx context.Context, noticeID, exitID uuid.UUID) error
+
+	// ── On hold ────────────────────────────────────────────────
+	CreateOnHold(ctx context.Context, h *employee.EmployeeOnHold) error
+	GetActiveOnHold(ctx context.Context, companyID, userID uuid.UUID) (*employee.EmployeeOnHold, error)
+	EndOnHoldRow(ctx context.Context, onHoldID uuid.UUID, endedBy uuid.UUID) error
+
+	// ── Scheduled jobs ─────────────────────────────────────────
+	EnqueueScheduledJob(ctx context.Context, job *employee.ScheduledJob) error
+	ClaimScheduledJobs(ctx context.Context, workerID string, batch int) ([]*employee.ScheduledJob, error)
+	CompleteScheduledJob(ctx context.Context, jobID uuid.UUID) error
+	FailScheduledJob(ctx context.Context, jobID uuid.UUID, errMsg string) error
+	// Cancel queued/processing scheduled jobs for (company, user, type).
+	// Pass userID == nil to cancel company-scoped jobs of that type.
+	CancelScheduledJobs(ctx context.Context, companyID uuid.UUID, userID *uuid.UUID, jobType string) error
+
+	// CancelEmployeeExit flips a scheduled exit to 'cancelled'. No-op if
+	// the exit is not in 'scheduled' state.
+	CancelEmployeeExit(ctx context.Context, exitID uuid.UUID) error
+	// Called by the on-hold expiry worker.
+	ApplyOnHoldExpiry(ctx context.Context, onHoldID uuid.UUID) error
 	UpdateEmployeeProfileTx(ctx context.Context, tx *sql.Tx, profile *employee.EmployeeProfile) error
 	GetPositionViewByID(ctx context.Context, positionID uuid.UUID) (*employee.PositionView, error)
 	GetEmployeeFullDetailsByIDs(ctx context.Context, companyID uuid.UUID, userIDs []uuid.UUID, locationIDs []uuid.UUID) ([]*employee.EmployeeFullDetailsExt, error)

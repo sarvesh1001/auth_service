@@ -136,8 +136,13 @@ func NewRouter(
 	locationService *service.LocationService,
 	companyService *service.CompanyService,
 
-	// 👇 NEW — Job catalog handler
+	// Job catalog handler
 	jobHandler *JobHandler,
+
+	// HR REMINDERS — in-app feed (inbox) for HR lifecycle events.
+	// NOTE: this is distinct from the subscription `reminderHandler` above,
+	// which handles billing reminders. They live in different packages.
+	hrReminderHandler *hrHandler.ReminderHandler,
 ) chi.Router {
 	router := chi.NewRouter()
 
@@ -299,13 +304,6 @@ func NewRouter(
 
 		// ==========================================================
 		// AVATAR ROUTES (inlined — full middleware control)
-		//
-		// ✅ Self-service only. NO {userId} anywhere. Identity comes
-		//    from the JWT. NO permission bitmask. NO location check
-		//    (avatars are not location-scoped).
-		//
-		//    The public /avatars/file endpoint (used for signed-URL
-		//    streaming) remains below, outside the auth group.
 		// ==========================================================
 		r.Route("/avatars", func(r chi.Router) {
 			// ---------- PUBLIC (HMAC-signed URL required) ----------
@@ -349,11 +347,12 @@ func NewRouter(
 				r.Use(EnhancedCompanyAccessMiddleware(jwtService))
 				r.Get("/departments", rbacHandler.GetMyDepartments)
 				r.Get("/locations", locationHandler.GetMyLocations)
+				r.Get("/employee-form-options", rbacHandler.GetEmployeeFormOptions)
 			})
 		})
 
 		// ==========================================================
-		// 👇 USER SELF-SERVICE (user-scoped, no company context)
+		// USER SELF-SERVICE (user-scoped, no company context)
 		// ==========================================================
 		r.Group(func(r chi.Router) {
 			r.Use(authMiddleware.JWTAuthMiddlewareWithRedis(sessionService))
@@ -362,9 +361,6 @@ func NewRouter(
 
 			r.Patch("/users/me", rbacHandler.UpdateMyProfile)
 		})
-		// ==========================================================
-		// 👆 END USER SELF-SERVICE
-		// ==========================================================
 
 		// ==========================================================
 		// PROTECTED COMPANY-SCOPED ROUTES
@@ -380,9 +376,6 @@ func NewRouter(
 				r.Use(authMiddleware.LocationValidationMiddleware(locationService))
 
 				authHandler.RegisterProtectedRoutes(r)
-				// ⚠️ REMOVED: avatar.RegisterAvatarRoutes(r, avatarHandler)
-				//    Avatar routes are now registered in the dedicated
-				//    /avatars block above (self-service, JWT-only).
 
 				r.Route("/admin/subscription-plans", func(r chi.Router) {
 					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.system_config")).
@@ -1138,6 +1131,30 @@ func NewRouter(
 
 					// ----- HR -----
 					r.Route("/hr", func(r chi.Router) {
+						// ----------------------------------------------------------
+						// REMINDERS — the in-app feed (HR inbox).
+						//
+						// Recipient is ALWAYS the caller (from JWT) — no user_id in
+						// the path, so one HR user cannot read another's feed.
+						//
+						// Writes are idempotent (already-read / already-dismissed
+						// rows are silently no-ops) but do NOT need a client
+						// Idempotency-Key; the operations are naturally idempotent
+						// on their primary key.
+						// ----------------------------------------------------------
+						r.Route("/reminders", func(r chi.Router) {
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view")).
+								Get("/", hrReminderHandler.ListReminders)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view")).
+								Get("/count", hrReminderHandler.GetReminderCounts)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view")).
+								Post("/read-all", hrReminderHandler.MarkAllRemindersRead)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view")).
+								Post("/{reminderID}/read", hrReminderHandler.MarkReminderRead)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view")).
+								Post("/{reminderID}/dismiss", hrReminderHandler.DismissReminder)
+						})
+
 						r.Route("/employees", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view")).
 								Get("/", employeeHandler.ListEmployeeProfiles)
@@ -1190,6 +1207,35 @@ func NewRouter(
 								})
 								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view")).
 									Get("/role-history", employeeHandler.GetRoleHistory)
+
+								// ==================================================
+								// EMPLOYEE LIFECYCLE — PROBATION / NOTICE / ON-HOLD
+								// ==================================================
+								r.Route("/probation", func(r chi.Router) {
+									r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update")).
+										Post("/confirm", employeeHandler.ConfirmProbation)
+									r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.terminate")).
+										Post("/fail", employeeHandler.FailProbation)
+									r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update")).
+										Post("/extend", employeeHandler.ExtendProbation)
+								})
+
+								r.Route("/notice", func(r chi.Router) {
+									r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.terminate")).
+										Post("/start", employeeHandler.StartNotice)
+									r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update")).
+										Post("/cancel", employeeHandler.CancelNotice)
+								})
+
+								r.Route("/on-hold", func(r chi.Router) {
+									r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update")).
+										Post("/start", employeeHandler.StartOnHold)
+									r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update")).
+										Post("/end", employeeHandler.EndOnHold)
+								})
+
+								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view")).
+									Get("/status-now", employeeHandler.GetStatusNow)
 							})
 
 							r.Route("/user/{userID}", func(r chi.Router) {
@@ -1199,6 +1245,30 @@ func NewRouter(
 									Get("/documents", employeeHandler.GetEmployeeDocuments)
 								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.document.upload")).
 									Post("/documents", employeeHandler.UploadEmployeeDocument)
+
+								// --------------------------------------------------
+								// Reactivate — inverse of termination.
+								//
+								// Restores a terminated or resigned employee to
+								// active. Idempotent: already-active returns 200.
+								//
+								// Keyed by user_id (not employee_profile_id) so the
+								// mobile client can call this with the id it already
+								// has on every typeahead row. Service enqueues a
+								// leave-resolver job on success so entitlements are
+								// rebuilt for the new employment window.
+								//
+								// Errors:
+								//   400 — invalid UUID, or status guard blocked the
+								//         reactivation (employee on probation /
+								//         notice / on_hold — those need their own
+								//         lifecycle path first)
+								//   403 — employee outside caller's location scope
+								//   404 — profile not found
+								//   500 — repo/tx failure
+								// --------------------------------------------------
+								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.terminate")).
+									Patch("/reactivate", employeeHandler.ReactivateEmployee)
 							})
 						})
 						r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.view")).

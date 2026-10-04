@@ -18,6 +18,7 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pg_trgm";
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 CREATE EXTENSION IF NOT EXISTS "btree_gist";
+CREATE SCHEMA IF NOT EXISTS hr;
 
 CREATE SCHEMA IF NOT EXISTS leave;
 CREATE SCHEMA IF NOT EXISTS payroll;
@@ -261,19 +262,43 @@ CREATE OR REPLACE FUNCTION enforce_scheduled_employee_exits(
     p_enforced_by UUID DEFAULT NULL
 )
 RETURNS INTEGER AS $$
-DECLARE affected_count INTEGER := 0;
+DECLARE
+    affected_count INTEGER := 0;
+    v_enforced_by UUID;
 BEGIN
-    UPDATE employee_exit SET exit_state = 'effective', enforced_at = NOW(), enforced_by = p_enforced_by
-    WHERE exit_state = 'scheduled' AND exit_date <= p_effective_date;
+    -- Normalize the all-zero UUID (uuid.Nil from Go) to NULL. When the Go
+    -- caller passes uuid.Nil for automatic runs, we want enforced_by = NULL
+    -- in the DB — "system initiated", not "user 00000000-0000-...".
+    v_enforced_by := NULLIF(p_enforced_by, '00000000-0000-0000-0000-000000000000'::uuid);
+
+    UPDATE employee_exit
+    SET exit_state = 'effective',
+        enforced_at = NOW(),
+        enforced_by = v_enforced_by
+    WHERE exit_state = 'scheduled'
+      AND exit_date <= p_effective_date;
+
     GET DIAGNOSTICS affected_count = ROW_COUNT;
-    UPDATE company_employees ce SET is_active = false
-    FROM employee_exit ee WHERE ce.company_id = ee.company_id AND ce.user_id = ee.user_id AND ee.exit_state = 'effective' AND ce.is_active = true;
-    UPDATE employee_profiles ep SET employment_status = 'terminated', updated_at = NOW()
-    FROM employee_exit ee WHERE ep.company_id = ee.company_id AND ep.user_id = ee.user_id AND ee.exit_state = 'effective' AND ep.employment_status <> 'terminated';
+
+    UPDATE company_employees ce
+    SET is_active = false
+    FROM employee_exit ee
+    WHERE ce.company_id = ee.company_id
+      AND ce.user_id = ee.user_id
+      AND ee.exit_state = 'effective'
+      AND ce.is_active = true;
+
+    UPDATE employee_profiles ep
+    SET employment_status = 'terminated', updated_at = NOW()
+    FROM employee_exit ee
+    WHERE ep.company_id = ee.company_id
+      AND ep.user_id = ee.user_id
+      AND ee.exit_state = 'effective'
+      AND ep.employment_status <> 'terminated';
+
     RETURN affected_count;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION mark_employee_rehired(
     p_company_id UUID,
     p_user_id UUID
@@ -1790,6 +1815,12 @@ CREATE TABLE IF NOT EXISTS companies (
     max_locations           INTEGER NOT NULL DEFAULT 10,
     subscription_amount     NUMERIC(14,2) NOT NULL DEFAULT 0.00,
     data_region             VARCHAR(10) NOT NULL DEFAULT 'us',
+
+    -- ── NEW: company default timezone. IANA name. Fallback for all tz resolution.
+    --    App MUST override this at creation. The 'UTC' default is only a safety net
+    --    for direct SQL inserts; it will surface as wrong data if never set.
+    default_timezone        VARCHAR(50) NOT NULL DEFAULT 'UTC',
+
     is_active               BOOLEAN NOT NULL DEFAULT true,
     created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -1812,9 +1843,17 @@ CREATE TABLE IF NOT EXISTS companies (
     CONSTRAINT check_max_locations CHECK (max_locations > 0 AND max_locations <= 500),
     CONSTRAINT chk_subscription_status CHECK (
         subscription_status IN ('pending','trial', 'active', 'past_due', 'expired', 'cancelled')
+    ),
+    -- ── NEW: cheap format guard. Rejects "UTC+5:30", "IST", "+05:30".
+    --    Full validation happens in Go via time.LoadLocation.
+    CONSTRAINT chk_companies_default_tz_format CHECK (
+        default_timezone = 'UTC' OR default_timezone ~ '^[A-Za-z_]+/[A-Za-z_]+$'
     )
 );
 
+-- Add index for tz lookups (used by resolvers)
+CREATE INDEX IF NOT EXISTS idx_companies_default_tz
+    ON companies (default_timezone);
 -- ============================================================
 -- SUBSCRIPTION PLANS
 -- ============================================================
@@ -2016,14 +2055,29 @@ CREATE TABLE IF NOT EXISTS locations (
     state            VARCHAR(100),
     country          VARCHAR(100),
     pincode          VARCHAR(20),
+
+    -- ── NEW: per-site timezone. NULL means "inherit company default".
+    --    Sales, attendance, tax-day counting all resolve from here.
+    timezone         VARCHAR(50),
+
     is_active        BOOLEAN NOT NULL DEFAULT true,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT fk_locations_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
     CONSTRAINT uq_locations_company_code UNIQUE (company_id, location_code),
-    CONSTRAINT uq_locations_company_name UNIQUE (company_id, location_name)
+    CONSTRAINT uq_locations_company_name UNIQUE (company_id, location_name),
+    -- ── NEW: format guard
+    CONSTRAINT chk_locations_tz_format CHECK (
+        timezone IS NULL OR timezone = 'UTC' OR timezone ~ '^[A-Za-z_]+/[A-Za-z_]+$'
+    )
 );
 
+CREATE INDEX IF NOT EXISTS idx_locations_company_active ON locations (company_id) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_locations_code ON locations (location_code);
+-- ── NEW: index for tz-aware location lookups
+CREATE INDEX IF NOT EXISTS idx_locations_company_tz
+    ON locations (company_id, timezone)
+    WHERE timezone IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_locations_company_active ON locations (company_id) WHERE is_active = true;
 CREATE INDEX IF NOT EXISTS idx_locations_code ON locations (location_code);
 
@@ -2470,7 +2524,7 @@ CREATE TABLE IF NOT EXISTS leave.leave_ledger (
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT fk_leave_ledger_entitlement FOREIGN KEY (entitlement_id) REFERENCES leave.leave_entitlement(entitlement_id) ON DELETE CASCADE,
     CONSTRAINT fk_leave_ledger_request FOREIGN KEY (leave_request_id) REFERENCES leave.leave_request(leave_request_id) ON DELETE SET NULL,
-    CONSTRAINT check_entry_type CHECK (entry_type IN ('accrual', 'consumption', 'reversal'))
+    CONSTRAINT check_entry_type CHECK (entry_type IN ('grant', 'accrual', 'consumption', 'reversal', 'lapse', 'adjustment'))
 );
 
 CREATE TABLE IF NOT EXISTS leave.leave_balance_snapshot (
@@ -4538,10 +4592,13 @@ CREATE TABLE IF NOT EXISTS leave.resolver_job (
     position_id    UUID,
     job_type       VARCHAR(40) NOT NULL
         CHECK (job_type IN (
-            'resolve_user',
-            'resolve_company',
-            'resolve_position',
-            'end_entitlements'
+            'probation_reminder',
+            'probation_end_reached',
+            'notice_reminder',
+            'notice_expiry',
+            'on_hold_reminder',
+            'on_hold_expiry',
+            'leave.accrual.monthly'
         )),
     status         VARCHAR(20) NOT NULL DEFAULT 'queued'
         CHECK (status IN ('queued','processing','completed','failed','cancelled')),
@@ -4581,5 +4638,384 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_leave_resolver_job_pending_company
 CREATE UNIQUE INDEX IF NOT EXISTS uq_leave_resolver_job_pending_position
     ON leave.resolver_job (company_id, position_id, job_type)
     WHERE status IN ('queued','processing') AND position_id IS NOT NULL;
+
+-- ============================================================
+-- EMPLOYEE LIFECYCLE: PROBATION / NOTICE / ON-HOLD
+-- Termination itself lives in employee_exit (already exists).
+-- ============================================================
+
+CREATE TABLE employee_probation (
+    probation_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id         UUID NOT NULL,
+    user_id            UUID NOT NULL,
+    start_date         DATE NOT NULL,
+    end_date           DATE NOT NULL,
+    extension_count    INT  NOT NULL DEFAULT 0,
+    pay_percentage     NUMERIC(5,2) NOT NULL DEFAULT 100.00
+        CHECK (pay_percentage >= 0 AND pay_percentage <= 100),
+    status             VARCHAR(20) NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','confirmed','extended','failed')),
+    outcome_reason     TEXT,
+    confirmed_at       TIMESTAMPTZ,
+    confirmed_by       UUID,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_probation_membership FOREIGN KEY (company_id, user_id)
+        REFERENCES company_employees (company_id, user_id) ON DELETE CASCADE,
+    CONSTRAINT chk_probation_dates CHECK (end_date > start_date)
+);
+
+CREATE UNIQUE INDEX uq_probation_open
+    ON employee_probation (company_id, user_id)
+    WHERE status IN ('pending','extended');
+CREATE INDEX idx_probation_end_open
+    ON employee_probation (end_date)
+    WHERE status IN ('pending','extended');
+
+CREATE TABLE employee_notice (
+    notice_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id         UUID NOT NULL,
+    user_id            UUID NOT NULL,
+    start_date         DATE NOT NULL,
+    end_date           DATE NOT NULL,
+    reason             VARCHAR(100),
+    initiated_by       VARCHAR(20) NOT NULL
+        CHECK (initiated_by IN ('employee','employer')),
+    served             BOOLEAN NOT NULL DEFAULT true,
+    pay_percentage     NUMERIC(5,2) NOT NULL DEFAULT 100.00
+        CHECK (pay_percentage >= 0 AND pay_percentage <= 100),
+    status             VARCHAR(20) NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active','completed','cancelled')),
+    exit_id            UUID,   -- set when employee_exit row is created
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by         UUID,
+    CONSTRAINT fk_notice_membership FOREIGN KEY (company_id, user_id)
+        REFERENCES company_employees (company_id, user_id) ON DELETE CASCADE,
+    CONSTRAINT fk_notice_exit FOREIGN KEY (exit_id)
+        REFERENCES employee_exit(exit_id) ON DELETE SET NULL,
+    CONSTRAINT chk_notice_dates CHECK (end_date >= start_date)
+);
+
+CREATE UNIQUE INDEX uq_notice_active
+    ON employee_notice (company_id, user_id)
+    WHERE status = 'active';
+CREATE INDEX idx_notice_end_active
+    ON employee_notice (end_date)
+    WHERE status = 'active';
+
+CREATE TABLE employee_on_hold (
+    on_hold_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id         UUID NOT NULL,
+    user_id            UUID NOT NULL,
+    start_date         DATE NOT NULL,
+    end_date           DATE,          -- NULL = open-ended, HR must close manually
+    reason             TEXT NOT NULL,
+    previous_status    VARCHAR(30) NOT NULL,
+    pay_percentage     NUMERIC(5,2) NOT NULL DEFAULT 100.00
+        CHECK (pay_percentage >= 0 AND pay_percentage <= 100),
+    status             VARCHAR(20) NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active','ended')),
+    ended_at           TIMESTAMPTZ,
+    ended_by           UUID,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by         UUID,
+    CONSTRAINT fk_onhold_membership FOREIGN KEY (company_id, user_id)
+        REFERENCES company_employees (company_id, user_id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX uq_onhold_active
+    ON employee_on_hold (company_id, user_id)
+    WHERE status = 'active';
+CREATE INDEX idx_onhold_end_active
+    ON employee_on_hold (end_date)
+    WHERE status = 'active' AND end_date IS NOT NULL;
+
+CREATE TRIGGER update_employee_probation_updated_at
+    BEFORE UPDATE ON employee_probation FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();    
+
+
+ALTER TABLE employee_exit
+    ADD COLUMN IF NOT EXISTS notice_id UUID
+        REFERENCES employee_notice(notice_id) ON DELETE SET NULL;
+
+-- and stop treating exit_state='rehired' as a valid terminal state,
+-- it's a soft-delete of the exit record. Already handled by the rehire fn.
+
+-- ============================================================
+-- HR LIFECYCLE SCHEDULER
+-- Mirrors leave.resolver_job. One worker polls this.
+-- ============================================================
+
+CREATE TABLE hr.scheduled_job (
+    job_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id     UUID NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
+    user_id        UUID,
+    job_type       VARCHAR(40) NOT NULL
+        CHECK (job_type IN (
+            'probation_reminder',
+            'probation_end_reached',
+            'notice_reminder',
+            'notice_expiry',
+            'on_hold_reminder',
+            'on_hold_expiry'
+        )),
+    status         VARCHAR(20) NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued','processing','completed','failed','cancelled')),
+    run_at         TIMESTAMPTZ NOT NULL,
+    attempts       INT NOT NULL DEFAULT 0,
+    max_attempts   INT NOT NULL DEFAULT 5,
+    priority       INT NOT NULL DEFAULT 5,
+    payload        JSONB,
+    error_message  TEXT,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at     TIMESTAMPTZ,
+    completed_at   TIMESTAMPTZ,
+    locked_by      TEXT,
+    locked_at      TIMESTAMPTZ
+);
+
+CREATE INDEX idx_hr_job_runnable
+    ON hr.scheduled_job (priority, run_at)
+    WHERE status = 'queued';
+
+CREATE INDEX idx_hr_job_company
+    ON hr.scheduled_job (company_id, job_type, status);
+
+CREATE INDEX idx_hr_job_stale
+    ON hr.scheduled_job (locked_at)
+    WHERE status = 'processing';
+
+-- Dedup: at most one queued job of the same type per employee.
+CREATE UNIQUE INDEX uq_hr_job_pending_user
+    ON hr.scheduled_job (company_id, user_id, job_type, run_at)
+    WHERE status IN ('queued','processing')
+      AND user_id IS NOT NULL;
+CREATE OR REPLACE FUNCTION close_notice_on_exit()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.exit_state = 'effective' AND OLD.exit_state = 'scheduled' THEN
+        UPDATE employee_notice
+           SET status = 'completed'
+         WHERE exit_id = NEW.exit_id
+           AND status  = 'active';
+    END IF;
+    IF NEW.exit_state = 'cancelled' AND OLD.exit_state = 'scheduled' THEN
+        UPDATE employee_notice
+           SET status = 'cancelled'
+         WHERE exit_id = NEW.exit_id
+           AND status  = 'active';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_close_notice_on_exit
+    AFTER UPDATE OF exit_state ON employee_exit
+    FOR EACH ROW
+    EXECUTE FUNCTION close_notice_on_exit();
+-- notice_expiry: nothing to do — the existing nightly job covers it.
+-- Just need to enqueue it in the first place. So the worker only handles:
+--   - probation_reminder  → emit notification
+--   - probation_end_reached → emit notification (do NOT change status)
+--   - on_hold_expiry      → restore previous_status
+
+CREATE OR REPLACE FUNCTION apply_on_hold_expiry(p_job_id UUID)
+RETURNS VOID AS $$
+DECLARE v_company UUID; v_user UUID; v_prev VARCHAR(30);
+BEGIN
+    SELECT company_id, user_id, previous_status
+      INTO v_company, v_user, v_prev
+      FROM employee_on_hold
+     WHERE status = 'active'
+       AND end_date <= CURRENT_DATE
+     LIMIT 1
+     FOR UPDATE SKIP LOCKED;
+
+    IF NOT FOUND THEN RETURN; END IF;
+
+    UPDATE employee_on_hold
+       SET status = 'ended', ended_at = NOW()
+     WHERE company_id = v_company AND user_id = v_user AND status = 'active';
+
+    UPDATE employee_profiles
+       SET employment_status = v_prev, updated_at = NOW()
+     WHERE company_id = v_company AND user_id = v_user
+       AND employment_status = 'on_hold';
+END;
+$$ LANGUAGE plpgsql;    
+CREATE TABLE hr.reminder (
+    reminder_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id        UUID NOT NULL,
+    recipient_id      UUID NOT NULL,          -- HR user who sees it
+    recipient_type    VARCHAR(20) NOT NULL DEFAULT 'hr'
+        CHECK (recipient_type IN ('hr','manager','admin')),
+
+    subject_user_id   UUID,                   -- employee it's about (nullable for company-wide)
+
+    reminder_type     VARCHAR(50) NOT NULL,
+    severity          VARCHAR(20) NOT NULL DEFAULT 'info'
+        CHECK (severity IN ('info','warning','critical')),
+
+    title             TEXT NOT NULL,
+    body              TEXT,
+
+    action_type       VARCHAR(30),            -- 'navigate' | 'approve' | 'open_form'
+    action_payload    JSONB,                  -- { screen: 'probation', employee_id: '...' }
+
+    metadata          JSONB,
+
+    status            VARCHAR(20) NOT NULL DEFAULT 'unread'
+        CHECK (status IN ('unread','read','dismissed','actioned')),
+    read_at           TIMESTAMPTZ,
+    actioned_at       TIMESTAMPTZ,
+    dismissed_at      TIMESTAMPTZ,
+
+    -- Auto-hide noisy rows after a while (probation T-14 reminder is useless at T-0)
+    expires_at        TIMESTAMPTZ,
+
+    -- One row per (recipient, subject, type, day). Re-runs are silent no-ops.
+    dedupe_key        TEXT NOT NULL,
+
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Feed query: recent, unread first, per recipient
+CREATE INDEX idx_reminder_recipient_feed
+    ON hr.reminder (recipient_id, status, created_at DESC);
+
+-- Badge count: cheap unread fetch
+CREATE INDEX idx_reminder_unread_count
+    ON hr.reminder (recipient_id)
+    WHERE status = 'unread';
+
+-- Dedup guard (re-running the same reminder on the same day does nothing)
+CREATE UNIQUE INDEX uq_reminder_dedupe
+    ON hr.reminder (recipient_id, dedupe_key);
+
+-- Purge index
+CREATE INDEX idx_reminder_expires
+    ON hr.reminder (expires_at)
+    WHERE expires_at IS NOT NULL AND status = 'unread';
+-- Every reminder is stamped with the location it belongs to.
+-- NULL = company-wide (visible to everyone with scope ALL).
+ALTER TABLE hr.reminder
+    ADD COLUMN location_id UUID REFERENCES locations(location_id) ON DELETE SET NULL;
+
+-- Feed query: recipient + location + recent
+CREATE INDEX idx_reminder_recipient_location_feed
+    ON hr.reminder (recipient_id, location_id, status, created_at DESC);
+
+-- Badge count: recipient + location, unread only
+CREATE INDEX idx_reminder_unread_by_location
+    ON hr.reminder (recipient_id, location_id)
+    WHERE status = 'unread';    
+-- migrations/YYYYMMDDHHMMSS_employee_search_by_status.sql
+--
+-- Extends search_company_employee_ids with an employment_status filter.
+-- Callers pass NULL or 'all' to keep the old behavior (no status filter).
+--
+-- Backwards compatible: search_company_employee_ids is left untouched.
+
+CREATE OR REPLACE FUNCTION search_company_employee_ids_by_status(
+    p_company_id  uuid,
+    p_query       text,
+    p_location_ids uuid[],
+    p_status      text,
+    p_limit       integer,
+    p_offset      integer
+)
+RETURNS TABLE(user_id uuid)
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT ce.user_id
+    FROM company_employees ce
+    INNER JOIN users u
+        ON u.user_id = ce.user_id
+    LEFT JOIN employee_profiles ep
+        ON ep.company_id = ce.company_id
+       AND ep.user_id    = ce.user_id
+    WHERE ce.company_id = p_company_id
+      AND (
+            p_location_ids IS NULL
+         OR cardinality(p_location_ids) = 0
+         OR ce.primary_location_id = ANY(p_location_ids)
+      )
+      AND (
+            p_status IS NULL
+         OR p_status = ''
+         OR p_status = 'all'
+         OR ep.employment_status = p_status
+      )
+      AND (
+            p_query IS NULL
+         OR p_query = ''
+         OR u.user_search_tsv @@ websearch_to_tsquery('simple', p_query)
+         OR u.username ILIKE '%' || p_query || '%'
+         OR coalesce(u.full_name, '') ILIKE '%' || p_query || '%'
+      )
+    ORDER BY u.full_name NULLS LAST, u.username
+    LIMIT  p_limit
+    OFFSET p_offset;
+$$;
+
+-- Matching COUNT function so the handler can return total for pagination.
+CREATE OR REPLACE FUNCTION count_company_employee_ids_by_status(
+    p_company_id  uuid,
+    p_query       text,
+    p_location_ids uuid[],
+    p_status      text
+)
+RETURNS bigint
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT COUNT(*)
+    FROM company_employees ce
+    INNER JOIN users u
+        ON u.user_id = ce.user_id
+    LEFT JOIN employee_profiles ep
+        ON ep.company_id = ce.company_id
+       AND ep.user_id    = ce.user_id
+    WHERE ce.company_id = p_company_id
+      AND (
+            p_location_ids IS NULL
+         OR cardinality(p_location_ids) = 0
+         OR ce.primary_location_id = ANY(p_location_ids)
+      )
+      AND (
+            p_status IS NULL
+         OR p_status = ''
+         OR p_status = 'all'
+         OR ep.employment_status = p_status
+      )
+      AND (
+            p_query IS NULL
+         OR p_query = ''
+         OR u.user_search_tsv @@ websearch_to_tsquery('simple', p_query)
+         OR u.username ILIKE '%' || p_query || '%'
+         OR coalesce(u.full_name, '') ILIKE '%' || p_query || '%'
+      );
+$$;    
+-- Prevent double-posting the same day's accrual for the same entitlement.
+-- Required for the ON CONFLICT clause in the accrual ledger insert.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_leave_ledger_accrual_per_entitlement_date
+    ON leave.leave_ledger (entitlement_id, (entry_date::date))
+    WHERE entry_type = 'accrual';
+
+-- Same guard for opening grants.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_leave_ledger_grant_per_entitlement_date
+    ON leave.leave_ledger (entitlement_id, (entry_date::date))
+    WHERE entry_type = 'grant';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_scheduled_job_monthly_accrual
+    ON hr.scheduled_job (
+        company_id,
+        job_type,
+        ((payload->>'accrual_date'))
+    )
+    WHERE user_id IS NULL
+      AND job_type = 'leave.accrual.monthly'
+      AND status IN ('queued', 'processing');
 EOSQL
 echo "✅ Main schema initialized successfully!"

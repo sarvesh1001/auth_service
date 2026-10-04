@@ -31,19 +31,27 @@ import (
 var ErrEmployeeOutsideScope = errors.New("employee belongs to a different location than your current scope")
 var ErrEmployeeHasNoLocation = errors.New("target employee has no employment location assigned")
 
+// Lifecycle-specific errors
+var (
+	ErrProbationAlreadyOpen = errors.New("employee already has an open probation")
+	ErrNoticeAlreadyActive  = errors.New("employee already has an active notice")
+	ErrOnHoldAlreadyActive  = errors.New("employee is already on hold")
+)
+
 // ============================================================================
 // EMPLOYEE SERVICE
 // ============================================================================
 
 type EmployeeService struct {
 	employeeRepo      repository.EmployeeRepository
+	scheduledJobs     repository.ScheduledJobRepository
+	reminderSvc       *ReminderService
 	auditService      *audit.AuditService
 	idempotencyStore  idempotency.Store
 	documentStorage   DocumentStorage
 	encryptionMgr     *encryption.EncryptionManager
 	maxDocumentSizeMB int
 
-	// 👇 ADD
 	pgClient     *client.PostgresClient
 	resolverJobs leaveRepo.ResolverJobRepository
 }
@@ -56,11 +64,13 @@ type EmployeeServiceConfig struct {
 
 func NewEmployeeService(
 	employeeRepo repository.EmployeeRepository,
+	scheduledJobs repository.ScheduledJobRepository,
+	reminderSvc *ReminderService,
 	auditService *audit.AuditService,
 	idempotencyStore idempotency.Store,
 	config EmployeeServiceConfig,
-	pgClient *client.PostgresClient, // 👈 ADD
-	resolverJobs leaveRepo.ResolverJobRepository, // 👈 ADD
+	pgClient *client.PostgresClient,
+	resolverJobs leaveRepo.ResolverJobRepository,
 ) *EmployeeService {
 	if auditService == nil {
 		panic("auditService is required for EmployeeService")
@@ -80,12 +90,20 @@ func NewEmployeeService(
 	if resolverJobs == nil {
 		panic("resolverJobs is required for EmployeeService")
 	}
+	if scheduledJobs == nil {
+		panic("scheduledJobs is required for EmployeeService")
+	}
+	if reminderSvc == nil {
+		panic("reminderSvc is required for EmployeeService")
+	}
 	if config.MaxDocumentSizeMB <= 0 {
 		config.MaxDocumentSizeMB = 50
 	}
 
 	return &EmployeeService{
 		employeeRepo:      employeeRepo,
+		scheduledJobs:     scheduledJobs,
+		reminderSvc:       reminderSvc,
 		auditService:      auditService,
 		idempotencyStore:  idempotencyStore,
 		documentStorage:   config.DocumentStorage,
@@ -310,6 +328,24 @@ func (s *EmployeeService) CreateEmployeeProfile(
 		return nil, fmt.Errorf("failed to create employee profile: %w", err)
 	}
 
+	// Auto-open a probation row if the hire carries a probation window.
+	// Non-fatal: we never fail the hire for this.
+	if profile.ProbationEndDate != nil {
+		if _, err := s.StartProbation(ctx,
+			profile.CompanyID,
+			profile.UserID,
+			profile.CreatedAt,
+			*profile.ProbationEndDate,
+			100,
+		); err != nil {
+			zap.L().Warn("auto StartProbation failed on hire",
+				zap.String("company_id", profile.CompanyID.String()),
+				zap.String("user_id", profile.UserID.String()),
+				zap.Error(err),
+			)
+		}
+	}
+
 	afterJSON, _ := json.Marshal(profile)
 
 	ip, _ := ctx.Value("ip_address").(string)
@@ -366,6 +402,10 @@ func (s *EmployeeService) CreateEmployeeProfileInTx(
 	if err := s.employeeRepo.CreateEmployeeProfileTx(ctx, tx, profile); err != nil {
 		return nil, fmt.Errorf("failed to create employee profile (tx): %w", err)
 	}
+
+	// NOTE: StartProbation is NOT called here. It uses the non-tx repo and
+	// would deadlock against the caller's tx. The caller (CompanyService.AddMember)
+	// must call StartProbation AFTER the tx commits.
 
 	out := *profile
 	s.decryptPIIFields(ctx, &out)
@@ -427,10 +467,12 @@ func (s *EmployeeService) UpdateEmployeeProfile(
 			if empType, ok := value.(string); ok {
 				updatedProfile.EmploymentType = &empType
 			}
-		case "employment_status":
-			if status, ok := value.(string); ok {
-				updatedProfile.EmploymentStatus = &status
-			}
+		// NOTE: "employment_status" deliberately NOT handled here.
+		// Status only changes through the lifecycle methods
+		// (StartProbation / ConfirmProbation / FailProbation /
+		//  StartNotice / CancelNotice / StartOnHold / EndOnHold),
+		// which keep the probation/notice/on_hold tables in sync.
+		// Allowing it here would let a caller bypass the whole flow.
 		case "job_title":
 			if title, ok := value.(string); ok {
 				updatedProfile.JobTitle = &title
@@ -768,9 +810,14 @@ func (s *EmployeeService) CreateEmployeeExit(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) (*employee.EmployeeExit, error) {
+	// NOTE: idempotency key is per-CALL, not per-user. Using userID would
+	// cache the exit forever and return a stale (possibly cancelled) exit
+	// when the same employee starts a new notice later. The DB unique index
+	// uq_employee_exit_active + the "already scheduled" check below enforce
+	// the one-scheduled-exit-per-user invariant.
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
-		idempKey = fmt.Sprintf("exit-%s", userID.String())
+		idempKey = fmt.Sprintf("exit-%s", uuid.New().String())
 	}
 	var cached *employee.EmployeeExit
 	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
@@ -825,10 +872,6 @@ func (s *EmployeeService) CreateEmployeeExit(
 // POSITION WRITES
 // ============================================================================
 
-// ============================================================================
-// POSITION WRITES
-// ============================================================================
-
 func (s *EmployeeService) CreatePosition(
 	ctx context.Context,
 	position *employee.Position,
@@ -863,8 +906,6 @@ func (s *EmployeeService) CreatePosition(
 	afterJSON, _ := json.Marshal(position)
 	ip, _ := ctx.Value("ip_address").(string)
 
-	// Audit metadata now carries the new schema fields (job_id + location_id)
-	// and the seat's title override rather than the old `Title`.
 	auditMeta := mergeMetadata(metadata, map[string]interface{}{
 		"ip":             ip,
 		"position_id":    position.PositionID.String(),
@@ -913,7 +954,7 @@ func (s *EmployeeService) RehireEmployee(
 		return err
 	}
 
-	// 👇 Enqueue resolver job.
+	// Enqueue resolver job.
 	if err := s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
 		return s.resolverJobs.EnqueueUserResolution(ctx, tx, companyID, userID, "rehire")
 	}); err != nil {
@@ -940,6 +981,19 @@ func (s *EmployeeService) RehireEmployee(
 // SYSTEM OPERATIONS
 // ============================================================================
 
+// EnforceScheduledEmployeeExits runs the nightly transition:
+//
+//  1. Flip employee_exit.exit_state 'scheduled' → 'effective' for exits
+//     whose exit_date <= effectiveDate.
+//  2. Cascade: deactivate company_employees, set employment_status =
+//     'terminated', close the linked notice row (via DB trigger).
+//  3. For each affected (company, user):
+//     - enqueue leave end_entitlements resolver job
+//     - cancel any pending reminder/expiry jobs
+//     - close any open reminders (probation / notice / on-hold)
+//
+// The whole thing is idempotent — rerunning it on the same date is a no-op
+// once the exit is 'effective'.
 func (s *EmployeeService) EnforceScheduledEmployeeExits(
 	ctx context.Context,
 	effectiveDate time.Time,
@@ -957,9 +1011,11 @@ func (s *EmployeeService) EnforceScheduledEmployeeExits(
 		return 0, err
 	}
 
-	// 3. Enqueue end_entitlements for each (company, user) that just exited.
+	// 3. Per-employee cleanup: leave resolver enqueue, pending job cancellation,
+	//    and open reminder closure.
 	logger := zap.L()
 	for _, p := range pairs {
+		// 3a. Enqueue leave end-entitlements resolver job.
 		if err := s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
 			return s.resolverJobs.EnqueueEndEntitlements(ctx, tx, p.CompanyID, p.UserID, "scheduled exit")
 		}); err != nil {
@@ -969,6 +1025,39 @@ func (s *EmployeeService) EnforceScheduledEmployeeExits(
 				zap.Error(err),
 			)
 		}
+
+		// 3b. Cancel any pending lifecycle jobs. They are meaningless now —
+		//     the employee is terminated. Leaving them queued would cause
+		//     the worker to fire "notice ends in 3 days" for a person who
+		//     is already gone.
+		uid := p.UserID
+		if err := s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
+			for _, jt := range []string{
+				employee.JobProbationReminder,
+				employee.JobProbationEndReached,
+				employee.JobNoticeReminder,
+				employee.JobOnHoldReminder,
+				employee.JobOnHoldExpiry,
+			} {
+				if err := s.scheduledJobs.CancelJobs(ctx, tx, p.CompanyID, &uid, jt); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			logger.Warn("cancel pending lifecycle jobs failed",
+				zap.String("company_id", p.CompanyID.String()),
+				zap.String("user_id", p.UserID.String()),
+				zap.Error(err),
+			)
+		}
+
+		// 3c. Close any open reminders. They stay in history (status='actioned')
+		//     but drop out of the HR unread badge. HR no longer needs to
+		//     "act" on a probation that will never be confirmed.
+		s.reminderSvc.MarkActioned(ctx, p.CompanyID, p.UserID, ReminderTypePrefixProbation)
+		s.reminderSvc.MarkActioned(ctx, p.CompanyID, p.UserID, ReminderTypePrefixNotice)
+		s.reminderSvc.MarkActioned(ctx, p.CompanyID, p.UserID, ReminderTypePrefixOnHold)
 	}
 	return count, nil
 }
@@ -998,6 +1087,621 @@ func (s *EmployeeService) GetEmployeeProfileByID(
 	}
 	s.decryptPIIFields(ctx, profile)
 	return profile, nil
+}
+
+// ============================================================================
+// EMPLOYEE LIFECYCLE — PROBATION / NOTICE / ON-HOLD
+// ============================================================================
+
+// setEmploymentStatus is the ONLY place that should write employment_status
+// outside of the lifecycle methods. It talks to the repo directly (no
+// service-level idempotency cache) so consecutive transitions don't collide.
+func (s *EmployeeService) setEmploymentStatus(
+	ctx context.Context, companyID, userID uuid.UUID, status string,
+) error {
+	prof, err := s.employeeRepo.GetEmployeeProfileByUserID(ctx, userID, companyID)
+	if err != nil {
+		return fmt.Errorf("setEmploymentStatus: fetch profile: %w", err)
+	}
+	prev := ""
+	if prof.EmploymentStatus != nil {
+		prev = *prof.EmploymentStatus
+	}
+	if prev == status {
+		return nil
+	}
+	prof.EmploymentStatus = &status
+	prof.UpdatedAt = time.Now().UTC()
+	return s.employeeRepo.UpdateEmployeeProfile(ctx, prof)
+}
+
+// ---- PROBATION ----
+
+func (s *EmployeeService) StartProbation(
+	ctx context.Context,
+	companyID, userID uuid.UUID,
+	start, end time.Time,
+	payPct float64,
+) (*employee.EmployeeProbation, error) {
+	if !end.After(start) {
+		return nil, fmt.Errorf("probation end must be after start")
+	}
+	if payPct <= 0 {
+		payPct = 100
+	}
+	if _, err := s.employeeRepo.GetActiveProbation(ctx, companyID, userID); err == nil {
+		return nil, ErrProbationAlreadyOpen
+	}
+
+	p := &employee.EmployeeProbation{
+		ProbationID:   uuid.New(),
+		CompanyID:     companyID,
+		UserID:        userID,
+		StartDate:     start,
+		EndDate:       end,
+		PayPercentage: payPct,
+		Status:        "pending",
+	}
+	if err := s.employeeRepo.CreateProbation(ctx, p); err != nil {
+		return nil, err
+	}
+	if err := s.setEmploymentStatus(ctx, companyID, userID, "probation"); err != nil {
+		return nil, err
+	}
+	s.enqueueProbationReminders(ctx, companyID, userID, p.ProbationID, end)
+	return p, nil
+}
+
+func (s *EmployeeService) ConfirmProbation(
+	ctx context.Context,
+	companyID, userID, actorID uuid.UUID, note string,
+) (*employee.EmployeeProbation, error) {
+	p, err := s.employeeRepo.GetActiveProbation(ctx, companyID, userID)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	p.Status = "confirmed"
+	p.ConfirmedAt = &now
+	p.ConfirmedBy = &actorID
+	if note != "" {
+		p.OutcomeReason = &note
+	}
+	if err := s.employeeRepo.UpdateProbationStatus(ctx, p); err != nil {
+		return nil, err
+	}
+	if err := s.setEmploymentStatus(ctx, companyID, userID, "active"); err != nil {
+		return nil, err
+	}
+	s.cancelJobs(ctx, companyID, userID, employee.JobProbationReminder)
+	s.cancelJobs(ctx, companyID, userID, employee.JobProbationEndReached)
+
+	// Close out every open probation reminder about this employee so they
+	// drop out of the HR unread feed.
+	s.reminderSvc.MarkActioned(ctx, companyID, userID, ReminderTypePrefixProbation)
+
+	afterJSON, _ := json.Marshal(p)
+	_ = s.auditService.LogAction(
+		ctx, nil, &companyID, "hr",
+		"employee.probation.confirm", "employee_probation", &p.ProbationID,
+		"user", &actorID, []byte("{}"), afterJSON,
+		map[string]interface{}{
+			"probation_id": p.ProbationID.String(),
+			"user_id":      userID.String(),
+			"company_id":   companyID.String(),
+			"note":         note,
+		},
+	)
+	return p, nil
+}
+
+func (s *EmployeeService) FailProbation(
+	ctx context.Context,
+	companyID, userID, actorID uuid.UUID,
+	reason string, terminationDate time.Time,
+) error {
+	p, err := s.employeeRepo.GetActiveProbation(ctx, companyID, userID)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	p.Status = "failed"
+	p.ConfirmedAt = &now
+	p.ConfirmedBy = &actorID
+	p.OutcomeReason = &reason
+	if err := s.employeeRepo.UpdateProbationStatus(ctx, p); err != nil {
+		return err
+	}
+
+	// No notice period — straight to a scheduled exit.
+	if _, err := s.CreateEmployeeExit(ctx, userID, companyID, terminationDate,
+		"probation_failed", false, "user", actorID, nil); err != nil {
+		return err
+	}
+
+	s.cancelJobs(ctx, companyID, userID, employee.JobProbationReminder)
+	s.cancelJobs(ctx, companyID, userID, employee.JobProbationEndReached)
+
+	// Close out every open probation reminder — the decision has been made.
+	s.reminderSvc.MarkActioned(ctx, companyID, userID, ReminderTypePrefixProbation)
+
+	afterJSON, _ := json.Marshal(p)
+	_ = s.auditService.LogAction(
+		ctx, nil, &companyID, "hr",
+		"employee.probation.fail", "employee_probation", &p.ProbationID,
+		"user", &actorID, []byte("{}"), afterJSON,
+		map[string]interface{}{
+			"probation_id":     p.ProbationID.String(),
+			"user_id":          userID.String(),
+			"company_id":       companyID.String(),
+			"reason":           reason,
+			"termination_date": terminationDate,
+		},
+	)
+	return nil
+}
+
+func (s *EmployeeService) ExtendProbation(
+	ctx context.Context,
+	companyID, userID, actorID uuid.UUID,
+	newEnd time.Time, reason string,
+) (*employee.EmployeeProbation, error) {
+	p, err := s.employeeRepo.GetActiveProbation(ctx, companyID, userID)
+	if err != nil {
+		return nil, err
+	}
+	if p.ExtensionCount >= 2 {
+		return nil, fmt.Errorf("probation can only be extended twice")
+	}
+	if !newEnd.After(p.EndDate) {
+		return nil, fmt.Errorf("new end must be after current end")
+	}
+	p.ExtensionCount++
+	p.EndDate = newEnd
+	p.Status = "extended"
+	if reason != "" {
+		p.OutcomeReason = &reason
+	}
+	if err := s.employeeRepo.UpdateProbationStatus(ctx, p); err != nil {
+		return nil, err
+	}
+	s.cancelJobs(ctx, companyID, userID, employee.JobProbationReminder)
+	s.cancelJobs(ctx, companyID, userID, employee.JobProbationEndReached)
+	s.enqueueProbationReminders(ctx, companyID, userID, p.ProbationID, newEnd)
+
+	// NOTE: we intentionally do NOT MarkActioned here. The probation is
+	// still open, just with a new end date. Old reminders expire naturally
+	// via ExpiresIn; new ones are scheduled with the new end date.
+
+	afterJSON, _ := json.Marshal(p)
+	_ = s.auditService.LogAction(
+		ctx, nil, &companyID, "hr",
+		"employee.probation.extend", "employee_probation", &p.ProbationID,
+		"user", &actorID, []byte("{}"), afterJSON,
+		map[string]interface{}{
+			"probation_id":    p.ProbationID.String(),
+			"user_id":         userID.String(),
+			"company_id":      companyID.String(),
+			"new_end":         newEnd,
+			"extension_count": p.ExtensionCount,
+		},
+	)
+	return p, nil
+}
+
+// ---- NOTICE ----
+
+func (s *EmployeeService) StartNotice(
+	ctx context.Context,
+	companyID, userID, actorID uuid.UUID,
+	endDate time.Time,
+	reason, initiatedBy string,
+	served bool, payPct float64,
+) (*employee.EmployeeNotice, error) {
+	if initiatedBy != "employee" && initiatedBy != "employer" {
+		return nil, fmt.Errorf("initiated_by must be employee or employer")
+	}
+	if served && !endDate.After(time.Now()) {
+		return nil, fmt.Errorf("notice end must be in the future")
+	}
+	if payPct <= 0 {
+		payPct = 100
+	}
+	if _, err := s.employeeRepo.GetActiveNotice(ctx, companyID, userID); err == nil {
+		return nil, ErrNoticeAlreadyActive
+	}
+
+	// Status guard: an employee must be 'active' to start notice. Probation
+	// must be resolved first (confirm or fail) — otherwise open probation
+	// reminders linger forever and the transition is ambiguous.
+	prof, err := s.employeeRepo.GetEmployeeProfileByUserID(ctx, userID, companyID)
+	if err != nil {
+		return nil, fmt.Errorf("load profile: %w", err)
+	}
+	if prof.EmploymentStatus == nil {
+		return nil, fmt.Errorf("employee has no employment status set")
+	}
+	switch *prof.EmploymentStatus {
+	case "active":
+		// ok
+	case "probation":
+		return nil, fmt.Errorf("employee is on probation — confirm or fail probation first")
+	case "notice":
+		return nil, ErrNoticeAlreadyActive
+	case "on_hold":
+		return nil, fmt.Errorf("employee is on hold — end the hold first")
+	case "terminated":
+		return nil, fmt.Errorf("employee is already terminated")
+	default:
+		return nil, fmt.Errorf("cannot start notice from status %q", *prof.EmploymentStatus)
+	}
+
+	// 1. schedule the exit first so we can link notice → exit
+	exit, err := s.CreateEmployeeExit(ctx, userID, companyID, endDate,
+		reason, initiatedBy == "employee", "user", actorID, nil)
+	if err != nil {
+		return nil, fmt.Errorf("schedule exit: %w", err)
+	}
+
+	// 2. create the notice row, linked to the exit
+	reasonCopy := reason
+	n := &employee.EmployeeNotice{
+		NoticeID:      uuid.New(),
+		CompanyID:     companyID,
+		UserID:        userID,
+		StartDate:     time.Now().UTC().Truncate(24 * time.Hour),
+		EndDate:       endDate,
+		Reason:        &reasonCopy,
+		InitiatedBy:   initiatedBy,
+		Served:        served,
+		PayPercentage: payPct,
+		Status:        "active",
+		ExitID:        &exit.ExitID,
+		CreatedBy:     &actorID,
+	}
+	if err := s.employeeRepo.CreateNotice(ctx, n); err != nil {
+		return nil, fmt.Errorf("create notice: %w", err)
+	}
+	if err := s.employeeRepo.AttachNoticeToExit(ctx, n.NoticeID, exit.ExitID); err != nil {
+		return nil, fmt.Errorf("attach notice to exit: %w", err)
+	}
+
+	// 3. flip the profile status
+	if err := s.setEmploymentStatus(ctx, companyID, userID, "notice"); err != nil {
+		return nil, err
+	}
+
+	// 3a. Close any open probation reminders in the HR feed. With the
+	//     status guard above, this is only reachable from 'active', so
+	//     there shouldn't be open probation reminders — but the call is
+	//     cheap insurance against races.
+	s.reminderSvc.MarkActioned(ctx, companyID, userID, ReminderTypePrefixProbation)
+
+	// 4. schedule T-3 and T-1 reminders before the notice ends
+	s.enqueueNoticeReminders(ctx, companyID, userID, n.NoticeID, endDate)
+
+	// 5. compute day counters for the response
+	s.populateNoticeCounts(n)
+
+	// 6. audit
+	afterJSON, _ := json.Marshal(n)
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.auditService.LogAction(
+		ctx, nil, &companyID, "hr",
+		"employee.notice.start", "employee_notice", &n.NoticeID,
+		"user", &actorID, []byte("{}"), afterJSON,
+		map[string]interface{}{
+			"ip":         ip,
+			"notice_id":  n.NoticeID.String(),
+			"user_id":    userID.String(),
+			"company_id": companyID.String(),
+			"end_date":   endDate,
+			"initiated":  initiatedBy,
+			"served":     served,
+		},
+	)
+	return n, nil
+}
+
+func (s *EmployeeService) CancelNotice(
+	ctx context.Context,
+	companyID, userID, actorID uuid.UUID, reason string,
+) error {
+	n, err := s.employeeRepo.GetActiveNotice(ctx, companyID, userID)
+	if err != nil {
+		return err
+	}
+	if err := s.employeeRepo.UpdateNoticeStatus(ctx, n.NoticeID, "cancelled"); err != nil {
+		return err
+	}
+	if n.ExitID != nil {
+		if err := s.employeeRepo.CancelEmployeeExit(ctx, *n.ExitID); err != nil {
+			return err
+		}
+	}
+	if err := s.setEmploymentStatus(ctx, companyID, userID, "active"); err != nil {
+		return err
+	}
+
+	// Cancel any queued notice reminders.
+	s.cancelJobs(ctx, companyID, userID, employee.JobNoticeReminder)
+
+	// Close out open notice reminders in the HR feed.
+	s.reminderSvc.MarkActioned(ctx, companyID, userID, ReminderTypePrefixNotice)
+
+	_ = s.auditService.LogAction(
+		ctx, nil, &companyID, "hr",
+		"employee.notice.cancel", "employee_notice", &n.NoticeID,
+		"user", &actorID, nil, nil,
+		map[string]interface{}{
+			"notice_id":  n.NoticeID.String(),
+			"user_id":    userID.String(),
+			"company_id": companyID.String(),
+			"reason":     reason,
+		},
+	)
+	return nil
+}
+
+// ---- ON HOLD ----
+
+func (s *EmployeeService) StartOnHold(
+	ctx context.Context,
+	companyID, userID, actorID uuid.UUID,
+	start time.Time, end *time.Time,
+	reason string, payPct float64,
+) (*employee.EmployeeOnHold, error) {
+	if reason == "" {
+		return nil, fmt.Errorf("reason is required")
+	}
+	if payPct <= 0 {
+		payPct = 100
+	}
+	if _, err := s.employeeRepo.GetActiveOnHold(ctx, companyID, userID); err == nil {
+		return nil, ErrOnHoldAlreadyActive
+	}
+
+	prof, err := s.employeeRepo.GetEmployeeProfileByUserID(ctx, userID, companyID)
+	if err != nil {
+		return nil, err
+	}
+	prev := "active"
+	if prof.EmploymentStatus != nil {
+		prev = *prof.EmploymentStatus
+	}
+
+	// Status guard: on-hold is only meaningful for a fully active employee.
+	// Probation must be resolved, notice must be cancelled first, and a
+	// terminated employee obviously can't be put on hold.
+	switch prev {
+	case "active":
+		// ok
+	case "probation":
+		return nil, fmt.Errorf("cannot place a probationary employee on hold — confirm or fail probation first")
+	case "notice":
+		return nil, fmt.Errorf("cannot place an employee on notice on hold — cancel or complete the notice first")
+	case "on_hold":
+		return nil, ErrOnHoldAlreadyActive
+	case "terminated":
+		return nil, fmt.Errorf("cannot place a terminated employee on hold")
+	default:
+		return nil, fmt.Errorf("cannot place %s employee on hold", prev)
+	}
+
+	h := &employee.EmployeeOnHold{
+		OnHoldID:       uuid.New(),
+		CompanyID:      companyID,
+		UserID:         userID,
+		StartDate:      start,
+		EndDate:        end,
+		Reason:         reason,
+		PreviousStatus: prev,
+		PayPercentage:  payPct,
+		Status:         "active",
+		CreatedBy:      &actorID,
+	}
+	if err := s.employeeRepo.CreateOnHold(ctx, h); err != nil {
+		return nil, err
+	}
+	if err := s.setEmploymentStatus(ctx, companyID, userID, "on_hold"); err != nil {
+		return nil, err
+	}
+	if end != nil {
+		s.enqueueOnHoldExpiry(ctx, companyID, userID, *end)
+		s.enqueueOnHoldReminders(ctx, companyID, userID, h.OnHoldID, *end)
+	}
+
+	afterJSON, _ := json.Marshal(h)
+	ip, _ := ctx.Value("ip_address").(string)
+	_ = s.auditService.LogAction(
+		ctx, nil, &companyID, "hr",
+		"employee.on_hold.start", "employee_on_hold", &h.OnHoldID,
+		"user", &actorID, []byte("{}"), afterJSON,
+		map[string]interface{}{
+			"ip":         ip,
+			"on_hold_id": h.OnHoldID.String(),
+			"user_id":    userID.String(),
+			"company_id": companyID.String(),
+			"reason":     reason,
+			"prev":       prev,
+		},
+	)
+	return h, nil
+}
+
+func (s *EmployeeService) EndOnHold(
+	ctx context.Context,
+	companyID, userID, actorID uuid.UUID,
+) error {
+	h, err := s.employeeRepo.GetActiveOnHold(ctx, companyID, userID)
+	if err != nil {
+		return err
+	}
+	if err := s.employeeRepo.EndOnHoldRow(ctx, h.OnHoldID, actorID); err != nil {
+		return err
+	}
+	if err := s.setEmploymentStatus(ctx, companyID, userID, h.PreviousStatus); err != nil {
+		return err
+	}
+	s.cancelJobs(ctx, companyID, userID, employee.JobOnHoldExpiry)
+	s.cancelJobs(ctx, companyID, userID, employee.JobOnHoldReminder)
+
+	// Close out open on-hold reminders in the HR feed.
+	s.reminderSvc.MarkActioned(ctx, companyID, userID, ReminderTypePrefixOnHold)
+
+	_ = s.auditService.LogAction(
+		ctx, nil, &companyID, "hr",
+		"employee.on_hold.end", "employee_on_hold", &h.OnHoldID,
+		"user", &actorID, nil, nil,
+		map[string]interface{}{
+			"on_hold_id": h.OnHoldID.String(),
+			"user_id":    userID.String(),
+			"company_id": companyID.String(),
+		},
+	)
+	return nil
+}
+
+// ---- enqueue / cancel helpers ----
+//
+// All enqueue helpers go through the ScheduledJobRepository via
+// pgClient.WithTx so the job row commits atomically with the enqueue.
+// Failures are logged, never propagated — a full queue table must not
+// fail the HR transition.
+
+func (s *EmployeeService) enqueueProbationReminders(
+	ctx context.Context, companyID, userID, probationID uuid.UUID, end time.Time,
+) {
+	now := time.Now()
+	offsets := []time.Duration{-14 * 24 * time.Hour, -7 * 24 * time.Hour, -3 * 24 * time.Hour}
+
+	err := s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
+		for _, off := range offsets {
+			runAt := end.Add(off)
+			if runAt.Before(now) {
+				continue
+			}
+			if err := s.scheduledJobs.EnqueueProbationReminder(
+				ctx, tx, companyID, userID, runAt, probationID, end,
+			); err != nil {
+				return err
+			}
+		}
+		return s.scheduledJobs.EnqueueProbationEndReached(
+			ctx, tx, companyID, userID, end.Add(24*time.Hour), probationID,
+		)
+	})
+	if err != nil {
+		zap.L().Warn("enqueue probation reminders failed",
+			zap.String("company_id", companyID.String()),
+			zap.String("user_id", userID.String()),
+			zap.Error(err),
+		)
+	}
+}
+
+func (s *EmployeeService) enqueueNoticeReminders(
+	ctx context.Context, companyID, userID, noticeID uuid.UUID, end time.Time,
+) {
+	now := time.Now()
+	offsets := []time.Duration{-3 * 24 * time.Hour, -1 * 24 * time.Hour}
+
+	err := s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
+		for _, off := range offsets {
+			runAt := end.Add(off)
+			if runAt.Before(now) {
+				continue
+			}
+			if err := s.scheduledJobs.EnqueueNoticeReminder(
+				ctx, tx, companyID, userID, runAt, noticeID, end,
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		zap.L().Warn("enqueue notice reminders failed",
+			zap.String("company_id", companyID.String()),
+			zap.String("user_id", userID.String()),
+			zap.Error(err),
+		)
+	}
+}
+
+func (s *EmployeeService) enqueueOnHoldExpiry(
+	ctx context.Context, companyID, userID uuid.UUID, end time.Time,
+) {
+	err := s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
+		return s.scheduledJobs.EnqueueOnHoldExpiry(ctx, tx, companyID, userID, end)
+	})
+	if err != nil {
+		zap.L().Warn("enqueue on-hold expiry failed",
+			zap.String("company_id", companyID.String()),
+			zap.String("user_id", userID.String()),
+			zap.Error(err),
+		)
+	}
+}
+
+func (s *EmployeeService) enqueueOnHoldReminders(
+	ctx context.Context, companyID, userID, onHoldID uuid.UUID, end time.Time,
+) {
+	now := time.Now()
+	offsets := []time.Duration{-3 * 24 * time.Hour, -1 * 24 * time.Hour}
+
+	err := s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
+		for _, off := range offsets {
+			runAt := end.Add(off)
+			if runAt.Before(now) {
+				continue
+			}
+			if err := s.scheduledJobs.EnqueueOnHoldReminder(
+				ctx, tx, companyID, userID, runAt, onHoldID, end,
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		zap.L().Warn("enqueue on-hold reminders failed",
+			zap.String("company_id", companyID.String()),
+			zap.String("user_id", userID.String()),
+			zap.Error(err),
+		)
+	}
+}
+
+func (s *EmployeeService) cancelJobs(
+	ctx context.Context, companyID, userID uuid.UUID, jobType string,
+) {
+	uid := userID
+	err := s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
+		return s.scheduledJobs.CancelJobs(ctx, tx, companyID, &uid, jobType)
+	})
+	if err != nil {
+		zap.L().Warn("cancel scheduled jobs failed",
+			zap.String("company_id", companyID.String()),
+			zap.String("user_id", userID.String()),
+			zap.String("job_type", jobType),
+			zap.Error(err),
+		)
+	}
+}
+
+func (s *EmployeeService) populateNoticeCounts(n *employee.EmployeeNotice) {
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	n.DaysTotal = int(n.EndDate.Sub(n.StartDate).Hours()/24) + 1
+	served := int(today.Sub(n.StartDate).Hours()/24) + 1
+	if served < 0 {
+		served = 0
+	}
+	if served > n.DaysTotal {
+		served = n.DaysTotal
+	}
+	n.DaysServed = served
+	n.DaysRemaining = n.DaysTotal - served
 }
 
 // ============================================================================
@@ -1048,4 +1752,126 @@ func (s *EmployeeService) UpdateEmployeeProfileInTx(
 	out := *profile
 	s.decryptPIIFields(ctx, &out)
 	return &out, nil
+}
+
+// ============================================================================
+// REACTIVATE (inverse of exit enforcement)
+// ============================================================================
+
+// ReactivateEmployee restores a terminated or resigned employee to active.
+//
+// Flow:
+//  1. Row-level authorization check (ensureEmployeeInScope).
+//  2. Status guard — only 'terminated' or 'resigned' can be reactivated.
+//     An employee on notice / probation / on-hold must go through their
+//     own lifecycle path first (cancel notice, confirm probation, end hold).
+//  3. Repo call — flips employee_profiles.employment_status to 'active',
+//     re-enables company_employees.is_active, marks the latest effective
+//     exit as 'rehired'. All three happen in one tx inside the repo.
+//  4. Leave resolver enqueue — so entitlements get rebuilt for the new
+//     employment window. Non-fatal on failure (worker will retry).
+//  5. Audit log.
+//
+// Idempotent: calling on an already-active employee returns nil.
+func (s *EmployeeService) ReactivateEmployee(
+	ctx context.Context,
+	companyID, userID uuid.UUID,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) error {
+	logger := zap.L().With(
+		zap.String("component", "employee_service"),
+		zap.String("op", "reactivate_employee"),
+		zap.String("company_id", companyID.String()),
+		zap.String("user_id", userID.String()),
+	)
+	logger.Info("reactivate — entry")
+
+	if companyID == uuid.Nil || userID == uuid.Nil {
+		return fmt.Errorf("company_id and user_id are required")
+	}
+
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("reactivate-%s-%s", companyID.String(), userID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		logger.Info("reactivate — short-circuited by idempotency",
+			zap.String("idemp_key", idempKey))
+		return nil
+	}
+
+	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
+		logger.Warn("reactivate — out of scope", zap.Error(err))
+		return err
+	}
+
+	// Status guard — read current status.
+	prof, err := s.employeeRepo.GetEmployeeProfileByUserID(ctx, userID, companyID)
+	if err != nil {
+		logger.Error("reactivate — load profile failed", zap.Error(err))
+		return fmt.Errorf("load profile: %w", err)
+	}
+	var prevStatus string
+	if prof.EmploymentStatus != nil {
+		prevStatus = *prof.EmploymentStatus
+	}
+	logger.Info("reactivate — current status",
+		zap.String("employment_status", prevStatus))
+
+	switch prevStatus {
+	case "active":
+		logger.Info("reactivate — already active, treating as success")
+		_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+		return nil
+	case "terminated", "resigned":
+		// ok — proceed
+	case "probation":
+		return fmt.Errorf("cannot reactivate a probationary employee — confirm or fail probation first")
+	case "notice":
+		return fmt.Errorf("cannot reactivate an employee on notice — cancel the notice first")
+	case "on_hold":
+		return fmt.Errorf("cannot reactivate an employee on hold — end the hold first")
+	default:
+		return fmt.Errorf("cannot reactivate employee with status %q", prevStatus)
+	}
+
+	// Repo call — profile + roster + exit in one tx.
+	if err := s.employeeRepo.ReactivateEmployee(ctx, companyID, userID); err != nil {
+		logger.Error("reactivate — repo failed", zap.Error(err))
+		return err
+	}
+	logger.Info("reactivate — repo committed")
+
+	// Enqueue leave resolver so entitlements get rebuilt. Non-fatal.
+	if err := s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
+		return s.resolverJobs.EnqueueUserResolution(
+			ctx, tx, companyID, userID, "reactivate",
+		)
+	}); err != nil {
+		logger.Warn("reactivate — enqueue resolver job failed", zap.Error(err))
+		// continue — the resolver job will be re-enqueued by the next
+		// policy edit or manual re-resolve. Not fatal to the reactivate.
+	}
+
+	// Audit
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMetadata(metadata, map[string]interface{}{
+		"ip":              ip,
+		"user_id":         userID.String(),
+		"company_id":      companyID.String(),
+		"previous_status": prevStatus,
+		"new_status":      "active",
+	})
+	_ = s.auditService.LogAction(
+		ctx, nil, &companyID, "hr",
+		"employee.reactivate", "employee_profile", &userID,
+		actorType, &actorID, nil, nil, auditMeta,
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+	logger.Info("reactivate — done")
+	return nil
 }

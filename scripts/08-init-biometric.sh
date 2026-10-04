@@ -1,9 +1,28 @@
 #!/bin/bash
 set -e
+
 echo "🧬 Initializing biometric schema..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'EOSQL'
 CREATE SCHEMA IF NOT EXISTS attendance;
 CREATE SCHEMA IF NOT EXISTS biometric;
+
+-- ============================================================
+-- TIMEZONE HELPERS
+-- Cheap DB-level IANA format guard. Not a substitute for Go's
+-- time.LoadLocation, but catches obvious junk at the boundary.
+-- ============================================================
+CREATE OR REPLACE FUNCTION timezone_is_valid(tz TEXT)
+RETURNS BOOLEAN AS $$
+BEGIN
+    IF tz IS NULL OR tz = '' THEN
+        RETURN false;
+    END IF;
+    IF tz = 'UTC' THEN
+        RETURN true;
+    END IF;
+    RETURN tz ~ '^[A-Za-z_]+/[A-Za-z_]+$';
+END;
+$$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
 
 -- ============================================================
 -- GEOFENCES
@@ -205,6 +224,15 @@ CREATE TABLE IF NOT EXISTS attendance.attendance_sources (
 
 -- ============================================================
 -- ATTENDANCE EVENTS
+--
+-- TIMEZONE-CORRECT SHAPE:
+--   event_time             → absolute UTC instant (TZ-agnostic)
+--   event_tz               → IANA name, resolved at write time
+--   event_offset_minutes   → DST-aware offset snapshot for audit
+--   event_date_local       → business date (YYYY-MM-DD) in event_tz, indexed
+--
+-- The old UTC-generated event_date is REMOVED. Bucketing is now
+-- done by the writer, not the DB. See Go timeutil package.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS attendance.attendance_events (
     attendance_event_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -220,12 +248,21 @@ CREATE TABLE IF NOT EXISTS attendance.attendance_events (
     employment_location_id UUID,
     geofence_id            UUID,
     ip_address             VARCHAR(64),
+
+    -- ── NEW: 3 tz columns replace the UTC-generated event_date
+    event_tz               VARCHAR(50) NOT NULL,
+    event_offset_minutes   SMALLINT NOT NULL,
+    event_date_local       DATE NOT NULL,
+
+    -- ── Optional: ISO-3166 alpha-2 country code for tax-residency queries
+    event_country          CHAR(2),
+
     metadata               JSONB,
     context                JSONB,
     raw_event_payload      JSONB,
     created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_by             UUID,
-    event_date             DATE GENERATED ALWAYS AS ((event_time AT TIME ZONE 'UTC')::date) STORED,
+
     CONSTRAINT fk_att_events_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
     CONSTRAINT fk_att_events_source_type FOREIGN KEY (source_type) REFERENCES attendance.attendance_source_types(source_type),
     CONSTRAINT fk_att_events_source FOREIGN KEY (source_id) REFERENCES attendance.attendance_sources(source_id),
@@ -233,19 +270,47 @@ CREATE TABLE IF NOT EXISTS attendance.attendance_events (
     CONSTRAINT fk_att_events_employment_location
         FOREIGN KEY (employment_location_id) REFERENCES locations(location_id) ON DELETE RESTRICT,
     CONSTRAINT fk_att_events_geofence
-        FOREIGN KEY (geofence_id) REFERENCES attendance.geofences(geofence_id) ON DELETE RESTRICT
+        FOREIGN KEY (geofence_id) REFERENCES attendance.geofences(geofence_id) ON DELETE RESTRICT,
+
+    -- ── NEW: format + range guards
+    CONSTRAINT chk_att_events_tz_format CHECK (
+        event_tz = 'UTC' OR event_tz ~ '^[A-Za-z_]+/[A-Za-z_]+$'
+    ),
+    CONSTRAINT chk_att_events_offset_range CHECK (
+        event_offset_minutes BETWEEN -720 AND 840
+    )
 );
 
 CREATE INDEX idx_att_events_subject_time ON attendance.attendance_events (company_id, subject_type, subject_id, event_time DESC);
-CREATE INDEX idx_att_events_company_event_date ON attendance.attendance_events (company_id, event_date);
+
+-- ── NEW: indexes keyed by LOCAL date (used for "today's punches" queries)
+CREATE INDEX idx_att_events_company_date_local
+    ON attendance.attendance_events (company_id, event_date_local DESC);
+
+CREATE INDEX idx_att_events_subject_date_local
+    ON attendance.attendance_events
+        (company_id, subject_type, subject_id, event_date_local DESC);
+
+CREATE INDEX idx_att_events_tz
+    ON attendance.attendance_events (event_tz);
+
+CREATE INDEX idx_att_events_country
+    ON attendance.attendance_events
+        (company_id, subject_type, subject_id, event_country, event_date_local)
+    WHERE event_country IS NOT NULL;
+
+-- ── Indexes on event_time (UTC) remain correct — leave unchanged
 CREATE INDEX idx_attendance_events_company ON attendance.attendance_events (company_id);
 CREATE INDEX idx_attendance_events_type ON attendance.attendance_events (event_type);
 CREATE INDEX idx_attendance_events_source ON attendance.attendance_events (source_type, source_id);
-CREATE INDEX idx_attendance_events_event_date ON attendance.attendance_events (event_date);
 CREATE INDEX idx_attendance_events_user_type_time ON attendance.attendance_events (company_id, subject_type, subject_id, event_type, event_time DESC) WHERE source_type != 'correction';
 CREATE INDEX idx_attendance_events_device_time ON attendance.attendance_events (company_id, subject_type, subject_id, device_id, event_type, event_time DESC) WHERE device_id IS NOT NULL AND source_type != 'correction';
 CREATE INDEX idx_att_events_company_emploc_time ON attendance.attendance_events (company_id, employment_location_id, event_time DESC) WHERE employment_location_id IS NOT NULL;
 CREATE INDEX idx_att_events_company_geofence_time ON attendance.attendance_events (company_id, geofence_id, event_time DESC) WHERE geofence_id IS NOT NULL;
+
+-- ── REMOVED (were keyed on the broken UTC-generated event_date):
+--    idx_att_events_company_event_date
+--    idx_attendance_events_event_date
 
 -- ============================================================
 -- POLICIES
@@ -298,6 +363,8 @@ CREATE INDEX idx_uap_subject ON attendance.user_attendance_policies (subject_typ
 
 -- ============================================================
 -- DAILY SUMMARY
+-- Adds timezone + offset_minutes so every summary row records
+-- which tz its attendance_date was computed in.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS attendance.attendance_daily_summary (
     attendance_summary_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -311,6 +378,11 @@ CREATE TABLE IF NOT EXISTS attendance.attendance_daily_summary (
     overtime_minutes       INTEGER,
     late_minutes           INTEGER,
     expected_minutes       INTEGER,
+
+    -- ── NEW: tz snapshot
+    timezone               VARCHAR(50) NOT NULL,
+    offset_minutes         SMALLINT NOT NULL,
+
     metadata               JSONB,
     generated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     generated_by           VARCHAR(30) DEFAULT 'system',
@@ -319,7 +391,14 @@ CREATE TABLE IF NOT EXISTS attendance.attendance_daily_summary (
     is_payable             BOOLEAN NOT NULL DEFAULT false,
     UNIQUE (company_id, subject_type, subject_id, attendance_date),
     CONSTRAINT fk_att_summary_employment_location
-        FOREIGN KEY (employment_location_id) REFERENCES locations(location_id) ON DELETE RESTRICT
+        FOREIGN KEY (employment_location_id) REFERENCES locations(location_id) ON DELETE RESTRICT,
+    -- ── NEW: guards
+    CONSTRAINT chk_att_summary_tz_format CHECK (
+        timezone = 'UTC' OR timezone ~ '^[A-Za-z_]+/[A-Za-z_]+$'
+    ),
+    CONSTRAINT chk_att_summary_offset_range CHECK (
+        offset_minutes BETWEEN -720 AND 840
+    )
 );
 
 CREATE INDEX idx_att_summary_subject_date ON attendance.attendance_daily_summary (company_id, subject_type, subject_id, attendance_date DESC);
@@ -330,6 +409,7 @@ CREATE INDEX idx_att_summary_company_emploc_date ON attendance.attendance_daily_
 
 -- ============================================================
 -- SESSION SUMMARY
+-- Adds timezone so session bucketing can be audited.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS attendance.attendance_session_summary (
     summary_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -346,13 +426,21 @@ CREATE TABLE IF NOT EXISTS attendance.attendance_session_summary (
     device_id              VARCHAR(256),
     is_auto                BOOLEAN NOT NULL DEFAULT false,
     remarks                TEXT,
+
+    -- ── NEW: tz snapshot
+    timezone               VARCHAR(50) NOT NULL,
+
     metadata               JSONB,
     created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT fk_session_summary_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
     CONSTRAINT fk_att_session_summary_employment_location
         FOREIGN KEY (employment_location_id) REFERENCES locations(location_id) ON DELETE RESTRICT,
-    UNIQUE (company_id, subject_type, subject_id, session_id)
+    UNIQUE (company_id, subject_type, subject_id, session_id),
+    -- ── NEW: guard
+    CONSTRAINT chk_att_session_tz_format CHECK (
+        timezone = 'UTC' OR timezone ~ '^[A-Za-z_]+/[A-Za-z_]+$'
+    )
 );
 
 CREATE INDEX idx_att_session_summary_subject ON attendance.attendance_session_summary (company_id, subject_type, subject_id);
@@ -363,6 +451,9 @@ CREATE INDEX idx_att_session_summary_company_emploc ON attendance.attendance_ses
 
 -- ============================================================
 -- WORK CENTERS / CALENDARS / SCHEDULES
+-- Removed silent UTC defaults — tz is mandatory, validated by
+-- the writer (Go timeutil.ValidateTimezone) and by the check
+-- constraints below.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS attendance.work_centers (
     work_center_code VARCHAR(100) NOT NULL,
@@ -370,13 +461,20 @@ CREATE TABLE IF NOT EXISTS attendance.work_centers (
     location_id      UUID,
     name             VARCHAR(255) NOT NULL,
     description      TEXT,
-    timezone         VARCHAR(50) NOT NULL DEFAULT 'UTC',
+
+    -- ── CHANGED: no DEFAULT 'UTC'
+    timezone         VARCHAR(50) NOT NULL,
+
     is_active        BOOLEAN NOT NULL DEFAULT true,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT fk_work_centers_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
     CONSTRAINT fk_work_centers_location FOREIGN KEY (location_id) REFERENCES locations(location_id) ON DELETE SET NULL,
-    PRIMARY KEY (company_id, work_center_code)
+    PRIMARY KEY (company_id, work_center_code),
+    -- ── NEW: guard
+    CONSTRAINT chk_work_centers_tz_format CHECK (
+        timezone = 'UTC' OR timezone ~ '^[A-Za-z_]+/[A-Za-z_]+$'
+    )
 );
 
 CREATE INDEX idx_work_centers_company ON attendance.work_centers (company_id, is_active);
@@ -388,14 +486,21 @@ CREATE TABLE IF NOT EXISTS attendance.work_calendars (
     location_id  UUID,
     year         INTEGER NOT NULL,
     name         VARCHAR(100) NOT NULL,
-    timezone     VARCHAR(50) NOT NULL DEFAULT 'UTC',
+
+    -- ── CHANGED: no DEFAULT 'UTC'
+    timezone     VARCHAR(50) NOT NULL,
+
     working_days INTEGER[] NOT NULL,
     holidays     JSONB,
     is_active    BOOLEAN DEFAULT true,
     created_at   TIMESTAMPTZ DEFAULT NOW(),
     CONSTRAINT fk_calendar_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
     CONSTRAINT fk_work_calendars_location FOREIGN KEY (location_id) REFERENCES locations(location_id) ON DELETE CASCADE,
-    CONSTRAINT uq_work_calendar_company_year UNIQUE (company_id, year)
+    CONSTRAINT uq_work_calendar_company_year UNIQUE (company_id, year),
+    -- ── NEW: guard
+    CONSTRAINT chk_work_calendars_tz_format CHECK (
+        timezone = 'UTC' OR timezone ~ '^[A-Za-z_]+/[A-Za-z_]+$'
+    )
 );
 
 CREATE INDEX idx_work_calendars_company ON attendance.work_calendars (company_id);
@@ -450,7 +555,10 @@ CREATE TABLE IF NOT EXISTS attendance.schedule_instances (
     schedule_template_id UUID NOT NULL,
     expected_start       TIMESTAMPTZ,
     expected_end         TIMESTAMPTZ,
-    timezone             VARCHAR(50) NOT NULL DEFAULT 'UTC',
+
+    -- ── CHANGED: no DEFAULT 'UTC'
+    timezone             VARCHAR(50) NOT NULL,
+
     metadata             JSONB,
     generated_at         TIMESTAMPTZ DEFAULT NOW(),
     status               VARCHAR(20) NOT NULL DEFAULT 'active',
@@ -464,7 +572,11 @@ CREATE TABLE IF NOT EXISTS attendance.schedule_instances (
     CONSTRAINT fk_si_template FOREIGN KEY (schedule_template_id) REFERENCES attendance.schedule_templates(schedule_template_id),
     CONSTRAINT fk_schedule_instances_work_center FOREIGN KEY (company_id, work_center_code)
         REFERENCES attendance.work_centers(company_id, work_center_code),
-    CONSTRAINT fk_schedule_instances_location FOREIGN KEY (location_id) REFERENCES locations(location_id) ON DELETE RESTRICT
+    CONSTRAINT fk_schedule_instances_location FOREIGN KEY (location_id) REFERENCES locations(location_id) ON DELETE RESTRICT,
+    -- ── NEW: guard
+    CONSTRAINT chk_schedule_instances_tz_format CHECK (
+        timezone = 'UTC' OR timezone ~ '^[A-Za-z_]+/[A-Za-z_]+$'
+    )
 );
 
 CREATE INDEX idx_schedule_instances_user_date ON attendance.schedule_instances (user_id, schedule_date);
@@ -534,9 +646,16 @@ CREATE TABLE IF NOT EXISTS attendance.company_attendance_rules (
     company_id              UUID PRIMARY KEY,
     allowed_source_types    VARCHAR(30)[] NOT NULL,
     allow_multiple_checkins BOOLEAN NOT NULL DEFAULT false,
-    timezone                VARCHAR(50) NOT NULL DEFAULT 'UTC',
+
+    -- ── CHANGED: no DEFAULT 'UTC'
+    timezone                VARCHAR(50) NOT NULL,
+
     created_at              TIMESTAMPTZ DEFAULT NOW(),
-    CONSTRAINT fk_company_attendance_rules_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE
+    CONSTRAINT fk_company_attendance_rules_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
+    -- ── NEW: guard
+    CONSTRAINT chk_company_rules_tz_format CHECK (
+        timezone = 'UTC' OR timezone ~ '^[A-Za-z_]+/[A-Za-z_]+$'
+    )
 );
 
 CREATE TABLE IF NOT EXISTS attendance.department_attendance_rules (
@@ -967,54 +1086,97 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- ============================================================
+-- prevent_past_schedule_update — CHANGED
+--
+-- Was: compared schedule_date against server CURRENT_DATE.
+-- Now: resolves the shift's tz via instance > work_center > company
+--      and compares against today in that tz.
+-- ============================================================
 CREATE OR REPLACE FUNCTION prevent_past_schedule_update()
 RETURNS TRIGGER AS $$
+DECLARE
+    v_tz          TEXT;
+    v_today_local DATE;
 BEGIN
-    IF OLD.schedule_date <= CURRENT_DATE THEN
-        RAISE EXCEPTION 'Past or current schedules are immutable';
+    SELECT COALESCE(
+             NULLIF(OLD.timezone, ''),
+             NULLIF(wc.timezone, ''),
+             NULLIF(c.default_timezone, ''),
+             'UTC'
+           )
+    INTO v_tz
+    FROM attendance.schedule_instances si
+    LEFT JOIN attendance.work_centers wc
+      ON wc.company_id       = si.company_id
+     AND wc.work_center_code = si.work_center_code
+    LEFT JOIN companies c
+      ON c.company_id = si.company_id
+    WHERE si.schedule_instance_id = OLD.schedule_instance_id;
+
+    IF v_tz IS NULL THEN
+        v_tz := 'UTC';
     END IF;
+
+    v_today_local := (NOW() AT TIME ZONE v_tz)::date;
+
+    IF OLD.schedule_date <= v_today_local THEN
+        RAISE EXCEPTION
+          'Past or current schedules are immutable (shift tz=%, today=%)',
+          v_tz, v_today_local;
+    END IF;
+
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION enforce_schedule_cancellation()
 RETURNS TRIGGER AS $$
+DECLARE
+    v_tz          TEXT;
+    v_today_local DATE;
 BEGIN
-    IF OLD.status = 'active' AND NEW.status = 'cancelled' AND OLD.schedule_date > CURRENT_DATE THEN
+    SELECT COALESCE(
+             NULLIF(OLD.timezone, ''),
+             NULLIF(wc.timezone, ''),
+             NULLIF(c.default_timezone, ''),
+             'UTC'
+           )
+    INTO v_tz
+    FROM attendance.schedule_instances si
+    LEFT JOIN attendance.work_centers wc
+      ON wc.company_id       = si.company_id
+     AND wc.work_center_code = si.work_center_code
+    LEFT JOIN companies c
+      ON c.company_id = si.company_id
+    WHERE si.schedule_instance_id = OLD.schedule_instance_id;
+
+    IF v_tz IS NULL THEN
+        v_tz := 'UTC';
+    END IF;
+
+    v_today_local := (NOW() AT TIME ZONE v_tz)::date;
+
+    IF OLD.status = 'active' AND NEW.status = 'cancelled' AND OLD.schedule_date > v_today_local THEN
         RETURN NEW;
     END IF;
+
     IF OLD.status = 'active' AND NEW.status = 'active' THEN
         RAISE EXCEPTION 'Direct modification not allowed. Cancel and regenerate.';
     END IF;
+
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
 -- ============================================================
--- SYNC WORK CENTER ASSIGNMENT — corrected
+-- sync_work_center_assignment — CHANGED
 --
--- Fires on INSERT or UPDATE OF position_id on company_employees.
---
--- 1. Guards on OLD.position_id IS DISTINCT FROM NEW.position_id,
---    so UpdateEmployeeTx (which always includes position_id in the
---    SET clause) does not spuriously open a new row.
--- 2. Closes the currently open row at v_effective_from (with the
---    exclusion constraint using '[)', [old, today) does NOT overlap
---    [today, ∞)).
--- 3. If the new position has no work center, only closes — no insert.
--- ============================================================
--- ============================================================
--- SYNC WORK CENTER ASSIGNMENT — corrected
---
--- Fires on INSERT or UPDATE OF position_id on company_employees.
---
--- 1. Guards on position_id actually changing.
--- 2. Same-day short-circuit: if a row already exists for
---    (company, user, WC, today), reopen it instead of trying
---    to insert a duplicate. Handles "user moves away and back
---    on the same day" without tripping the unique constraint.
--- 3. Otherwise: close the currently-open row, then insert.
--- 4. If the new position has no WC, only closes — no insert.
+-- Was: used server CURRENT_DATE for "today".
+-- Now: uses company.default_timezone to compute "today" locally,
+--      so an employee assigned near IST midnight gets the right
+--      effective_from date.
+-- Also retains the same-day short-circuit from before.
 -- ============================================================
 CREATE OR REPLACE FUNCTION sync_work_center_assignment()
 RETURNS TRIGGER AS $$
@@ -1022,7 +1184,21 @@ DECLARE
     v_wc_code        VARCHAR;
     v_effective_from DATE;
     v_existing_id    UUID;
+    v_tz             TEXT;
+    v_today_local    DATE;
 BEGIN
+    -- Resolve company tz
+    SELECT COALESCE(NULLIF(default_timezone, ''), 'UTC')
+    INTO v_tz
+    FROM companies
+    WHERE company_id = NEW.company_id;
+
+    IF v_tz IS NULL THEN
+        v_tz := 'UTC';
+    END IF;
+
+    v_today_local := (NOW() AT TIME ZONE v_tz)::date;
+
     -- Guard: only fire when position_id actually changed.
     IF TG_OP = 'UPDATE'
        AND OLD.position_id IS NOT DISTINCT FROM NEW.position_id THEN
@@ -1030,21 +1206,18 @@ BEGIN
     END IF;
 
     IF TG_OP = 'INSERT' THEN
-        v_effective_from := COALESCE(NEW.hire_date::date, CURRENT_DATE);
+        v_effective_from := COALESCE(NEW.hire_date::date, v_today_local);
     ELSE
-        v_effective_from := CURRENT_DATE;
+        v_effective_from := v_today_local;
     END IF;
 
-    -- Resolve the work center for the new position.
     IF NEW.position_id IS NOT NULL THEN
         SELECT work_center_code INTO v_wc_code
         FROM positions
         WHERE position_id = NEW.position_id;
     END IF;
 
-    -- Same-day re-assignment short-circuit.
-    -- If (user, company, WC, today) already exists, do not close+insert.
-    -- Reopen the existing row if it was closed, then return.
+    -- Same-day re-assignment short-circuit
     IF v_wc_code IS NOT NULL THEN
         SELECT assignment_id INTO v_existing_id
         FROM attendance.user_work_center_assignments
@@ -1065,7 +1238,7 @@ BEGIN
         END IF;
     END IF;
 
-    -- Close whatever row is currently open for this user in this company.
+    -- Close whatever row is currently open
     UPDATE attendance.user_work_center_assignments
     SET effective_to = v_effective_from,
         is_active    = false,
@@ -1075,12 +1248,11 @@ BEGIN
       AND effective_to IS NULL
       AND is_active    = true;
 
-    -- New position has no WC → already closed old row, nothing to open.
     IF v_wc_code IS NULL THEN
         RETURN NEW;
     END IF;
 
-    -- Open the new assignment.
+    -- Open the new assignment
     INSERT INTO attendance.user_work_center_assignments (
         assignment_id, company_id, user_id, work_center_code,
         effective_from, effective_to, is_active, created_at, updated_at
@@ -1092,6 +1264,7 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
+
 -- ============================================================
 -- TRIGGERS
 -- ============================================================
@@ -1188,7 +1361,6 @@ ALTER TABLE positions ADD CONSTRAINT fk_positions_work_center
     FOREIGN KEY (company_id, work_center_code)
     REFERENCES attendance.work_centers(company_id, work_center_code);
 
--- Payroll constraints
 ALTER TABLE payroll.payroll_run DROP CONSTRAINT IF EXISTS payroll_run_status_check;
 ALTER TABLE payroll.payroll_run ADD CONSTRAINT payroll_run_status_check
 CHECK (status IN ('draft','processing','executing','calculated','approved','paid','failed','partially_processed','cancelled'));
@@ -1201,8 +1373,6 @@ ADD CONSTRAINT payroll_item_run_user_unique UNIQUE (payroll_run_id, user_id);
 
 -- ============================================================
 -- APPENDIX — POSITION / LOCATION CONSISTENCY
---   Auto-fill and validate positions.location_id against the
---   location that owns positions.work_center_code.
 -- ============================================================
 CREATE OR REPLACE FUNCTION enforce_position_location_matches_work_center()
 RETURNS TRIGGER AS $$
@@ -1210,7 +1380,7 @@ DECLARE
     wc_loc UUID;
 BEGIN
     IF NEW.work_center_code IS NULL THEN
-        RETURN NEW;   -- company-wide seat, no site constraint
+        RETURN NEW;
     END IF;
 
     SELECT location_id INTO wc_loc
@@ -1245,19 +1415,50 @@ CREATE TRIGGER trg_enforce_position_location
     BEFORE INSERT OR UPDATE OF work_center_code, location_id ON positions
     FOR EACH ROW
     EXECUTE FUNCTION enforce_position_location_matches_work_center();
--- ============================================================
--- Late FK: company_employees.position_id → positions
---
--- Defined here (not inline on company_employees) because positions
--- is created later in this file. ON DELETE RESTRICT is deliberate:
--- a seat with an active employee is load-bearing — hard-deleting it
--- would orphan the roster row and break the owner.
--- ============================================================
+
 ALTER TABLE company_employees
     ADD CONSTRAINT fk_employees_position
     FOREIGN KEY (position_id)
     REFERENCES positions(position_id)
     ON DELETE RESTRICT
-    ON UPDATE CASCADE;    
+    ON UPDATE CASCADE;
+
+-- ============================================================
+-- POST-INIT SANITY CHECKS
+-- ============================================================
+DO $$
+DECLARE
+    v_cnt INTEGER;
+BEGIN
+    -- No company missing a default timezone
+    SELECT COUNT(*) INTO v_cnt FROM companies
+    WHERE default_timezone IS NULL OR default_timezone = '';
+    IF v_cnt > 0 THEN
+        RAISE EXCEPTION 'Init check failed: % companies have no default_timezone', v_cnt;
+    END IF;
+
+    -- Every tz column in our schema passes the format guard
+    SELECT COUNT(*) INTO v_cnt FROM companies
+    WHERE NOT timezone_is_valid(default_timezone);
+    IF v_cnt > 0 THEN
+        RAISE EXCEPTION 'Init check failed: % companies have invalid default_timezone', v_cnt;
+    END IF;
+
+    SELECT COUNT(*) INTO v_cnt FROM locations
+    WHERE timezone IS NOT NULL AND NOT timezone_is_valid(timezone);
+    IF v_cnt > 0 THEN
+        RAISE EXCEPTION 'Init check failed: % locations have invalid timezone', v_cnt;
+    END IF;
+
+    SELECT COUNT(*) INTO v_cnt FROM attendance.work_centers
+    WHERE NOT timezone_is_valid(timezone);
+    IF v_cnt > 0 THEN
+        RAISE EXCEPTION 'Init check failed: % work centers have invalid timezone', v_cnt;
+    END IF;
+
+    RAISE NOTICE '✅ All timezone init checks passed';
+END $$;
+
 EOSQL
+
 echo "✅ Biometric schema initialized successfully!"

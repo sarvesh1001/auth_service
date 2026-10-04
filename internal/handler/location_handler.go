@@ -14,6 +14,7 @@ import (
 	customErrors "auth-service/internal/errors"
 	"auth-service/internal/models"
 	"auth-service/internal/service"
+	"auth-service/internal/util" // ← NEW
 )
 
 // LocationHandler handles location-related endpoints.
@@ -42,6 +43,18 @@ func (h *LocationHandler) CreateLocation(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	req.CompanyID = companyID
+
+	// ── NEW: timezone validation at the boundary.
+	//   nil       → inherit company.default_timezone
+	//   ""        → also treated as "inherit" (nil)
+	//   valid IANA → set
+	//   anything else → 400
+	if req.Timezone != nil && strings.TrimSpace(*req.Timezone) != "" {
+		if err := util.ValidateTimezone(*req.Timezone); err != nil {
+			respondError(w, http.StatusBadRequest, "timezone: "+err.Error())
+			return
+		}
+	}
 
 	loc, err := h.locationService.CreateLocation(r.Context(), &req)
 	if err != nil {
@@ -82,6 +95,19 @@ func (h *LocationHandler) UpdateLocation(w http.ResponseWriter, r *http.Request)
 		respondError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
+
+	// ── NEW: timezone validation.
+	//   nil       → preserve current tz
+	//   ""        → clear (revert to inheriting company default)
+	//   valid IANA → set
+	//   anything else → 400
+	if req.Timezone != nil && strings.TrimSpace(*req.Timezone) != "" {
+		if err := util.ValidateTimezone(*req.Timezone); err != nil {
+			respondError(w, http.StatusBadRequest, "timezone: "+err.Error())
+			return
+		}
+	}
+
 	loc, err := h.locationService.UpdateLocation(r.Context(), locationID, &req)
 	if err != nil {
 		status, msg := mapServiceError(err)

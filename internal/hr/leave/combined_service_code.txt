@@ -1,0 +1,2501 @@
+
+================================================================================
+FILE: ./service/leave_accrual_service.go
+================================================================================
+
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+
+	"auth-service/internal/hr/leave/models"
+	"auth-service/internal/hr/leave/repository"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+)
+
+type LeaveAccrualService interface {
+	AccrueMonthlyLeave(ctx context.Context, companyID uuid.UUID, accrualDate time.Time, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (int, error)
+	RecalculateEntitlement(ctx context.Context, entitlementID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.LeaveBalance, error)
+	GetAccrualsByDate(ctx context.Context, companyID uuid.UUID, date time.Time) ([]*models.LeaveAccrual, error)
+	ProcessLeaveAccruals(ctx context.Context, companyID uuid.UUID, accrualDate time.Time, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (int, error)
+}
+
+type leaveAccrualService struct {
+	repo             repository.LeaveRepository
+	idempotencyStore idempotency.Store
+	auditService     *audit.AuditService
+}
+
+func NewLeaveAccrualService(
+	repo repository.LeaveRepository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+) LeaveAccrualService {
+	return &leaveAccrualService{
+		repo:             repo,
+		idempotencyStore: idempotencyStore,
+		auditService:     auditService,
+	}
+}
+
+func (s *leaveAccrualService) AccrueMonthlyLeave(
+	ctx context.Context,
+	companyID uuid.UUID,
+	accrualDate time.Time,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) (int, error) {
+
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("accrue_monthly-%s-%s", companyID.String(), accrualDate.Format("2006-01-02"))
+	}
+	var processed int
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil {
+		return processed, nil
+	}
+
+	processed, err := s.repo.ProcessLeaveAccruals(ctx, companyID, accrualDate)
+	if err != nil {
+		return 0, fmt.Errorf("failed to process monthly accruals: %w", err)
+	}
+
+	// Audit
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"company_id":   companyID.String(),
+		"accrual_date": accrualDate,
+		"processed":    processed,
+		"ip":           ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&companyID,
+		"leave",
+		"accrual.monthly",
+		"leave_accrual",
+		nil,
+		actorType,
+		&actorID,
+		[]byte("{}"),
+		[]byte(fmt.Sprintf(`{"processed":%d}`, processed)),
+		auditMeta,
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, processed)
+
+	return processed, nil
+}
+
+func (s *leaveAccrualService) RecalculateEntitlement(
+	ctx context.Context,
+	entitlementID uuid.UUID,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) (*models.LeaveBalance, error) {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("recalc_ent-%s", entitlementID.String())
+	}
+	var cached *models.LeaveBalance
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
+
+	entitlement, err := s.repo.GetLeaveEntitlementByID(ctx, entitlementID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get entitlement: %w", err)
+	}
+	if entitlement == nil {
+		return nil, fmt.Errorf("entitlement not found")
+	}
+
+	ledgerEntries, err := s.repo.GetLeaveLedgerEntriesByEntitlement(ctx, entitlementID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get ledger entries: %w", err)
+	}
+
+	var totalAccrued, totalConsumed float64
+	for _, entry := range ledgerEntries {
+		switch entry.EntryType {
+		case "accrual", "reversal":
+			totalAccrued += float64(entry.Days)
+		case "consumption":
+			totalConsumed += float64(entry.Days)
+		}
+	}
+
+	leaveType, err := s.repo.GetLeaveTypeByID(ctx, entitlement.LeaveTypeID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get leave type: %w", err)
+	}
+	if leaveType == nil {
+		return nil, fmt.Errorf("leave type not found")
+	}
+
+	// Carry-forward limit comes from the effective policy rule, not the
+	// leave type. If the entitlement is policy-sourced we look up the
+	// rule; for manual entitlements there is no rule so the limit is nil.
+	var carryForward *int
+	if entitlement.PolicyID != nil {
+		rules, err := s.repo.GetPolicyRules(ctx, *entitlement.PolicyID)
+		if err == nil {
+			for _, r := range rules {
+				if r.LeaveTypeID == entitlement.LeaveTypeID {
+					carryForward = r.CarryForwardLimit
+					break
+				}
+			}
+		}
+	}
+
+	balance := &models.LeaveBalance{
+		UserID:        entitlement.UserID,
+		LeaveTypeID:   entitlement.LeaveTypeID,
+		LeaveTypeCode: leaveType.Code,
+		LeaveTypeName: leaveType.Name,
+		TotalEntitled: float64(entitlement.TotalDays),
+		Accrued:       totalAccrued,
+		Consumed:      totalConsumed,
+		Balance:       totalAccrued - totalConsumed,
+		CarryForward:  carryForward,
+	}
+
+	// Audit
+	ip, _ := ctx.Value("ip_address").(string)
+	afterJSON, _ := json.Marshal(balance)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"entitlement_id": entitlementID.String(),
+		"ip":             ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&entitlement.CompanyID,
+		"leave",
+		"entitlement.recalculate",
+		"leave_entitlement",
+		&entitlementID,
+		actorType,
+		&actorID,
+		nil,
+		afterJSON,
+		auditMeta,
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, balance)
+
+	return balance, nil
+}
+
+func (s *leaveAccrualService) GetAccrualsByDate(ctx context.Context, companyID uuid.UUID, date time.Time) ([]*models.LeaveAccrual, error) {
+	// read-only, no idempotency needed, but can audit if required (optional)
+	return s.repo.GetLeaveAccrualsByDate(ctx, companyID, date)
+}
+
+func (s *leaveAccrualService) ProcessLeaveAccruals(
+	ctx context.Context,
+	companyID uuid.UUID,
+	accrualDate time.Time,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) (int, error) {
+	// This is the same as AccrueMonthlyLeave, but can be used separately.
+	// We'll just delegate to AccrueMonthlyLeave.
+	return s.AccrueMonthlyLeave(ctx, companyID, accrualDate, actorType, actorID, metadata)
+}
+
+// helper
+func mergeMeta(base, extra map[string]interface{}) map[string]interface{} {
+	if base == nil {
+		base = make(map[string]interface{})
+	}
+	for k, v := range extra {
+		base[k] = v
+	}
+	return base
+}
+
+
+
+================================================================================
+FILE: ./service/leave_policy_resolution_service.go
+================================================================================
+
+package service
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"auth-service/internal/client"
+	"auth-service/internal/hr/leave/models"
+	"auth-service/internal/hr/leave/repository"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+)
+
+// ErrNoMatchingPolicy is returned by ResolveUserLeaveEntitlements when the
+// resolver found zero applicable policy rules for a user. It is not a hard
+// failure — it means the user has no policy coverage — but the batch caller
+// must distinguish it from "resolved successfully" so counts are honest.
+var ErrNoMatchingPolicy = errors.New("no matching policy rules for user")
+
+type LeavePolicyResolutionService interface {
+	ResolveUserLeaveEntitlements(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, asOf time.Time, reason string, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
+	ResolveBatchLeaveEntitlements(ctx context.Context, companyID uuid.UUID, userIDs []uuid.UUID, asOf time.Time, reason string, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*LeavePolicyResolutionResult, error)
+
+	// ── Enqueue API (used by HTTP handlers, fan-out only) ────────────────
+	EnqueueUserResolutionJobs(ctx context.Context, companyID uuid.UUID, userIDs []uuid.UUID, reason string) error
+	EnqueueCompanyResolution(ctx context.Context, companyID uuid.UUID, reason string) error
+
+	GetLeaveEntitlements(
+		ctx context.Context,
+		companyID uuid.UUID,
+		userID *uuid.UUID,
+		locationID *uuid.UUID,
+		page, pageSize int,
+	) ([]*models.LeaveEntitlement, int64, error)
+
+	GetUserEffectivePolicies(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, asOf time.Time) ([]*models.LeavePolicyRuleResolution, error)
+
+	EndActivePolicyEntitlements(ctx context.Context, companyID, userID uuid.UUID, effectiveTo time.Time) error
+
+	ListActiveEmployeeUserIDs(ctx context.Context, companyID uuid.UUID) ([]uuid.UUID, error)
+
+	ListActiveEmployeeUserIDsByPosition(ctx context.Context, companyID, positionID uuid.UUID) ([]uuid.UUID, error)
+}
+
+type LeavePolicyResolutionResult struct {
+	TotalUsers     int         `json:"TotalUsers"`
+	ProcessedUsers int         `json:"ProcessedUsers"`
+	SkippedUsers   []uuid.UUID `json:"SkippedUsers"`
+	FailedUsers    []uuid.UUID `json:"FailedUsers"`
+	Errors         []string    `json:"Errors"`
+}
+
+type leavePolicyResolutionService struct {
+	repo             repository.LeaveRepository
+	resolverJobs     repository.ResolverJobRepository
+	pgClient         *client.PostgresClient
+	idempotencyStore idempotency.Store
+	auditService     *audit.AuditService
+}
+
+func NewLeavePolicyResolutionService(
+	repo repository.LeaveRepository,
+	resolverJobs repository.ResolverJobRepository,
+	pgClient *client.PostgresClient,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+) LeavePolicyResolutionService {
+	return &leavePolicyResolutionService{
+		repo:             repo,
+		resolverJobs:     resolverJobs,
+		pgClient:         pgClient,
+		idempotencyStore: idempotencyStore,
+		auditService:     auditService,
+	}
+}
+
+// ============================================================
+// Enqueue API — used by HTTP handlers, never does the work inline
+// ============================================================
+
+// EnqueueUserResolutionJobs enqueues one resolve_user job per user.
+// Duplicates (a user already having a pending/processing resolve_user job)
+// are silently skipped by the repository's NOT EXISTS check, so this is
+// safe to call repeatedly.
+func (s *leavePolicyResolutionService) EnqueueUserResolutionJobs(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userIDs []uuid.UUID,
+	reason string,
+) error {
+	if s.pgClient == nil || s.resolverJobs == nil {
+		return errors.New("resolver job repository not configured")
+	}
+	if len(userIDs) == 0 {
+		return nil
+	}
+	zap.L().Info("enqueue user resolution jobs",
+		zap.String("component", "leave_resolution"),
+		zap.String("company_id", companyID.String()),
+		zap.Int("user_count", len(userIDs)),
+		zap.String("reason", reason),
+	)
+	return s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
+		return s.resolverJobs.EnqueueUserResolutions(ctx, tx, companyID, userIDs, reason)
+	})
+}
+
+// EnqueueCompanyResolution enqueues a single resolve_company job. The
+// worker will fan out internally in chunks of 100.
+func (s *leavePolicyResolutionService) EnqueueCompanyResolution(
+	ctx context.Context,
+	companyID uuid.UUID,
+	reason string,
+) error {
+	if s.pgClient == nil || s.resolverJobs == nil {
+		return errors.New("resolver job repository not configured")
+	}
+	zap.L().Info("enqueue company resolution job",
+		zap.String("component", "leave_resolution"),
+		zap.String("company_id", companyID.String()),
+		zap.String("reason", reason),
+	)
+	return s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
+		return s.resolverJobs.EnqueueCompanyResolution(ctx, tx, companyID, reason)
+	})
+}
+
+// ============================================================
+// Synchronous resolver — kept for the worker and single-user calls
+// ============================================================
+
+func (s *leavePolicyResolutionService) ResolveUserLeaveEntitlements(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+	asOf time.Time,
+	reason string,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) error {
+	logger := zap.L().With(
+		zap.String("component", "leave_resolution"),
+		zap.String("company_id", companyID.String()),
+		zap.String("user_id", userID.String()),
+		zap.Time("as_of", asOf),
+		zap.String("reason", reason),
+	)
+
+	logger.Info("resolve user — entry")
+
+	idempKey := resolveUserIdempotencyKey(ctx, userID, asOf)
+	logger.Debug("resolve user — idempotency key", zap.String("idemp_key", idempKey))
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		logger.Info("resolve user — short-circuited by idempotency",
+			zap.String("idemp_key", idempKey),
+		)
+		return nil
+	}
+
+	positionID, workCenterCode, err := s.repo.GetUserPositionContext(ctx, companyID, userID)
+	if err != nil {
+		logger.Error("resolve user — GetUserPositionContext failed", zap.Error(err))
+		return fmt.Errorf("failed to get user position context: %w", err)
+	}
+	logger.Info("resolve user — position context",
+		zap.String("position_id", uuidPtrStr(positionID)),
+		zap.String("work_center_code", strPtrStr(workCenterCode)),
+	)
+
+	rules, err := s.repo.ResolveUserPolicyRules(ctx, companyID, userID, asOf)
+	if err != nil {
+		logger.Error("resolve user — ResolveUserPolicyRules failed", zap.Error(err))
+		return fmt.Errorf("resolve policy rules failed: %w", err)
+	}
+	logger.Info("resolve user — policy rules resolved", zap.Int("rule_count", len(rules)))
+
+	for i, r := range rules {
+		logger.Info("resolve user — rule",
+			zap.Int("index", i),
+			zap.String("policy_id", r.PolicyID.String()),
+			zap.String("leave_type_id", r.LeaveTypeID.String()),
+			zap.Int("total_days", r.TotalDays),
+			zap.String("accrual_method", r.AccrualMethod),
+			zap.String("carry_forward_limit", intPtrStr(r.CarryForwardLimit)),
+		)
+	}
+
+	if len(rules) == 0 {
+		logger.Warn("resolve user — no matching policy rules; skipping and storing marker")
+		_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+		return ErrNoMatchingPolicy
+	}
+
+	processedLeaveTypes := make(map[uuid.UUID]bool)
+	created, updated, skipped := 0, 0, 0
+
+	for _, rule := range rules {
+		if processedLeaveTypes[rule.LeaveTypeID] {
+			logger.Info("resolve user — leave type already processed, skipping",
+				zap.String("leave_type_id", rule.LeaveTypeID.String()),
+			)
+			continue
+		}
+
+		existing, err := s.repo.GetActivePolicyEntitlement(ctx, companyID, userID, rule.LeaveTypeID, positionID)
+		if err != nil {
+			logger.Error("resolve user — GetActivePolicyEntitlement failed",
+				zap.String("leave_type_id", rule.LeaveTypeID.String()),
+				zap.Error(err),
+			)
+			return fmt.Errorf("failed to check existing entitlement: %w", err)
+		}
+
+		if existing != nil {
+			logger.Info("resolve user — existing entitlement found",
+				zap.String("leave_type_id", rule.LeaveTypeID.String()),
+				zap.String("existing_policy_id", uuidPtrStr(existing.PolicyID)),
+				zap.String("target_policy_id", rule.PolicyID.String()),
+				zap.Int("existing_total_days", existing.TotalDays),
+				zap.Int("target_total_days", rule.TotalDays),
+			)
+		} else {
+			logger.Info("resolve user — no existing entitlement; will create",
+				zap.String("leave_type_id", rule.LeaveTypeID.String()),
+				zap.String("target_policy_id", rule.PolicyID.String()),
+				zap.Int("target_total_days", rule.TotalDays),
+			)
+		}
+
+		if existing != nil && existing.PolicyID != nil &&
+			*existing.PolicyID == rule.PolicyID &&
+			existing.TotalDays == rule.TotalDays {
+			logger.Info("resolve user — entitlement already correct; skipping",
+				zap.String("leave_type_id", rule.LeaveTypeID.String()),
+				zap.String("policy_id", rule.PolicyID.String()),
+				zap.Int("total_days", rule.TotalDays),
+			)
+			processedLeaveTypes[rule.LeaveTypeID] = true
+			skipped++
+			continue
+		}
+
+		if err := s.repo.EndActivePolicyEntitlementsByLeaveType(
+			ctx, companyID, userID, rule.LeaveTypeID, asOf, positionID,
+		); err != nil {
+			logger.Error("resolve user — EndActivePolicyEntitlementsByLeaveType failed",
+				zap.String("leave_type_id", rule.LeaveTypeID.String()),
+				zap.Error(err),
+			)
+			return fmt.Errorf("failed to end entitlement: %w", err)
+		}
+		logger.Info("resolve user — ended old entitlements for leave type",
+			zap.String("leave_type_id", rule.LeaveTypeID.String()),
+			zap.Time("end_date", asOf),
+		)
+
+		entitlement := &models.LeaveEntitlement{
+			EntitlementID:  uuid.New(),
+			CompanyID:      companyID,
+			UserID:         userID,
+			LeaveTypeID:    rule.LeaveTypeID,
+			TotalDays:      rule.TotalDays,
+			EffectiveFrom:  asOf,
+			PolicyID:       &rule.PolicyID,
+			Source:         "policy",
+			CreatedAt:      time.Now().UTC(),
+			PositionID:     positionID,
+			WorkCenterCode: workCenterCode,
+		}
+		if err := s.repo.CreatePolicyLeaveEntitlement(ctx, entitlement); err != nil {
+			logger.Error("resolve user — CreatePolicyLeaveEntitlement failed",
+				zap.String("leave_type_id", rule.LeaveTypeID.String()),
+				zap.String("policy_id", rule.PolicyID.String()),
+				zap.Error(err),
+			)
+			return fmt.Errorf("failed to create entitlement: %w", err)
+		}
+
+		logger.Info("resolve user — entitlement written",
+			zap.String("entitlement_id", entitlement.EntitlementID.String()),
+			zap.String("leave_type_id", rule.LeaveTypeID.String()),
+			zap.String("policy_id", rule.PolicyID.String()),
+			zap.Int("total_days", rule.TotalDays),
+		)
+		processedLeaveTypes[rule.LeaveTypeID] = true
+
+		if existing != nil {
+			updated++
+		} else {
+			created++
+		}
+	}
+
+	logger.Info("resolve user — summary",
+		zap.Int("created", created),
+		zap.Int("updated", updated),
+		zap.Int("skipped", skipped),
+		zap.Int("total_rules", len(rules)),
+	)
+
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"company_id": companyID.String(),
+		"user_id":    userID.String(),
+		"as_of":      asOf,
+		"reason":     reason,
+		"ip":         ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx, nil, &companyID, "leave", "resolution.user", "leave_entitlement",
+		nil, actorType, &actorID, nil, nil, auditMeta,
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+
+	logger.Info("resolve user — done")
+	return nil
+}
+
+func (s *leavePolicyResolutionService) ResolveBatchLeaveEntitlements(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userIDs []uuid.UUID,
+	asOf time.Time,
+	reason string,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) (*LeavePolicyResolutionResult, error) {
+	logger := zap.L().With(
+		zap.String("component", "leave_resolution"),
+		zap.String("company_id", companyID.String()),
+		zap.Int("user_count", len(userIDs)),
+		zap.String("reason", reason),
+	)
+	logger.Info("resolve batch — entry")
+
+	batchKey := resolveBatchIdempotencyKey(ctx)
+	logger.Debug("resolve batch — idempotency key", zap.String("batch_key", batchKey))
+
+	var cached *LeavePolicyResolutionResult
+	if err := s.idempotencyStore.Get(ctx, nil, batchKey, &cached); err == nil && cached != nil {
+		logger.Info("resolve batch — short-circuited by idempotency",
+			zap.String("batch_key", batchKey),
+		)
+		return cached, nil
+	}
+
+	result := &LeavePolicyResolutionResult{
+		TotalUsers:   len(userIDs),
+		SkippedUsers: []uuid.UUID{},
+		FailedUsers:  []uuid.UUID{},
+		Errors:       []string{},
+	}
+	for _, userID := range userIDs {
+		err := s.ResolveUserLeaveEntitlements(
+			ctx, companyID, userID, asOf, reason, actorType, actorID, metadata,
+		)
+		switch {
+		case err == nil:
+			result.ProcessedUsers++
+		case errors.Is(err, ErrNoMatchingPolicy):
+			result.SkippedUsers = append(result.SkippedUsers, userID)
+		default:
+			result.FailedUsers = append(result.FailedUsers, userID)
+			result.Errors = append(result.Errors, err.Error())
+		}
+	}
+
+	logger.Info("resolve batch — summary",
+		zap.Int("total", result.TotalUsers),
+		zap.Int("processed", result.ProcessedUsers),
+		zap.Int("skipped", len(result.SkippedUsers)),
+		zap.Int("failed", len(result.FailedUsers)),
+	)
+
+	ip, _ := ctx.Value("ip_address").(string)
+	afterJSON, _ := json.Marshal(result)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"company_id": companyID.String(),
+		"total":      result.TotalUsers,
+		"processed":  result.ProcessedUsers,
+		"skipped":    len(result.SkippedUsers),
+		"failed":     len(result.FailedUsers),
+		"ip":         ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx, nil, &companyID, "leave", "resolution.batch", "leave_entitlement",
+		nil, actorType, &actorID, nil, afterJSON, auditMeta,
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, batchKey, result)
+
+	logger.Info("resolve batch — done")
+	return result, nil
+}
+
+func (s *leavePolicyResolutionService) GetLeaveEntitlements(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID *uuid.UUID,
+	locationID *uuid.UUID,
+	page, pageSize int,
+) ([]*models.LeaveEntitlement, int64, error) {
+	return s.repo.GetLeaveEntitlementsByCompanyAndUser(ctx, companyID, userID, locationID, page, pageSize)
+}
+
+func (s *leavePolicyResolutionService) GetUserEffectivePolicies(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, asOf time.Time) ([]*models.LeavePolicyRuleResolution, error) {
+	return s.repo.ResolveUserPolicyRules(ctx, companyID, userID, asOf)
+}
+
+// ============================================================
+// Resolver worker support
+// ============================================================
+
+func (s *leavePolicyResolutionService) EndActivePolicyEntitlements(
+	ctx context.Context, companyID, userID uuid.UUID, effectiveTo time.Time,
+) error {
+	positionID, _, err := s.repo.GetUserPositionContext(ctx, companyID, userID)
+	if err != nil {
+		return fmt.Errorf("get user position context: %w", err)
+	}
+	return s.repo.EndActivePolicyEntitlements(ctx, companyID, userID, effectiveTo, positionID)
+}
+
+func (s *leavePolicyResolutionService) ListActiveEmployeeUserIDs(
+	ctx context.Context, companyID uuid.UUID,
+) ([]uuid.UUID, error) {
+	return s.repo.ListActiveEmployeeUserIDs(ctx, companyID)
+}
+
+func (s *leavePolicyResolutionService) ListActiveEmployeeUserIDsByPosition(
+	ctx context.Context, companyID, positionID uuid.UUID,
+) ([]uuid.UUID, error) {
+	return s.repo.ListActiveEmployeeUserIDsByPosition(ctx, companyID, positionID)
+}
+
+// ============================================================
+// Idempotency key helpers
+// ============================================================
+
+// resolveUserIdempotencyKey builds a per-user, per-operation key.
+//
+// Priority order:
+//
+//  1. resolver_job_id  → one key per resolver job, unique across jobs.
+//     Multiple jobs for the same user on the same day
+//     each get their own key and both run.
+//
+//  2. idempotency_key  → one key per HTTP request. Retries of the same
+//     request are idempotent; distinct clicks are not.
+//
+//  3. fallback         → day-scoped, last-resort safety net. Only fires
+//     when a caller supplies NEITHER a job id NOR a
+//     request key — a wiring bug we want to collapse
+//     rather than multiply.
+func resolveUserIdempotencyKey(ctx context.Context, userID uuid.UUID, asOf time.Time) string {
+	if jobID, _ := ctx.Value("resolver_job_id").(string); jobID != "" {
+		return fmt.Sprintf("resolve_user_job-%s-user-%s", jobID, userID.String())
+	}
+	if reqKey, _ := ctx.Value("idempotency_key").(string); reqKey != "" {
+		return fmt.Sprintf("%s-user-%s", reqKey, userID.String())
+	}
+	return fmt.Sprintf("resolve_user-%s-%s", userID.String(), asOf.Format("2006-01-02"))
+}
+
+func resolveBatchIdempotencyKey(ctx context.Context) string {
+	if reqKey, _ := ctx.Value("idempotency_key").(string); reqKey != "" {
+		return fmt.Sprintf("%s-batch", reqKey)
+	}
+	return fmt.Sprintf("resolve_batch-%s", uuid.New().String())
+}
+
+// ============================================================
+// Logging helpers — small pointer→string adapters so zap fields
+// don't panic on nil pointers and read cleanly in the log output.
+// ============================================================
+
+func uuidPtrStr(id *uuid.UUID) string {
+	if id == nil {
+		return "<nil>"
+	}
+	return id.String()
+}
+
+func strPtrStr(s *string) string {
+	if s == nil {
+		return "<nil>"
+	}
+	return *s
+}
+
+func intPtrStr(i *int) string {
+	if i == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("%d", *i)
+}
+
+
+
+================================================================================
+FILE: ./service/leave_balance_service.go
+================================================================================
+
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+
+	"auth-service/internal/hr/leave/models"
+	"auth-service/internal/hr/leave/repository"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+)
+
+type LeaveBalanceService interface {
+	GetCurrentBalance(ctx context.Context, entitlementID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.LeaveBalanceSnapshot, error)
+	GetBalanceAsOf(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, leaveTypeID uuid.UUID, asOfDate time.Time, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.LeaveBalance, error)
+	RecalculateAndSnapshot(ctx context.Context, entitlementID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.LeaveBalanceSnapshot, error)
+}
+
+type leaveBalanceService struct {
+	repo             repository.LeaveRepository
+	idempotencyStore idempotency.Store
+	auditService     *audit.AuditService
+}
+
+func NewLeaveBalanceService(
+	repo repository.LeaveRepository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+) LeaveBalanceService {
+	return &leaveBalanceService{
+		repo:             repo,
+		idempotencyStore: idempotencyStore,
+		auditService:     auditService,
+	}
+}
+
+// GetCurrentBalance – read, no idempotency, but audit if required
+func (s *leaveBalanceService) GetCurrentBalance(
+	ctx context.Context,
+	entitlementID uuid.UUID,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) (*models.LeaveBalanceSnapshot, error) {
+	ledgerEntries, err := s.repo.GetLeaveLedgerEntriesByEntitlement(ctx, entitlementID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get ledger entries: %w", err)
+	}
+	var balance float64
+	for _, e := range ledgerEntries {
+		switch e.EntryType {
+		case "accrual", "reversal":
+			balance += float64(e.Days)
+		case "consumption":
+			balance -= float64(e.Days)
+		}
+	}
+	snapshot := &models.LeaveBalanceSnapshot{
+		EntitlementID: entitlementID,
+		BalanceDays:   balance,
+		CalculatedAt:  time.Now().UTC(),
+	}
+
+	// Audit read (optional)
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"entitlement_id": entitlementID.String(),
+		"balance":        balance,
+		"ip":             ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		nil, // companyID unknown, but can be fetched if needed
+		"leave",
+		"balance.get_current",
+		"leave_balance",
+		&entitlementID,
+		actorType,
+		&actorID,
+		nil,
+		nil,
+		auditMeta,
+	)
+
+	return snapshot, nil
+}
+
+func (s *leaveBalanceService) RecalculateAndSnapshot(
+	ctx context.Context,
+	entitlementID uuid.UUID,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) (*models.LeaveBalanceSnapshot, error) {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("snapshot-%s", entitlementID.String())
+	}
+	var cached *models.LeaveBalanceSnapshot
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
+
+	snapshot, err := s.GetCurrentBalance(ctx, entitlementID, actorType, actorID, metadata)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.repo.CreateLeaveBalanceSnapshot(ctx, snapshot); err != nil {
+		return nil, fmt.Errorf("failed to create snapshot: %w", err)
+	}
+
+	// Audit
+	ip, _ := ctx.Value("ip_address").(string)
+	afterJSON, _ := json.Marshal(snapshot)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"entitlement_id": entitlementID.String(),
+		"balance":        snapshot.BalanceDays,
+		"ip":             ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		nil,
+		"leave",
+		"balance.snapshot",
+		"leave_balance_snapshot",
+		&entitlementID,
+		actorType,
+		&actorID,
+		nil,
+		afterJSON,
+		auditMeta,
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, snapshot)
+
+	return snapshot, nil
+}
+
+func (s *leaveBalanceService) GetBalanceAsOf(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+	leaveTypeID uuid.UUID,
+	asOfDate time.Time,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) (*models.LeaveBalance, error) {
+	positionID, _, err := s.repo.GetUserPositionContext(ctx, companyID, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve user position: %w", err)
+	}
+	balance, err := s.repo.CalculateLeaveBalance(ctx, userID, leaveTypeID, asOfDate, positionID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Audit read
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"user_id":    userID.String(),
+		"leave_type": leaveTypeID.String(),
+		"as_of":      asOfDate,
+		"balance":    balance.Balance,
+		"ip":         ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&companyID,
+		"leave",
+		"balance.get_as_of",
+		"leave_balance",
+		nil,
+		actorType,
+		&actorID,
+		nil,
+		nil,
+		auditMeta,
+	)
+
+	return balance, nil
+}
+
+
+
+================================================================================
+FILE: ./service/leave_policy_service.go
+================================================================================
+
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+
+	hrErrors "auth-service/internal/hr/errors"
+	"auth-service/internal/hr/leave/models"
+	"auth-service/internal/hr/leave/repository"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+)
+
+type LeavePolicyService interface {
+	CreateLeaveType(ctx context.Context, companyID uuid.UUID, req *models.LeaveTypeCreate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.LeaveType, error)
+	UpdateLeaveType(ctx context.Context, leaveTypeID uuid.UUID, update *models.LeaveTypeUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
+	AssignEntitlementToUser(ctx context.Context, req *models.LeaveEntitlementCreate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.LeaveEntitlement, error)
+	GetLeaveTypesByCompany(ctx context.Context, companyID uuid.UUID) ([]*models.LeaveType, error)
+	DeleteLeaveType(ctx context.Context, leaveTypeID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
+}
+
+type leavePolicyService struct {
+	repo             repository.LeaveRepository
+	idempotencyStore idempotency.Store
+	auditService     *audit.AuditService
+}
+
+func NewLeavePolicyService(
+	repo repository.LeaveRepository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+) LeavePolicyService {
+	return &leavePolicyService{
+		repo:             repo,
+		idempotencyStore: idempotencyStore,
+		auditService:     auditService,
+	}
+}
+
+func (s *leavePolicyService) CreateLeaveType(
+	ctx context.Context,
+	companyID uuid.UUID,
+	req *models.LeaveTypeCreate,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) (*models.LeaveType, error) {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("create_lt-%s-%s", companyID.String(), req.Code)
+	}
+	var cached *models.LeaveType
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
+
+	// GetLeaveTypeByCode returns ErrLeaveTypeNotFound when the code does
+	// not exist yet — that's the SUCCESS path for a duplicate check.
+	existing, err := s.repo.GetLeaveTypeByCode(ctx, companyID, req.Code)
+	if err != nil && !errors.Is(err, hrErrors.ErrLeaveTypeNotFound) {
+		return nil, fmt.Errorf("failed to check leave type: %w", err)
+	}
+	if existing != nil {
+		return nil, fmt.Errorf("leave type with code %s already exists", req.Code)
+	}
+
+	leaveType := &models.LeaveType{
+		LeaveTypeID:      uuid.New(),
+		CompanyID:        companyID,
+		Code:             req.Code,
+		Name:             req.Name,
+		IsPaid:           req.IsPaid,
+		RequiresApproval: req.RequiresApproval,
+		CreatedAt:        time.Now().UTC(),
+	}
+
+	if err := s.repo.CreateLeaveType(ctx, leaveType); err != nil {
+		return nil, err
+	}
+
+	afterJSON, _ := json.Marshal(leaveType)
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"leave_type_id": leaveType.LeaveTypeID.String(),
+		"company_id":    companyID.String(),
+		"code":          req.Code,
+		"ip":            ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&companyID,
+		"leave",
+		"leave_type.create",
+		"leave_type",
+		&leaveType.LeaveTypeID,
+		actorType,
+		&actorID,
+		[]byte("{}"),
+		afterJSON,
+		auditMeta,
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, leaveType)
+
+	return leaveType, nil
+}
+
+func (s *leavePolicyService) UpdateLeaveType(
+	ctx context.Context,
+	leaveTypeID uuid.UUID,
+	update *models.LeaveTypeUpdate,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("update_lt-%s", leaveTypeID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	existing, err := s.repo.GetLeaveTypeByID(ctx, leaveTypeID)
+	if err != nil {
+		return fmt.Errorf("failed to get leave type: %w", err)
+	}
+	if existing == nil {
+		return fmt.Errorf("leave type not found")
+	}
+	beforeJSON, _ := json.Marshal(existing)
+
+	if err := s.repo.UpdateLeaveType(ctx, leaveTypeID, update); err != nil {
+		return err
+	}
+
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"leave_type_id": leaveTypeID.String(),
+		"ip":            ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&existing.CompanyID,
+		"leave",
+		"leave_type.update",
+		"leave_type",
+		&leaveTypeID,
+		actorType,
+		&actorID,
+		beforeJSON,
+		nil,
+		auditMeta,
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+
+	return nil
+}
+
+func (s *leavePolicyService) AssignEntitlementToUser(
+	ctx context.Context,
+	req *models.LeaveEntitlementCreate,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) (*models.LeaveEntitlement, error) {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("assign_ent-%s-%s", req.UserID.String(), req.LeaveTypeID.String())
+	}
+	var cached *models.LeaveEntitlement
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
+
+	if req.EffectiveFrom.IsZero() {
+		return nil, fmt.Errorf("effective from date is required")
+	}
+	if req.EffectiveTo != nil && req.EffectiveTo.Before(req.EffectiveFrom) {
+		return nil, fmt.Errorf("effective to must be after effective from")
+	}
+	if req.TotalDays <= 0 {
+		return nil, fmt.Errorf("total days must be > 0")
+	}
+
+	positionID, workCenterCode, err := s.repo.GetUserPositionContext(ctx, req.CompanyID, req.UserID)
+	if err != nil {
+		// log but continue
+	}
+	entitlement := &models.LeaveEntitlement{
+		EntitlementID:  uuid.New(),
+		CompanyID:      req.CompanyID,
+		UserID:         req.UserID,
+		LeaveTypeID:    req.LeaveTypeID,
+		TotalDays:      req.TotalDays,
+		EffectiveFrom:  req.EffectiveFrom,
+		EffectiveTo:    req.EffectiveTo,
+		PositionID:     positionID,
+		WorkCenterCode: workCenterCode,
+		Source:         "manual",
+		CreatedAt:      time.Now().UTC(),
+	}
+	if err := s.repo.CreateLeaveEntitlement(ctx, entitlement); err != nil {
+		return nil, err
+	}
+
+	afterJSON, _ := json.Marshal(entitlement)
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"entitlement_id": entitlement.EntitlementID.String(),
+		"user_id":        req.UserID.String(),
+		"leave_type":     req.LeaveTypeID.String(),
+		"ip":             ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&req.CompanyID,
+		"leave",
+		"entitlement.assign",
+		"leave_entitlement",
+		&entitlement.EntitlementID,
+		actorType,
+		&actorID,
+		[]byte("{}"),
+		afterJSON,
+		auditMeta,
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, entitlement)
+
+	return entitlement, nil
+}
+
+func (s *leavePolicyService) GetLeaveTypesByCompany(ctx context.Context, companyID uuid.UUID) ([]*models.LeaveType, error) {
+	return s.repo.GetLeaveTypesByCompany(ctx, companyID)
+}
+
+func (s *leavePolicyService) DeleteLeaveType(
+	ctx context.Context,
+	leaveTypeID uuid.UUID,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("delete_lt-%s", leaveTypeID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	leaveType, err := s.repo.GetLeaveTypeByID(ctx, leaveTypeID)
+	if err != nil {
+		return err
+	}
+	beforeJSON, _ := json.Marshal(leaveType)
+
+	inUse, err := s.repo.IsLeaveTypeInUse(ctx, leaveTypeID)
+	if err != nil {
+		return fmt.Errorf("failed to check usage: %w", err)
+	}
+	if inUse {
+		return fmt.Errorf("cannot delete leave type in use")
+	}
+
+	if err := s.repo.DeleteLeaveType(ctx, leaveTypeID); err != nil {
+		return err
+	}
+
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"leave_type_id": leaveTypeID.String(),
+		"ip":            ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&leaveType.CompanyID,
+		"leave",
+		"leave_type.delete",
+		"leave_type",
+		&leaveTypeID,
+		actorType,
+		&actorID,
+		beforeJSON,
+		[]byte("{}"),
+		auditMeta,
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+
+	return nil
+}
+
+
+
+================================================================================
+FILE: ./service/leave_request_service.go
+================================================================================
+
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+
+	"auth-service/internal/hr/leave/models"
+	"auth-service/internal/hr/leave/repository"
+	hrRepo "auth-service/internal/hr/repository"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+	"auth-service/internal/locationctx"
+)
+
+type LeaveRequestService interface {
+	RequestLeave(ctx context.Context, req *models.LeaveRequestCreate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.LeaveRequest, error)
+	ApproveLeave(ctx context.Context, requestID uuid.UUID, approvedBy uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.LeaveRequest, error)
+	RejectLeave(ctx context.Context, requestID uuid.UUID, rejectedBy uuid.UUID, reason string, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.LeaveRequest, error)
+	CancelLeave(ctx context.Context, requestID uuid.UUID, cancelledBy uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.LeaveRequest, error)
+
+	// GetPendingRequests — location filter applies when locationID != nil.
+	GetPendingRequests(
+		ctx context.Context,
+		companyID uuid.UUID,
+		approverID uuid.UUID,
+		locationID *uuid.UUID,
+	) ([]*models.LeaveRequest, error)
+
+	UpdateLeaveRequest(ctx context.Context, requestID uuid.UUID, update *models.LeaveRequestUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
+}
+
+type leaveRequestService struct {
+	repo             repository.LeaveRepository
+	employeeRepo     hrRepo.EmployeeRepository // 👈 new — for location lookup
+	balanceService   LeaveBalanceService
+	idempotencyStore idempotency.Store
+	auditService     *audit.AuditService
+}
+
+func NewLeaveRequestService(
+	repo repository.LeaveRepository,
+	employeeRepo hrRepo.EmployeeRepository, // 👈 new
+	balanceService LeaveBalanceService,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+) LeaveRequestService {
+	return &leaveRequestService{
+		repo:             repo,
+		employeeRepo:     employeeRepo,
+		balanceService:   balanceService,
+		idempotencyStore: idempotencyStore,
+		auditService:     auditService,
+	}
+}
+
+// ensureEmployeeInScope — see hr/service for the equivalent helper.
+//
+// Rules:
+//   - ScopeAll      → pass
+//   - ScopeLocation → target.employment_location_id must match scope
+//   - missing ctx   → error (route not wrapped → wiring bug)
+func (s *leaveRequestService) ensureEmployeeInScope(
+	ctx context.Context,
+	companyID, userID uuid.UUID,
+) error {
+	locCtx, err := locationctx.FromContext(ctx)
+	if err != nil {
+		return fmt.Errorf("location context missing: %w", err)
+	}
+	if locCtx.Mode == locationctx.ScopeAll {
+		return nil
+	}
+	empLoc, err := s.employeeRepo.GetEmploymentLocationID(ctx, companyID, userID)
+	if err != nil {
+		return err
+	}
+	if empLoc == nil {
+		return ErrEmployeeHasNoLocation
+	}
+	if *empLoc != *locCtx.LocationID {
+		return ErrEmployeeOutsideScope
+	}
+	return nil
+}
+
+func (s *leaveRequestService) RequestLeave(
+	ctx context.Context,
+	req *models.LeaveRequestCreate,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) (*models.LeaveRequest, error) {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("request_leave-%s", uuid.New().String())
+	}
+	var cached *models.LeaveRequest
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
+
+	// 👇 Row-level authorization — target employee must be in scope.
+	if err := s.ensureEmployeeInScope(ctx, req.CompanyID, req.UserID); err != nil {
+		return nil, err
+	}
+
+	valid, message, err := s.repo.ValidateLeaveRequest(ctx, req, nil)
+	if err != nil {
+		return nil, err
+	}
+	if !valid {
+		return nil, fmt.Errorf("%s", message)
+	}
+	leaveType, err := s.repo.GetLeaveTypeByID(ctx, req.LeaveTypeID)
+	if err != nil {
+		return nil, err
+	}
+	if leaveType == nil {
+		return nil, fmt.Errorf("leave type not found")
+	}
+
+	request := &models.LeaveRequest{
+		LeaveRequestID: uuid.New(),
+		CompanyID:      req.CompanyID,
+		UserID:         req.UserID,
+		LeaveTypeID:    req.LeaveTypeID,
+		StartDate:      req.StartDate,
+		EndDate:        req.EndDate,
+		TotalDays:      req.TotalDays,
+		Status:         "pending",
+		RequestedBy:    req.RequestedBy,
+		RequestedAt:    time.Now().UTC(),
+	}
+	if !leaveType.RequiresApproval {
+		request.Status = "approved"
+		request.ApprovedBy = &req.RequestedBy
+		now := time.Now().UTC()
+		request.ApprovedAt = &now
+	}
+
+	if err := s.repo.CreateLeaveRequest(ctx, request); err != nil {
+		return nil, err
+	}
+
+	if request.Status == "approved" {
+		if err := s.processApproval(ctx, request, *request.ApprovedBy); err != nil {
+			// Non-fatal — the request is created; the approval ledger entry
+			// can be reconciled later. Log via audit metadata below.
+		}
+	}
+
+	afterJSON, _ := json.Marshal(request)
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"request_id": request.LeaveRequestID.String(),
+		"user_id":    req.UserID.String(),
+		"status":     request.Status,
+		"ip":         ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx, nil, &req.CompanyID, "leave", "request.create", "leave_request",
+		&request.LeaveRequestID, actorType, &actorID, []byte("{}"), afterJSON, auditMeta,
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, request)
+
+	return request, nil
+}
+
+func (s *leaveRequestService) ApproveLeave(
+	ctx context.Context,
+	requestID uuid.UUID,
+	approvedBy uuid.UUID,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) (*models.LeaveRequest, error) {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("approve_leave-%s", requestID.String())
+	}
+	var cached *models.LeaveRequest
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
+
+	request, err := s.repo.GetLeaveRequestByID(ctx, requestID)
+	if err != nil {
+		return nil, err
+	}
+	if request == nil {
+		return nil, fmt.Errorf("leave request not found")
+	}
+	if request.Status != "pending" {
+		return nil, fmt.Errorf("leave request is not pending")
+	}
+
+	// 👇 Row-level authorization — target employee must be in scope.
+	if err := s.ensureEmployeeInScope(ctx, request.CompanyID, request.UserID); err != nil {
+		return nil, err
+	}
+
+	balance, err := s.balanceService.GetBalanceAsOf(ctx, request.CompanyID, request.UserID, request.LeaveTypeID, request.StartDate, actorType, actorID, metadata)
+	if err != nil {
+		return nil, err
+	}
+	if balance.Balance < float64(request.TotalDays) {
+		return nil, fmt.Errorf("insufficient balance: available=%.2f, required=%d", balance.Balance, request.TotalDays)
+	}
+
+	beforeJSON, _ := json.Marshal(request)
+	if err := s.processApproval(ctx, request, approvedBy); err != nil {
+		return nil, err
+	}
+	updated, _ := s.repo.GetLeaveRequestByID(ctx, requestID)
+	afterJSON, _ := json.Marshal(updated)
+
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"request_id":  requestID.String(),
+		"approved_by": approvedBy.String(),
+		"ip":          ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx, nil, &request.CompanyID, "leave", "request.approve", "leave_request",
+		&requestID, actorType, &actorID, beforeJSON, afterJSON, auditMeta,
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, updated)
+
+	return updated, nil
+}
+
+func (s *leaveRequestService) RejectLeave(
+	ctx context.Context,
+	requestID uuid.UUID,
+	rejectedBy uuid.UUID,
+	reason string,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) (*models.LeaveRequest, error) {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("reject_leave-%s", requestID.String())
+	}
+	var cached *models.LeaveRequest
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
+
+	request, err := s.repo.GetLeaveRequestByID(ctx, requestID)
+	if err != nil {
+		return nil, err
+	}
+	if request == nil {
+		return nil, fmt.Errorf("request not found")
+	}
+
+	// 👇 Row-level authorization — target employee must be in scope.
+	if err := s.ensureEmployeeInScope(ctx, request.CompanyID, request.UserID); err != nil {
+		return nil, err
+	}
+
+	beforeJSON, _ := json.Marshal(request)
+
+	update := &models.LeaveRequestUpdate{
+		Status:     stringPtr("rejected"),
+		ApprovedBy: &rejectedBy,
+		ApprovedAt: timePtr(time.Now().UTC()),
+	}
+	if err := s.repo.UpdateLeaveRequest(ctx, requestID, update); err != nil {
+		return nil, err
+	}
+	updated, _ := s.repo.GetLeaveRequestByID(ctx, requestID)
+	afterJSON, _ := json.Marshal(updated)
+
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"request_id": requestID.String(),
+		"reason":     reason,
+		"ip":         ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx, nil, &request.CompanyID, "leave", "request.reject", "leave_request",
+		&requestID, actorType, &actorID, beforeJSON, afterJSON, auditMeta,
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, updated)
+
+	return updated, nil
+}
+
+func (s *leaveRequestService) CancelLeave(
+	ctx context.Context,
+	requestID uuid.UUID,
+	cancelledBy uuid.UUID,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) (*models.LeaveRequest, error) {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("cancel_leave-%s", requestID.String())
+	}
+	var cached *models.LeaveRequest
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
+
+	request, err := s.repo.GetLeaveRequestByID(ctx, requestID)
+	if err != nil {
+		return nil, err
+	}
+	if request == nil {
+		return nil, fmt.Errorf("request not found")
+	}
+
+	// 👇 Row-level authorization — target employee must be in scope.
+	if err := s.ensureEmployeeInScope(ctx, request.CompanyID, request.UserID); err != nil {
+		return nil, err
+	}
+
+	beforeJSON, _ := json.Marshal(request)
+
+	if err := s.repo.CancelLeaveRequest(ctx, requestID); err != nil {
+		return nil, err
+	}
+	updated, _ := s.repo.GetLeaveRequestByID(ctx, requestID)
+	afterJSON, _ := json.Marshal(updated)
+
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"request_id":   requestID.String(),
+		"cancelled_by": cancelledBy.String(),
+		"ip":           ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx, nil, &request.CompanyID, "leave", "request.cancel", "leave_request",
+		&requestID, actorType, &actorID, beforeJSON, afterJSON, auditMeta,
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, updated)
+
+	return updated, nil
+}
+
+// GetPendingRequests — location filter applies when locationID != nil.
+func (s *leaveRequestService) GetPendingRequests(
+	ctx context.Context,
+	companyID uuid.UUID,
+	approverID uuid.UUID,
+	locationID *uuid.UUID,
+) ([]*models.LeaveRequest, error) {
+	return s.repo.GetPendingLeaveRequests(ctx, companyID, approverID, locationID)
+}
+
+func (s *leaveRequestService) UpdateLeaveRequest(
+	ctx context.Context,
+	requestID uuid.UUID,
+	update *models.LeaveRequestUpdate,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("update_req-%s", requestID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	request, err := s.repo.GetLeaveRequestByID(ctx, requestID)
+	if err != nil {
+		return err
+	}
+
+	// 👇 Row-level authorization — target employee must be in scope.
+	if err := s.ensureEmployeeInScope(ctx, request.CompanyID, request.UserID); err != nil {
+		return err
+	}
+
+	beforeJSON, _ := json.Marshal(request)
+
+	if err := s.repo.UpdateLeaveRequest(ctx, requestID, update); err != nil {
+		return err
+	}
+
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"request_id": requestID.String(),
+		"ip":         ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx, nil, &request.CompanyID, "leave", "request.update", "leave_request",
+		&requestID, actorType, &actorID, beforeJSON, nil, auditMeta,
+	)
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+
+	return nil
+}
+
+func (s *leaveRequestService) processApproval(ctx context.Context, request *models.LeaveRequest, approvedBy uuid.UUID) error {
+	return s.repo.ProcessLeaveRequest(ctx, request.LeaveRequestID, true, approvedBy)
+}
+
+func stringPtr(v string) *string     { return &v }
+func timePtr(t time.Time) *time.Time { return &t }
+
+
+
+================================================================================
+FILE: ./service/leave_policy_config_service.go
+================================================================================
+
+package service
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"auth-service/internal/client"
+	"auth-service/internal/hr/leave/models"
+	"auth-service/internal/hr/leave/repository"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+)
+
+type LeavePolicyConfigService interface {
+	CreatePolicy(ctx context.Context, policy *models.LeavePolicy, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.LeavePolicy, error)
+	DeactivatePolicy(ctx context.Context, policyID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
+	GetPolicy(ctx context.Context, policyID uuid.UUID) (*models.LeavePolicy, error)
+	ListActivePolicies(ctx context.Context, companyID uuid.UUID, asOf time.Time) ([]*models.LeavePolicy, error)
+	UpdatePolicy(ctx context.Context, policyID uuid.UUID, update *models.LeavePolicyUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
+	AddPolicyRule(ctx context.Context, rule *models.LeavePolicyRule, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.LeavePolicyRule, error)
+	UpdatePolicyRule(ctx context.Context, companyID uuid.UUID, policyRuleID uuid.UUID, update *models.LeavePolicyRuleUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
+	RemovePolicyRule(ctx context.Context, policyRuleID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
+	GetPolicyRules(ctx context.Context, policyID uuid.UUID) ([]*models.LeavePolicyRule, error)
+}
+
+type leavePolicyConfigService struct {
+	repo             repository.LeaveRepository
+	idempotencyStore idempotency.Store
+	auditService     *audit.AuditService
+
+	// 👇 ADD
+	pgClient     *client.PostgresClient
+	resolverJobs repository.ResolverJobRepository
+}
+
+func NewLeavePolicyConfigService(
+	repo repository.LeaveRepository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient, // 👈 ADD
+	resolverJobs repository.ResolverJobRepository, // 👈 ADD
+) LeavePolicyConfigService {
+	return &leavePolicyConfigService{
+		repo:             repo,
+		idempotencyStore: idempotencyStore,
+		auditService:     auditService,
+		pgClient:         pgClient,
+		resolverJobs:     resolverJobs,
+	}
+}
+
+// enqueueCompanyResolution is the best-effort emit used by every policy
+// mutation. The policy write has already committed by the time we get here,
+// so a failed enqueue MUST NOT surface as an HTTP error — log and move on.
+// The next policy edit will re-enqueue.
+func (s *leavePolicyConfigService) enqueueCompanyResolution(
+	ctx context.Context,
+	companyID uuid.UUID,
+	reason string,
+) {
+	if s.pgClient == nil || s.resolverJobs == nil {
+		return
+	}
+	if companyID == uuid.Nil {
+		return
+	}
+	if err := s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
+		return s.resolverJobs.EnqueueCompanyResolution(ctx, tx, companyID, reason)
+	}); err != nil {
+		zap.L().Warn("enqueue company resolution failed",
+			zap.String("company_id", companyID.String()),
+			zap.String("reason", reason),
+			zap.Error(err),
+		)
+	}
+}
+
+// ---------- POLICY ----------
+
+func (s *leavePolicyConfigService) CreatePolicy(
+	ctx context.Context,
+	policy *models.LeavePolicy,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) (*models.LeavePolicy, error) {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("create_policy-%s", uuid.New().String())
+	}
+	var cached *models.LeavePolicy
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
+
+	if policy.CompanyID == uuid.Nil {
+		return nil, fmt.Errorf("company_id is required")
+	}
+	if policy.PolicyName == "" {
+		return nil, fmt.Errorf("policy_name is required")
+	}
+	if policy.AppliesToType == "" {
+		return nil, fmt.Errorf("applies_to_type is required")
+	}
+	switch policy.AppliesToType {
+	case "company":
+		policy.AppliesToPositionID = nil
+		policy.AppliesToWorkCenterCode = nil
+	case "position":
+		if policy.AppliesToPositionID == nil {
+			return nil, fmt.Errorf("applies_to_position_id required")
+		}
+	case "work_center":
+		if policy.AppliesToWorkCenterCode == nil {
+			return nil, fmt.Errorf("applies_to_work_center_code required")
+		}
+	default:
+		return nil, fmt.Errorf("invalid applies_to_type")
+	}
+	if policy.Priority <= 0 {
+		return nil, fmt.Errorf("priority must be > 0")
+	}
+
+	policy.PolicyID = uuid.New()
+	policy.IsActive = true
+	policy.CreatedAt = time.Now().UTC()
+
+	if err := s.repo.CreateLeavePolicy(ctx, policy); err != nil {
+		return nil, err
+	}
+
+	afterJSON, _ := json.Marshal(policy)
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"policy_id":  policy.PolicyID.String(),
+		"company_id": policy.CompanyID.String(),
+		"name":       policy.PolicyName,
+		"ip":         ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&policy.CompanyID,
+		"leave",
+		"policy.create",
+		"leave_policy",
+		&policy.PolicyID,
+		actorType,
+		&actorID,
+		[]byte("{}"),
+		afterJSON,
+		auditMeta,
+	)
+
+	// 👇 Policy changed → re-resolve every active employee in the company.
+	s.enqueueCompanyResolution(ctx, policy.CompanyID, "policy change")
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, policy)
+
+	return policy, nil
+}
+
+func (s *leavePolicyConfigService) DeactivatePolicy(
+	ctx context.Context,
+	policyID uuid.UUID,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("deactivate_policy-%s", policyID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	policy, err := s.repo.GetLeavePolicyByID(ctx, policyID)
+	if err != nil {
+		return err
+	}
+	beforeJSON, _ := json.Marshal(policy)
+
+	if err := s.repo.DeactivateLeavePolicy(ctx, policyID); err != nil {
+		return err
+	}
+
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"policy_id": policyID.String(),
+		"ip":        ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&policy.CompanyID,
+		"leave",
+		"policy.deactivate",
+		"leave_policy",
+		&policyID,
+		actorType,
+		&actorID,
+		beforeJSON,
+		[]byte("{}"),
+		auditMeta,
+	)
+
+	// 👇 Policy changed → re-resolve every active employee in the company.
+	s.enqueueCompanyResolution(ctx, policy.CompanyID, "policy change")
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+
+	return nil
+}
+
+func (s *leavePolicyConfigService) GetPolicy(ctx context.Context, policyID uuid.UUID) (*models.LeavePolicy, error) {
+	return s.repo.GetLeavePolicyByID(ctx, policyID)
+}
+
+func (s *leavePolicyConfigService) ListActivePolicies(ctx context.Context, companyID uuid.UUID, asOf time.Time) ([]*models.LeavePolicy, error) {
+	return s.repo.GetActiveLeavePoliciesByCompany(ctx, companyID, asOf)
+}
+
+func (s *leavePolicyConfigService) UpdatePolicy(
+	ctx context.Context,
+	policyID uuid.UUID,
+	update *models.LeavePolicyUpdate,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("update_policy-%s", policyID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	policy, err := s.repo.GetLeavePolicyByID(ctx, policyID)
+	if err != nil {
+		return err
+	}
+	beforeJSON, _ := json.Marshal(policy)
+
+	if update.AppliesToType != nil {
+		switch *update.AppliesToType {
+		case "company":
+			update.AppliesToPositionID = nil
+			update.AppliesToWorkCenterCode = nil
+		case "position":
+			if update.AppliesToPositionID == nil {
+				return fmt.Errorf("applies_to_position_id required")
+			}
+		case "work_center":
+			if update.AppliesToWorkCenterCode == nil {
+				return fmt.Errorf("applies_to_work_center_code required")
+			}
+		default:
+			return fmt.Errorf("invalid applies_to_type")
+		}
+	}
+	if update.Priority != nil && *update.Priority <= 0 {
+		return fmt.Errorf("priority must be > 0")
+	}
+
+	if err := s.repo.UpdateLeavePolicy(ctx, policyID, update); err != nil {
+		return err
+	}
+
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"policy_id": policyID.String(),
+		"ip":        ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&policy.CompanyID,
+		"leave",
+		"policy.update",
+		"leave_policy",
+		&policyID,
+		actorType,
+		&actorID,
+		beforeJSON,
+		nil,
+		auditMeta,
+	)
+
+	// 👇 Policy changed → re-resolve every active employee in the company.
+	s.enqueueCompanyResolution(ctx, policy.CompanyID, "policy change")
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+
+	return nil
+}
+
+// ---------- RULES ----------
+
+func (s *leavePolicyConfigService) AddPolicyRule(
+	ctx context.Context,
+	rule *models.LeavePolicyRule,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) (*models.LeavePolicyRule, error) {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("add_rule-%s", uuid.New().String())
+	}
+	var cached *models.LeavePolicyRule
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &cached); err == nil && cached != nil {
+		return cached, nil
+	}
+
+	if rule.PolicyID == uuid.Nil {
+		return nil, fmt.Errorf("policy_id required")
+	}
+	if rule.LeaveTypeID == uuid.Nil {
+		return nil, fmt.Errorf("leave_type_id required")
+	}
+	if rule.TotalDays <= 0 {
+		return nil, fmt.Errorf("total_days must be > 0")
+	}
+	rule.PolicyRuleID = uuid.New()
+	rule.CreatedAt = time.Now().UTC()
+
+	if err := s.repo.AddPolicyRule(ctx, rule); err != nil {
+		return nil, err
+	}
+
+	afterJSON, _ := json.Marshal(rule)
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"policy_rule_id": rule.PolicyRuleID.String(),
+		"policy_id":      rule.PolicyID.String(),
+		"leave_type_id":  rule.LeaveTypeID.String(),
+		"ip":             ip,
+	})
+	// Get companyID from policy
+	policy, _ := s.repo.GetLeavePolicyByID(ctx, rule.PolicyID)
+	var companyID *uuid.UUID
+	if policy != nil {
+		companyID = &policy.CompanyID
+	}
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		companyID,
+		"leave",
+		"policy_rule.add",
+		"leave_policy_rule",
+		&rule.PolicyRuleID,
+		actorType,
+		&actorID,
+		[]byte("{}"),
+		afterJSON,
+		auditMeta,
+	)
+
+	// 👇 Policy changed → re-resolve every active employee in the company.
+	if policy != nil {
+		s.enqueueCompanyResolution(ctx, policy.CompanyID, "policy change")
+	}
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, rule)
+
+	return rule, nil
+}
+
+func (s *leavePolicyConfigService) RemovePolicyRule(
+	ctx context.Context,
+	policyRuleID uuid.UUID,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("remove_rule-%s", policyRuleID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	if err := s.repo.DeletePolicyRule(ctx, policyRuleID); err != nil {
+		return err
+	}
+
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"policy_rule_id": policyRuleID.String(),
+		"ip":             ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		nil,
+		"leave",
+		"policy_rule.remove",
+		"leave_policy_rule",
+		&policyRuleID,
+		actorType,
+		&actorID,
+		nil,
+		[]byte("{}"),
+		auditMeta,
+	)
+
+	// 👇 Policy changed → re-resolve every active employee in the company.
+	// company_id comes via metadata (the handler supplies it) because this
+	// method does not otherwise load the rule's parent policy.
+	if companyIDStr, ok := metadata["company_id"].(string); ok && companyIDStr != "" {
+		if companyID, perr := uuid.Parse(companyIDStr); perr == nil {
+			s.enqueueCompanyResolution(ctx, companyID, "policy change")
+		}
+	}
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+
+	return nil
+}
+
+func (s *leavePolicyConfigService) GetPolicyRules(ctx context.Context, policyID uuid.UUID) ([]*models.LeavePolicyRule, error) {
+	return s.repo.GetPolicyRules(ctx, policyID)
+}
+
+func (s *leavePolicyConfigService) UpdatePolicyRule(
+	ctx context.Context,
+	companyID uuid.UUID,
+	policyRuleID uuid.UUID,
+	update *models.LeavePolicyRuleUpdate,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("update_rule-%s", policyRuleID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	if update.TotalDays != nil && *update.TotalDays <= 0 {
+		return fmt.Errorf("total_days must be > 0")
+	}
+	if update.CarryForwardLimit != nil && *update.CarryForwardLimit < 0 {
+		return fmt.Errorf("carry_forward_limit cannot be negative")
+	}
+	if update.AccrualMethod != nil {
+		valid := map[string]bool{"none": true, "monthly": true, "quarterly": true, "yearly": true}
+		if !valid[*update.AccrualMethod] {
+			return fmt.Errorf("invalid accrual method")
+		}
+	}
+
+	if err := s.repo.UpdatePolicyRule(ctx, companyID, policyRuleID, update); err != nil {
+		return err
+	}
+
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"policy_rule_id": policyRuleID.String(),
+		"company_id":     companyID.String(),
+		"ip":             ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx,
+		nil,
+		&companyID,
+		"leave",
+		"policy_rule.update",
+		"leave_policy_rule",
+		&policyRuleID,
+		actorType,
+		&actorID,
+		nil,
+		nil,
+		auditMeta,
+	)
+
+	// 👇 Policy changed → re-resolve every active employee in the company.
+	s.enqueueCompanyResolution(ctx, companyID, "policy change")
+
+	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
+
+	return nil
+}
+
+
+
+================================================================================
+FILE: ./service/leave_query_service.go
+================================================================================
+
+package service
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+
+	"auth-service/internal/hr/leave/models"
+	"auth-service/internal/hr/leave/repository"
+	hrRepo "auth-service/internal/hr/repository"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/locationctx"
+)
+
+type LeaveQueryService interface {
+	// Balance — P3 validates the target user
+	GetLeaveBalance(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, asOfDate time.Time, actorType string, actorID uuid.UUID, metadata map[string]interface{}) ([]*models.LeaveBalance, error)
+	GetLeaveBalanceByType(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, leaveTypeID uuid.UUID, asOfDate time.Time, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.LeaveBalance, error)
+
+	// Internal scheduling resolver — no request ctx, no P3
+	IsUserOnLeave(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, date time.Time) (bool, *models.LeaveRequest, error)
+	GetApprovedLeaveForDate(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, date time.Time) (*models.LeaveRequest, error)
+
+	// History — P3 validates the target user (signature now takes companyID)
+	GetUserLeaveHistory(ctx context.Context, companyID, userID uuid.UUID, startDate, endDate time.Time) ([]*models.LeaveRequest, error)
+	GetLeaveTransactionHistory(ctx context.Context, companyID, userID uuid.UUID, startDate, endDate time.Time) ([]*models.LeaveTransaction, error)
+
+	GetLeaveTypeByID(ctx context.Context, companyID uuid.UUID, leaveTypeID uuid.UUID) (*models.LeaveType, error)
+	GetLeaveForecast(ctx context.Context, userID uuid.UUID, months int) ([]*models.LeaveBalance, error)
+
+	// GetLeaveUtilizationReport — location filter applies when locationID != nil.
+	GetLeaveUtilizationReport(
+		ctx context.Context,
+		companyID uuid.UUID,
+		locationID *uuid.UUID,
+		startDate, endDate time.Time,
+	) ([]*models.LeaveBalance, error)
+
+	CheckLeaveAvailability(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, leaveTypeID uuid.UUID, days int, startDate time.Time) (bool, float64, error)
+}
+
+type leaveQueryService struct {
+	repo         repository.LeaveRepository
+	employeeRepo hrRepo.EmployeeRepository // 👈 new — for P3
+	auditService *audit.AuditService
+}
+
+func NewLeaveQueryService(
+	repo repository.LeaveRepository,
+	employeeRepo hrRepo.EmployeeRepository, // 👈 new
+	auditService *audit.AuditService,
+) LeaveQueryService {
+	return &leaveQueryService{
+		repo:         repo,
+		employeeRepo: employeeRepo,
+		auditService: auditService,
+	}
+}
+
+// ensureEmployeeInScope verifies that the target employee is within the
+// request's current location scope.
+//
+//   - ScopeAll      → pass
+//   - ScopeLocation → target must be at that location
+//   - missing ctx   → error (route not wrapped → wiring bug)
+func (s *leaveQueryService) ensureEmployeeInScope(
+	ctx context.Context,
+	companyID, userID uuid.UUID,
+) error {
+	locCtx, err := locationctx.FromContext(ctx)
+	if err != nil {
+		return fmt.Errorf("location context missing: %w", err)
+	}
+	if locCtx.Mode == locationctx.ScopeAll {
+		return nil
+	}
+	empLoc, err := s.employeeRepo.GetEmploymentLocationID(ctx, companyID, userID)
+	if err != nil {
+		return err
+	}
+	if empLoc == nil {
+		return ErrEmployeeHasNoLocation
+	}
+	if *empLoc != *locCtx.LocationID {
+		return ErrEmployeeOutsideScope
+	}
+	return nil
+}
+
+// ============================================================================
+// BALANCE (P3 validates target)
+// ============================================================================
+
+func (s *leaveQueryService) GetLeaveBalance(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+	asOfDate time.Time,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) ([]*models.LeaveBalance, error) {
+	// 👇 P3 — row-level authorization
+	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
+		return nil, err
+	}
+
+	positionID, _, err := s.repo.GetUserPositionContext(ctx, companyID, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve user position: %w", err)
+	}
+	balances, err := s.repo.GetLeaveBalancesByUser(ctx, userID, positionID, asOfDate)
+	if err != nil {
+		return nil, err
+	}
+
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"user_id": userID.String(),
+		"as_of":   asOfDate,
+		"count":   len(balances),
+		"ip":      ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx, nil, &companyID, "leave", "query.balance", "leave_balance",
+		nil, actorType, &actorID, nil, nil, auditMeta,
+	)
+	return balances, nil
+}
+
+func (s *leaveQueryService) GetLeaveBalanceByType(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+	leaveTypeID uuid.UUID,
+	asOfDate time.Time,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) (*models.LeaveBalance, error) {
+	// 👇 P3 — row-level authorization
+	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
+		return nil, err
+	}
+
+	positionID, _, err := s.repo.GetUserPositionContext(ctx, companyID, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve user position: %w", err)
+	}
+	balance, err := s.repo.CalculateLeaveBalance(ctx, userID, leaveTypeID, asOfDate, positionID)
+	if err != nil {
+		return nil, err
+	}
+
+	ip, _ := ctx.Value("ip_address").(string)
+	auditMeta := mergeMeta(metadata, map[string]interface{}{
+		"user_id":    userID.String(),
+		"leave_type": leaveTypeID.String(),
+		"as_of":      asOfDate,
+		"balance":    balance.Balance,
+		"ip":         ip,
+	})
+	_ = s.auditService.LogAction(
+		ctx, nil, &companyID, "leave", "query.balance_by_type", "leave_balance",
+		nil, actorType, &actorID, nil, nil, auditMeta,
+	)
+	return balance, nil
+}
+
+// ============================================================================
+// INTERNAL (no P3 — called by scheduler resolver without request ctx)
+// ============================================================================
+
+func (s *leaveQueryService) IsUserOnLeave(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+	date time.Time,
+) (bool, *models.LeaveRequest, error) {
+	start := date.AddDate(0, 0, -1)
+	end := date.AddDate(0, 0, 1)
+	requests, err := s.repo.GetLeaveRequestsByUser(ctx, userID, start, end)
+	if err != nil {
+		return false, nil, err
+	}
+	for _, r := range requests {
+		if r.Status == "approved" && !date.Before(r.StartDate) && !date.After(r.EndDate) {
+			return true, r, nil
+		}
+	}
+	return false, nil, nil
+}
+
+func (s *leaveQueryService) GetApprovedLeaveForDate(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+	date time.Time,
+) (*models.LeaveRequest, error) {
+	start := date.Truncate(24 * time.Hour)
+	end := start.Add(24 * time.Hour).Add(-time.Second)
+	requests, err := s.repo.GetLeaveRequestsByUser(ctx, userID, start, end)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range requests {
+		if r.Status == "approved" && !date.Before(r.StartDate) &&
+			!date.After(r.EndDate) && r.CompanyID == companyID {
+			return r, nil
+		}
+	}
+	return nil, nil
+}
+
+// ============================================================================
+// HISTORY (P3 validates target; signature changed to accept companyID)
+// ============================================================================
+
+func (s *leaveQueryService) GetUserLeaveHistory(
+	ctx context.Context,
+	companyID, userID uuid.UUID,
+	startDate, endDate time.Time,
+) ([]*models.LeaveRequest, error) {
+	// 👇 P3 — row-level authorization
+	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
+		return nil, err
+	}
+	return s.repo.GetLeaveRequestsByUser(ctx, userID, startDate, endDate)
+}
+
+func (s *leaveQueryService) GetLeaveTransactionHistory(
+	ctx context.Context,
+	companyID, userID uuid.UUID,
+	startDate, endDate time.Time,
+) ([]*models.LeaveTransaction, error) {
+	// 👇 P3 — row-level authorization
+	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
+		return nil, err
+	}
+	return s.repo.GetLeaveTransactionHistory(ctx, userID, startDate, endDate)
+}
+
+// ============================================================================
+// LEAVE TYPE / FORECAST / UTILIZATION / AVAILABILITY
+// ============================================================================
+
+func (s *leaveQueryService) GetLeaveTypeByID(
+	ctx context.Context,
+	companyID uuid.UUID,
+	leaveTypeID uuid.UUID,
+) (*models.LeaveType, error) {
+	lt, err := s.repo.GetLeaveTypeByID(ctx, leaveTypeID)
+	if err != nil {
+		return nil, err
+	}
+	if lt.CompanyID != companyID {
+		return nil, fmt.Errorf("leave type does not belong to company")
+	}
+	return lt, nil
+}
+
+func (s *leaveQueryService) GetLeaveForecast(
+	ctx context.Context,
+	userID uuid.UUID,
+	months int,
+) ([]*models.LeaveBalance, error) {
+	return s.repo.GetLeaveForecast(ctx, userID, months)
+}
+
+// GetLeaveUtilizationReport — location filter applied when locationID != nil.
+func (s *leaveQueryService) GetLeaveUtilizationReport(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+	startDate, endDate time.Time,
+) ([]*models.LeaveBalance, error) {
+	return s.repo.GetLeaveUtilizationReport(ctx, companyID, locationID, startDate, endDate)
+}
+
+func (s *leaveQueryService) CheckLeaveAvailability(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+	leaveTypeID uuid.UUID,
+	days int,
+	startDate time.Time,
+) (bool, float64, error) {
+	positionID, _, err := s.repo.GetUserPositionContext(ctx, companyID, userID)
+	if err != nil {
+		return false, 0, fmt.Errorf("failed to resolve user position: %w", err)
+	}
+	return s.repo.CheckLeaveAvailability(ctx, userID, leaveTypeID, days, startDate, positionID)
+}
+
+
+
+================================================================================
+FILE: ./service/errors.go
+================================================================================
+
+package service
+
+import "errors"
+
+// ErrEmployeeOutsideScope is returned when a write targets an employee whose
+// employment_location_id does not match the request's current location scope.
+var ErrEmployeeOutsideScope = errors.New("employee belongs to a different location than your current scope")
+
+// ErrEmployeeHasNoLocation is returned when the target employee has no
+// employment_location_id assigned, so scope cannot be verified.
+var ErrEmployeeHasNoLocation = errors.New("target employee has no employment location assigned")
+
+

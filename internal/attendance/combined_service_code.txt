@@ -8,6 +8,8 @@ package outbox
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,14 +18,22 @@ import (
 	"auth-service/internal/attendance/repository"
 )
 
+// BatchOutboxProcessor is a lightweight alternative to OutboxService.
+//
+// NOTE: Do NOT wire both this and OutboxService against the same outbox
+// table at the same time — they will race and double-publish. Pick one.
+// The two are kept separate only so different deployments can choose.
 type BatchOutboxProcessor struct {
 	outboxRepo repository.OutboxRepository
 	kafka      KafkaProducer
 	logger     *zap.Logger
 	batchSize  int
 	interval   time.Duration
-	stopChan   chan struct{}
-	isRunning  bool
+	topicName  string
+
+	mu       sync.Mutex
+	running  bool
+	cancelFn context.CancelFunc
 }
 
 func NewBatchOutboxProcessor(
@@ -39,30 +49,63 @@ func NewBatchOutboxProcessor(
 		logger:     logger,
 		batchSize:  batchSize,
 		interval:   interval,
-		stopChan:   make(chan struct{}),
+		topicName:  "attendance.events",
 	}
 }
 
+func (p *BatchOutboxProcessor) IsRunning() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.running
+}
+
 func (p *BatchOutboxProcessor) Start(ctx context.Context) {
+	p.mu.Lock()
+	if p.running {
+		p.mu.Unlock()
+		p.logger.Warn("Batch outbox processor already running; ignoring Start")
+		return
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	p.cancelFn = cancel
+	p.running = true
+	p.mu.Unlock()
+
+	p.logger.Info("Batch outbox processor started")
+
+	defer func() {
+		p.mu.Lock()
+		p.running = false
+		p.cancelFn = nil
+		p.mu.Unlock()
+		cancel()
+	}()
+
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
-	p.logger.Info("Batch outbox processor started")
-	p.isRunning = true
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-runCtx.Done():
 			p.logger.Info("Batch outbox processor stopped via context")
-			p.isRunning = false
-			return
-		case <-p.stopChan:
-			p.logger.Info("Batch outbox processor stopped")
-			p.isRunning = false
 			return
 		case <-ticker.C:
-			p.processOnce(ctx)
+			p.processOnce(runCtx)
 		}
 	}
+}
+
+// Stop is idempotent and safe against concurrent calls.
+func (p *BatchOutboxProcessor) Stop() {
+	p.mu.Lock()
+	cancel := p.cancelFn
+	p.mu.Unlock()
+
+	if cancel == nil {
+		return
+	}
+	p.logger.Info("Batch outbox processor stopping...")
+	cancel()
 }
 
 func (p *BatchOutboxProcessor) processOnce(ctx context.Context) {
@@ -93,6 +136,7 @@ func (p *BatchOutboxProcessor) processOnce(ctx context.Context) {
 
 func (p *BatchOutboxProcessor) publishOne(ctx context.Context, evt *repository.OutboxEvent) error {
 	message := map[string]interface{}{
+		"event_id":     evt.EventID,
 		"event_type":   evt.EventType,
 		"aggregate_id": evt.AggregateID,
 		"payload":      json.RawMessage(evt.Payload),
@@ -100,13 +144,12 @@ func (p *BatchOutboxProcessor) publishOne(ctx context.Context, evt *repository.O
 	}
 	value, err := json.Marshal(message)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshal outbox event: %w", err)
 	}
 
-	const topic = "attendance.events" // or use evt.Topic if per-event
 	err = p.kafka.ProduceMessage(
 		ctx,
-		topic,
+		p.topicName,
 		[]byte(evt.AggregateID.String()),
 		value,
 		map[string]string{
@@ -116,7 +159,7 @@ func (p *BatchOutboxProcessor) publishOne(ctx context.Context, evt *repository.O
 	)
 	if err != nil {
 		p.logger.Error("Kafka publish failed",
-			zap.String("topic", topic),
+			zap.String("topic", p.topicName),
 			zap.String("event_type", evt.EventType),
 			zap.String("event_id", evt.EventID.String()),
 			zap.Error(err),
@@ -130,14 +173,6 @@ func (p *BatchOutboxProcessor) publishOne(ctx context.Context, evt *repository.O
 	return nil
 }
 
-func (p *BatchOutboxProcessor) Stop() {
-	if p.isRunning {
-		close(p.stopChan)
-		p.isRunning = false
-	}
-}
-
-
 
 ================================================================================
 FILE: ./service/outbox/outbox_service.go
@@ -149,6 +184,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -161,6 +197,17 @@ type KafkaProducer interface {
 	ProduceMessage(ctx context.Context, topic string, key []byte, value []byte, headers map[string]string) error
 }
 
+// OutboxService polls the outbox table and publishes events to Kafka.
+//
+// Lifecycle is safe against:
+//   - calling Stop() multiple times
+//   - calling Stop() before Start()
+//   - Start -> Stop -> Start (a new run creates a fresh cancel func)
+//
+// FIX (Tier 1): the previous implementation closed a channel that was
+// created once in the constructor and guarded by a plain bool. That led to
+// panics on the second Stop() and to a data race between the loop goroutine
+// and Stop() callers. Replaced with a mutex-guarded context.CancelFunc.
 type OutboxService struct {
 	outboxRepo   repository.OutboxRepository
 	kafka        KafkaProducer
@@ -168,8 +215,10 @@ type OutboxService struct {
 	batchSize    int
 	pollInterval time.Duration
 	topicName    string
-	stopChan     chan struct{}
-	isRunning    bool
+
+	mu       sync.Mutex
+	running  bool
+	cancelFn context.CancelFunc
 }
 
 func NewOutboxService(
@@ -187,36 +236,69 @@ func NewOutboxService(
 		batchSize:    batchSize,
 		pollInterval: pollInterval,
 		topicName:    topicName,
-		stopChan:     make(chan struct{}),
 	}
 }
 
+// IsRunning reports whether the service loop is currently active.
+func (s *OutboxService) IsRunning() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.running
+}
+
 func (s *OutboxService) Start(ctx context.Context) error {
+	s.mu.Lock()
+	if s.running {
+		s.mu.Unlock()
+		return fmt.Errorf("outbox service already running")
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	s.cancelFn = cancel
+	s.running = true
+	s.mu.Unlock()
+
 	s.logger.Info("Starting outbox service",
 		zap.String("topic", s.topicName),
 		zap.Int("batch_size", s.batchSize),
 		zap.Duration("poll_interval", s.pollInterval),
 	)
-	s.isRunning = true
+
+	defer func() {
+		s.mu.Lock()
+		s.running = false
+		s.cancelFn = nil
+		s.mu.Unlock()
+		cancel()
+	}()
+
 	ticker := time.NewTicker(s.pollInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-runCtx.Done():
 			s.logger.Info("Outbox service stopped via context")
-			s.isRunning = false
-			return nil
-		case <-s.stopChan:
-			s.logger.Info("Outbox service stopped")
-			s.isRunning = false
 			return nil
 		case <-ticker.C:
-			if err := s.processBatch(ctx); err != nil {
+			if err := s.processBatch(runCtx); err != nil {
 				s.logger.Error("Failed to process outbox batch", zap.Error(err))
 			}
 		}
 	}
+}
+
+// Stop requests the running loop to exit. Safe to call multiple times and
+// safe to call when the service is not running.
+func (s *OutboxService) Stop() {
+	s.mu.Lock()
+	cancel := s.cancelFn
+	s.mu.Unlock()
+
+	if cancel == nil {
+		return
+	}
+	s.logger.Info("Outbox service stopping...")
+	cancel()
 }
 
 func (s *OutboxService) processBatch(ctx context.Context) error {
@@ -230,7 +312,6 @@ func (s *OutboxService) processBatch(ctx context.Context) error {
 
 	var processedIDs []uuid.UUID
 	for _, evt := range events {
-		// Build Kafka message
 		msg := map[string]interface{}{
 			"event_id":     evt.EventID,
 			"aggregate_id": evt.AggregateID,
@@ -243,7 +324,6 @@ func (s *OutboxService) processBatch(ctx context.Context) error {
 			s.logger.Error("marshal outbox event", zap.String("event_id", evt.EventID.String()), zap.Error(err))
 			continue
 		}
-		// Publish
 		err = s.kafka.ProduceMessage(
 			ctx,
 			s.topicName,
@@ -271,14 +351,6 @@ func (s *OutboxService) processBatch(ctx context.Context) error {
 	return nil
 }
 
-func (s *OutboxService) Stop() {
-	if s.isRunning {
-		close(s.stopChan)
-		s.isRunning = false
-		s.logger.Info("Outbox service stopping...")
-	}
-}
-
 func (s *OutboxService) HealthCheck(ctx context.Context) error {
 	if err := s.outboxRepo.HealthCheck(ctx); err != nil {
 		return fmt.Errorf("outbox repo health: %w", err)
@@ -297,7 +369,6 @@ func (s *OutboxService) HealthCheck(ctx context.Context) error {
 }
 
 
-
 ================================================================================
 FILE: ./service/scheduling/scheduling_query_service.go
 ================================================================================
@@ -306,6 +377,7 @@ package scheduling
 
 import (
 	"context"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -317,21 +389,26 @@ import (
 )
 
 // SchedulingQueryService defines query operations.
+//
+// Location-scoped methods take a `locationID *uuid.UUID`:
+//
+//	nil      = no location filter (ALL scope)
+//	non-nil  = filter to entities at that employment location
 type SchedulingQueryService interface {
 	// Work Calendars
 	GetWorkCalendarByID(ctx context.Context, calendarID uuid.UUID) (*models.WorkCalendar, error)
-	GetWorkCalendarsByCompany(ctx context.Context, companyID uuid.UUID) ([]*models.WorkCalendar, error)
+	GetWorkCalendarsByCompany(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID) ([]*models.WorkCalendar, error)
 	GetWorkCalendarAvailability(ctx context.Context, calendarID uuid.UUID, startDate, endDate time.Time) ([]CalendarAvailability, error)
 
 	// Schedule Templates
 	GetScheduleTemplateByID(ctx context.Context, templateID uuid.UUID) (*models.ScheduleTemplate, error)
-	GetScheduleTemplatesByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.ScheduleTemplate, error)
+	GetScheduleTemplatesByCompany(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, activeOnly bool) ([]*models.ScheduleTemplate, error)
 	GetScheduleTemplatesByCalendar(ctx context.Context, calendarID uuid.UUID) ([]*models.ScheduleTemplate, error)
 
 	// Schedule Instances
 	GetScheduleInstanceByID(ctx context.Context, instanceID uuid.UUID) (*models.ScheduleInstance, error)
 	GetScheduleInstancesByUser(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
-	GetScheduleInstancesByCompany(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
+	GetScheduleInstancesByCompany(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
 	GetScheduleInstancesByTemplate(ctx context.Context, templateID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
 	GetScheduleInstancesByPosition(ctx context.Context, positionID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
 	GetScheduleInstancesByWorkCenter(ctx context.Context, companyID uuid.UUID, workCenterCode string, startDate, endDate time.Time) ([]*models.ScheduleInstance, error)
@@ -348,7 +425,7 @@ type SchedulingQueryService interface {
 	GetScheduleOverrideByUserDate(ctx context.Context, userID uuid.UUID, date time.Time) (*models.ScheduleOverride, error)
 
 	// Stats
-	GetScheduleStats(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) (*ScheduleStats, error)
+	GetScheduleStats(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, startDate, endDate time.Time) (*ScheduleStats, error)
 
 	// Health
 	HealthCheck(ctx context.Context) error
@@ -386,6 +463,10 @@ type ScheduleInstanceSummary struct {
 	WorkCenterCode string     `json:"work_center_code,omitempty"`
 }
 
+// maxUpcomingSchedules caps the size of the UpcomingSchedules list returned
+// by GetScheduleStats so responses stay bounded regardless of window size.
+const maxUpcomingSchedules = 50
+
 // Implementation
 type schedulingQueryServiceImpl struct {
 	schedulingRepo  repository.ScheduleRepository
@@ -411,38 +492,64 @@ func (qs *schedulingQueryServiceImpl) GetWorkCalendarByID(ctx context.Context, c
 	return qs.schedulingRepo.GetWorkCalendarByID(ctx, calendarID)
 }
 
-func (qs *schedulingQueryServiceImpl) GetWorkCalendarsByCompany(ctx context.Context, companyID uuid.UUID) ([]*models.WorkCalendar, error) {
-	return qs.schedulingRepo.GetWorkCalendarsByCompany(ctx, companyID)
+func (qs *schedulingQueryServiceImpl) GetWorkCalendarsByCompany(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+) ([]*models.WorkCalendar, error) {
+	return qs.schedulingRepo.GetWorkCalendarsByCompany(ctx, companyID, locationID)
 }
 
-func (qs *schedulingQueryServiceImpl) GetWorkCalendarAvailability(ctx context.Context, calendarID uuid.UUID, startDate, endDate time.Time) ([]CalendarAvailability, error) {
+// GetWorkCalendarAvailability returns day-by-day working/holiday info.
+//
+// FIX (Tier 1): the previous implementation shadowed the outer `holidayMap`
+// inside the loop, so entries were never added to the map and `IsHoliday`
+// was always false. The map is now built directly from cal.Holidays, which
+// is already keyed by "YYYY-MM-DD" (see AddHolidayToCalendar and
+// UpdateWorkCalendar). Values are stored as `map[string]interface{}`
+// containing "date" and "name".
+func (qs *schedulingQueryServiceImpl) GetWorkCalendarAvailability(
+	ctx context.Context,
+	calendarID uuid.UUID,
+	startDate, endDate time.Time,
+) ([]CalendarAvailability, error) {
 	cal, err := qs.schedulingRepo.GetWorkCalendarByID(ctx, calendarID)
 	if err != nil {
 		return nil, err
 	}
-	// Build holiday map (holidays are stored as JSONB, but we treat them as map)
-	holidayMap := make(map[string]string)
-	for _, h := range cal.Holidays {
-		// h is interface{} from JSON unmarshaling; we need to assert it to a map
-		if holidayMap, ok := h.(map[string]interface{}); ok {
-			if date, ok := holidayMap["date"].(string); ok {
-				if name, ok := holidayMap["name"].(string); ok {
-					holidayMap[date] = name
-				}
+
+	// Build the holiday lookup: date-string -> holiday name.
+	// cal.Holidays is already keyed by date, so we don't need to parse the
+	// inner "date" field. We only read "name" from the value.
+	holidayMap := make(map[string]string, len(cal.Holidays))
+	for dateKey, raw := range cal.Holidays {
+		switch v := raw.(type) {
+		case map[string]interface{}:
+			if name, ok := v["name"].(string); ok {
+				holidayMap[dateKey] = name
+			} else {
+				holidayMap[dateKey] = "" // exists but unnamed
 			}
+		case string:
+			// Some legacy rows may have stored the name as the raw value.
+			holidayMap[dateKey] = v
+		default:
+			holidayMap[dateKey] = ""
 		}
 	}
+
+	// Precompute working days as a set for O(1) lookup.
+	working := make(map[int]struct{}, len(cal.WorkingDays))
+	for _, wd := range cal.WorkingDays {
+		working[wd] = struct{}{}
+	}
+
 	var avail []CalendarAvailability
 	for d := startDate; !d.After(endDate); d = d.AddDate(0, 0, 1) {
 		dateStr := d.Format("2006-01-02")
-		isWorking := false
-		for _, wd := range cal.WorkingDays {
-			if int(d.Weekday()) == wd {
-				isWorking = true
-				break
-			}
-		}
+		_, isWorking := working[int(d.Weekday())]
 		holidayName, isHoliday := holidayMap[dateStr]
+
 		avail = append(avail, CalendarAvailability{
 			Date:         d,
 			IsWorkingDay: isWorking,
@@ -459,8 +566,13 @@ func (qs *schedulingQueryServiceImpl) GetScheduleTemplateByID(ctx context.Contex
 	return qs.schedulingRepo.GetScheduleTemplate(ctx, templateID)
 }
 
-func (qs *schedulingQueryServiceImpl) GetScheduleTemplatesByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.ScheduleTemplate, error) {
-	return qs.schedulingRepo.GetScheduleTemplatesByCompany(ctx, companyID, activeOnly)
+func (qs *schedulingQueryServiceImpl) GetScheduleTemplatesByCompany(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+	activeOnly bool,
+) ([]*models.ScheduleTemplate, error) {
+	return qs.schedulingRepo.GetScheduleTemplatesByCompany(ctx, companyID, locationID, activeOnly)
 }
 
 func (qs *schedulingQueryServiceImpl) GetScheduleTemplatesByCalendar(ctx context.Context, calendarID uuid.UUID) ([]*models.ScheduleTemplate, error) {
@@ -477,8 +589,13 @@ func (qs *schedulingQueryServiceImpl) GetScheduleInstancesByUser(ctx context.Con
 	return qs.schedulingRepo.GetScheduleInstancesByUser(ctx, userID, startDate, endDate)
 }
 
-func (qs *schedulingQueryServiceImpl) GetScheduleInstancesByCompany(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error) {
-	return qs.schedulingRepo.GetScheduleInstancesByCompany(ctx, companyID, startDate, endDate)
+func (qs *schedulingQueryServiceImpl) GetScheduleInstancesByCompany(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+	startDate, endDate time.Time,
+) ([]*models.ScheduleInstance, error) {
+	return qs.schedulingRepo.GetScheduleInstancesByCompany(ctx, companyID, locationID, startDate, endDate)
 }
 
 func (qs *schedulingQueryServiceImpl) GetScheduleInstancesByTemplate(ctx context.Context, templateID uuid.UUID, startDate, endDate time.Time) ([]*models.ScheduleInstance, error) {
@@ -494,6 +611,10 @@ func (qs *schedulingQueryServiceImpl) GetScheduleInstancesByPosition(ctx context
 	for _, uid := range users {
 		insts, err := qs.schedulingRepo.GetScheduleInstancesByUser(ctx, uid, startDate, endDate)
 		if err != nil {
+			qs.logger.Warn("Failed to fetch instances for user in position query",
+				zap.String("position_id", positionID.String()),
+				zap.String("user_id", uid.String()),
+				zap.Error(err))
 			continue
 		}
 		all = append(all, insts...)
@@ -546,34 +667,101 @@ func (qs *schedulingQueryServiceImpl) GetScheduleOverrideByUserDate(ctx context.
 
 // ---- Stats ----
 
-func (qs *schedulingQueryServiceImpl) GetScheduleStats(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) (*ScheduleStats, error) {
+// GetScheduleStats aggregates statistics for a company/location.
+//
+// FIX (Tier 1): previously issued one GetScheduleTemplate call per
+// instance (N+1). Now fetches each unique template exactly once and
+// populates UpcomingSchedules (which the struct declared but never set).
+func (qs *schedulingQueryServiceImpl) GetScheduleStats(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+	startDate, endDate time.Time,
+) (*ScheduleStats, error) {
 	stats := &ScheduleStats{
-		ByTemplateType: make(map[string]int64),
-		ByDate:         make(map[string]int64),
-		ByWorkCenter:   make(map[string]int64),
+		ByTemplateType:    make(map[string]int64),
+		ByDate:            make(map[string]int64),
+		ByWorkCenter:      make(map[string]int64),
+		UpcomingSchedules: []ScheduleInstanceSummary{},
 	}
-	instances, err := qs.schedulingRepo.GetScheduleInstancesByCompany(ctx, companyID, startDate, endDate)
+
+	instances, err := qs.schedulingRepo.GetScheduleInstancesByCompany(ctx, companyID, locationID, startDate, endDate)
 	if err != nil {
 		return nil, err
 	}
 	stats.TotalInstances = int64(len(instances))
-	userMap := make(map[uuid.UUID]bool)
-	templateMap := make(map[uuid.UUID]bool)
+
+	// --- Pass 1: collect unique template IDs ---
+	userSet := make(map[uuid.UUID]struct{})
+	templateSet := make(map[uuid.UUID]struct{})
 	for _, inst := range instances {
-		userMap[inst.UserID] = true
-		templateMap[inst.ScheduleTemplateID] = true
-		tmpl, err := qs.schedulingRepo.GetScheduleTemplate(ctx, inst.ScheduleTemplateID)
-		if err == nil && tmpl != nil {
+		userSet[inst.UserID] = struct{}{}
+		templateSet[inst.ScheduleTemplateID] = struct{}{}
+	}
+	stats.TotalUsers = int64(len(userSet))
+	stats.TotalTemplates = int64(len(templateSet))
+
+	// --- Pass 2: fetch each unique template exactly once ---
+	templates := make(map[uuid.UUID]*models.ScheduleTemplate, len(templateSet))
+	for tplID := range templateSet {
+		tmpl, err := qs.schedulingRepo.GetScheduleTemplate(ctx, tplID)
+		if err != nil || tmpl == nil {
+			qs.logger.Warn("Failed to load schedule template for stats",
+				zap.String("template_id", tplID.String()),
+				zap.Error(err))
+			continue
+		}
+		templates[tplID] = tmpl
+	}
+
+	// --- Pass 3: aggregate ---
+	for _, inst := range instances {
+		if tmpl, ok := templates[inst.ScheduleTemplateID]; ok {
 			stats.ByTemplateType[tmpl.TemplateType]++
 		}
-		dateStr := inst.ScheduleDate.Format("2006-01-02")
-		stats.ByDate[dateStr]++
+		stats.ByDate[inst.ScheduleDate.Format("2006-01-02")]++
 		if inst.WorkCenterCode != nil {
 			stats.ByWorkCenter[*inst.WorkCenterCode]++
 		}
 	}
-	stats.TotalUsers = int64(len(userMap))
-	stats.TotalTemplates = int64(len(templateMap))
+
+	// --- Pass 4: UpcomingSchedules — the next N instances by date ---
+	// Only include instances at or after "now" in the queried window.
+	now := time.Now().UTC()
+	upcoming := make([]*models.ScheduleInstance, 0, len(instances))
+	for _, inst := range instances {
+		if inst.ScheduleDate.Before(now) {
+			continue
+		}
+		if inst.Status != "" && inst.Status != "active" {
+			continue
+		}
+		upcoming = append(upcoming, inst)
+	}
+	sort.Slice(upcoming, func(i, j int) bool {
+		return upcoming[i].ScheduleDate.Before(upcoming[j].ScheduleDate)
+	})
+	if len(upcoming) > maxUpcomingSchedules {
+		upcoming = upcoming[:maxUpcomingSchedules]
+	}
+	for _, inst := range upcoming {
+		summary := ScheduleInstanceSummary{
+			InstanceID:    inst.ScheduleInstanceID,
+			UserID:        inst.UserID,
+			ScheduleDate:  inst.ScheduleDate,
+			ExpectedStart: inst.ExpectedStart,
+			ExpectedEnd:   inst.ExpectedEnd,
+		}
+		if tmpl, ok := templates[inst.ScheduleTemplateID]; ok {
+			summary.TemplateName = tmpl.Name
+			summary.TemplateType = tmpl.TemplateType
+		}
+		if inst.WorkCenterCode != nil {
+			summary.WorkCenterCode = *inst.WorkCenterCode
+		}
+		stats.UpcomingSchedules = append(stats.UpcomingSchedules, summary)
+	}
+
 	return stats, nil
 }
 
@@ -582,7 +770,6 @@ func (qs *schedulingQueryServiceImpl) GetScheduleStats(ctx context.Context, comp
 func (qs *schedulingQueryServiceImpl) HealthCheck(ctx context.Context) error {
 	return qs.schedulingRepo.HealthCheck(ctx)
 }
-
 
 
 ================================================================================
@@ -595,6 +782,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -602,7 +790,6 @@ import (
 	"auth-service/internal/attendance/repository"
 	"auth-service/internal/attendance/service/resolver"
 	"auth-service/internal/infrastructure/audit"
-	"strings"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -649,7 +836,7 @@ type SchedulingService interface {
 	ApplyApprovedLeave(ctx context.Context, leaveData *LeaveScheduleData, actorType string, actorID uuid.UUID) error
 	RollbackCancelledLeave(ctx context.Context, leaveData *LeaveScheduleData, actorType string, actorID uuid.UUID) error
 
-	// Schedule Generation – FIXED: added companyID parameter
+	// Schedule Generation
 	GenerateScheduleForUser(ctx context.Context, companyID, userID uuid.UUID, config ScheduleGenerationConfig, actorType string, actorID uuid.UUID) ([]*models.ScheduleInstance, error)
 	GenerateScheduleForCompany(ctx context.Context, companyID uuid.UUID, config ScheduleGenerationConfig, actorType string, actorID uuid.UUID) ([]*models.ScheduleInstance, error)
 
@@ -755,9 +942,13 @@ func NewSchedulingService(
 	}
 }
 
-// ---- Work Calendar CRUD ----
-
-func (s *schedulingServiceImpl) CreateWorkCalendar(ctx context.Context, calendar *models.WorkCalendar, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.WorkCalendar, error) {
+func (s *schedulingServiceImpl) CreateWorkCalendar(
+	ctx context.Context,
+	calendar *models.WorkCalendar,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) (*models.WorkCalendar, error) {
 	if err := s.validateWorkCalendar(calendar); err != nil {
 		return nil, err
 	}
@@ -766,10 +957,18 @@ func (s *schedulingServiceImpl) CreateWorkCalendar(ctx context.Context, calendar
 	}
 	calendar.CreatedAt = time.Now().UTC()
 
-	existing, _ := s.schedulingRepo.GetWorkCalendarsByCompany(ctx, calendar.CompanyID)
+	existing, _ := s.schedulingRepo.GetWorkCalendarsByCompany(ctx, calendar.CompanyID, nil)
 	for _, e := range existing {
-		if e.Year == calendar.Year {
-			return nil, fmt.Errorf("calendar for year %d already exists", calendar.Year)
+		if e.Year != calendar.Year {
+			continue
+		}
+		sameScope := (e.LocationID == nil && calendar.LocationID == nil) ||
+			(e.LocationID != nil && calendar.LocationID != nil && *e.LocationID == *calendar.LocationID)
+		if sameScope {
+			if calendar.LocationID == nil {
+				return nil, fmt.Errorf("company-wide calendar for year %d already exists", calendar.Year)
+			}
+			return nil, fmt.Errorf("calendar for year %d already exists at this location", calendar.Year)
 		}
 	}
 
@@ -840,25 +1039,65 @@ func (s *schedulingServiceImpl) DeleteWorkCalendar(ctx context.Context, calendar
 	return nil
 }
 
-func (s *schedulingServiceImpl) AddHolidayToCalendar(ctx context.Context, calendarID uuid.UUID, date, name string, actorType string, actorID uuid.UUID) error {
+// AddHolidayToCalendar adds a holiday to a calendar.
+//
+// FIX (Tier 2):
+//   - copy-on-write the holidays map instead of mutating the object returned
+//     by the repo (which may be cached or shared).
+//   - set UpdatedAt.
+//   - emit an audit row (work_calendar.add_holiday) matching the other
+//     calendar mutations. Previously this endpoint was silently unaudited.
+func (s *schedulingServiceImpl) AddHolidayToCalendar(
+	ctx context.Context,
+	calendarID uuid.UUID,
+	date, name string,
+	actorType string,
+	actorID uuid.UUID,
+) error {
+	if date == "" {
+		return fmt.Errorf("date is required")
+	}
+	if name == "" {
+		return fmt.Errorf("name is required")
+	}
+	if _, err := time.Parse("2006-01-02", date); err != nil {
+		return fmt.Errorf("invalid date %q: must be YYYY-MM-DD", date)
+	}
+
 	calendar, err := s.schedulingRepo.GetWorkCalendarByID(ctx, calendarID)
 	if err != nil {
 		return err
 	}
-	if calendar.Holidays == nil {
-		calendar.Holidays = make(map[string]interface{})
-	}
-	for k := range calendar.Holidays {
-		if k == date {
-			return fmt.Errorf("holiday already exists on %s", date)
-		}
-	}
-	calendar.Holidays[date] = map[string]interface{}{"date": date, "name": name}
-	return s.schedulingRepo.UpdateWorkCalendar(ctx, calendar)
-}
 
-func (s *schedulingServiceImpl) ProcessHolidayForDate(ctx context.Context, companyID uuid.UUID, date time.Time, actorType string, actorID uuid.UUID) error {
-	instances, err := s.schedulingRepo.GetScheduleInstancesByCompany(ctx, companyID, date, date)
+	before, _ := json.Marshal(calendar)
+
+	if _, exists := calendar.Holidays[date]; exists {
+		return fmt.Errorf("holiday already exists on %s", date)
+	}
+
+	newHolidays := make(map[string]interface{}, len(calendar.Holidays)+1)
+	for k, v := range calendar.Holidays {
+		newHolidays[k] = v
+	}
+	newHolidays[date] = map[string]interface{}{"date": date, "name": name}
+	calendar.Holidays = newHolidays
+
+	if err := s.schedulingRepo.UpdateWorkCalendar(ctx, calendar); err != nil {
+		return err
+	}
+
+	after, _ := json.Marshal(calendar)
+	s.logAudit(ctx, calendar.CompanyID, "work_calendar.add_holiday", calendarID, actorType, actorID, before, after, nil)
+	return nil
+}
+func (s *schedulingServiceImpl) ProcessHolidayForDate(
+	ctx context.Context,
+	companyID uuid.UUID,
+	date time.Time,
+	actorType string,
+	actorID uuid.UUID,
+) error {
+	instances, err := s.schedulingRepo.GetScheduleInstancesByCompany(ctx, companyID, nil, date, date)
 	if err != nil {
 		return err
 	}
@@ -998,25 +1237,63 @@ func (s *schedulingServiceImpl) DeleteScheduleInstance(ctx context.Context, inst
 	return nil
 }
 
-func (s *schedulingServiceImpl) BulkCreateScheduleInstances(ctx context.Context, instances []*models.ScheduleInstance, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error {
+// BulkCreateScheduleInstances inserts a batch of schedule instances.
+//
+// FIX (Tier 2): the previous implementation looped with `continue` on
+// error, leaving partial state — if instance #73 of 100 failed, instances
+// 1..72 and 74..100 were committed and there was no way to retry just the
+// failure. The batch is now wrapped in a single transaction: any error
+// rolls the whole batch back, so the caller can safely retry the entire
+// request.
+//
+// Depends on repository.ScheduleRepository exposing:
+//
+//	BeginTx(ctx, *sql.TxOptions) (*sql.Tx, error)
+func (s *schedulingServiceImpl) BulkCreateScheduleInstances(
+	ctx context.Context,
+	instances []*models.ScheduleInstance,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) error {
 	if len(instances) == 0 {
 		return nil
 	}
 	companyID := instances[0].CompanyID
-	created := 0
+
+	// Prepare all instances first. If preparation were going to fail, we
+	// want it to fail before opening a transaction.
+	now := time.Now().UTC()
 	for _, inst := range instances {
 		if inst.ScheduleInstanceID == uuid.Nil {
 			inst.ScheduleInstanceID = uuid.New()
 		}
-		inst.GeneratedAt = time.Now().UTC()
+		inst.GeneratedAt = now
 		inst.Status = "active"
-		if err := s.schedulingRepo.CreateScheduleInstance(ctx, nil, inst); err != nil {
-			s.logger.Warn("Failed to create instance in bulk", zap.Error(err))
-			continue
-		}
-		created++
 	}
-	summary := map[string]interface{}{"created": created}
+
+	tx, err := s.schedulingRepo.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	for _, inst := range instances {
+		if err := s.schedulingRepo.CreateScheduleInstance(ctx, tx, inst); err != nil {
+			s.logger.Error("Bulk create failed; transaction will be rolled back",
+				zap.String("instance_id", inst.ScheduleInstanceID.String()),
+				zap.String("user_id", inst.UserID.String()),
+				zap.Time("schedule_date", inst.ScheduleDate),
+				zap.Error(err))
+			return fmt.Errorf("create instance %s: %w", inst.ScheduleInstanceID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit bulk create: %w", err)
+	}
+
+	summary := map[string]interface{}{"created": len(instances)}
 	summaryJSON, _ := json.Marshal(summary)
 	s.logAudit(ctx, companyID, "schedule_instance.bulk_create", uuid.Nil, actorType, actorID, nil, summaryJSON, metadata)
 	return nil
@@ -1024,13 +1301,11 @@ func (s *schedulingServiceImpl) BulkCreateScheduleInstances(ctx context.Context,
 
 // ---- Generation ----
 
-// GenerateScheduleForUser – FIXED: companyID is passed as parameter
 func (s *schedulingServiceImpl) GenerateScheduleForUser(ctx context.Context, companyID, userID uuid.UUID, config ScheduleGenerationConfig, actorType string, actorID uuid.UUID) ([]*models.ScheduleInstance, error) {
 	subject, err := s.subjectResolver.ResolveSubject(ctx, companyID, userID, "employee", config.StartDate)
 	if err != nil || subject == nil {
 		return nil, fmt.Errorf("failed to resolve subject: %w", err)
 	}
-	// Use the passed companyID, not from subject
 	instances := s.generateInstancesForUser(ctx, companyID, userID, config, actorType, actorID)
 	if len(instances) == 0 {
 		return []*models.ScheduleInstance{}, nil
@@ -1054,6 +1329,8 @@ func (s *schedulingServiceImpl) GenerateScheduleForCompany(ctx context.Context, 
 	if len(allInstances) == 0 {
 		return []*models.ScheduleInstance{}, nil
 	}
+	// BulkCreateScheduleInstances is transactional — the entire company
+	// generation is now all-or-nothing.
 	if err := s.BulkCreateScheduleInstances(ctx, allInstances, actorType, actorID, nil); err != nil {
 		return nil, err
 	}
@@ -1859,11 +2136,24 @@ type Service interface {
 }
 
 // QueryService defines read operations for work centers.
+//
+// Location-scoped methods take a `locationID *uuid.UUID`:
+//
+//	nil      = no location filter (ALL scope, or route not location-scoped)
+//	non-nil  = return only work centers at that employment location
+//
+// Work centers may have a NULL location (company-wide). When locationID is
+// set, NULL-location work centers are excluded — they are not "at" any
+// specific location.
 type QueryService interface {
 	GetWorkCenter(ctx context.Context, companyID uuid.UUID, code string) (*models.WorkCenter, error)
-	ListWorkCenters(ctx context.Context, companyID uuid.UUID, page, pageSize int) ([]*models.WorkCenter, int, error)
-	SearchWorkCenters(ctx context.Context, companyID uuid.UUID, filters map[string]interface{}, page, pageSize int) ([]*models.WorkCenter, int, error)
-	GetActiveWorkCenters(ctx context.Context, companyID uuid.UUID) ([]*models.WorkCenter, error)
+
+	ListWorkCenters(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, page, pageSize int) ([]*models.WorkCenter, int, error)
+
+	SearchWorkCenters(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, filters map[string]interface{}, page, pageSize int) ([]*models.WorkCenter, int, error)
+
+	GetActiveWorkCenters(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID) ([]*models.WorkCenter, error)
+
 	HealthCheck(ctx context.Context) error
 }
 
@@ -1893,7 +2183,11 @@ func NewQueryService(repo repository.WorkCenterRepository) QueryService {
 	return &workcenterQueryService{repo: repo}
 }
 
-func (s *workcenterQueryService) GetWorkCenter(ctx context.Context, companyID uuid.UUID, code string) (*models.WorkCenter, error) {
+func (s *workcenterQueryService) GetWorkCenter(
+	ctx context.Context,
+	companyID uuid.UUID,
+	code string,
+) (*models.WorkCenter, error) {
 	if code == "" {
 		return nil, fmt.Errorf("work center code is required")
 	}
@@ -1903,7 +2197,13 @@ func (s *workcenterQueryService) GetWorkCenter(ctx context.Context, companyID uu
 	return s.repo.GetByCode(ctx, companyID, code)
 }
 
-func (s *workcenterQueryService) ListWorkCenters(ctx context.Context, companyID uuid.UUID, page, pageSize int) ([]*models.WorkCenter, int, error) {
+// ListWorkCenters — locationID == nil means no filter (ALL scope).
+func (s *workcenterQueryService) ListWorkCenters(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+	page, pageSize int,
+) ([]*models.WorkCenter, int, error) {
 	if companyID == uuid.Nil {
 		return nil, 0, fmt.Errorf("company ID is required")
 	}
@@ -1914,10 +2214,17 @@ func (s *workcenterQueryService) ListWorkCenters(ctx context.Context, companyID 
 		pageSize = 50
 	}
 	offset := (page - 1) * pageSize
-	return s.repo.List(ctx, companyID, pageSize, offset)
+	return s.repo.List(ctx, companyID, locationID, pageSize, offset)
 }
 
-func (s *workcenterQueryService) SearchWorkCenters(ctx context.Context, companyID uuid.UUID, filters map[string]interface{}, page, pageSize int) ([]*models.WorkCenter, int, error) {
+// SearchWorkCenters — locationID == nil means no filter (ALL scope).
+func (s *workcenterQueryService) SearchWorkCenters(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+	filters map[string]interface{},
+	page, pageSize int,
+) ([]*models.WorkCenter, int, error) {
 	if companyID == uuid.Nil {
 		return nil, 0, fmt.Errorf("company ID is required")
 	}
@@ -1928,14 +2235,19 @@ func (s *workcenterQueryService) SearchWorkCenters(ctx context.Context, companyI
 		pageSize = 50
 	}
 	offset := (page - 1) * pageSize
-	return s.repo.Search(ctx, companyID, filters, pageSize, offset)
+	return s.repo.Search(ctx, companyID, locationID, filters, pageSize, offset)
 }
 
-func (s *workcenterQueryService) GetActiveWorkCenters(ctx context.Context, companyID uuid.UUID) ([]*models.WorkCenter, error) {
+// GetActiveWorkCenters — locationID == nil means no filter (ALL scope).
+func (s *workcenterQueryService) GetActiveWorkCenters(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+) ([]*models.WorkCenter, error) {
 	if companyID == uuid.Nil {
 		return nil, fmt.Errorf("company ID is required")
 	}
-	return s.repo.GetActive(ctx, companyID)
+	return s.repo.GetActive(ctx, companyID, locationID)
 }
 
 func (s *workcenterQueryService) HealthCheck(ctx context.Context) error {
@@ -1989,7 +2301,6 @@ func (s *workcenterService) CreateWorkCenter(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) (*models.WorkCenter, error) {
-	// Validate
 	if wc.WorkCenterCode == "" {
 		return nil, fmt.Errorf("work center code is required")
 	}
@@ -2003,7 +2314,6 @@ func (s *workcenterService) CreateWorkCenter(
 		return nil, fmt.Errorf("company ID is required")
 	}
 
-	// Check existence by code
 	exists, err := s.repo.Exists(ctx, wc.CompanyID, wc.WorkCenterCode)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check work center existence: %w", err)
@@ -2012,7 +2322,6 @@ func (s *workcenterService) CreateWorkCenter(
 		return nil, fmt.Errorf("work center with code %s already exists", wc.WorkCenterCode)
 	}
 
-	// Check name uniqueness
 	nameExists, err := s.repo.ExistsByName(ctx, wc.CompanyID, wc.Name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check name uniqueness: %w", err)
@@ -2024,25 +2333,32 @@ func (s *workcenterService) CreateWorkCenter(
 	now := time.Now().UTC()
 	wc.CreatedAt = now
 	wc.UpdatedAt = now
-	wc.IsActive = true // default
+	wc.IsActive = true
 
 	if err := s.repo.Create(ctx, nil, wc); err != nil {
 		return nil, fmt.Errorf("failed to create work center: %w", err)
 	}
 
-	// Audit (pass nil for resource UUID, include code in metadata)
 	if s.auditService != nil {
 		afterJSON, _ := json.Marshal(wc)
 		if metadata == nil {
 			metadata = make(map[string]interface{})
 		}
 		metadata["work_center_code"] = wc.WorkCenterCode
-		_ = s.auditService.LogAction(ctx, nil, &wc.CompanyID, "workcenter", "create", "workcenter", nil, actorType, &actorID, nil, afterJSON, metadata)
+		_ = s.auditService.LogAction(ctx, nil, &wc.CompanyID,
+			"workcenter", "create", "workcenter", nil,
+			actorType, &actorID, nil, afterJSON, metadata)
 	}
 
 	return wc, nil
 }
 
+// UpdateWorkCenter updates an existing work center.
+//
+// FIX (Tier 1): the previous implementation marshaled `beforeJSON` AFTER
+// applying mutations, so every audit row showed before == after and the
+// audit trail could not answer "what changed?". The snapshot is now
+// captured before any field is touched.
 func (s *workcenterService) UpdateWorkCenter(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -2068,7 +2384,10 @@ func (s *workcenterService) UpdateWorkCenter(
 		return nil, fmt.Errorf("work center not found")
 	}
 
-	// Check name uniqueness if name is being changed
+	// Snapshot the "before" state BEFORE any mutation.
+	beforeJSON, _ := json.Marshal(existing)
+
+	// Check name uniqueness if name is being changed.
 	if name != nil && *name != existing.Name {
 		nameExists, err := s.repo.ExistsByName(ctx, companyID, *name)
 		if err != nil {
@@ -2079,36 +2398,40 @@ func (s *workcenterService) UpdateWorkCenter(
 		}
 	}
 
-	// Apply updates
+	// Apply updates to a copy so `existing` stays a clean "before" reference
+	// if we ever need it downstream.
+	updated := *existing
 	if name != nil {
-		existing.Name = *name
+		updated.Name = *name
 	}
 	if description != nil {
-		existing.Description = description
+		updated.Description = description
 	}
 	if timezone != nil {
-		existing.Timezone = *timezone
+		updated.Timezone = *timezone
 	}
 	if isActive != nil {
-		existing.IsActive = *isActive
+		updated.IsActive = *isActive
 	}
-	existing.UpdatedAt = time.Now().UTC()
+	updated.UpdatedAt = time.Now().UTC()
 
-	beforeJSON, _ := json.Marshal(existing)
-	if err := s.repo.Update(ctx, nil, existing); err != nil {
+	if err := s.repo.Update(ctx, nil, &updated); err != nil {
 		return nil, fmt.Errorf("failed to update work center: %w", err)
 	}
-	afterJSON, _ := json.Marshal(existing)
+
+	afterJSON, _ := json.Marshal(&updated)
 
 	if s.auditService != nil {
 		if metadata == nil {
 			metadata = make(map[string]interface{})
 		}
 		metadata["work_center_code"] = code
-		_ = s.auditService.LogAction(ctx, nil, &companyID, "workcenter", "update", "workcenter", nil, actorType, &actorID, beforeJSON, afterJSON, metadata)
+		_ = s.auditService.LogAction(ctx, nil, &companyID,
+			"workcenter", "update", "workcenter", nil,
+			actorType, &actorID, beforeJSON, afterJSON, metadata)
 	}
 
-	return existing, nil
+	return &updated, nil
 }
 
 func (s *workcenterService) DeleteWorkCenter(
@@ -2144,7 +2467,9 @@ func (s *workcenterService) DeleteWorkCenter(
 			metadata = make(map[string]interface{})
 		}
 		metadata["work_center_code"] = code
-		_ = s.auditService.LogAction(ctx, nil, &companyID, "workcenter", "delete", "workcenter", nil, actorType, &actorID, beforeJSON, nil, metadata)
+		_ = s.auditService.LogAction(ctx, nil, &companyID,
+			"workcenter", "delete", "workcenter", nil,
+			actorType, &actorID, beforeJSON, nil, metadata)
 	}
 
 	return nil
@@ -2154,6 +2479,426 @@ func (s *workcenterService) HealthCheck(ctx context.Context) error {
 	return s.repo.HealthCheck(ctx)
 }
 
+
+================================================================================
+FILE: ./service/exemption/exemption_service.go
+================================================================================
+
+package exemption
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"auth-service/internal/attendance/models"
+	"auth-service/internal/attendance/repository"
+	"auth-service/internal/attendance/service/resolver"
+	auditservice "auth-service/internal/infrastructure/audit"
+	"auth-service/internal/locationctx"
+)
+
+// Sentinel errors — handlers can map these to HTTP status codes with errors.Is.
+var (
+	ErrExemptionNotFound = errors.New("exemption not found")
+	ErrInvalidSubject    = errors.New("invalid subject_type")
+	ErrInvalidDateRange  = errors.New("from_date must be on or before to_date")
+	ErrOverlap           = errors.New("overlapping exemption already exists for this subject")
+	ErrUnauthorized      = errors.New("actor is not authorized for this subject")
+)
+
+// Allowed subjects — keep in sync with the resolver package constants.
+var allowedSubjectTypes = map[string]struct{}{
+	resolver.SubjectTypeEmployee: {},
+	resolver.SubjectTypeStudent:  {},
+	resolver.SubjectTypeCustomer: {},
+}
+
+type CreateExemptionInput struct {
+	SubjectType string
+	SubjectID   uuid.UUID
+	FromDate    time.Time
+	ToDate      time.Time
+	Reason      *string
+	ApprovedBy  *uuid.UUID // optional, admin-supplied
+}
+
+type UpdateExemptionInput struct {
+	FromDate   *time.Time
+	ToDate     *time.Time
+	Reason     *string
+	ApprovedBy *uuid.UUID
+}
+
+type ExemptionService interface {
+	Create(
+		ctx context.Context,
+		companyID uuid.UUID,
+		input *CreateExemptionInput,
+		actorType string,
+		actorID uuid.UUID,
+	) (*models.AttendanceExemption, error)
+
+	Update(
+		ctx context.Context,
+		companyID uuid.UUID,
+		exemptionID uuid.UUID,
+		input *UpdateExemptionInput,
+		actorType string,
+		actorID uuid.UUID,
+	) (*models.AttendanceExemption, error)
+
+	Delete(
+		ctx context.Context,
+		companyID uuid.UUID,
+		exemptionID uuid.UUID,
+		actorType string,
+		actorID uuid.UUID,
+	) error
+
+	GetByID(
+		ctx context.Context,
+		companyID uuid.UUID,
+		exemptionID uuid.UUID,
+	) (*models.AttendanceExemption, error)
+}
+
+type exemptionService struct {
+	repo             repository.AttendanceExemptionRepository
+	locationResolver resolver.SubjectLocationResolver
+	audit            *auditservice.AuditService
+	logger           *zap.Logger
+}
+
+func NewExemptionService(
+	repo repository.AttendanceExemptionRepository,
+	locationResolver resolver.SubjectLocationResolver,
+	audit *auditservice.AuditService,
+	logger *zap.Logger,
+) ExemptionService {
+	return &exemptionService{
+		repo:             repo,
+		locationResolver: locationResolver,
+		audit:            audit,
+		logger:           logger,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Create
+// ---------------------------------------------------------------------------
+
+func (s *exemptionService) Create(
+	ctx context.Context,
+	companyID uuid.UUID,
+	input *CreateExemptionInput,
+	actorType string,
+	actorID uuid.UUID,
+) (*models.AttendanceExemption, error) {
+	if companyID == uuid.Nil {
+		return nil, fmt.Errorf("company_id is required")
+	}
+	if input == nil {
+		return nil, fmt.Errorf("input is required")
+	}
+	if _, ok := allowedSubjectTypes[input.SubjectType]; !ok {
+		return nil, fmt.Errorf("%w: %q", ErrInvalidSubject, input.SubjectType)
+	}
+	if input.SubjectID == uuid.Nil {
+		return nil, fmt.Errorf("subject_id is required")
+	}
+	if input.FromDate.IsZero() || input.ToDate.IsZero() {
+		return nil, fmt.Errorf("from_date and to_date are required")
+	}
+	if input.FromDate.After(input.ToDate) {
+		return nil, ErrInvalidDateRange
+	}
+
+	// Enforce caller's location scope against the target subject.
+	if err := s.ensureSubjectInScope(ctx, companyID, input.SubjectType, input.SubjectID); err != nil {
+		return nil, err
+	}
+
+	// Reject overlaps: any active exemption that touches the same window.
+	overlaps, err := s.hasOverlap(ctx, companyID, input.SubjectType, input.SubjectID, input.FromDate, input.ToDate, uuid.Nil)
+	if err != nil {
+		return nil, fmt.Errorf("check overlap: %w", err)
+	}
+	if overlaps {
+		return nil, ErrOverlap
+	}
+
+	var createdBy *uuid.UUID
+	if actorID != uuid.Nil {
+		createdBy = &actorID
+	}
+
+	exemption := &models.AttendanceExemption{
+		CompanyID:   companyID,
+		SubjectType: input.SubjectType,
+		SubjectID:   input.SubjectID,
+		FromDate:    input.FromDate,
+		ToDate:      input.ToDate,
+		Reason:      input.Reason,
+		ApprovedBy:  input.ApprovedBy,
+		CreatedBy:   createdBy,
+	}
+
+	if err := s.repo.Create(ctx, nil, exemption); err != nil {
+		return nil, fmt.Errorf("create exemption: %w", err)
+	}
+
+	s.logAudit(ctx, companyID, "attendance.exemption.create", exemption.ExemptionID,
+		actorType, actorID, nil, exemption, nil)
+	s.logger.Info("Attendance exemption created",
+		zap.String("company_id", companyID.String()),
+		zap.String("subject_type", exemption.SubjectType),
+		zap.String("subject_id", exemption.SubjectID.String()),
+	)
+	return exemption, nil
+}
+
+// ---------------------------------------------------------------------------
+// Update
+// ---------------------------------------------------------------------------
+
+func (s *exemptionService) Update(
+	ctx context.Context,
+	companyID uuid.UUID,
+	exemptionID uuid.UUID,
+	input *UpdateExemptionInput,
+	actorType string,
+	actorID uuid.UUID,
+) (*models.AttendanceExemption, error) {
+	if exemptionID == uuid.Nil {
+		return nil, fmt.Errorf("exemption_id is required")
+	}
+	if input == nil {
+		return nil, fmt.Errorf("input is required")
+	}
+
+	existing, err := s.fetchScoped(ctx, companyID, exemptionID)
+	if err != nil {
+		return nil, err
+	}
+	before := *existing // shallow copy for audit
+
+	// Apply mutations.
+	if input.FromDate != nil {
+		existing.FromDate = *input.FromDate
+	}
+	if input.ToDate != nil {
+		existing.ToDate = *input.ToDate
+	}
+	if input.Reason != nil {
+		existing.Reason = input.Reason
+	}
+	if input.ApprovedBy != nil {
+		existing.ApprovedBy = input.ApprovedBy
+	}
+
+	if existing.FromDate.After(existing.ToDate) {
+		return nil, ErrInvalidDateRange
+	}
+
+	// Re-run scope check in case the subject was reassigned since creation.
+	if err := s.ensureSubjectInScope(ctx, companyID, existing.SubjectType, existing.SubjectID); err != nil {
+		return nil, err
+	}
+
+	// Overlap check must exclude this row.
+	overlaps, err := s.hasOverlap(ctx, companyID, existing.SubjectType, existing.SubjectID,
+		existing.FromDate, existing.ToDate, exemptionID)
+	if err != nil {
+		return nil, fmt.Errorf("check overlap: %w", err)
+	}
+	if overlaps {
+		return nil, ErrOverlap
+	}
+
+	if err := s.repo.Update(ctx, nil, existing); err != nil {
+		return nil, fmt.Errorf("update exemption: %w", err)
+	}
+
+	s.logAudit(ctx, companyID, "attendance.exemption.update", exemptionID,
+		actorType, actorID, before, existing, nil)
+	s.logger.Info("Attendance exemption updated",
+		zap.String("exemption_id", exemptionID.String()),
+		zap.String("company_id", companyID.String()),
+	)
+	return existing, nil
+}
+
+// ---------------------------------------------------------------------------
+// Delete
+// ---------------------------------------------------------------------------
+
+func (s *exemptionService) Delete(
+	ctx context.Context,
+	companyID uuid.UUID,
+	exemptionID uuid.UUID,
+	actorType string,
+	actorID uuid.UUID,
+) error {
+	if exemptionID == uuid.Nil {
+		return fmt.Errorf("exemption_id is required")
+	}
+
+	existing, err := s.fetchScoped(ctx, companyID, exemptionID)
+	if err != nil {
+		return err
+	}
+
+	if err := s.repo.Delete(ctx, nil, exemptionID); err != nil {
+		return fmt.Errorf("delete exemption: %w", err)
+	}
+
+	s.logAudit(ctx, companyID, "attendance.exemption.delete", exemptionID,
+		actorType, actorID, existing, nil, nil)
+	s.logger.Info("Attendance exemption deleted",
+		zap.String("exemption_id", exemptionID.String()),
+		zap.String("company_id", companyID.String()),
+	)
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// GetByID (read, still company-scoped)
+// ---------------------------------------------------------------------------
+
+func (s *exemptionService) GetByID(
+	ctx context.Context,
+	companyID uuid.UUID,
+	exemptionID uuid.UUID,
+) (*models.AttendanceExemption, error) {
+	return s.fetchScoped(ctx, companyID, exemptionID)
+}
+
+// ---------------------------------------------------------------------------
+// internals
+// ---------------------------------------------------------------------------
+
+// fetchScoped loads by ID and rejects rows that belong to a different company.
+// Returns ErrExemptionNotFound (not Forbidden) so we don't leak existence.
+func (s *exemptionService) fetchScoped(
+	ctx context.Context,
+	companyID uuid.UUID,
+	exemptionID uuid.UUID,
+) (*models.AttendanceExemption, error) {
+	row, err := s.repo.GetByID(ctx, nil, exemptionID)
+	if err != nil {
+		return nil, fmt.Errorf("get exemption: %w", err)
+	}
+	if row == nil || row.CompanyID != companyID {
+		return nil, ErrExemptionNotFound
+	}
+	return row, nil
+}
+
+// ensureSubjectInScope mirrors CorrectionService.ensureSubjectInScope.
+func (s *exemptionService) ensureSubjectInScope(
+	ctx context.Context,
+	companyID uuid.UUID,
+	subjectType string,
+	subjectID uuid.UUID,
+) error {
+	locCtx, err := locationctx.FromContext(ctx)
+	if err != nil {
+		// No location context → treat as fail-closed for mutations.
+		// If your middleware guarantees one for every request, this
+		// branch should be unreachable.
+		return fmt.Errorf("location context missing: %w", ErrUnauthorized)
+	}
+	if locCtx.Mode == locationctx.ScopeAll {
+		return nil
+	}
+	if s.locationResolver == nil {
+		return nil // no resolver wired → can't enforce, allow (log-only mode)
+	}
+	subjectLoc, err := s.locationResolver.ResolveLocation(ctx, companyID, subjectType, subjectID)
+	if err != nil {
+		return fmt.Errorf("resolve subject location: %w", err)
+	}
+	if subjectLoc == nil {
+		return resolver.ErrSubjectHasNoLocation
+	}
+	if locCtx.LocationID == nil || *subjectLoc != *locCtx.LocationID {
+		return resolver.ErrSubjectOutsideScope
+	}
+	return nil
+}
+
+// hasOverlap returns true if any *other* exemption for the same subject
+// intersects the [from, to] window. excludeID skips the current row during update.
+func (s *exemptionService) hasOverlap(
+	ctx context.Context,
+	companyID uuid.UUID,
+	subjectType string,
+	subjectID uuid.UUID,
+	from, to time.Time,
+	excludeID uuid.UUID,
+) (bool, error) {
+	filter := repository.ExemptionFilter{
+		CompanyID:   &companyID,
+		SubjectType: &subjectType,
+		SubjectID:   &subjectID,
+		FromDate:    &from,
+		ToDate:      &to,
+	}
+	pag := repository.Pagination{Limit: 1000, Offset: 0}
+	rows, err := s.repo.List(ctx, nil, filter, pag)
+	if err != nil {
+		return false, err
+	}
+	for _, r := range rows {
+		if excludeID != uuid.Nil && r.ExemptionID == excludeID {
+			continue
+		}
+		// Overlap: NOT (r.ToDate < from || r.FromDate > to)
+		if !r.ToDate.Before(from) && !r.FromDate.After(to) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *exemptionService) logAudit(
+	ctx context.Context,
+	companyID uuid.UUID,
+	action string,
+	resourceID uuid.UUID,
+	actorType string,
+	actorID uuid.UUID,
+	before interface{},
+	after interface{},
+	metadata map[string]interface{},
+) {
+	if s.audit == nil {
+		return
+	}
+	var beforeJSON, afterJSON []byte
+	if before != nil {
+		beforeJSON, _ = json.Marshal(before)
+	}
+	if after != nil {
+		afterJSON, _ = json.Marshal(after)
+	}
+	var actorPtr *uuid.UUID
+	if actorID != uuid.Nil {
+		actorPtr = &actorID
+	}
+	_ = s.audit.LogAction(
+		ctx, nil, &companyID,
+		"attendance", action, "attendance_exemption",
+		&resourceID, actorType, actorPtr,
+		beforeJSON, afterJSON, metadata,
+	)
+}
 
 
 ================================================================================
@@ -2170,19 +2915,19 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 
 	"auth-service/internal/attendance/models"
 	"auth-service/internal/attendance/repository"
 	"auth-service/internal/attendance/service/admin"
 	"auth-service/internal/attendance/service/enrollment"
+	"auth-service/internal/attendance/service/resolver"
 	"auth-service/internal/attendance/service/source"
+	"auth-service/internal/attendance/service/usage_integration"
 	auditservice "auth-service/internal/infrastructure/audit"
+	"auth-service/internal/locationctx"
 )
-
-// ---------------------------------------------------------------------------
-// Request types
-// ---------------------------------------------------------------------------
 
 type PunchRequest struct {
 	CompanyID      uuid.UUID
@@ -2203,10 +2948,6 @@ type PunchSource struct {
 	IPAddress  *string
 }
 
-// ---------------------------------------------------------------------------
-// Main interface and service struct
-// ---------------------------------------------------------------------------
-
 type IngestService interface {
 	IngestPunch(ctx context.Context, req *PunchRequest) (*models.AttendanceEvent, error)
 }
@@ -2226,6 +2967,8 @@ type ingestService struct {
 	audit              *auditservice.AuditService
 	logger             *zap.Logger
 	sessionSummaryRepo repository.AttendanceSessionSummaryRepository
+	usageService       *usage_integration.UsageIntegrationService
+	locationResolver   resolver.SubjectLocationResolver
 }
 
 func NewIngestService(
@@ -2239,6 +2982,8 @@ func NewIngestService(
 	audit *auditservice.AuditService,
 	logger *zap.Logger,
 	sessionSummaryRepo repository.AttendanceSessionSummaryRepository,
+	usageService *usage_integration.UsageIntegrationService,
+	locationResolver resolver.SubjectLocationResolver,
 ) IngestService {
 	return &ingestService{
 		eventRepo:          eventRepo,
@@ -2251,12 +2996,10 @@ func NewIngestService(
 		audit:              audit,
 		logger:             logger,
 		sessionSummaryRepo: sessionSummaryRepo,
+		usageService:       usageService,
+		locationResolver:   locationResolver,
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Core ingest logic
-// ---------------------------------------------------------------------------
 
 func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*models.AttendanceEvent, error) {
 	start := time.Now().UTC()
@@ -2266,7 +3009,6 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		zap.String("source_type", req.Source.SourceType),
 	)
 
-	// 1. Basic validation
 	if req.CompanyID == uuid.Nil {
 		return nil, errors.New("company_id required")
 	}
@@ -2280,29 +3022,27 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		req.Context = &models.EventContext{}
 	}
 
-	// 2. Resolve source rules
 	sourceRules, err := s.sourceResolver.Resolve(ctx, req.Source.SourceType)
 	if err != nil {
 		return nil, fmt.Errorf("invalid source type: %w", err)
 	}
 
-	// 3. Resolve event time
 	eventTime, err := s.resolveEventTime(ctx, req, sourceRules)
 	if err != nil {
 		return nil, err
 	}
 
-	// 4. Determine subject (via enrollment if device)
 	subjectType := req.SubjectType
 	subjectID := req.SubjectID
 	var deviceID *string
+	var device *models.AttendanceDevice
 
 	if sourceRules.RequiresDevice {
 		if req.Source.DeviceID == nil || *req.Source.DeviceID == "" {
 			return nil, errors.New("device_id required for this source type")
 		}
 		deviceID = req.Source.DeviceID
-		device, err := s.deviceRepo.GetActiveDevice(ctx, req.CompanyID, *deviceID)
+		device, err = s.deviceRepo.GetActiveDevice(ctx, req.CompanyID, *deviceID)
 		if err != nil || device == nil || !device.IsTrusted {
 			return nil, errors.New("invalid or untrusted device")
 		}
@@ -2324,15 +3064,13 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		}
 	}
 
-	// 5. Resolve attendance rules (policy)
-	// --- FIX: add subjectType to the call ---
 	resolvedRules, err := s.adminService.ResolveAttendanceRules(
 		ctx,
 		subjectID,
 		req.CompanyID,
-		subjectType, // <-- added
+		subjectType,
 		derefString(req.Context.WorkCenterCode),
-		nil, // positionID
+		nil,
 		eventTime,
 	)
 	if err != nil {
@@ -2342,7 +3080,6 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		return nil, fmt.Errorf("source '%s' not allowed by rules", req.Source.SourceType)
 	}
 
-	// 6. Ensure attendance source exists
 	if req.Source.SourceID == nil {
 		src, err := s.sourceRepo.GetByType(ctx, req.CompanyID, req.Source.SourceType)
 		if err != nil {
@@ -2354,7 +3091,6 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		req.Source.SourceID = &src.SourceID
 	}
 
-	// 7. OM authorization
 	var actorPtr *uuid.UUID
 	if req.ActorID != uuid.Nil {
 		actorPtr = &req.ActorID
@@ -2378,7 +3114,26 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		return nil, fmt.Errorf("not authorized: %s", reason)
 	}
 
-	// 8. Build and store the event
+	if err := s.ensureActorCanActOnSubject(ctx, req.CompanyID, req.ActorID, subjectType, subjectID); err != nil {
+		s.logger.Warn("Actor not authorized for subject location",
+			zap.String("actor_id", req.ActorID.String()),
+			zap.String("subject_type", subjectType),
+			zap.String("subject_id", subjectID.String()),
+			zap.Error(err),
+		)
+		return nil, err
+	}
+
+	subjectLocation, err := s.locationResolver.ResolveLocation(ctx, req.CompanyID, subjectType, subjectID)
+	if err != nil {
+		s.logger.Error("Failed to resolve subject location",
+			zap.String("subject_type", subjectType),
+			zap.String("subject_id", subjectID.String()),
+			zap.Error(err),
+		)
+		return nil, fmt.Errorf("resolve subject location: %w", err)
+	}
+
 	event := &models.AttendanceEvent{
 		AttendanceEventID: uuid.New(),
 		CompanyID:         req.CompanyID,
@@ -2386,12 +3141,16 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		SubjectID:         subjectID,
 		EventType:         req.EventType,
 		EventTime:         eventTime,
-		SourceType:        req.Source.SourceType,
-		SourceID:          req.Source.SourceID,
-		DeviceID:          deviceID,
-		DeviceUserCode:    req.DeviceUserCode,
-		IPAddress:         req.Source.IPAddress,
-		Context:           *req.Context,
+
+		EmploymentLocationID: subjectLocation,
+		GeofenceID:           deviceGeofence(device),
+
+		SourceType:     req.Source.SourceType,
+		SourceID:       req.Source.SourceID,
+		DeviceID:       deviceID,
+		DeviceUserCode: req.DeviceUserCode,
+		IPAddress:      req.Source.IPAddress,
+		Context:        *req.Context,
 		Metadata: models.EventMetadata{
 			IsAutoGenerated: boolPtr(sourceRules.IsSystem),
 		},
@@ -2403,6 +3162,10 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
+	if tx == nil {
+		s.logger.Error("Transaction is nil but no error returned from BeginTx")
+		return nil, errors.New("failed to begin transaction: tx is nil")
+	}
 	defer tx.Rollback()
 
 	if err := s.eventRepo.CreateEvent(ctx, tx, event); err != nil {
@@ -2413,15 +3176,38 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		_ = s.deviceRepo.UpdateLastSeen(ctx, *deviceID)
 	}
 
-	// 9. If this punch is linked to a session, upsert the session summary
 	if req.Context.SessionID != nil && *req.Context.SessionID != uuid.Nil {
-		if err := s.updateSessionSummary(ctx, tx, event, *req.Context.SessionID); err != nil {
-			// Do not fail the whole transaction; just log.
+		if err := s.updateSessionSummary(ctx, tx, event, *req.Context.SessionID, subjectLocation); err != nil {
 			s.logger.Warn("Failed to update session summary",
 				zap.String("event_id", event.AttendanceEventID.String()),
 				zap.String("session_id", req.Context.SessionID.String()),
 				zap.Error(err),
 			)
+		}
+	}
+
+	if subjectType == "customer" && req.EventType == "check_in" {
+		featureKey := s.getFeatureKeyForEvent(req.EventType, req.Source.SourceType)
+		if featureKey != "" {
+			if s.usageService == nil {
+				s.logger.Error("usageService is nil; cannot process usage")
+				return nil, errors.New("usage service not available")
+			}
+			if err := s.usageService.ProcessCheckIn(
+				ctx,
+				tx,
+				req.CompanyID,
+				subjectID,
+				event.AttendanceEventID,
+				featureKey,
+				decimal.NewFromInt(1),
+			); err != nil {
+				s.logger.Error("Usage processing failed, rejecting punch",
+					zap.Error(err),
+					zap.String("customer_id", subjectID.String()),
+				)
+				return nil, fmt.Errorf("usage processing failed: %w", err)
+			}
 		}
 	}
 
@@ -2438,9 +3224,60 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 	return event, nil
 }
 
-// ---------------------------------------------------------------------------
-// Helper functions
-// ---------------------------------------------------------------------------
+// ensureActorCanActOnSubject verifies that, when an actor is present and
+// differs from the target subject, the target subject is within the caller's
+// current location scope.
+//
+// Rules:
+//   - actorID == uuid.Nil         → device / system → permitted
+//   - actorID == subjectID        → self-punch      → permitted
+//   - scope == ScopeAll           → permitted
+//   - no location context at all  → DENIED (fail-closed)
+//
+// FIX (Tier 1): previously a missing location context returned nil, silently
+// converting the scope check into a no-op. That is fail-open for a
+// cross-subject write, which is exactly the case that needs to be checked.
+// It now fails closed.
+func (s *ingestService) ensureActorCanActOnSubject(
+	ctx context.Context,
+	companyID, actorID uuid.UUID,
+	subjectType string,
+	subjectID uuid.UUID,
+) error {
+	if actorID == uuid.Nil {
+		return nil // device / system
+	}
+	if actorID == subjectID {
+		return nil // self-punch
+	}
+
+	locCtx, err := locationctx.FromContext(ctx)
+	if err != nil {
+		return fmt.Errorf("location context missing for cross-subject write: %w", resolver.ErrSubjectOutsideScope)
+	}
+	if locCtx.Mode == locationctx.ScopeAll {
+		return nil
+	}
+
+	subjectLoc, err := s.locationResolver.ResolveLocation(ctx, companyID, subjectType, subjectID)
+	if err != nil {
+		return err
+	}
+	if subjectLoc == nil {
+		return resolver.ErrSubjectHasNoLocation
+	}
+	if locCtx.LocationID == nil || *subjectLoc != *locCtx.LocationID {
+		return resolver.ErrSubjectOutsideScope
+	}
+	return nil
+}
+
+func deviceGeofence(device *models.AttendanceDevice) *uuid.UUID {
+	if device == nil {
+		return nil
+	}
+	return device.GeofenceID
+}
 
 func derefString(s *string) string {
 	if s != nil {
@@ -2453,51 +3290,96 @@ func boolPtr(b bool) *bool {
 	return &b
 }
 
-// resolveEventTime determines the event timestamp based on source rules and company timezone.
-func (s *ingestService) resolveEventTime(ctx context.Context, req *PunchRequest, rules *source.ResolvedSourceRules) (time.Time, error) {
+// resolveEventTime determines the event timestamp for a punch.
+//
+// Contract:
+//   - For device sources, req.EventTime MUST be a `time.Time` carrying an
+//     explicit location (i.e. constructed from a string with a tz offset
+//     like RFC3339). It is converted to UTC before being stored.
+//   - For non-device human sources, the event is stamped at "now" in the
+//     company timezone, then stored as UTC.
+//   - For system sources, "now" UTC is used.
+//
+// FIX (Tier 1): the previous implementation returned
+// `req.EventTime.In(loc).UTC()`, which is an identity transform: an instant
+// already in UTC is unchanged, and a naive timestamp (parsed as UTC by Go)
+// is unchanged too. The tz from company rules had no effect. That line is
+// removed. The store-as-UTC contract is now explicit and enforced.
+func (s *ingestService) resolveEventTime(
+	ctx context.Context,
+	req *PunchRequest,
+	rules *source.ResolvedSourceRules,
+) (time.Time, error) {
 	companyRules, err := s.adminService.GetCompanyAttendanceRules(ctx, req.CompanyID)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("get company rules: %w", err)
 	}
-	loc, err := time.LoadLocation(companyRules.Timezone)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("invalid timezone: %w", err)
+
+	if companyRules == nil {
+		s.logger.Warn("No company attendance rules found; falling back to UTC timezone",
+			zap.String("company_id", req.CompanyID.String()))
+		if rules.RequiresDevice {
+			if req.EventTime == nil {
+				return time.Time{}, errors.New("event_time required for device events")
+			}
+			return req.EventTime.UTC(), nil
+		}
+		return time.Now().UTC(), nil
 	}
+
 	if rules.RequiresDevice {
 		if req.EventTime == nil {
 			return time.Time{}, errors.New("event_time required for device events")
 		}
-		return req.EventTime.In(loc).UTC(), nil
+		// Trust the tz information embedded in req.EventTime. If the caller
+		// built it from a tz-less string, that is an upstream bug: this
+		// method cannot reconstruct the intended tz.
+		if _, offset := req.EventTime.Zone(); offset == 0 {
+			s.logger.Warn("Device event_time has zero offset; timezone may be missing from payload",
+				zap.String("company_id", req.CompanyID.String()),
+				zap.Time("event_time", *req.EventTime),
+			)
+		}
+		return req.EventTime.UTC(), nil
 	}
+
 	if rules.IsSystem {
 		return time.Now().UTC(), nil
 	}
-	nowUTC := time.Now().UTC()
-	nowInLoc := nowUTC.In(loc)
-	return nowInLoc.UTC(), nil
+
+	// Non-device human punches: stamp "now" in the company tz, store as UTC.
+	loc, err := time.LoadLocation(companyRules.Timezone)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid timezone: %w", err)
+	}
+	return time.Now().In(loc).UTC(), nil
 }
 
-// updateSessionSummary creates or updates the session summary based on the event.
-// Note: tx is *sql.Tx because that's what the repository expects.
-func (s *ingestService) updateSessionSummary(ctx context.Context, tx *sql.Tx, event *models.AttendanceEvent, sessionID uuid.UUID) error {
-	// Determine session date from event time (use UTC for simplicity; can be enhanced with company timezone)
+func (s *ingestService) updateSessionSummary(
+	ctx context.Context,
+	tx *sql.Tx,
+	event *models.AttendanceEvent,
+	sessionID uuid.UUID,
+	subjectLocation *uuid.UUID,
+) error {
 	sessionDate := event.EventTime.UTC().Truncate(24 * time.Hour)
 
 	status := mapEventTypeToSessionStatus(event.EventType)
 
 	summary := &models.AttendanceSessionSummary{
-		CompanyID:   event.CompanyID,
-		SubjectType: event.SubjectType,
-		SubjectID:   event.SubjectID,
-		SessionID:   sessionID,
-		SessionDate: sessionDate,
-		Status:      status,
-		MarkedAt:    event.EventTime,
-		MarkedBy:    event.CreatedBy,
-		SourceType:  event.SourceType,
-		DeviceID:    event.DeviceID,
-		IsAuto:      event.Metadata.IsAutoGenerated != nil && *event.Metadata.IsAutoGenerated,
-		Remarks:     nil,
+		CompanyID:            event.CompanyID,
+		SubjectType:          event.SubjectType,
+		SubjectID:            event.SubjectID,
+		EmploymentLocationID: subjectLocation,
+		SessionID:            sessionID,
+		SessionDate:          sessionDate,
+		Status:               status,
+		MarkedAt:             event.EventTime,
+		MarkedBy:             event.CreatedBy,
+		SourceType:           event.SourceType,
+		DeviceID:             event.DeviceID,
+		IsAuto:               event.Metadata.IsAutoGenerated != nil && *event.Metadata.IsAutoGenerated,
+		Remarks:              nil,
 		Metadata: models.JSONB{
 			"event_id": event.AttendanceEventID.String(),
 		},
@@ -2506,8 +3388,6 @@ func (s *ingestService) updateSessionSummary(ctx context.Context, tx *sql.Tx, ev
 	return s.sessionSummaryRepo.Upsert(ctx, tx, summary)
 }
 
-// mapEventTypeToSessionStatus converts an attendance event type to a session status.
-// Customize this mapping based on your business rules.
 func mapEventTypeToSessionStatus(eventType string) string {
 	switch eventType {
 	case "check_in", "shift_start", "class_start", "session_join", "present":
@@ -2519,11 +3399,20 @@ func mapEventTypeToSessionStatus(eventType string) string {
 	case "excused", "exempted":
 		return "excused"
 	default:
-		// Default to "present" for unknown event types
 		return "present"
 	}
 }
 
+func (s *ingestService) getFeatureKeyForEvent(eventType, sourceType string) string {
+	switch eventType {
+	case "check_in":
+		return "gym_visit"
+	case "class_start":
+		return "class_attendance"
+	default:
+		return ""
+	}
+}
 
 
 ================================================================================
@@ -2918,9 +3807,16 @@ import (
 	auditservice "auth-service/internal/infrastructure/audit"
 )
 
-// AdminService handles policy, rule, profile, and correction administration.
+// defaultAllowedSourceTypes is the fallback list used when company rules
+// are absent. Keep in sync with service/source/canonicalSourceRules.
+//
+// FIX (Tier 1): "rfid" is not a canonical source type. It previously
+// appeared here, which caused every device punch under default rules to
+// pass rule resolution and then hard-fail in SourceResolver.Resolve with
+// "unsupported source type: rfid". Removed.
+var defaultAllowedSourceTypes = []string{"mobile", "web", "biometric"}
+
 type AdminService interface {
-	// Policy management
 	CreateAttendancePolicy(ctx context.Context, policy *models.AttendancePolicy, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.AttendancePolicy, error)
 	UpdateAttendancePolicy(ctx context.Context, policy *models.AttendancePolicy) error
 	DeleteAttendancePolicy(ctx context.Context, policyID uuid.UUID) error
@@ -2929,30 +3825,23 @@ type AdminService interface {
 	GetPositionAttendancePolicy(ctx context.Context, positionID uuid.UUID) (*models.AttendancePolicy, error)
 	GetUsersByAttendancePolicy(ctx context.Context, policyID uuid.UUID, effectiveDate time.Time) ([]uuid.UUID, error)
 
-	// NEW: Polymorphic policy methods
 	AssignPolicyToSubject(ctx context.Context, subjectType string, subjectID uuid.UUID, policyID uuid.UUID, effectiveFrom time.Time, effectiveTo *time.Time, assignedBy *uuid.UUID) error
 	EndPolicyForSubject(ctx context.Context, subjectType string, subjectID uuid.UUID, policyID uuid.UUID, endDate time.Time) error
 	GetActivePolicyForSubject(ctx context.Context, subjectType string, subjectID uuid.UUID, date time.Time) (*models.AttendancePolicy, error)
 
-	// Company & department rules
 	GetCompanyAttendanceRules(ctx context.Context, companyID uuid.UUID) (*models.CompanyAttendanceRules, error)
 	UpdateCompanyAttendanceRules(ctx context.Context, rules *models.CompanyAttendanceRules, updatedBy uuid.UUID) error
 	GetDepartmentAttendanceRules(ctx context.Context, companyID, departmentID uuid.UUID) (*models.DepartmentAttendanceRules, error)
 	UpsertDepartmentAttendanceRules(ctx context.Context, rules *models.DepartmentAttendanceRules) error
 
-	// User attendance profile (overrides)
 	GetUserAttendanceProfile(ctx context.Context, userID uuid.UUID) (*models.UserAttendanceProfile, error)
 	UpsertUserAttendanceProfile(ctx context.Context, profile *models.UserAttendanceProfile) error
 
-	// Rule resolution (used by ingest)
-	// CHANGED: added subjectType parameter
 	ResolveAttendanceRules(ctx context.Context, userID, companyID uuid.UUID, subjectType string, workCenterCode string, positionID *uuid.UUID, date time.Time) (*models.ResolvedAttendanceRules, error)
 
-	// Validation helpers
 	ValidateAttendanceEventType(ctx context.Context, eventType string) error
 	ValidateAttendanceSourceType(ctx context.Context, sourceType string, sourceID *uuid.UUID) error
 
-	// Health
 	HealthCheck(ctx context.Context) error
 }
 
@@ -2961,7 +3850,7 @@ type adminService struct {
 	policyRepo   repository.PolicyRepository
 	ruleRepo     repository.RuleRepository
 	sourceRepo   repository.SourceRepository
-	scheduleRepo repository.ScheduleRepository // for work center lookup, etc.
+	scheduleRepo repository.ScheduleRepository
 	resolver     resolver.SubjectResolver
 	logger       *zap.Logger
 	audit        *auditservice.AuditService
@@ -2997,7 +3886,6 @@ func (s *adminService) CreateAttendancePolicy(ctx context.Context, policy *model
 	if err := s.validatePolicy(policy); err != nil {
 		return nil, err
 	}
-	// Check duplicate policy code
 	existing, err := s.policyRepo.GetPoliciesByCompany(ctx, policy.CompanyID, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check existing policies: %w", err)
@@ -3045,7 +3933,6 @@ func (s *adminService) UpdateAttendancePolicy(ctx context.Context, policy *model
 	if existing == nil {
 		return fmt.Errorf("policy not found")
 	}
-	// Duplicate code check (excluding self)
 	all, err := s.policyRepo.GetPoliciesByCompany(ctx, policy.CompanyID, false)
 	if err != nil {
 		return fmt.Errorf("list policies: %w", err)
@@ -3077,7 +3964,6 @@ func (s *adminService) DeleteAttendancePolicy(ctx context.Context, policyID uuid
 	if policy == nil {
 		return fmt.Errorf("policy not found")
 	}
-	// Check if assigned to any users
 	users, err := s.policyRepo.GetUsersByPolicy(ctx, policyID, time.Now())
 	if err != nil {
 		return fmt.Errorf("check users: %w", err)
@@ -3085,9 +3971,6 @@ func (s *adminService) DeleteAttendancePolicy(ctx context.Context, policyID uuid
 	if len(users) > 0 {
 		return fmt.Errorf("cannot delete policy assigned to %d users", len(users))
 	}
-	// Also check for other subjects (students, teachers)
-	// TODO: implement cross-subject check if needed
-
 	tx, err := s.eventRepo.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -3100,10 +3983,9 @@ func (s *adminService) DeleteAttendancePolicy(ctx context.Context, policyID uuid
 }
 
 // =============================================================================
-// NEW POLYMORPHIC POLICY METHODS (for any subject)
+// Polymorphic policy assignment
 // =============================================================================
 
-// AssignPolicyToSubject assigns a policy to any subject (employee, student, teacher, etc.)
 func (s *adminService) AssignPolicyToSubject(ctx context.Context, subjectType string, subjectID uuid.UUID, policyID uuid.UUID, effectiveFrom time.Time, effectiveTo *time.Time, assignedBy *uuid.UUID) error {
 	if subjectType == "" || subjectID == uuid.Nil {
 		return errors.New("subject_type and subject_id are required")
@@ -3114,7 +3996,6 @@ func (s *adminService) AssignPolicyToSubject(ctx context.Context, subjectType st
 	if effectiveFrom.IsZero() {
 		effectiveFrom = time.Now().UTC()
 	}
-	// Validate policy exists and is active
 	policy, err := s.policyRepo.GetPolicyByID(ctx, policyID)
 	if err != nil {
 		return fmt.Errorf("get policy: %w", err)
@@ -3123,11 +4004,8 @@ func (s *adminService) AssignPolicyToSubject(ctx context.Context, subjectType st
 		return errors.New("policy not active or not found")
 	}
 
-	// Idempotency: check if exact assignment already exists
-	// We'll use a helper method to find assignment by subject
 	existing, err := s.policyRepo.GetActivePolicyBySubject(ctx, subjectType, subjectID, effectiveFrom)
 	if err == nil && existing != nil {
-		// If the active policy at that date is the same, return success
 		if existing.PolicyID == policyID {
 			s.logger.Info("Policy already assigned to subject (idempotent)",
 				zap.String("subject_type", subjectType),
@@ -3136,7 +4014,6 @@ func (s *adminService) AssignPolicyToSubject(ctx context.Context, subjectType st
 				zap.Time("effective_from", effectiveFrom))
 			return nil
 		}
-		// Otherwise, end the current active policy before assigning the new one
 		_ = s.EndPolicyForSubject(ctx, subjectType, subjectID, existing.PolicyID, effectiveFrom)
 	}
 
@@ -3161,7 +4038,6 @@ func (s *adminService) AssignPolicyToSubject(ctx context.Context, subjectType st
 	return nil
 }
 
-// EndPolicyForSubject ends an active policy for a given subject
 func (s *adminService) EndPolicyForSubject(ctx context.Context, subjectType string, subjectID uuid.UUID, policyID uuid.UUID, endDate time.Time) error {
 	if endDate.IsZero() {
 		endDate = time.Now().UTC()
@@ -3185,17 +4061,14 @@ func (s *adminService) EndPolicyForSubject(ctx context.Context, subjectType stri
 	return nil
 }
 
-// GetActivePolicyForSubject retrieves the active policy for a given subject at a given date
 func (s *adminService) GetActivePolicyForSubject(ctx context.Context, subjectType string, subjectID uuid.UUID, date time.Time) (*models.AttendancePolicy, error) {
 	return s.policyRepo.GetActivePolicyBySubject(ctx, subjectType, subjectID, date)
 }
 
 // =============================================================================
-// LEGACY EMPLOYEE METHODS (kept for backward compatibility)
+// Legacy employee assignment (kept for backward compat)
 // =============================================================================
 
-// AssignUserAttendancePolicy is the legacy employee-only assignment method.
-// It now populates SubjectType="employee" and SubjectID=userID before calling the repository.
 func (s *adminService) AssignUserAttendancePolicy(ctx context.Context, userPolicy *models.UserAttendancePolicy, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error {
 	if userPolicy.UserID == uuid.Nil || userPolicy.PolicyID == uuid.Nil {
 		return fmt.Errorf("user_id and policy_id required")
@@ -3203,14 +4076,12 @@ func (s *adminService) AssignUserAttendancePolicy(ctx context.Context, userPolic
 	if userPolicy.EffectiveFrom.IsZero() {
 		userPolicy.EffectiveFrom = time.Now().UTC()
 	}
-	// Set polymorphic fields for employees
 	if userPolicy.SubjectType == "" {
 		userPolicy.SubjectType = "employee"
 	}
 	if userPolicy.SubjectID == nil {
 		userPolicy.SubjectID = &userPolicy.UserID
 	}
-
 	policy, err := s.policyRepo.GetPolicyByID(ctx, userPolicy.PolicyID)
 	if err != nil {
 		return fmt.Errorf("get policy: %w", err)
@@ -3218,8 +4089,6 @@ func (s *adminService) AssignUserAttendancePolicy(ctx context.Context, userPolic
 	if policy == nil || !policy.IsActive {
 		return fmt.Errorf("policy not active")
 	}
-
-	// Idempotency check
 	existing, err := s.policyRepo.GetUserPolicyAssignment(ctx, userPolicy.UserID, userPolicy.PolicyID, userPolicy.EffectiveFrom)
 	if err != nil {
 		return fmt.Errorf("check existing assignment: %w", err)
@@ -3231,33 +4100,27 @@ func (s *adminService) AssignUserAttendancePolicy(ctx context.Context, userPolic
 			zap.Time("effective_from", userPolicy.EffectiveFrom))
 		return nil
 	}
-
-	// End any previous active policy (if different)
 	active, err := s.policyRepo.GetActivePolicyBySubject(ctx, "employee", userPolicy.UserID, userPolicy.EffectiveFrom)
 	if err == nil && active != nil && active.PolicyID != userPolicy.PolicyID {
 		_ = s.policyRepo.EndPolicyForSubject(ctx, "employee", userPolicy.UserID, active.PolicyID, userPolicy.EffectiveFrom)
 	}
-
 	if userPolicy.AssignedBy == nil {
 		userPolicy.AssignedBy = &actorID
 	}
 	if userPolicy.CreatedAt.IsZero() {
 		userPolicy.CreatedAt = time.Now().UTC()
 	}
-
 	tx, err := s.eventRepo.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
 	if err := s.policyRepo.AssignUserPolicy(ctx, tx, userPolicy); err != nil {
 		return fmt.Errorf("assign policy: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
-
 	s.logAudit(ctx, policy.CompanyID, "user_attendance_policy.assign", userPolicy.PolicyID,
 		actorType, actorID, nil, userPolicy, metadata)
 	s.logger.Info("User attendance policy assigned",
@@ -3266,8 +4129,6 @@ func (s *adminService) AssignUserAttendancePolicy(ctx context.Context, userPolic
 	return nil
 }
 
-// EndUserAttendancePolicy is the legacy employee-only end method.
-// It now uses the polymorphic EndPolicyForSubject with subjectType="employee".
 func (s *adminService) EndUserAttendancePolicy(ctx context.Context, userID, policyID uuid.UUID, endDate time.Time) error {
 	if endDate.IsZero() {
 		endDate = time.Now().UTC()
@@ -3298,7 +4159,6 @@ func (s *adminService) UpdateCompanyAttendanceRules(ctx context.Context, rules *
 	if rules == nil || rules.CompanyID == uuid.Nil {
 		return fmt.Errorf("company rules and company_id required")
 	}
-	// Validate source types
 	srcTypes, err := s.sourceRepo.GetSourceTypes(ctx, true)
 	if err != nil {
 		return fmt.Errorf("load source types: %w", err)
@@ -3308,7 +4168,8 @@ func (s *adminService) UpdateCompanyAttendanceRules(ctx context.Context, rules *
 		valid[st.SourceType] = struct{}{}
 	}
 	if len(rules.AllowedSourceTypes) == 0 {
-		rules.AllowedSourceTypes = []string{"mobile", "web", "biometric", "rfid"}
+		// FIX (Tier 1): no longer injects "rfid".
+		rules.AllowedSourceTypes = append([]string{}, defaultAllowedSourceTypes...)
 	} else {
 		seen := make(map[string]struct{})
 		var validated []string
@@ -3349,7 +4210,6 @@ func (s *adminService) UpsertDepartmentAttendanceRules(ctx context.Context, rule
 	if rules == nil || rules.CompanyID == uuid.Nil || rules.DepartmentID == uuid.Nil {
 		return fmt.Errorf("rules, company_id, department_id required")
 	}
-	// Validate against company allowed sources
 	companyRules, err := s.ruleRepo.GetCompanyRules(ctx, rules.CompanyID)
 	if err != nil {
 		return fmt.Errorf("get company rules: %w", err)
@@ -3363,7 +4223,6 @@ func (s *adminService) UpsertDepartmentAttendanceRules(ctx context.Context, rule
 			return fmt.Errorf("source type %s not allowed by company", src)
 		}
 	}
-	// Validate event types (we can use a predefined list)
 	for _, et := range rules.AllowedEventTypes {
 		if !isValidEventType(et) {
 			return fmt.Errorf("invalid event type: %s", et)
@@ -3384,7 +4243,7 @@ func (s *adminService) UpsertDepartmentAttendanceRules(ctx context.Context, rule
 }
 
 // ------------------------------------------------------------
-// User attendance profile (overrides)
+// User profile
 // ------------------------------------------------------------
 
 func (s *adminService) GetUserAttendanceProfile(ctx context.Context, userID uuid.UUID) (*models.UserAttendanceProfile, error) {
@@ -3410,9 +4269,9 @@ func (s *adminService) UpsertUserAttendanceProfile(ctx context.Context, profile 
 }
 
 // ------------------------------------------------------------
-// Rule resolution (used by ingest)
-// CHANGED: now uses polymorphic policy lookup
+// Rule resolution
 // ------------------------------------------------------------
+
 func (s *adminService) ResolveAttendanceRules(ctx context.Context, userID, companyID uuid.UUID, subjectType string, workCenterCode string, positionID *uuid.UUID, date time.Time) (*models.ResolvedAttendanceRules, error) {
 	now := time.Now().UTC()
 	resolved := &models.ResolvedAttendanceRules{
@@ -3424,7 +4283,6 @@ func (s *adminService) ResolveAttendanceRules(ctx context.Context, userID, compa
 		PolicySource:          "company",
 	}
 
-	// 1. Company rules (baseline)
 	companyRules, err := s.ruleRepo.GetCompanyRules(ctx, companyID)
 	if err != nil {
 		return nil, fmt.Errorf("get company rules: %w", err)
@@ -3434,7 +4292,8 @@ func (s *adminService) ResolveAttendanceRules(ctx context.Context, userID, compa
 			zap.String("company_id", companyID.String()))
 		resolved.Timezone = "UTC"
 		resolved.AllowMultipleCheckins = false
-		resolved.AllowedSourceTypes = []string{"mobile", "web", "biometric", "rfid"}
+		// FIX (Tier 1): use the shared default list (no "rfid").
+		resolved.AllowedSourceTypes = append([]string{}, defaultAllowedSourceTypes...)
 		for _, src := range resolved.AllowedSourceTypes {
 			resolved.AllowedSourceTypesMap[src] = true
 		}
@@ -3447,10 +4306,7 @@ func (s *adminService) ResolveAttendanceRules(ctx context.Context, userID, compa
 		}
 	}
 
-	// 2. Resolve policy: subject-specific > work_center > position
 	var resolvedPolicy *models.AttendancePolicy
-
-	// 2a. Try subject-specific policy (polymorphic)
 	if userID != uuid.Nil && subjectType != "" {
 		if p, err := s.policyRepo.GetActivePolicyBySubject(ctx, subjectType, userID, date); err == nil && p != nil && p.IsActive {
 			resolvedPolicy = p
@@ -3462,28 +4318,18 @@ func (s *adminService) ResolveAttendanceRules(ctx context.Context, userID, compa
 				zap.String("policy_code", p.PolicyCode))
 		}
 	}
-
-	// 2b. Fallback to work center policy
 	if resolvedPolicy == nil && workCenterCode != "" {
 		if p, err := s.policyRepo.GetWorkCenterPolicy(ctx, companyID, workCenterCode); err == nil && p != nil && p.IsActive {
 			resolvedPolicy = p
 			resolved.PolicySource = "work_center"
 			resolved.WorkCenterCode = &workCenterCode
-			s.logger.Debug("Resolved policy from work center",
-				zap.String("work_center", workCenterCode),
-				zap.String("policy_id", p.PolicyID.String()))
 		}
 	}
-
-	// 2c. Fallback to position policy
 	if resolvedPolicy == nil && positionID != nil {
 		if p, err := s.policyRepo.GetPositionPolicy(ctx, *positionID); err == nil && p != nil && p.IsActive {
 			resolvedPolicy = p
 			resolved.PolicySource = "position"
 			resolved.PositionID = positionID
-			s.logger.Debug("Resolved policy from position",
-				zap.String("position_id", positionID.String()),
-				zap.String("policy_id", p.PolicyID.String()))
 		}
 	}
 
@@ -3514,7 +4360,6 @@ func (s *adminService) ResolveAttendanceRules(ctx context.Context, userID, compa
 			zap.String("work_center", workCenterCode))
 	}
 
-	// 3. User profile overrides (still employee‑centric; could be extended)
 	if userID != uuid.Nil {
 		profile, err := s.ruleRepo.GetUserProfile(ctx, userID)
 		if err == nil && profile != nil {
@@ -3545,10 +4390,6 @@ func (s *adminService) ResolveAttendanceRules(ctx context.Context, userID, compa
 	return resolved, nil
 }
 
-// ------------------------------------------------------------
-// Validation helpers
-// ------------------------------------------------------------
-
 func (s *adminService) ValidateAttendanceEventType(ctx context.Context, eventType string) error {
 	types, err := s.sourceRepo.GetEventTypes(ctx, true)
 	if err != nil {
@@ -3576,20 +4417,12 @@ func (s *adminService) ValidateAttendanceSourceType(ctx context.Context, sourceT
 	return nil
 }
 
-// ------------------------------------------------------------
-// Health
-// ------------------------------------------------------------
-
 func (s *adminService) HealthCheck(ctx context.Context) error {
 	if err := s.eventRepo.HealthCheck(ctx); err != nil {
 		return fmt.Errorf("event repo health: %w", err)
 	}
 	return nil
 }
-
-// ------------------------------------------------------------
-// helpers
-// ------------------------------------------------------------
 
 func (s *adminService) validatePolicy(policy *models.AttendancePolicy) error {
 	if policy.CompanyID == uuid.Nil {
@@ -3635,7 +4468,6 @@ func isValidEventType(et string) bool {
 }
 
 
-
 ================================================================================
 FILE: ./service/admin/correction_service.go
 ================================================================================
@@ -3656,9 +4488,9 @@ import (
 	"auth-service/internal/attendance/repository"
 	"auth-service/internal/attendance/service/resolver"
 	auditservice "auth-service/internal/infrastructure/audit"
+	"auth-service/internal/locationctx"
 )
 
-// CorrectionRequest is the input for creating an attendance correction.
 type CorrectionRequest struct {
 	CompanyID      uuid.UUID
 	ActorID        uuid.UUID
@@ -3666,29 +4498,27 @@ type CorrectionRequest struct {
 	SubjectType    string
 	SubjectID      uuid.UUID
 	BusinessDate   time.Time
-	CorrectionType string // manual_check_in, manual_check_out, attendance_adjustment, manual_override
+	CorrectionType string
 	EventTime      *time.Time
-	OverrideStatus string // present, absent, late, half_day, etc. (for manual_override or adjustment)
+	OverrideStatus string
 	Reason         string
 }
 
-// CorrectionService handles creation of attendance corrections.
 type CorrectionService interface {
 	CreateCorrection(ctx context.Context, req *CorrectionRequest) error
 }
 
 type correctionService struct {
-	eventRepo   repository.EventRepository
-	summaryRepo repository.SummaryRepository
-	admin       AdminService // for validation of event types, etc.
-	resolver    resolver.SubjectResolver
-	resolution  ResolutionService // we'll define this interface later; for now we call RecalculateDay
-	logger      *zap.Logger
-	audit       *auditservice.AuditService
+	eventRepo        repository.EventRepository
+	summaryRepo      repository.SummaryRepository
+	admin            AdminService
+	resolver         resolver.SubjectResolver
+	locationResolver resolver.SubjectLocationResolver
+	resolution       ResolutionService
+	logger           *zap.Logger
+	audit            *auditservice.AuditService
 }
 
-// ResolutionService is a minimal interface for recalculating a day.
-// This will be implemented by the resolution service later.
 type ResolutionService interface {
 	RecalculateDay(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) error
 }
@@ -3698,30 +4528,30 @@ func NewCorrectionService(
 	summaryRepo repository.SummaryRepository,
 	admin AdminService,
 	resolver resolver.SubjectResolver,
+	locationResolver resolver.SubjectLocationResolver,
 	resolution ResolutionService,
 	logger *zap.Logger,
 	audit *auditservice.AuditService,
 ) CorrectionService {
 	return &correctionService{
-		eventRepo:   eventRepo,
-		summaryRepo: summaryRepo,
-		admin:       admin,
-		resolver:    resolver,
-		resolution:  resolution,
-		logger:      logger,
-		audit:       audit,
+		eventRepo:        eventRepo,
+		summaryRepo:      summaryRepo,
+		admin:            admin,
+		resolver:         resolver,
+		locationResolver: locationResolver,
+		resolution:       resolution,
+		logger:           logger,
+		audit:            audit,
 	}
 }
 
 func (s *correctionService) CreateCorrection(ctx context.Context, req *CorrectionRequest) error {
 	startTime := time.Now()
 
-	// 1. Validate correction type
 	if !isValidCorrectionType(req.CorrectionType) {
 		return fmt.Errorf("invalid correction type: %s", req.CorrectionType)
 	}
 
-	// 2. Required fields based on type
 	if req.CorrectionType == "manual_check_in" || req.CorrectionType == "manual_check_out" {
 		if req.EventTime == nil {
 			return fmt.Errorf("event_time required for %s", req.CorrectionType)
@@ -3736,21 +4566,37 @@ func (s *correctionService) CreateCorrection(ctx context.Context, req *Correctio
 		}
 	}
 
-	// 3. Ensure event_time belongs to business_date (if provided)
+	// Resolve the subject's timezone so business-date comparisons use the
+	// subject's local day, not UTC. FIX (Tier 1): previously compared
+	// eventTime.UTC() to businessDate.UTC(), which rejected valid
+	// corrections that cross local midnight for non-UTC subjects.
+	subjectTZ := s.resolveSubjectTimezone(ctx, req.CompanyID, req.SubjectType, req.SubjectID)
+	loc, err := time.LoadLocation(subjectTZ)
+	if err != nil {
+		loc = time.UTC
+	}
+
 	var eventTime time.Time
 	if req.EventTime != nil {
 		eventTime = *req.EventTime
-		if eventTime.UTC().Format("2006-01-02") != req.BusinessDate.UTC().Format("2006-01-02") {
-			return fmt.Errorf("event_time %s does not belong to business_date %s",
-				eventTime.Format("2006-01-02"), req.BusinessDate.Format("2006-01-02"))
+
+		// Compare local calendar days.
+		evtLocal := eventTime.In(loc).Format("2006-01-02")
+		bizLocal := req.BusinessDate.In(loc).Format("2006-01-02")
+		if evtLocal != bizLocal {
+			return fmt.Errorf("event_time %s does not belong to business_date %s (subject tz %s)",
+				eventTime.In(loc).Format(time.RFC3339),
+				req.BusinessDate.In(loc).Format("2006-01-02"),
+				subjectTZ)
 		}
 	} else {
-		// Default to midnight on business date
-		eventTime = time.Date(req.BusinessDate.Year(), req.BusinessDate.Month(), req.BusinessDate.Day(),
-			0, 0, 0, 0, req.BusinessDate.Location())
+		// Default to midnight at the subject's local business date.
+		eventTime = time.Date(
+			req.BusinessDate.Year(), req.BusinessDate.Month(), req.BusinessDate.Day(),
+			0, 0, 0, 0, loc,
+		).UTC()
 	}
 
-	// 4. Idempotency: check if correction already exists for this event_time and subject
 	existing, err := s.eventRepo.FindCorrection(ctx, req.CompanyID, req.SubjectID, req.SubjectType, req.CorrectionType, eventTime)
 	if err != nil {
 		return fmt.Errorf("check existing correction: %w", err)
@@ -3759,10 +4605,20 @@ func (s *correctionService) CreateCorrection(ctx context.Context, req *Correctio
 		return fmt.Errorf("correction already exists for this event")
 	}
 
-	// 5. Resolve subject (optional) – we could check if subject is active
-	// but that's not required for correction.
+	if err := s.ensureSubjectInScope(ctx, req.CompanyID, req.SubjectType, req.SubjectID); err != nil {
+		s.logger.Warn("Correction target outside caller scope",
+			zap.String("subject_type", req.SubjectType),
+			zap.String("subject_id", req.SubjectID.String()),
+			zap.Error(err),
+		)
+		return err
+	}
 
-	// 6. Create event
+	subjectLocation, err := s.locationResolver.ResolveLocation(ctx, req.CompanyID, req.SubjectType, req.SubjectID)
+	if err != nil {
+		return fmt.Errorf("resolve subject location: %w", err)
+	}
+
 	event := &models.AttendanceEvent{
 		AttendanceEventID: uuid.New(),
 		CompanyID:         req.CompanyID,
@@ -3770,10 +4626,13 @@ func (s *correctionService) CreateCorrection(ctx context.Context, req *Correctio
 		SubjectID:         req.SubjectID,
 		EventType:         req.CorrectionType,
 		EventTime:         eventTime,
-		SourceType:        "correction",
-		SourceID:          nil,
-		DeviceID:          nil,
-		IPAddress:         nil,
+
+		EmploymentLocationID: subjectLocation,
+
+		SourceType: "correction",
+		SourceID:   nil,
+		DeviceID:   nil,
+		IPAddress:  nil,
 		Context: models.EventContext{
 			CorrectionReason: &req.Reason,
 		},
@@ -3799,7 +4658,6 @@ func (s *correctionService) CreateCorrection(ctx context.Context, req *Correctio
 		return fmt.Errorf("commit tx: %w", err)
 	}
 
-	// 7. Recalculate attendance for that day
 	if s.resolution != nil {
 		if err := s.resolution.RecalculateDay(ctx, req.CompanyID, req.SubjectID, req.SubjectType, req.BusinessDate); err != nil {
 			s.logger.Warn("Correction created but recalculation failed",
@@ -3808,7 +4666,6 @@ func (s *correctionService) CreateCorrection(ctx context.Context, req *Correctio
 		}
 	}
 
-	// 8. Audit
 	s.logAudit(ctx, req.CompanyID, "attendance.correction.create", event.AttendanceEventID,
 		req.ActorType, req.ActorID, nil, event, map[string]interface{}{
 			"correction_type": req.CorrectionType,
@@ -3829,7 +4686,53 @@ func (s *correctionService) CreateCorrection(ctx context.Context, req *Correctio
 	return nil
 }
 
-// helpers
+// resolveSubjectTimezone returns the subject's timezone, falling back to UTC.
+// We try the resolver first; if it fails or returns no tz, we fall back.
+func (s *correctionService) resolveSubjectTimezone(
+	ctx context.Context,
+	companyID uuid.UUID,
+	subjectType string,
+	subjectID uuid.UUID,
+) string {
+	if s.resolver == nil {
+		return "UTC"
+	}
+	resolved, err := s.resolver.Resolve(ctx, companyID, subjectType, subjectID, time.Now())
+	if err != nil || resolved == nil || resolved.Timezone == "" {
+		return "UTC"
+	}
+	return resolved.Timezone
+}
+
+func (s *correctionService) ensureSubjectInScope(
+	ctx context.Context,
+	companyID uuid.UUID,
+	subjectType string,
+	subjectID uuid.UUID,
+) error {
+	locCtx, err := locationctx.FromContext(ctx)
+	if err != nil {
+		return fmt.Errorf("location context missing: %w", err)
+	}
+	if locCtx.Mode == locationctx.ScopeAll {
+		return nil
+	}
+	if s.locationResolver == nil {
+		return nil
+	}
+	subjectLoc, err := s.locationResolver.ResolveLocation(ctx, companyID, subjectType, subjectID)
+	if err != nil {
+		return err
+	}
+	if subjectLoc == nil {
+		return resolver.ErrSubjectHasNoLocation
+	}
+	if locCtx.LocationID == nil || *subjectLoc != *locCtx.LocationID {
+		return resolver.ErrSubjectOutsideScope
+	}
+	return nil
+}
+
 func isValidCorrectionType(t string) bool {
 	valid := map[string]bool{
 		"manual_check_in":       true,
@@ -3867,7 +4770,6 @@ func (s *correctionService) logAudit(ctx context.Context, companyID uuid.UUID, a
 	}
 	_ = s.audit.LogAction(ctx, nil, &companyID, "attendance", action, strings.Split(action, ".")[0], &resourceID, actorType, &actorID, beforeJSON, afterJSON, metadata)
 }
-
 
 
 ================================================================================
@@ -3931,15 +4833,16 @@ type ResolutionService interface {
 }
 
 type resolutionService struct {
-	eventRepo     repository.EventRepository
-	summaryRepo   repository.SummaryRepository
-	scheduleRepo  repository.ScheduleRepository
-	policyRepo    repository.PolicyRepository
-	subjectRes    resolver.SubjectResolver
-	adminSvc      admin.AdminService
-	exemptionRepo repository.AttendanceExemptionRepository
-	logger        *zap.Logger
-	audit         *auditservice.AuditService
+	eventRepo        repository.EventRepository
+	summaryRepo      repository.SummaryRepository
+	scheduleRepo     repository.ScheduleRepository
+	policyRepo       repository.PolicyRepository
+	subjectRes       resolver.SubjectResolver
+	locationResolver resolver.SubjectLocationResolver
+	adminSvc         admin.AdminService
+	exemptionRepo    repository.AttendanceExemptionRepository
+	logger           *zap.Logger
+	audit            *auditservice.AuditService
 }
 
 // NewResolutionService creates a new resolution service.
@@ -3949,21 +4852,23 @@ func NewResolutionService(
 	scheduleRepo repository.ScheduleRepository,
 	policyRepo repository.PolicyRepository,
 	subjectRes resolver.SubjectResolver,
+	locationResolver resolver.SubjectLocationResolver,
 	adminSvc admin.AdminService,
 	exemptionRepo repository.AttendanceExemptionRepository,
 	logger *zap.Logger,
 	audit *auditservice.AuditService,
 ) ResolutionService {
 	return &resolutionService{
-		eventRepo:     eventRepo,
-		summaryRepo:   summaryRepo,
-		scheduleRepo:  scheduleRepo,
-		policyRepo:    policyRepo,
-		subjectRes:    subjectRes,
-		adminSvc:      adminSvc,
-		exemptionRepo: exemptionRepo,
-		logger:        logger,
-		audit:         audit,
+		eventRepo:        eventRepo,
+		summaryRepo:      summaryRepo,
+		scheduleRepo:     scheduleRepo,
+		policyRepo:       policyRepo,
+		subjectRes:       subjectRes,
+		locationResolver: locationResolver,
+		adminSvc:         adminSvc,
+		exemptionRepo:    exemptionRepo,
+		logger:           logger,
+		audit:            audit,
 	}
 }
 
@@ -4119,6 +5024,8 @@ func (s *resolutionService) resolveSubjectDay(ctx context.Context, companyID, su
 	refLocal := refTime.In(loc)
 	businessDate := time.Date(refLocal.Year(), refLocal.Month(), refLocal.Day(), 0, 0, 0, 0, loc)
 
+	// Fetch the existing summary ONCE and pass it down. Previously this
+	// method fetched it, then applyAttendanceRules fetched it twice more.
 	existingSummary, _ := s.summaryRepo.GetBySubjectDate(ctx, companyID, subjectID, subjectType, businessDate)
 	if existingSummary != nil && existingSummary.IsPayrollLocked {
 		s.logger.Info("Attendance locked by payroll, skipping resolution",
@@ -4136,7 +5043,6 @@ func (s *resolutionService) resolveSubjectDay(ctx context.Context, companyID, su
 		return fmt.Errorf("fetch events: %w", err)
 	}
 
-	// FIX: added subjectType as 4th argument
 	rules, err := s.adminSvc.ResolveAttendanceRules(
 		ctx,
 		subjectID,
@@ -4150,10 +5056,15 @@ func (s *resolutionService) resolveSubjectDay(ctx context.Context, companyID, su
 		return fmt.Errorf("resolve rules: %w", err)
 	}
 
-	return s.applyAttendanceRules(ctx, events, companyID, subjectID, subjectType, businessDate, resolved, rules)
+	return s.applyAttendanceRules(ctx, events, companyID, subjectID, subjectType, businessDate, resolved, rules, existingSummary)
 }
 
-// applyAttendanceRules does the heavy lifting: exemptions, pairing, overrides, metrics, status, upsert
+// applyAttendanceRules does the heavy lifting: exemptions, pairing, overrides, metrics, status, upsert.
+//
+// `existingSummary` is passed in from resolveSubjectDay so the upsert paths
+// don't have to re-read it. This removes two redundant GetBySubjectDate
+// calls per resolution and closes a race where a concurrent resolver could
+// see a different summary ID between the two reads.
 func (s *resolutionService) applyAttendanceRules(
 	ctx context.Context,
 	events []*models.AttendanceEvent,
@@ -4162,8 +5073,21 @@ func (s *resolutionService) applyAttendanceRules(
 	businessDate time.Time,
 	resolved *resolver.ResolvedSubject,
 	rules *models.ResolvedAttendanceRules,
+	existingSummary *models.AttendanceDailySummary,
 ) error {
-	// ── Helper to upsert a summary with a given status and anomalies ──
+	// Resolve the subject's employment location once for this day.
+	subjectLocation, locErr := s.locationResolver.ResolveLocation(ctx, companyID, subjectType, subjectID)
+	if locErr != nil {
+		s.logger.Warn("Failed to resolve subject location, proceeding without",
+			zap.String("subject_type", subjectType),
+			zap.String("subject_id", subjectID.String()),
+			zap.Error(locErr),
+		)
+		subjectLocation = nil
+	}
+
+	// Helper to upsert a summary with a given status and anomalies.
+	// Reuses `existingSummary` (passed in) instead of re-fetching.
 	upsertStatus := func(status string, anomalies []string) error {
 		isPayable := status != models.StatusAbsent &&
 			status != models.StatusLeaveUnpaid &&
@@ -4171,16 +5095,17 @@ func (s *resolutionService) applyAttendanceRules(
 			status != models.StatusExcused
 
 		summary := &models.AttendanceDailySummary{
-			AttendanceSummaryID: uuid.New(),
-			CompanyID:           companyID,
-			SubjectType:         subjectType,
-			SubjectID:           subjectID,
-			AttendanceDate:      businessDate,
-			Status:              status,
-			IsPayrollLocked:     false,
-			IsPayable:           isPayable,
-			GeneratedAt:         time.Now().UTC(),
-			GeneratedBy:         "attendance_resolution_service",
+			AttendanceSummaryID:  uuid.New(),
+			CompanyID:            companyID,
+			SubjectType:          subjectType,
+			SubjectID:            subjectID,
+			EmploymentLocationID: subjectLocation,
+			AttendanceDate:       businessDate,
+			Status:               status,
+			IsPayrollLocked:      false,
+			IsPayable:            isPayable,
+			GeneratedAt:          time.Now().UTC(),
+			GeneratedBy:          "attendance_resolution_service",
 			Metadata: models.SummaryMetadata{
 				ScheduleStatus: &resolved.ScheduleStatus,
 				Timezone:       &resolved.Timezone,
@@ -4188,8 +5113,8 @@ func (s *resolutionService) applyAttendanceRules(
 			},
 		}
 
-		if existing, _ := s.summaryRepo.GetBySubjectDate(ctx, companyID, subjectID, subjectType, businessDate); existing != nil {
-			summary.AttendanceSummaryID = existing.AttendanceSummaryID
+		if existingSummary != nil {
+			summary.AttendanceSummaryID = existingSummary.AttendanceSummaryID
 		}
 
 		return s.summaryRepo.UpsertSummary(ctx, nil, summary)
@@ -4240,7 +5165,7 @@ func (s *resolutionService) applyAttendanceRules(
 		if evt.Metadata.IsCorrection != nil && *evt.Metadata.IsCorrection {
 			if evt.EventType == "manual_override" && evt.Metadata.OverrideStatus != nil {
 				status := *evt.Metadata.OverrideStatus
-				anomalies := s.detectAnomaliesFromPairs(dayPairs)
+				anomalies := s.detectAnomaliesFromPairs(dayPairs, rules.AllowMultipleCheckins)
 				return upsertStatus(status, anomalies)
 			}
 		}
@@ -4270,8 +5195,13 @@ func (s *resolutionService) applyAttendanceRules(
 		return upsertStatus(models.StatusAbsent, nil)
 	}
 
-	// 8. Detect anomalies (informational only)
-	anomalies := s.detectAnomaliesFromPairs(dayPairs)
+	// 8. Detect anomalies (informational only).
+	//
+	// The multiple_pairs anomaly respects company/policy rules: when
+	// multiple check-ins are allowed, having more than one complete
+	// pair in a day is NOT an anomaly — it's the expected shape for
+	// split-shift workers, gig staff, and multi-visit customers.
+	anomalies := s.detectAnomaliesFromPairs(dayPairs, rules.AllowMultipleCheckins)
 
 	// 9. Resolve policy
 	policy, err := s.resolvePolicy(ctx, companyID, subjectID, subjectType, businessDate, resolved)
@@ -4280,33 +5210,34 @@ func (s *resolutionService) applyAttendanceRules(
 		policy = s.defaultPolicy()
 	}
 
-	// 10. Compute metrics (pass businessDate for end-of-day fallback)
+	// 10. Compute metrics
 	metrics := s.calculateMetrics(dayPairs, resolved, policy, anomalies, businessDate)
 
 	// 11. Determine final status
 	status := s.determineStatus(metrics, resolved, policy)
 
-	// 12. Build and upsert summary
+	// 12. Build and upsert summary — uses the passed-in existingSummary.
 	isPayable := status != models.StatusAbsent &&
 		status != models.StatusLeaveUnpaid &&
 		status != models.StatusNotScheduled &&
 		status != models.StatusExcused
 
 	summary := &models.AttendanceDailySummary{
-		AttendanceSummaryID: uuid.New(),
-		CompanyID:           companyID,
-		SubjectType:         subjectType,
-		SubjectID:           subjectID,
-		AttendanceDate:      businessDate,
-		Status:              status,
-		IsPayrollLocked:     false,
-		IsPayable:           isPayable,
-		WorkedMinutes:       metrics.WorkedMinutes,
-		ExpectedMinutes:     metrics.ExpectedMinutes,
-		OvertimeMinutes:     metrics.OvertimeMinutes,
-		LateMinutes:         metrics.LateMinutes,
-		GeneratedAt:         time.Now().UTC(),
-		GeneratedBy:         "attendance_resolution_service",
+		AttendanceSummaryID:  uuid.New(),
+		CompanyID:            companyID,
+		SubjectType:          subjectType,
+		SubjectID:            subjectID,
+		EmploymentLocationID: subjectLocation,
+		AttendanceDate:       businessDate,
+		Status:               status,
+		IsPayrollLocked:      false,
+		IsPayable:            isPayable,
+		WorkedMinutes:        metrics.WorkedMinutes,
+		ExpectedMinutes:      metrics.ExpectedMinutes,
+		OvertimeMinutes:      metrics.OvertimeMinutes,
+		LateMinutes:          metrics.LateMinutes,
+		GeneratedAt:          time.Now().UTC(),
+		GeneratedBy:          "attendance_resolution_service",
 		Metadata: models.SummaryMetadata{
 			CheckInTime:    metrics.FirstCheckIn,
 			CheckOutTime:   metrics.LastCheckOut,
@@ -4323,9 +5254,8 @@ func (s *resolutionService) applyAttendanceRules(
 			IsLeavePaid:    &resolved.IsLeavePaid,
 		},
 	}
-
-	if existing, _ := s.summaryRepo.GetBySubjectDate(ctx, companyID, subjectID, subjectType, businessDate); existing != nil {
-		summary.AttendanceSummaryID = existing.AttendanceSummaryID
+	if existingSummary != nil {
+		summary.AttendanceSummaryID = existingSummary.AttendanceSummaryID
 	}
 
 	if err := s.summaryRepo.UpsertSummary(ctx, nil, summary); err != nil {
@@ -4437,45 +5367,61 @@ func (s *resolutionService) normalizeEventType(t string) string {
 	}
 }
 
-func (s *resolutionService) detectAnomaliesFromPairs(pairs []PairedEvent) []string {
+// detectAnomaliesFromPairs reports structural anomalies in a day's pairs.
+//
+// Anomaly rules:
+//   - missing_checkout      — a check-in has no matching check-out
+//   - missing_checkin       — a check-out has no preceding check-in
+//   - excessive_shift_duration — a single pair exceeds max shift hours
+//   - multiple_pairs        — more than one COMPLETE pair in a day,
+//     and the rules do NOT permit it
+//
+// The `allowMultiple` flag is the company-wide or per-policy
+// "AllowMultipleCheckins" setting. When true, having N complete pairs in
+// a day is intentional (split shifts, gig workers, multi-visit customers)
+// and is NOT flagged. When false, only the first pair is expected and
+// extras are surfaced to HR for review.
+//
+// Note: this function only changes the anomaly list. It does NOT change
+// how worked_minutes is computed — all completed pairs always count
+// toward the day's total. Downgrading to "first pair only" would be a
+// separate, explicit change.
+func (s *resolutionService) detectAnomaliesFromPairs(pairs []PairedEvent, allowMultiple bool) []string {
 	var anomalies []string
-	checkIns, checkOuts := 0, 0
 	maxDur := time.Duration(defaultMaxShiftDurationHours) * time.Hour
+	completePairs := 0
 
 	for _, p := range pairs {
-		if p.CheckIn != nil {
-			checkIns++
-		}
-		if p.CheckOut != nil {
-			checkOuts++
-		}
-		if p.CheckIn != nil && p.CheckOut == nil {
+		switch {
+		case p.CheckIn != nil && p.CheckOut != nil:
+			completePairs++
+		case p.CheckIn != nil:
 			anomalies = append(anomalies, "missing_checkout")
-		}
-		if p.CheckIn == nil && p.CheckOut != nil {
+		case p.CheckOut != nil:
 			anomalies = append(anomalies, "missing_checkin")
 		}
+
 		if p.CheckInTime != nil && p.CheckOutTime != nil {
 			if p.CheckOutTime.Sub(*p.CheckInTime) > maxDur {
 				anomalies = append(anomalies, "excessive_shift_duration")
 			}
 		}
 	}
-	if checkIns > 1 || checkOuts > 1 {
+
+	// Only flag multiple_pairs when the rules don't allow it.
+	if completePairs > 1 && !allowMultiple {
 		anomalies = append(anomalies, "multiple_pairs")
 	}
+
 	return anomalies
 }
 
-// calculateMetrics computes worked minutes, late, overtime, etc. from all pairs.
-// It uses the earliest check-in for late minutes and latest check-out for overtime.
-// Unmatched check-ins are closed at expected end (or end of day).
 func (s *resolutionService) calculateMetrics(
 	pairs []PairedEvent,
 	resolved *resolver.ResolvedSubject,
 	policy *models.AttendancePolicy,
 	anomalies []string,
-	businessDate time.Time, // added to avoid using resolved.Date
+	businessDate time.Time,
 ) *DailyMetrics {
 	metrics := &DailyMetrics{
 		Status:       models.StatusPresent,
@@ -4542,7 +5488,6 @@ func (s *resolutionService) calculateMetrics(
 		}
 	}
 
-	// Handle unmatched check-ins (no checkout): close them at expected end (or end-of-day)
 	for _, p := range pairs {
 		if p.CheckIn != nil && p.CheckOut == nil {
 			closeTime := expectedEndLocal
@@ -4573,7 +5518,6 @@ func (s *resolutionService) calculateMetrics(
 		metrics.BreakMinutes = &breakMin
 	}
 
-	// Late minutes: earliest check-in compared to expected start
 	if expectedStartLocal != nil && earliestCheckIn != nil {
 		if earliestCheckIn.After(*expectedStartLocal) {
 			lateSec := earliestCheckIn.Sub(*expectedStartLocal).Seconds()
@@ -4589,7 +5533,6 @@ func (s *resolutionService) calculateMetrics(
 		metrics.LateMinutes = &zero
 	}
 
-	// Overtime: latest checkout compared to expected end
 	if expectedEndLocal != nil && latestCheckOut != nil {
 		if latestCheckOut.After(*expectedEndLocal) {
 			otSec := latestCheckOut.Sub(*expectedEndLocal).Seconds()
@@ -4616,13 +5559,11 @@ func (s *resolutionService) calculateMetrics(
 	return metrics
 }
 
-// determineStatus decides final status using metrics, resolved subject, and policy.
 func (s *resolutionService) determineStatus(
 	metrics *DailyMetrics,
 	resolved *resolver.ResolvedSubject,
 	policy *models.AttendancePolicy,
 ) string {
-	// Respect schedule overrides (already handled earlier, but double-check)
 	if resolved.ScheduleStatus != "" {
 		switch resolved.ScheduleStatus {
 		case "weekly_off":
@@ -4637,12 +5578,10 @@ func (s *resolutionService) determineStatus(
 		}
 	}
 
-	// No check-ins → absent
 	if metrics.CheckIns == 0 {
 		return models.StatusAbsent
 	}
 
-	// Late logic
 	if metrics.LateMinutes != nil && *metrics.LateMinutes > 0 {
 		if policy != nil && policy.Rules.MaxLateAllowed != nil && *metrics.LateMinutes > *policy.Rules.MaxLateAllowed {
 			return models.StatusAbsent
@@ -4650,33 +5589,28 @@ func (s *resolutionService) determineStatus(
 		return models.StatusLate
 	}
 
-	// Half-day: if worked < half-day threshold (and policy has threshold)
 	if policy != nil && policy.Rules.HalfDayAfter != nil && metrics.WorkedMinutes != nil && metrics.ExpectedMinutes != nil {
 		if *metrics.WorkedMinutes < *policy.Rules.HalfDayAfter {
 			return models.StatusHalfDay
 		}
 	}
 
-	// If there is at least one check-in, but no check-outs, and auto-checkout is allowed
 	if metrics.CheckIns > 0 && metrics.CheckOuts == 0 {
 		if policy != nil && policy.Rules.AutoCheckout != nil && *policy.Rules.AutoCheckout {
-			if metrics.WorkedMinutes != nil && *metrics.WorkedMinutes >= 240 { // 4 hours minimum to be considered present
+			if metrics.WorkedMinutes != nil && *metrics.WorkedMinutes >= 240 {
 				return models.StatusPresent
 			}
 		}
-		// Otherwise, it's a half-day or absent (if no work)
 		if metrics.WorkedMinutes != nil && *metrics.WorkedMinutes > 0 {
 			return models.StatusHalfDay
 		}
 		return models.StatusAbsent
 	}
 
-	// If some work was done, mark present
 	if metrics.WorkedMinutes != nil && *metrics.WorkedMinutes > 0 {
 		return models.StatusPresent
 	}
 
-	// Fallback
 	return models.StatusAbsent
 }
 
@@ -4687,13 +5621,11 @@ func (s *resolutionService) resolvePolicy(
 	date time.Time,
 	resolved *resolver.ResolvedSubject,
 ) (*models.AttendancePolicy, error) {
-	// 1. Try subject-specific policy (polymorphic – works for any subject type)
 	policy, err := s.policyRepo.GetActivePolicyBySubject(ctx, subjectType, subjectID, date)
 	if err == nil && policy != nil {
 		return policy, nil
 	}
 
-	// 2. For employees only, fallback to position/work center policies (legacy)
 	if subjectType == models.SubjectTypeEmployee {
 		if resolved.PositionID != nil {
 			posPolicy, err := s.policyRepo.GetPositionPolicy(ctx, *resolved.PositionID)
@@ -4711,6 +5643,7 @@ func (s *resolutionService) resolvePolicy(
 
 	return s.defaultPolicy(), nil
 }
+
 func (s *resolutionService) defaultPolicy() *models.AttendancePolicy {
 	return &models.AttendancePolicy{
 		PolicyID:   uuid.New(),
@@ -4787,15 +5720,18 @@ import (
 	"context"
 	"errors"
 
-	"auth-service/internal/attendance/repository"
-
+	"github.com/google/uuid"
 	"go.uber.org/zap"
+
+	"auth-service/internal/attendance/repository"
 )
 
-// BatchFailureService handles retrieval of batch processing failures.
 type BatchFailureService interface {
-	// GetFailures returns all failures for a batch reference.
-	GetFailures(ctx context.Context, batchRef string) ([]*repository.AttendancePunchFailureView, error)
+	GetFailures(
+		ctx context.Context,
+		companyID uuid.UUID,
+		batchRef string,
+	) ([]*repository.AttendancePunchFailureView, error)
 }
 
 type batchFailureService struct {
@@ -4803,24 +5739,50 @@ type batchFailureService struct {
 	logger    *zap.Logger
 }
 
-// NewBatchFailureService creates a new batch failure service.
-func NewBatchFailureService(batchRepo repository.AttendanceBatchRepository, logger *zap.Logger) BatchFailureService {
+func NewBatchFailureService(
+	batchRepo repository.AttendanceBatchRepository,
+	logger *zap.Logger,
+) BatchFailureService {
 	return &batchFailureService{
 		batchRepo: batchRepo,
 		logger:    logger,
 	}
 }
 
-func (s *batchFailureService) GetFailures(ctx context.Context, batchRef string) ([]*repository.AttendancePunchFailureView, error) {
+// GetFailures returns the recorded failures for a batch, scoped to the
+// caller's company.
+//
+// FIX: previous version attempted to post-filter using f.CompanyID, but
+// AttendancePunchFailureView does not expose that field. The company
+// filter is now applied inside the repository (ListFailuresByBatchRef
+// takes companyID and constrains the JOIN on attendance_device_punch_batches
+// by company_id). Cross-tenant rows never leave the database.
+func (s *batchFailureService) GetFailures(
+	ctx context.Context,
+	companyID uuid.UUID,
+	batchRef string,
+) ([]*repository.AttendancePunchFailureView, error) {
 	if batchRef == "" {
 		return nil, errors.New("batch_ref is required")
 	}
-	failures, err := s.batchRepo.ListFailuresByBatchRef(ctx, batchRef)
+	if companyID == uuid.Nil {
+		return nil, errors.New("company_id is required")
+	}
+
+	failures, err := s.batchRepo.ListFailuresByBatchRef(ctx, companyID, batchRef)
 	if err != nil {
-		s.logger.Error("Failed to list failures", zap.String("batch_ref", batchRef), zap.Error(err))
+		s.logger.Error("Failed to list failures",
+			zap.String("batch_ref", batchRef),
+			zap.String("company_id", companyID.String()),
+			zap.Error(err))
 		return nil, err
 	}
-	s.logger.Info("GetFailures completed", zap.String("batch_ref", batchRef), zap.Int("count", len(failures)))
+
+	s.logger.Info("GetFailures completed",
+		zap.String("batch_ref", batchRef),
+		zap.String("company_id", companyID.String()),
+		zap.Int("count", len(failures)),
+	)
 	return failures, nil
 }
 
@@ -4835,6 +5797,7 @@ package batch
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -4846,16 +5809,15 @@ import (
 	"auth-service/internal/attendance/service/enrollment"
 	"auth-service/internal/attendance/service/ingest"
 	"auth-service/internal/attendance/service/resolver"
+	"auth-service/internal/infrastructure/outbox"
 )
 
-// OfflinePunchEvent represents a single punch from a device batch.
 type OfflinePunchEvent struct {
 	EventType   string    `json:"event_type"`
 	EventTime   time.Time `json:"event_time"`
-	ExternalRef string    `json:"external_ref"` // device_user_code
+	ExternalRef string    `json:"external_ref"`
 }
 
-// BatchIngestRequest is the input for ingesting a batch.
 type BatchIngestRequest struct {
 	CompanyID  uuid.UUID
 	DeviceID   string
@@ -4864,7 +5826,11 @@ type BatchIngestRequest struct {
 	Events     []OfflinePunchEvent
 }
 
-// BatchIngestService defines the batch ingestion operations.
+// ErrAllEventsFailed signals that the batch was received and persisted,
+// but zero events could be processed. Callers should surface this so the
+// device knows to look at /failures and retry.
+var ErrAllEventsFailed = errors.New("all events in batch failed")
+
 type BatchIngestService interface {
 	IngestBatch(ctx context.Context, req *BatchIngestRequest) error
 	GetFailures(ctx context.Context, companyID uuid.UUID, deviceID, batchRef string, limit, offset int) ([]repository.AttendancePunchFailureView, error)
@@ -4872,19 +5838,18 @@ type BatchIngestService interface {
 }
 
 type batchIngestService struct {
-	batchRepo  repository.AttendanceBatchRepository
-	outboxRepo repository.OutboxRepository
-	deviceRepo repository.DeviceRepository
-	ingestSvc  ingest.IngestService
-	enrollSvc  enrollment.EnrollmentService
-	subjectRes resolver.SubjectResolver
-	logger     *zap.Logger
+	batchRepo     repository.AttendanceBatchRepository
+	centralOutbox outbox.Repository
+	deviceRepo    repository.DeviceRepository
+	ingestSvc     ingest.IngestService
+	enrollSvc     enrollment.EnrollmentService
+	subjectRes    resolver.SubjectResolver
+	logger        *zap.Logger
 }
 
-// NewBatchIngestService creates a new batch ingest service.
 func NewBatchIngestService(
 	batchRepo repository.AttendanceBatchRepository,
-	outboxRepo repository.OutboxRepository,
+	centralOutbox outbox.Repository,
 	deviceRepo repository.DeviceRepository,
 	ingestSvc ingest.IngestService,
 	enrollSvc enrollment.EnrollmentService,
@@ -4892,13 +5857,13 @@ func NewBatchIngestService(
 	logger *zap.Logger,
 ) BatchIngestService {
 	return &batchIngestService{
-		batchRepo:  batchRepo,
-		outboxRepo: outboxRepo,
-		deviceRepo: deviceRepo,
-		ingestSvc:  ingestSvc,
-		enrollSvc:  enrollSvc,
-		subjectRes: subjectRes,
-		logger:     logger,
+		batchRepo:     batchRepo,
+		centralOutbox: centralOutbox,
+		deviceRepo:    deviceRepo,
+		ingestSvc:     ingestSvc,
+		enrollSvc:     enrollSvc,
+		subjectRes:    subjectRes,
+		logger:        logger,
 	}
 }
 
@@ -4906,6 +5871,16 @@ func (s *batchIngestService) GetStatus(ctx context.Context, companyID uuid.UUID,
 	return s.batchRepo.GetByRef(ctx, companyID, deviceID, batchRef)
 }
 
+// IngestBatch processes a device batch.
+//
+// Returns:
+//   - nil                      → all events processed (or batch was already seen)
+//   - ErrAllEventsFailed       → batch persisted, all events rejected
+//   - other error              → framework error (device, DB, etc.)
+//
+// FIX (Tier 1): previously returned nil even when successCount == 0 and
+// failureCount > 0, so the device received 202 Accepted for a fully-failed
+// batch and had no signal to retry or inspect /failures.
 func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRequest) error {
 	s.logger.Info("IngestBatch START",
 		zap.String("company_id", req.CompanyID.String()),
@@ -4915,14 +5890,12 @@ func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRe
 		zap.Int("event_count", len(req.Events)),
 	)
 
-	// 1. Validate device
 	device, err := s.deviceRepo.GetActiveDevice(ctx, req.CompanyID, req.DeviceID)
 	if err != nil || device == nil || !device.IsTrusted {
 		s.logger.Error("Device validation failed", zap.String("device_id", req.DeviceID), zap.Error(err))
 		return repository.ErrValidationFailed
 	}
 
-	// 2. Idempotency check
 	exists, err := s.batchRepo.ExistsByRef(ctx, req.CompanyID, req.DeviceID, req.BatchRef)
 	if err != nil {
 		return fmt.Errorf("idempotency check: %w", err)
@@ -4932,7 +5905,6 @@ func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRe
 		return nil
 	}
 
-	// 3. Create batch record
 	batch := &repository.AttendancePunchBatch{
 		BatchID:     uuid.New(),
 		CompanyID:   req.CompanyID,
@@ -4949,7 +5921,6 @@ func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRe
 
 	successCount, failureCount := 0, 0
 
-	// 4. Emit batch received outbox (once)
 	payloadBytes, _ := json.Marshal(map[string]interface{}{
 		"batch_id":     batch.BatchID,
 		"batch_ref":    batch.BatchRef,
@@ -4958,23 +5929,24 @@ func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRe
 		"total_events": batch.TotalEvents,
 		"received_at":  batch.ReceivedAt,
 	})
-	outboxEvent := &repository.OutboxEvent{
-		EventID:     uuid.New(),
-		EventType:   "attendance.batch.received",
-		AggregateID: batch.BatchID,
-		Payload:     payloadBytes,
-		CreatedAt:   time.Now().UTC(),
+	centralEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "attendance_batch",
+		AggregateID:   batch.BatchID.String(),
+		EventType:     "attendance.batch.received",
+		Topic:         "attendance.events",
+		Payload:       payloadBytes,
+		Headers: map[string]string{
+			"source": "attendance-batch",
+		},
 	}
-	// Store outbox event (no transaction for simplicity; can be wrapped if needed)
-	if err := s.outboxRepo.Store(ctx, nil, outboxEvent); err != nil {
+	if err := s.centralOutbox.Store(ctx, nil, centralEvent); err != nil {
 		s.logger.Error("Failed to store batch received outbox", zap.Error(err))
 	}
 
-	// 5. Process each event
 	for i, event := range req.Events {
 		s.logger.Info("Processing event", zap.Int("index", i), zap.String("external_ref", event.ExternalRef))
 
-		// Resolve subject using enrollment
 		enrollment, err := s.enrollSvc.ResolveEnrollment(ctx, req.CompanyID, req.DeviceID, req.SourceType, event.ExternalRef)
 		if err != nil {
 			s.recordFailure(ctx, batch, event, "enrollment_resolution_failed: "+err.Error())
@@ -4984,10 +5956,9 @@ func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRe
 		subjectType := enrollment.SubjectType
 		subjectID := enrollment.SubjectID
 
-		// Prepare punch request
 		punchReq := &ingest.PunchRequest{
 			CompanyID:      req.CompanyID,
-			ActorID:        uuid.Nil, // device punch, no actor
+			ActorID:        uuid.Nil,
 			SubjectType:    subjectType,
 			SubjectID:      subjectID,
 			EventType:      event.EventType,
@@ -5002,7 +5973,6 @@ func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRe
 			},
 		}
 
-		// Call ingest service
 		_, err = s.ingestSvc.IngestPunch(ctx, punchReq)
 		if err != nil {
 			s.recordFailure(ctx, batch, event, "punch_ingest_failed: "+err.Error())
@@ -5012,7 +5982,6 @@ func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRe
 
 		successCount++
 
-		// Emit raw event outbox per success
 		rawPayload, _ := json.Marshal(map[string]interface{}{
 			"company_id":   req.CompanyID,
 			"device_id":    req.DeviceID,
@@ -5024,19 +5993,24 @@ func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRe
 			"external_ref": event.ExternalRef,
 			"source_type":  req.SourceType,
 		})
-		rawOutbox := &repository.OutboxEvent{
-			EventID:     uuid.New(),
-			EventType:   "attendance.raw.events",
-			AggregateID: batch.BatchID,
-			Payload:     rawPayload,
-			CreatedAt:   time.Now().UTC(),
+		rawCentralEvent := &outbox.Event{
+			EventID:       uuid.New().String(),
+			AggregateType: "attendance_punch",
+			AggregateID:   batch.BatchID.String(),
+			EventType:     "attendance.raw.events",
+			Topic:         "attendance.events",
+			Payload:       rawPayload,
+			Headers: map[string]string{
+				"source": "attendance-batch",
+			},
 		}
-		_ = s.outboxRepo.Store(ctx, nil, rawOutbox)
+		_ = s.centralOutbox.Store(ctx, nil, rawCentralEvent)
 	}
 
-	// 6. Update batch status
+	// Persist final status.
+	allFailed := successCount == 0 && failureCount > 0
 	var updateErr error
-	if successCount == 0 && failureCount > 0 {
+	if allFailed {
 		updateErr = s.batchRepo.MarkFailed(ctx, batch.BatchID, "all_events_failed")
 	} else {
 		updateErr = s.batchRepo.MarkProcessed(ctx, batch.BatchID)
@@ -5044,9 +6018,16 @@ func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRe
 	if updateErr != nil {
 		s.logger.Error("Failed to update batch status", zap.Error(updateErr))
 	} else {
-		s.logger.Info("Batch status updated", zap.String("batch_id", batch.BatchID.String()), zap.Int("success", successCount), zap.Int("failures", failureCount))
+		s.logger.Info("Batch status updated",
+			zap.String("batch_id", batch.BatchID.String()),
+			zap.Int("success", successCount),
+			zap.Int("failures", failureCount))
 	}
 
+	// Surface total failure to the caller.
+	if allFailed {
+		return fmt.Errorf("%w: %d events rejected; see GET .../failures", ErrAllEventsFailed, failureCount)
+	}
 	return nil
 }
 
@@ -5082,7 +6063,6 @@ func (s *batchIngestService) GetFailures(ctx context.Context, companyID uuid.UUI
 }
 
 
-
 ================================================================================
 FILE: ./service/report/report_service.go
 ================================================================================
@@ -5106,8 +6086,12 @@ import (
 )
 
 type ReportService interface {
+	// GenerateReport — LocationID on the request is passed through to the
+	// query service. nil = company-wide (ALL scope).
 	GenerateReport(ctx context.Context, req *ReportRequest) ([]byte, string, error)
-	StreamEvents(ctx context.Context, companyID uuid.UUID, filter query.EventFilter, writer io.Writer, format string) error
+
+	// StreamEvents — locationID == nil means no filter (ALL scope).
+	StreamEvents(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, filter query.EventFilter, writer io.Writer, format string) error
 }
 
 type ReportRequest struct {
@@ -5118,6 +6102,9 @@ type ReportRequest struct {
 	EndDate       time.Time
 	ReportType    string // "csv" or "json"
 	IncludeEvents bool
+
+	// 👇 New. nil = company-wide (ALL scope).
+	LocationID *uuid.UUID
 }
 
 type reportService struct {
@@ -5156,7 +6143,7 @@ func (s *reportService) GenerateReport(ctx context.Context, req *ReportRequest) 
 			Page:        1,
 			PageSize:    10000,
 		}
-		events, _, err := s.queryService.ListEvents(ctx, filter)
+		events, _, err := s.queryService.ListEvents(ctx, filter, req.LocationID)
 		if err != nil {
 			return nil, "", err
 		}
@@ -5164,9 +6151,11 @@ func (s *reportService) GenerateReport(ctx context.Context, req *ReportRequest) 
 	} else {
 		var summaries []*models.AttendanceDailySummary
 		if req.SubjectType != nil && req.SubjectID != nil {
+			// Single-subject report — the subject is already scoped, no location filter needed.
 			summaries, err = s.queryService.ListDailySummaries(ctx, req.CompanyID, *req.SubjectID, *req.SubjectType, req.StartDate, req.EndDate)
 		} else {
-			summaries, err = s.queryService.ListCompanySummaries(ctx, req.CompanyID, req.StartDate, req.EndDate)
+			// Company-wide report — apply the location scope if the caller set one.
+			summaries, err = s.queryService.ListCompanySummaries(ctx, req.CompanyID, req.LocationID, req.StartDate, req.EndDate)
 		}
 		if err != nil {
 			return nil, "", err
@@ -5190,7 +6179,15 @@ func (s *reportService) GenerateReport(ctx context.Context, req *ReportRequest) 
 	return reportData, contentType, nil
 }
 
-func (s *reportService) StreamEvents(ctx context.Context, companyID uuid.UUID, filter query.EventFilter, writer io.Writer, format string) error {
+// StreamEvents — locationID == nil means no filter (ALL scope).
+func (s *reportService) StreamEvents(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+	filter query.EventFilter,
+	writer io.Writer,
+	format string,
+) error {
 	if format != "csv" && format != "jsonl" {
 		return fmt.Errorf("unsupported stream format: %s", format)
 	}
@@ -5200,7 +6197,7 @@ func (s *reportService) StreamEvents(ctx context.Context, companyID uuid.UUID, f
 
 	firstPage := true
 	for {
-		events, total, err := s.queryService.ListEvents(ctx, filter)
+		events, total, err := s.queryService.ListEvents(ctx, filter, locationID)
 		if err != nil {
 			return err
 		}
@@ -5225,7 +6222,8 @@ func (s *reportService) StreamEvents(ctx context.Context, companyID uuid.UUID, f
 	return nil
 }
 
-// Helper methods
+// --- helpers (unchanged) ---
+
 func (s *reportService) generateCSV(data interface{}, isEvents bool) ([]byte, error) {
 	var buf bytes.Buffer
 	writer := csv.NewWriter(&buf)
@@ -5392,7 +6390,7 @@ import (
 type DeviceFilter struct {
 	SourceType      *string
 	WorkCenterCode  *string
-	LocationID      *uuid.UUID
+	GeofenceID      *uuid.UUID
 	IsActive        *bool
 	IsTrusted       *bool
 	IncludeInactive bool
@@ -5483,9 +6481,13 @@ func (s *deviceService) ListDevices(ctx context.Context, companyID uuid.UUID, fi
 	var err error
 
 	activeOnly := !filter.IncludeInactive
-	if filter.SourceType != nil && filter.WorkCenterCode != nil {
+
+	switch {
+	case filter.GeofenceID != nil:
+		devices, err = s.deviceRepo.GetDevicesByGeofence(ctx, companyID, *filter.GeofenceID, activeOnly)
+	case filter.SourceType != nil && filter.WorkCenterCode != nil:
 		devices, err = s.deviceRepo.GetDevicesByWorkCenter(ctx, companyID, *filter.WorkCenterCode, activeOnly)
-		if err == nil && filter.SourceType != nil {
+		if err == nil {
 			filtered := make([]*models.AttendanceDevice, 0)
 			for _, d := range devices {
 				if d.SourceType == *filter.SourceType {
@@ -5494,18 +6496,18 @@ func (s *deviceService) ListDevices(ctx context.Context, companyID uuid.UUID, fi
 			}
 			devices = filtered
 		}
-	} else if filter.SourceType != nil {
+	case filter.SourceType != nil:
 		devices, err = s.deviceRepo.GetDevicesBySourceType(ctx, companyID, *filter.SourceType, activeOnly)
-	} else if filter.WorkCenterCode != nil {
+	case filter.WorkCenterCode != nil:
 		devices, err = s.deviceRepo.GetDevicesByWorkCenter(ctx, companyID, *filter.WorkCenterCode, activeOnly)
-	} else {
+	default:
 		devices, err = s.deviceRepo.GetDevicesByCompany(ctx, companyID, activeOnly)
 	}
 	if err != nil {
 		return nil, err
 	}
 
-	// Apply additional filters
+	// Apply additional in-memory filters
 	devices = s.applyFilters(devices, filter)
 
 	// Pagination
@@ -5634,7 +6636,7 @@ func (s *deviceService) validateDeviceRegistration(device *models.AttendanceDevi
 }
 
 func (s *deviceService) applyFilters(devices []*models.AttendanceDevice, filter DeviceFilter) []*models.AttendanceDevice {
-	if filter.IsActive == nil && filter.IsTrusted == nil && filter.LocationID == nil {
+	if filter.IsActive == nil && filter.IsTrusted == nil && filter.GeofenceID == nil {
 		return devices
 	}
 	result := make([]*models.AttendanceDevice, 0, len(devices))
@@ -5645,7 +6647,7 @@ func (s *deviceService) applyFilters(devices []*models.AttendanceDevice, filter 
 		if filter.IsTrusted != nil && d.IsTrusted != *filter.IsTrusted {
 			continue
 		}
-		if filter.LocationID != nil && (d.LocationID == nil || *d.LocationID != *filter.LocationID) {
+		if filter.GeofenceID != nil && (d.GeofenceID == nil || *d.GeofenceID != *filter.GeofenceID) {
 			continue
 		}
 		result = append(result, d)
@@ -5816,7 +6818,12 @@ type TokenService interface {
 	IssueToken(ctx context.Context, req *models.IssueTokenRequest) (*models.DeviceToken, string, error)
 	ValidateToken(ctx context.Context, rawToken string, deviceID string) (*models.DeviceAuthContext, error)
 	ValidateTokenForRequest(ctx context.Context, req *models.ValidateTokenRequest) (*models.TokenValidationResult, error)
-	RevokeToken(ctx context.Context, tokenID uuid.UUID, revokedBy *uuid.UUID, reason string) error
+
+	// RevokeToken revokes a single token. The companyID scopes the operation
+	// to the caller's tenant: tokens belonging to a different company are
+	// reported as "not found" to avoid leaking existence.
+	RevokeToken(ctx context.Context, companyID uuid.UUID, tokenID uuid.UUID, revokedBy *uuid.UUID, reason string) error
+
 	RevokeAllDeviceTokens(ctx context.Context, companyID uuid.UUID, deviceID string, revokedBy *uuid.UUID, reason string) error
 	RotateToken(ctx context.Context, oldTokenID uuid.UUID, revokedBy *uuid.UUID, reason string) (*models.DeviceToken, string, error)
 	GetCurrentDeviceToken(ctx context.Context, companyID uuid.UUID, deviceID string) (*models.DeviceToken, error)
@@ -5825,7 +6832,7 @@ type TokenService interface {
 type tokenService struct {
 	tokenRepo     repository.TokenRepository
 	deviceRepo    repository.DeviceRepository
-	pgClient      *client.PostgresClient // ✅ added
+	pgClient      *client.PostgresClient
 	logger        *zap.Logger
 	tokenPrefix   string
 	tokenSecret   string
@@ -5841,7 +6848,7 @@ type TokenServiceConfig struct {
 func NewTokenService(
 	tokenRepo repository.TokenRepository,
 	deviceRepo repository.DeviceRepository,
-	pgClient *client.PostgresClient, // ✅ added
+	pgClient *client.PostgresClient,
 	logger *zap.Logger,
 	config TokenServiceConfig,
 ) TokenService {
@@ -5859,23 +6866,31 @@ func NewTokenService(
 	}
 }
 
+// -----------------------------------------------------------------------------
+// Issue
+// -----------------------------------------------------------------------------
+
 func (s *tokenService) IssueToken(ctx context.Context, req *models.IssueTokenRequest) (*models.DeviceToken, string, error) {
 	if req.CompanyID == uuid.Nil || req.DeviceID == "" || req.SourceType == "" {
 		return nil, "", errors.New("company_id, device_id, source_type required")
 	}
+
 	device, err := s.deviceRepo.GetActiveDevice(ctx, req.CompanyID, req.DeviceID)
 	if err != nil || device == nil || !device.IsTrusted {
 		return nil, "", errors.New("invalid or untrusted device")
 	}
-	// revoke existing tokens
+
+	// Revoke any existing tokens for this device before issuing a new one.
 	_ = s.tokenRepo.RevokeAllDeviceTokens(ctx, req.CompanyID, req.DeviceID, req.IssuedBy, "new token issuance")
 
 	rawToken := s.generateRawToken()
 	tokenHash := s.generateTokenHash(rawToken)
+
 	expiry := time.Now().UTC().Add(s.tokenValidity)
 	if req.ExpiresIn != nil && *req.ExpiresIn > 0 {
 		expiry = time.Now().UTC().Add(time.Duration(*req.ExpiresIn) * time.Second)
 	}
+
 	token := &models.DeviceToken{
 		TokenID:      uuid.New(),
 		CompanyID:    req.CompanyID,
@@ -5894,7 +6909,6 @@ func (s *tokenService) IssueToken(ctx context.Context, req *models.IssueTokenReq
 		CreatedAt: time.Now().UTC(),
 	}
 
-	// ✅ Begin transaction
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, "", fmt.Errorf("begin tx: %w", err)
@@ -5904,7 +6918,6 @@ func (s *tokenService) IssueToken(ctx context.Context, req *models.IssueTokenReq
 	if err := s.tokenRepo.CreateToken(ctx, tx, token); err != nil {
 		return nil, "", fmt.Errorf("create token: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return nil, "", fmt.Errorf("commit tx: %w", err)
 	}
@@ -5912,26 +6925,35 @@ func (s *tokenService) IssueToken(ctx context.Context, req *models.IssueTokenReq
 	return token, s.formatRawToken(req.CompanyID, rawToken), nil
 }
 
+// -----------------------------------------------------------------------------
+// Validate
+// -----------------------------------------------------------------------------
+
 func (s *tokenService) ValidateToken(ctx context.Context, formattedToken string, deviceID string) (*models.DeviceAuthContext, error) {
 	if deviceID == "" {
 		return nil, errors.New("device_id required")
 	}
+
 	companyID, rawToken, err := s.parseRawToken(formattedToken)
 	if err != nil {
 		return nil, err
 	}
+
 	tokenHash := s.generateTokenHash(rawToken)
 	token, err := s.tokenRepo.GetActiveTokenByHash(ctx, companyID, deviceID, tokenHash)
 	if err != nil || token == nil {
 		return nil, errors.New("invalid or expired token")
 	}
-	// update last used asynchronously
+
+	// Fire-and-forget last-used update.
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = s.tokenRepo.UpdateTokenLastUsed(ctx, token.TokenID)
 	}()
+
 	device, _ := s.deviceRepo.GetActiveDevice(ctx, companyID, token.DeviceID)
+
 	auth := &models.DeviceAuthContext{
 		CompanyID:    companyID,
 		DeviceID:     token.DeviceID,
@@ -5948,54 +6970,110 @@ func (s *tokenService) ValidateToken(ctx context.Context, formattedToken string,
 
 func (s *tokenService) ValidateTokenForRequest(ctx context.Context, req *models.ValidateTokenRequest) (*models.TokenValidationResult, error) {
 	result := &models.TokenValidationResult{IsValid: false}
+
 	auth, err := s.ValidateToken(ctx, req.RawToken, req.DeviceID)
 	if err != nil {
 		result.Error = err.Error()
 		return result, nil
 	}
+
 	if auth.CompanyID != req.CompanyID || auth.DeviceID != req.DeviceID {
 		result.Error = "token mismatch"
 		return result, nil
 	}
+
 	token, err := s.tokenRepo.GetTokenByID(ctx, auth.TokenID)
 	if err != nil {
 		result.Error = err.Error()
 		return result, nil
 	}
+
 	result.IsValid = true
 	result.Token = token
 	result.AuthContext = auth
 	return result, nil
 }
 
-// The rest of the methods (RevokeToken, RevokeAllDeviceTokens, RotateToken, GetCurrentDeviceToken) remain unchanged
-// because they either don't need a transaction or already handle it.
-// For RotateToken, it calls tokenRepo.RotateToken which probably expects a transaction,
-// but we'll keep it as is for now; you may need to add transaction handling there as well.
+// -----------------------------------------------------------------------------
+// Revoke
+// -----------------------------------------------------------------------------
 
-func (s *tokenService) RevokeToken(ctx context.Context, tokenID uuid.UUID, revokedBy *uuid.UUID, reason string) error {
+// RevokeToken revokes a single token, scoped to companyID.
+//
+// Returns "token not found" both when the token doesn't exist and when it
+// belongs to a different company, so callers cannot probe for the existence
+// of tokens in other tenants.
+func (s *tokenService) RevokeToken(
+	ctx context.Context,
+	companyID uuid.UUID,
+	tokenID uuid.UUID,
+	revokedBy *uuid.UUID,
+	reason string,
+) error {
 	if tokenID == uuid.Nil {
 		return errors.New("token_id required")
 	}
-	return s.tokenRepo.RevokeToken(ctx, tokenID, revokedBy, reason)
+	if companyID == uuid.Nil {
+		return errors.New("company_id required")
+	}
+
+	token, err := s.tokenRepo.GetTokenByID(ctx, tokenID)
+	if err != nil {
+		return fmt.Errorf("get token: %w", err)
+	}
+	if token == nil || token.CompanyID != companyID {
+		return errors.New("token not found")
+	}
+
+	if err := s.tokenRepo.RevokeToken(ctx, tokenID, revokedBy, reason); err != nil {
+		return fmt.Errorf("revoke token: %w", err)
+	}
+
+	s.logger.Info("Device token revoked",
+		zap.String("token_id", tokenID.String()),
+		zap.String("company_id", companyID.String()),
+		zap.String("device_id", token.DeviceID),
+	)
+	return nil
 }
 
-func (s *tokenService) RevokeAllDeviceTokens(ctx context.Context, companyID uuid.UUID, deviceID string, revokedBy *uuid.UUID, reason string) error {
+func (s *tokenService) RevokeAllDeviceTokens(
+	ctx context.Context,
+	companyID uuid.UUID,
+	deviceID string,
+	revokedBy *uuid.UUID,
+	reason string,
+) error {
+	if companyID == uuid.Nil || deviceID == "" {
+		return errors.New("company_id and device_id required")
+	}
 	return s.tokenRepo.RevokeAllDeviceTokens(ctx, companyID, deviceID, revokedBy, reason)
 }
 
-func (s *tokenService) RotateToken(ctx context.Context, oldTokenID uuid.UUID, revokedBy *uuid.UUID, reason string) (*models.DeviceToken, string, error) {
+// -----------------------------------------------------------------------------
+// Rotate
+// -----------------------------------------------------------------------------
+
+func (s *tokenService) RotateToken(
+	ctx context.Context,
+	oldTokenID uuid.UUID,
+	revokedBy *uuid.UUID,
+	reason string,
+) (*models.DeviceToken, string, error) {
 	oldToken, err := s.tokenRepo.GetTokenByID(ctx, oldTokenID)
 	if err != nil || oldToken == nil {
 		return nil, "", errors.New("token not found")
 	}
+
 	newRaw := s.generateRawToken()
 	newHash := s.generateTokenHash(newRaw)
+
 	exp := oldToken.ExpiresAt
 	if exp == nil {
 		t := time.Now().UTC().Add(s.tokenValidity)
 		exp = &t
 	}
+
 	newToken := &models.DeviceToken{
 		TokenID:      uuid.New(),
 		CompanyID:    oldToken.CompanyID,
@@ -6012,7 +7090,7 @@ func (s *tokenService) RotateToken(ctx context.Context, oldTokenID uuid.UUID, re
 		},
 		CreatedAt: time.Now().UTC(),
 	}
-	// RotateToken may also need a transaction – for consistency, we'll create one.
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, "", fmt.Errorf("begin tx: %w", err)
@@ -6022,7 +7100,6 @@ func (s *tokenService) RotateToken(ctx context.Context, oldTokenID uuid.UUID, re
 	if err := s.tokenRepo.RotateToken(ctx, oldTokenID, newToken, revokedBy, reason); err != nil {
 		return nil, "", err
 	}
-
 	if err := tx.Commit(); err != nil {
 		return nil, "", fmt.Errorf("commit tx: %w", err)
 	}
@@ -6030,7 +7107,15 @@ func (s *tokenService) RotateToken(ctx context.Context, oldTokenID uuid.UUID, re
 	return newToken, s.formatRawToken(newToken.CompanyID, newRaw), nil
 }
 
-func (s *tokenService) GetCurrentDeviceToken(ctx context.Context, companyID uuid.UUID, deviceID string) (*models.DeviceToken, error) {
+// -----------------------------------------------------------------------------
+// Read
+// -----------------------------------------------------------------------------
+
+func (s *tokenService) GetCurrentDeviceToken(
+	ctx context.Context,
+	companyID uuid.UUID,
+	deviceID string,
+) (*models.DeviceToken, error) {
 	if companyID == uuid.Nil || deviceID == "" {
 		return nil, errors.New("company_id and device_id required")
 	}
@@ -6041,7 +7126,10 @@ func (s *tokenService) GetCurrentDeviceToken(ctx context.Context, companyID uuid
 	return tokens[0], nil
 }
 
-// helpers remain unchanged
+// -----------------------------------------------------------------------------
+// Token helpers
+// -----------------------------------------------------------------------------
+
 func (s *tokenService) generateTokenHash(rawToken string) string {
 	sum := sha256.Sum256([]byte(rawToken + s.tokenSecret))
 	return hex.EncodeToString(sum[:])
@@ -6050,6 +7138,8 @@ func (s *tokenService) generateTokenHash(rawToken string) string {
 func (s *tokenService) generateRawToken() string {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
+		// crypto/rand failing means the system is broken; a panic here is
+		// intentional. Replace with an error return if the call path allows.
 		panic("secure token generation failed")
 	}
 	return hex.EncodeToString(b)
@@ -6072,6 +7162,230 @@ func (s *tokenService) parseRawToken(formatted string) (uuid.UUID, string, error
 }
 
 
+================================================================================
+FILE: ./service/usage_integration/usage_integration_service.go
+================================================================================
+
+package usage_integration
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
+
+	"auth-service/internal/subscription/models"
+	"auth-service/internal/subscription/models/enums"
+	"auth-service/internal/subscription/repository"
+)
+
+// UsageIntegrationService orchestrates creating usage from attendance events.
+type UsageIntegrationService struct {
+	db               *sql.DB
+	subscriptionRepo repository.SubscriptionRepository
+	subItemRepo      repository.SubscriptionItemRepository
+	planItemRepo     repository.PlanItemRepository
+	entitlementRepo  repository.EntitlementRepository
+	usageRepo        repository.UsageRepository
+	logger           *zap.Logger
+}
+
+func NewUsageIntegrationService(
+	db *sql.DB,
+	subscriptionRepo repository.SubscriptionRepository,
+	subItemRepo repository.SubscriptionItemRepository,
+	planItemRepo repository.PlanItemRepository,
+	entitlementRepo repository.EntitlementRepository,
+	usageRepo repository.UsageRepository,
+	logger *zap.Logger,
+) *UsageIntegrationService {
+	return &UsageIntegrationService{
+		db:               db,
+		subscriptionRepo: subscriptionRepo,
+		subItemRepo:      subItemRepo,
+		planItemRepo:     planItemRepo,
+		entitlementRepo:  entitlementRepo,
+		usageRepo:        usageRepo,
+		logger:           logger.Named("usage_integration"),
+	}
+}
+
+// ProcessCheckIn handles a customer check-in event:
+// - finds the active subscription item with the given feature key
+// - checks if the entitlement limit allows usage
+// - creates a usage record and links it to the attendance event
+// It expects an already started transaction (tx) to allow atomicity with the attendance event.
+func (s *UsageIntegrationService) ProcessCheckIn(
+	ctx context.Context,
+	tx *sql.Tx, // <-- transaction passed from caller
+	companyID, customerID uuid.UUID,
+	attendanceEventID uuid.UUID,
+	featureKey string,
+	quantity decimal.Decimal,
+) error {
+	s.logger.Debug("ProcessCheckIn called",
+		zap.Any("tx_ptr", tx),
+		zap.Bool("tx_is_nil", tx == nil),
+		zap.String("company_id", companyID.String()),
+		zap.String("customer_id", customerID.String()),
+		zap.String("attendance_event_id", attendanceEventID.String()),
+		zap.String("feature_key", featureKey),
+		zap.String("quantity", quantity.String()),
+	)
+
+	// Check if transaction is nil
+	if tx == nil {
+		s.logger.Error("Transaction is nil")
+		return fmt.Errorf("transaction is nil")
+	}
+
+	// 0. Idempotency: check if an attendance link already exists for this event.
+	s.logger.Debug("Checking if attendance link already exists")
+	exists, err := s.usageRepo.ExistsAttendanceLink(ctx, tx, attendanceEventID)
+	if err != nil {
+		s.logger.Error("Failed to check attendance link existence", zap.Error(err))
+		return fmt.Errorf("check attendance link existence: %w", err)
+	}
+	if exists {
+		s.logger.Warn("attendance event already linked to a usage; skipping",
+			zap.String("attendance_event_id", attendanceEventID.String()))
+		return nil
+	}
+
+	// 1. Get the active subscription for this customer
+	s.logger.Debug("Fetching active subscription for customer")
+	subs, err := s.subscriptionRepo.GetByCustomer(ctx, tx, companyID, customerID)
+	if err != nil {
+		s.logger.Error("Failed to fetch subscriptions", zap.Error(err))
+		return fmt.Errorf("fetch subscriptions: %w", err)
+	}
+	var activeSub *models.Subscription
+	for _, sub := range subs {
+		if sub.Status == enums.SubStatusActive || sub.Status == enums.SubStatusTrial {
+			activeSub = sub
+			break
+		}
+	}
+	if activeSub == nil {
+		s.logger.Warn("No active subscription found for customer", zap.String("customer_id", customerID.String()))
+		return fmt.Errorf("no active subscription found for customer %s", customerID)
+	}
+	s.logger.Debug("Found active subscription", zap.String("subscription_id", activeSub.SubscriptionID.String()))
+
+	// 2. Get the subscription items for this subscription (only active ones)
+	s.logger.Debug("Fetching active subscription items")
+	items, err := s.subItemRepo.GetActiveBySubscription(ctx, tx, activeSub.SubscriptionID)
+	if err != nil {
+		s.logger.Error("Failed to fetch subscription items", zap.Error(err))
+		return fmt.Errorf("fetch subscription items: %w", err)
+	}
+	if len(items) == 0 {
+		s.logger.Warn("No subscription items for subscription", zap.String("subscription_id", activeSub.SubscriptionID.String()))
+		return fmt.Errorf("no subscription items for subscription %s", activeSub.SubscriptionID)
+	}
+	s.logger.Debug("Found subscription items", zap.Int("count", len(items)))
+
+	// 3. Find the item that has the required feature as an entitlement
+	s.logger.Debug("Searching for entitlement with feature key", zap.String("feature_key", featureKey))
+	var targetItem *models.SubscriptionItem
+	for _, item := range items {
+		entitlements, err := s.entitlementRepo.GetByPlanItem(ctx, tx, item.PlanItemID)
+		if err != nil {
+			s.logger.Warn("failed to get entitlements for plan item", zap.Error(err), zap.String("plan_item_id", item.PlanItemID.String()))
+			continue
+		}
+		for _, ent := range entitlements {
+			if ent.FeatureKey == featureKey && ent.IsEnabled {
+				targetItem = item
+				break
+			}
+		}
+		if targetItem != nil {
+			break
+		}
+	}
+	if targetItem == nil {
+		s.logger.Warn("No active entitlement found for feature", zap.String("feature_key", featureKey))
+		return fmt.Errorf("no active entitlement for feature '%s' in customer's subscription", featureKey)
+	}
+	s.logger.Debug("Found target item", zap.String("sub_item_id", targetItem.SubItemID.String()))
+
+	// 4. Check remaining quota for the current period (e.g., month)
+	now := time.Now()
+	periodStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
+	periodEnd := periodStart.AddDate(0, 1, 0).Add(-time.Second)
+
+	s.logger.Debug("Checking remaining quota",
+		zap.String("period_start", periodStart.String()),
+		zap.String("period_end", periodEnd.String()),
+	)
+	remaining, err := s.usageRepo.GetUsageRemaining(ctx, tx, targetItem.SubItemID, featureKey, periodStart, periodEnd)
+	if err != nil {
+		s.logger.Error("Failed to get usage remaining", zap.Error(err))
+		return fmt.Errorf("get usage remaining: %w", err)
+	}
+	if remaining == nil || remaining.Remaining.LessThan(quantity) {
+		s.logger.Warn("Insufficient quota",
+			zap.Any("remaining", remaining),
+			zap.String("requested", quantity.String()),
+		)
+		if remaining == nil {
+			return fmt.Errorf("insufficient quota: remaining unavailable")
+		}
+		return fmt.Errorf("insufficient quota: remaining %s, requested %s", remaining.Remaining.String(), quantity.String())
+	}
+	s.logger.Debug("Quota sufficient", zap.String("remaining", remaining.Remaining.String()))
+
+	// 5. Create usage record using the provided transaction
+	s.logger.Debug("Creating usage record")
+	usage := &models.Usage{
+		UsageID:            uuid.New(),
+		SubscriptionItemID: targetItem.SubItemID,
+		FeatureKey:         featureKey,
+		QuantityUsed:       quantity,
+		PeriodStart:        periodStart,
+		PeriodEnd:          periodEnd,
+		RecordedAt:         time.Now(),
+		SourceType:         stringPtr("attendance"),
+		SourceID:           &attendanceEventID,
+		CreatedBy:          nil,
+	}
+	if err := s.usageRepo.Create(ctx, tx, usage); err != nil {
+		s.logger.Error("Failed to create usage", zap.Error(err))
+		return fmt.Errorf("create usage: %w", err)
+	}
+	s.logger.Debug("Usage created", zap.String("usage_id", usage.UsageID.String()))
+
+	// 6. Create link
+	s.logger.Debug("Creating attendance link")
+	link := &models.UsageAttendanceLink{
+		LinkID:            uuid.New(),
+		UsageID:           usage.UsageID,
+		AttendanceEventID: attendanceEventID,
+		CreatedAt:         time.Now(),
+	}
+	if err := s.usageRepo.AddAttendanceLink(ctx, tx, link); err != nil {
+		s.logger.Error("Failed to add attendance link", zap.Error(err))
+		return fmt.Errorf("add attendance link: %w", err)
+	}
+	s.logger.Debug("Attendance link created", zap.String("link_id", link.LinkID.String()))
+
+	s.logger.Info("usage recorded for attendance event",
+		zap.String("usage_id", usage.UsageID.String()),
+		zap.String("attendance_event_id", attendanceEventID.String()),
+		zap.String("feature", featureKey),
+		zap.String("quantity", quantity.String()),
+	)
+	return nil
+}
+
+func stringPtr(s string) *string { return &s }
+
+
 
 ================================================================================
 FILE: ./service/query/query_service.go
@@ -6092,14 +7406,30 @@ import (
 )
 
 // QueryService provides high-level read operations for attendance data.
+//
+// Read methods that return a set take a `locationID *uuid.UUID` parameter.
+//
+//	nil      = no location filter (company-wide, ALL scope)
+//	non-nil  = filter to subjects/events at that employment location
+//
+// Handlers read the scope from locationctx.Filter(ctx) and pass it down.
+// The middleware has already validated that the caller is allowed to see
+// that location.
 type QueryService interface {
-	// --- Existing methods ---
 	GetEventByID(ctx context.Context, eventID uuid.UUID) (*models.AttendanceEvent, error)
-	ListEvents(ctx context.Context, filter EventFilter) ([]*models.AttendanceEvent, int64, error)
+
+	// ListEvents — locationID == nil means no filter.
+	ListEvents(ctx context.Context, filter EventFilter, locationID *uuid.UUID) ([]*models.AttendanceEvent, int64, error)
+
 	GetDailySummary(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) (*models.AttendanceDailySummary, error)
 	ListDailySummaries(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, from, to time.Time) ([]*models.AttendanceDailySummary, error)
-	ListCompanySummaries(ctx context.Context, companyID uuid.UUID, from, to time.Time) ([]*models.AttendanceDailySummary, error)
-	GetCompanyStats(ctx context.Context, companyID uuid.UUID, from, to time.Time) (*models.AttendanceStats, error)
+
+	// ListCompanySummaries — locationID == nil means no filter.
+	ListCompanySummaries(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, from, to time.Time) ([]*models.AttendanceDailySummary, error)
+
+	// GetCompanyStats — locationID == nil means no filter.
+	GetCompanyStats(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, from, to time.Time) (*models.AttendanceStats, error)
+
 	GetSubjectStats(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, from, to time.Time) (*models.UserAttendanceStats, error)
 	GetAttendancePercentage(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, from, to time.Time) (float64, error)
 	ListEventTypes(ctx context.Context, activeOnly bool) ([]*models.AttendanceEventType, error)
@@ -6107,11 +7437,11 @@ type QueryService interface {
 	GetAttendancePolicyByID(ctx context.Context, policyID uuid.UUID) (*models.AttendancePolicy, error)
 	GetAttendancePoliciesByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.AttendancePolicy, error)
 
-	// --- NEW: Session Summary methods ---
+	// Session summary
 	GetSessionSummary(ctx context.Context, sessionID, subjectID uuid.UUID, subjectType string) (*models.AttendanceSessionSummary, error)
 	ListSessionSummaries(ctx context.Context, filter repository.SessionSummaryFilter, page, pageSize int) ([]*models.AttendanceSessionSummary, int64, error)
 
-	// --- NEW: Exemption methods ---
+	// Exemptions
 	GetExemptionsForSubject(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) ([]*models.AttendanceExemption, error)
 	ListExemptions(ctx context.Context, filter repository.ExemptionFilter, page, pageSize int) ([]*models.AttendanceExemption, int64, error)
 }
@@ -6134,20 +7464,18 @@ type queryService struct {
 	summaryRepo        repository.SummaryRepository
 	sourceRepo         repository.SourceRepository
 	policyRepo         repository.PolicyRepository
-	sessionSummaryRepo repository.AttendanceSessionSummaryRepository // 👈 NEW
-	exemptionRepo      repository.AttendanceExemptionRepository      // 👈 NEW
+	sessionSummaryRepo repository.AttendanceSessionSummaryRepository
+	exemptionRepo      repository.AttendanceExemptionRepository
 	logger             *zap.Logger
 }
 
-// NewQueryService creates a new query service.
-// Now accepts sessionSummaryRepo and exemptionRepo.
 func NewQueryService(
 	eventRepo repository.EventRepository,
 	summaryRepo repository.SummaryRepository,
 	sourceRepo repository.SourceRepository,
 	policyRepo repository.PolicyRepository,
-	sessionSummaryRepo repository.AttendanceSessionSummaryRepository, // 👈 NEW PARAM
-	exemptionRepo repository.AttendanceExemptionRepository, // 👈 NEW PARAM
+	sessionSummaryRepo repository.AttendanceSessionSummaryRepository,
+	exemptionRepo repository.AttendanceExemptionRepository,
 	logger *zap.Logger,
 ) QueryService {
 	return &queryService{
@@ -6161,7 +7489,7 @@ func NewQueryService(
 	}
 }
 
-// --- Existing methods (unchanged) ---
+// --- Single-row reads (unchanged) ---
 
 func (s *queryService) GetEventByID(ctx context.Context, eventID uuid.UUID) (*models.AttendanceEvent, error) {
 	if eventID == uuid.Nil {
@@ -6170,7 +7498,14 @@ func (s *queryService) GetEventByID(ctx context.Context, eventID uuid.UUID) (*mo
 	return s.eventRepo.GetEventByID(ctx, eventID)
 }
 
-func (s *queryService) ListEvents(ctx context.Context, filter EventFilter) ([]*models.AttendanceEvent, int64, error) {
+// --- Set reads (location-scoped) ---
+
+// ListEvents — locationID == nil means no filter (ALL scope).
+func (s *queryService) ListEvents(
+	ctx context.Context,
+	filter EventFilter,
+	locationID *uuid.UUID,
+) ([]*models.AttendanceEvent, int64, error) {
 	if filter.CompanyID == uuid.Nil {
 		return nil, 0, fmt.Errorf("company ID is required")
 	}
@@ -6201,6 +7536,7 @@ func (s *queryService) ListEvents(ctx context.Context, filter EventFilter) ([]*m
 		EndDate:     filter.EndDate,
 		Page:        filter.Page,
 		PageSize:    filter.PageSize,
+		LocationID:  locationID, // 👈 new — pass to repo
 	}
 	return s.eventRepo.ListEvents(ctx, repoFilter)
 }
@@ -6225,42 +7561,47 @@ func (s *queryService) ListDailySummaries(ctx context.Context, companyID, subjec
 	return s.summaryRepo.GetBySubjectRange(ctx, companyID, subjectID, subjectType, from, to)
 }
 
-func (s *queryService) ListCompanySummaries(ctx context.Context, companyID uuid.UUID, from, to time.Time) ([]*models.AttendanceDailySummary, error) {
-	if companyID == uuid.Nil {
-		return nil, fmt.Errorf("company ID is required")
-	}
-	summaries, _, err := s.summaryRepo.GetByCompanyRange(ctx, companyID, from, to, 1, 100000)
-	if err != nil {
-		return nil, err
-	}
-	return summaries, nil
-}
-
-func (s *queryService) GetCompanyStats(ctx context.Context, companyID uuid.UUID, from, to time.Time) (*models.AttendanceStats, error) {
+// ListCompanySummaries — locationID == nil means no filter (ALL scope).
+func (s *queryService) ListCompanySummaries(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+	from, to time.Time,
+) ([]*models.AttendanceDailySummary, error) {
 	if companyID == uuid.Nil {
 		return nil, fmt.Errorf("company ID is required")
 	}
 	if from.After(to) {
 		return nil, fmt.Errorf("start date cannot be after end date")
 	}
-	summaries, err := s.ListCompanySummaries(ctx, companyID, from, to)
+	summaries, _, err := s.summaryRepo.GetByCompanyRange(ctx, companyID, locationID, from, to, 1, 100000)
+	if err != nil {
+		return nil, err
+	}
+	return summaries, nil
+}
+
+// GetCompanyStats — locationID == nil means no filter (ALL scope).
+func (s *queryService) GetCompanyStats(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+	from, to time.Time,
+) (*models.AttendanceStats, error) {
+	if companyID == uuid.Nil {
+		return nil, fmt.Errorf("company ID is required")
+	}
+	if from.After(to) {
+		return nil, fmt.Errorf("start date cannot be after end date")
+	}
+	summaries, err := s.ListCompanySummaries(ctx, companyID, locationID, from, to)
 	if err != nil {
 		return nil, err
 	}
 	stats := &models.AttendanceStats{
-		CompanyID:          companyID,
-		StartDate:          from,
-		EndDate:            to,
-		TotalEmployees:     0,
-		PresentCount:       0,
-		AbsentCount:        0,
-		LateCount:          0,
-		HalfDayCount:       0,
-		LeaveCount:         0,
-		HolidayCount:       0,
-		TotalWorkedHours:   0,
-		TotalOvertimeHours: 0,
-		AverageAttendance:  0,
+		CompanyID: companyID,
+		StartDate: from,
+		EndDate:   to,
 	}
 	var totalWorkedMin, totalOvertimeMin int
 	subjectSet := make(map[string]bool)
@@ -6299,6 +7640,8 @@ func (s *queryService) GetCompanyStats(ctx context.Context, companyID uuid.UUID,
 	return stats, nil
 }
 
+// --- Per-subject reads (already scoped to one subject, no location filter) ---
+
 func (s *queryService) GetSubjectStats(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, from, to time.Time) (*models.UserAttendanceStats, error) {
 	if companyID == uuid.Nil || subjectID == uuid.Nil || subjectType == "" {
 		return nil, fmt.Errorf("company_id, subject_id, and subject_type are required")
@@ -6311,19 +7654,9 @@ func (s *queryService) GetSubjectStats(ctx context.Context, companyID, subjectID
 		return nil, err
 	}
 	stats := &models.UserAttendanceStats{
-		UserID:             subjectID,
-		StartDate:          from,
-		EndDate:            to,
-		PresentDays:        0,
-		AbsentDays:         0,
-		LateDays:           0,
-		HalfDays:           0,
-		LeaveDays:          0,
-		TotalWorkedHours:   0,
-		TotalOvertimeHours: 0,
-		AverageInTime:      "",
-		AverageOutTime:     "",
-		AttendancePercent:  0,
+		UserID:    subjectID,
+		StartDate: from,
+		EndDate:   to,
 	}
 	var totalWorkedMin, totalOvertimeMin int
 	for _, sum := range summaries {
@@ -6385,9 +7718,9 @@ func (s *queryService) GetAttendancePoliciesByCompany(ctx context.Context, compa
 	return s.policyRepo.GetPoliciesByCompany(ctx, companyID, activeOnly)
 }
 
-// ─────────────────────────────────────────────────────────────
-// NEW: Session Summary Methods
-// ─────────────────────────────────────────────────────────────
+// --- Session summaries ---
+// The SessionSummaryFilter now has a LocationID field. Callers set it before
+// calling ListSessionSummaries if they want location scope.
 
 func (s *queryService) GetSessionSummary(ctx context.Context, sessionID, subjectID uuid.UUID, subjectType string) (*models.AttendanceSessionSummary, error) {
 	if sessionID == uuid.Nil || subjectID == uuid.Nil || subjectType == "" {
@@ -6415,9 +7748,7 @@ func (s *queryService) ListSessionSummaries(ctx context.Context, filter reposito
 	return summaries, total, nil
 }
 
-// ─────────────────────────────────────────────────────────────
-// NEW: Exemption Methods
-// ─────────────────────────────────────────────────────────────
+// --- Exemptions ---
 
 func (s *queryService) GetExemptionsForSubject(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) ([]*models.AttendanceExemption, error) {
 	if companyID == uuid.Nil || subjectID == uuid.Nil || subjectType == "" {
@@ -6716,6 +8047,94 @@ func (p *sessionDataProvider) GetAcademicSession(
 
 
 ================================================================================
+FILE: ./service/resolver/employee_location_resolver.go
+================================================================================
+
+package resolver
+
+import (
+	"context"
+
+	"github.com/google/uuid"
+
+	hrRepo "auth-service/internal/hr/repository"
+)
+
+type employeeLocationResolver struct {
+	employeeRepo hrRepo.EmployeeRepository
+}
+
+// NewEmployeeLocationResolver wraps HR's EmployeeRepository.
+// GetEmploymentLocationID already exists on that interface.
+func NewEmployeeLocationResolver(employeeRepo hrRepo.EmployeeRepository) SubjectLocationResolver {
+	return &employeeLocationResolver{employeeRepo: employeeRepo}
+}
+
+func (r *employeeLocationResolver) ResolveLocation(
+	ctx context.Context,
+	companyID uuid.UUID,
+	_ string,
+	subjectID uuid.UUID,
+) (*uuid.UUID, error) {
+	return r.employeeRepo.GetEmploymentLocationID(ctx, companyID, subjectID)
+}
+
+
+
+================================================================================
+FILE: ./service/resolver/composite_location_resolver.go
+================================================================================
+
+package resolver
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/google/uuid"
+)
+
+type compositeLocationResolver struct {
+	employee SubjectLocationResolver
+	student  SubjectLocationResolver
+	customer SubjectLocationResolver
+}
+
+// NewCompositeLocationResolver dispatches to the appropriate per-subject
+// resolver based on subject_type.
+func NewCompositeLocationResolver(
+	employee SubjectLocationResolver,
+	student SubjectLocationResolver,
+	customer SubjectLocationResolver,
+) SubjectLocationResolver {
+	return &compositeLocationResolver{
+		employee: employee,
+		student:  student,
+		customer: customer,
+	}
+}
+
+func (c *compositeLocationResolver) ResolveLocation(
+	ctx context.Context,
+	companyID uuid.UUID,
+	subjectType string,
+	subjectID uuid.UUID,
+) (*uuid.UUID, error) {
+	switch subjectType {
+	case SubjectTypeEmployee:
+		return c.employee.ResolveLocation(ctx, companyID, subjectType, subjectID)
+	case SubjectTypeStudent:
+		return c.student.ResolveLocation(ctx, companyID, subjectType, subjectID)
+	case SubjectTypeCustomer:
+		return c.customer.ResolveLocation(ctx, companyID, subjectType, subjectID)
+	default:
+		return nil, fmt.Errorf("unknown subject type: %s", subjectType)
+	}
+}
+
+
+
+================================================================================
 FILE: ./service/resolver/schedule_resolver.go
 ================================================================================
 
@@ -6770,6 +8189,155 @@ type ScheduleSubjectResolver interface {
 
 	// GetActiveSubjectsByCompany returns active subject IDs for a company (optionally filtered by position/work center).
 	GetActiveSubjectsByCompany(ctx context.Context, companyID uuid.UUID, filters map[string]interface{}) ([]uuid.UUID, error)
+}
+
+
+
+================================================================================
+FILE: ./service/resolver/customer_resolver_with_subscription.go
+================================================================================
+
+// file: service/resolver/customer_resolver_with_subscription.go
+
+package resolver
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"auth-service/internal/sales/repository"          // customer repo
+	"auth-service/internal/subscription/models/enums" // correct enums package
+	subRepo "auth-service/internal/subscription/repository"
+)
+
+// CustomerResolverWithSubscription validates customer and subscription status.
+type CustomerResolverWithSubscription struct {
+	db               *sql.DB
+	customerRepo     repository.CustomerRepository
+	subscriptionRepo subRepo.SubscriptionRepository
+	trialRepo        subRepo.TrialRepository
+	logger           *zap.Logger
+}
+
+func NewCustomerResolverWithSubscription(
+	db *sql.DB,
+	customerRepo repository.CustomerRepository,
+	subscriptionRepo subRepo.SubscriptionRepository,
+	trialRepo subRepo.TrialRepository,
+	logger *zap.Logger,
+) *CustomerResolverWithSubscription {
+	return &CustomerResolverWithSubscription{
+		db:               db,
+		customerRepo:     customerRepo,
+		subscriptionRepo: subscriptionRepo,
+		trialRepo:        trialRepo,
+		logger:           logger,
+	}
+}
+
+// Resolve implements SubjectResolver.
+func (r *CustomerResolverWithSubscription) Resolve(ctx context.Context, companyID uuid.UUID, subjectType string, subjectID uuid.UUID, date time.Time) (*ResolvedSubject, error) {
+	if subjectType != SubjectTypeCustomer {
+		return nil, fmt.Errorf("customer resolver called with subject_type=%s", subjectType)
+	}
+
+	// 1. Check if customer exists and is active
+	active, err := r.customerRepo.IsActive(ctx, r.db, companyID, subjectID)
+	if err != nil {
+		r.logger.Error("failed to check customer active status", zap.Error(err))
+		return nil, fmt.Errorf("customer active check: %w", err)
+	}
+	if !active {
+		r.logger.Info("Customer is inactive", zap.String("customer_id", subjectID.String()))
+		return &ResolvedSubject{IsActive: false}, nil
+	}
+
+	// 2. Fetch all subscriptions for this customer
+	subs, err := r.subscriptionRepo.GetByCustomer(ctx, r.db, companyID, subjectID)
+	if err != nil {
+		r.logger.Error("failed to get subscriptions for customer", zap.Error(err))
+		return nil, fmt.Errorf("get subscriptions: %w", err)
+	}
+
+	// 3. Determine active subscription and trial status
+	var (
+		hasActiveSub       bool
+		hasActiveTrial     bool
+		activeSubID        *uuid.UUID
+		trialID            *uuid.UUID
+		subscriptionStatus string
+	)
+
+	for _, sub := range subs {
+		// Consider Active, Trial, or maybe Pending as active? We'll treat Active and Trial as valid.
+		if sub.Status == enums.SubStatusActive || sub.Status == enums.SubStatusTrial {
+			hasActiveSub = true
+			activeSubID = &sub.SubscriptionID
+			if sub.Status == enums.SubStatusActive {
+				subscriptionStatus = "active"
+			} else {
+				subscriptionStatus = "trial"
+			}
+			// Check if this subscription has an active trial (only if subscription is active)
+			if sub.Status == enums.SubStatusActive {
+				trial, err := r.trialRepo.GetBySubscription(ctx, r.db, sub.SubscriptionID)
+				if err == nil && trial != nil && trial.Status == enums.TrialActive {
+					hasActiveTrial = true
+					trialID = &trial.TrialID
+					subscriptionStatus = "trial" // treat as trial if trial is active
+				}
+			} else if sub.Status == enums.SubStatusTrial {
+				trial, _ := r.trialRepo.GetBySubscription(ctx, r.db, sub.SubscriptionID)
+				if trial != nil && trial.Status == enums.TrialActive {
+					hasActiveTrial = true
+					trialID = &trial.TrialID
+				}
+			}
+			break // we only need one active subscription; you can refine if multiple
+		}
+	}
+
+	// 4. Build ResolvedSubject
+	resolved := &ResolvedSubject{
+		IsActive:       true,
+		Timezone:       "UTC",             // optionally fetch from customer or company
+		ScheduleStatus: "not_schedulable", // default for customers
+	}
+
+	// Set subscription fields
+	if hasActiveSub {
+		resolved.SubscriptionStatus = subscriptionStatus
+		resolved.SubscriptionID = activeSubID
+		resolved.HasActiveSubscription = true
+		resolved.HasActiveTrial = hasActiveTrial
+		if hasActiveTrial && trialID != nil {
+			resolved.TrialID = trialID
+		}
+	} else {
+		resolved.SubscriptionStatus = "no_subscription"
+		resolved.HasActiveSubscription = false
+	}
+
+	// Optionally, set ScheduleStatus to reflect subscription state for downstream logic
+	if hasActiveSub && hasActiveTrial {
+		resolved.ScheduleStatus = "trial_active"
+	} else if hasActiveSub {
+		resolved.ScheduleStatus = "subscription_active"
+	} else {
+		resolved.ScheduleStatus = "no_active_subscription"
+	}
+
+	r.logger.Debug("Customer resolved with subscription status",
+		zap.String("customer_id", subjectID.String()),
+		zap.String("subscription_status", resolved.SubscriptionStatus),
+	)
+
+	return resolved, nil
 }
 
 
@@ -7039,6 +8607,13 @@ type ResolvedSubject struct {
 	PolicyCode  *string
 	PolicyType  *string
 	PolicyRules interface{} // can be *models.PolicyRules or JSON
+
+	// Subscription related (for customers)
+	SubscriptionStatus    string     `json:"subscription_status,omitempty"` // "active", "trial", "no_subscription"
+	SubscriptionID        *uuid.UUID `json:"subscription_id,omitempty"`
+	TrialID               *uuid.UUID `json:"trial_id,omitempty"`
+	HasActiveSubscription bool       `json:"has_active_subscription"`
+	HasActiveTrial        bool       `json:"has_active_trial"`
 }
 
 // SubjectResolver is the main interface for resolving any subject.
@@ -7081,6 +8656,41 @@ func (c *CompositeResolver) Resolve(ctx context.Context, companyID uuid.UUID, su
 
 
 ================================================================================
+FILE: ./service/resolver/customer_location_resolver.go
+================================================================================
+
+package resolver
+
+import (
+	"context"
+
+	"github.com/google/uuid"
+)
+
+type customerLocationResolver struct{}
+
+// NewCustomerLocationResolver always returns (nil, nil).
+//
+// Customers are company-scoped, not location-scoped. The Apollo Ynr customer
+// who orders medicine can buy from any Apollo branch. Their location is a
+// *visit* location, derived from the device geofence or the admin's
+// X-Location-ID — never from the customer record itself.
+func NewCustomerLocationResolver() SubjectLocationResolver {
+	return &customerLocationResolver{}
+}
+
+func (r *customerLocationResolver) ResolveLocation(
+	_ context.Context,
+	_ uuid.UUID,
+	_ string,
+	_ uuid.UUID,
+) (*uuid.UUID, error) {
+	return nil, nil
+}
+
+
+
+================================================================================
 FILE: ./service/resolver/customer_resolver.go
 ================================================================================
 
@@ -7118,6 +8728,129 @@ func (r *CustomerResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 		ScheduleStatus: "not_schedulable",
 		// No schedule, no policies
 	}, nil
+}
+
+
+
+================================================================================
+FILE: ./service/resolver/subject_location_resolver.go
+================================================================================
+
+package resolver
+
+import (
+	"context"
+
+	"github.com/google/uuid"
+)
+
+// SubjectLocationResolver resolves the org-unit location of a subject.
+//
+// Contract:
+//   - employee: reads company_employees.employment_location_id
+//   - student:  reads academics.students.location_id
+//   - customer: always returns (nil, nil) — customers are company-scoped
+//
+// Return values:
+//   - (id, nil)  → subject belongs to this location
+//   - (nil, nil) → subject has no location (customers, or unconfigured)
+//   - (nil, err) → lookup failed
+//
+// This is a WRITE-side concern. It's called when attendance is recorded to
+// stamp the row with the subject's location. Read-side filtering uses the
+// denormalized column on the attendance row, not this resolver.
+//
+// Distinct from SubjectResolver (in resolver.go) — that one resolves schedule,
+// leave, policy, and subscription state. This one answers one question:
+// "which location does this subject belong to?"
+type SubjectLocationResolver interface {
+	ResolveLocation(
+		ctx context.Context,
+		companyID uuid.UUID,
+		subjectType string,
+		subjectID uuid.UUID,
+	) (*uuid.UUID, error)
+}
+
+
+
+================================================================================
+FILE: ./service/resolver/student_location_resolver.go
+================================================================================
+
+package resolver
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"auth-service/internal/client"
+)
+
+type studentLocationResolver struct {
+	client *client.PostgresClient
+	logger *zap.Logger
+}
+
+// NewStudentLocationResolver reads academics.students.location_id.
+//
+// A student's location is set at admission and changed only via transfer.
+// It's the org unit the student belongs to — the campus/branch they are
+// enrolled at — not the physical fence of a specific classroom.
+func NewStudentLocationResolver(pg *client.PostgresClient, logger *zap.Logger) SubjectLocationResolver {
+	return &studentLocationResolver{
+		client: pg,
+		logger: logger.Named("student_location_resolver"),
+	}
+}
+
+func (r *studentLocationResolver) ResolveLocation(
+	ctx context.Context,
+	companyID uuid.UUID,
+	_ string,
+	subjectID uuid.UUID,
+) (*uuid.UUID, error) {
+	var locID sql.NullString
+
+	query := `
+		SELECT location_id
+		FROM academics.students
+		WHERE student_id = $1
+		  AND company_id = $2
+		  AND deleted_at IS NULL
+	`
+
+	err := r.client.QueryRow(ctx, query, subjectID, companyID).Scan(&locID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Student not found or soft-deleted. Not an error — return no location.
+			return nil, nil
+		}
+		r.logger.Error("failed to resolve student location",
+			zap.String("student_id", subjectID.String()),
+			zap.Error(err))
+		return nil, fmt.Errorf("resolve student location: %w", err)
+	}
+
+	if !locID.Valid || locID.String == "" {
+		// Student exists but has no location assigned. Surface as (nil, nil)
+		// so the caller can decide — typically fall back to device geofence.
+		return nil, nil
+	}
+
+	id, err := uuid.Parse(locID.String)
+	if err != nil {
+		r.logger.Error("invalid location_id in students table",
+			zap.String("student_id", subjectID.String()),
+			zap.String("location_id", locID.String))
+		return nil, fmt.Errorf("invalid location_id in students table: %w", err)
+	}
+	return &id, nil
 }
 
 
@@ -7472,5 +9205,27 @@ func (p *enrollmentDataProvider) GetActiveEnrollment(ctx context.Context, compan
 	}
 	return &enrollment.SectionID, &enrollment.AcademicYearID, nil
 }
+
+
+
+================================================================================
+FILE: ./service/resolver/errors.go
+================================================================================
+
+package resolver
+
+import "errors"
+
+// ErrSubjectOutsideScope is returned when a write targets a subject whose
+// employment location does not match the request's current location scope.
+//
+// Handlers must map this to HTTP 403.
+var ErrSubjectOutsideScope = errors.New("subject belongs to a different location than your current scope")
+
+// ErrSubjectHasNoLocation is returned when the target subject has no
+// employment location assigned, so scope cannot be verified.
+//
+// Handlers must map this to HTTP 400.
+var ErrSubjectHasNoLocation = errors.New("target subject has no employment location assigned")
 
 

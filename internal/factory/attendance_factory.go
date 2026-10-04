@@ -17,8 +17,8 @@ import (
 	"auth-service/internal/attendance/service/batch"
 	"auth-service/internal/attendance/service/device"
 	"auth-service/internal/attendance/service/enrollment"
+	"auth-service/internal/attendance/service/exemption"
 	"auth-service/internal/attendance/service/ingest"
-
 	"auth-service/internal/attendance/service/query"
 	"auth-service/internal/attendance/service/report"
 	"auth-service/internal/attendance/service/resolution"
@@ -106,12 +106,15 @@ type AttendanceFactory struct {
 	// usage integration service
 	usageIntegrationService *usage_integration.UsageIntegrationService
 
+	// ── NEW: canonical timezone resolver (position → location → work center → company)
+	tzProvider resolver.TimezoneProvider
+
 	// resolvers
 	subjectResolver         resolver.SubjectResolver
 	scheduleSubjectResolver resolver.ScheduleSubjectResolver
 	studentResolver         resolver.SubjectResolver // external override (optional)
 
-	// 👇 NEW: subject location resolver (write-side location stamping + scope checks)
+	// subject location resolver (write-side location stamping + scope checks)
 	locationResolver resolver.SubjectLocationResolver
 
 	// services
@@ -136,6 +139,7 @@ type AttendanceFactory struct {
 	biometricEnrollmentSvc biometricSvc.BiometricEnrollmentService
 	biometricSyncSvc       biometricSvc.BiometricSyncService
 	omService              ingest.OMService
+	exemptionService       exemption.ExemptionService
 
 	// outbox & consumer
 	resolutionConsumer *consumer.AttendanceResolutionConsumer
@@ -321,10 +325,6 @@ func (f *AttendanceFactory) WorkCenterRepository() attendanceRepo.WorkCenterRepo
 }
 
 // GeofenceRepository returns the attendance geofence repository.
-//
-// A geofence is a physical zone belonging to exactly one employment
-// location (public.locations). Devices sit inside geofences; attendance
-// events snapshot the geofence they occurred in.
 func (f *AttendanceFactory) GeofenceRepository() attendanceRepo.GeofenceRepository {
 	if f.geofenceRepo == nil {
 		f.geofenceRepo = attendancePostgres.NewGeofenceRepository(f.postgresClient, f.logger)
@@ -353,8 +353,7 @@ func (f *AttendanceFactory) DeviceEmbeddingSyncRepository() biometricRepoPkg.Dev
 	return f.deviceSyncRepo
 }
 
-// HREmployeeRepository returns a cached HR employee repository. Used by the
-// subject resolver and the location resolver.
+// HREmployeeRepository returns a cached HR employee repository.
 func (f *AttendanceFactory) HREmployeeRepository() hrpostgres.EmployeeRepository {
 	if f.hrEmployeeRepo == nil {
 		f.hrEmployeeRepo = hrpostgres.NewEmployeeRepository(f.postgresClient)
@@ -424,6 +423,24 @@ func (f *AttendanceFactory) SessionDataProvider() resolver.SessionDataProvider {
 	)
 }
 
+// ---------- Timezone Provider ----------
+//
+// TimezoneProvider is the single source of truth for the effective tz of
+// any subject. Every resolver, writer, and scheduler calls this. It walks:
+//
+//	position.location_id → locations.timezone
+//	position.work_center_code → work_centers.timezone
+//	work_centers.location_id → locations.timezone
+//	companies.default_timezone
+//	"UTC" (last resort, logged)
+func (f *AttendanceFactory) TimezoneProvider() resolver.TimezoneProvider {
+	if f.tzProvider == nil {
+		f.tzProvider = resolver.NewTimezoneProvider(f.postgresClient, f.logger)
+		f.logger.Info("Timezone provider initialized")
+	}
+	return f.tzProvider
+}
+
 // ---------- Subject Location Resolver ----------
 //
 // The subject location resolver answers "which employment location does this
@@ -458,6 +475,9 @@ func (f *AttendanceFactory) SetStudentResolver(studentResolver resolver.SubjectR
 // SubjectResolver builds the composite resolver.
 func (f *AttendanceFactory) SubjectResolver() resolver.SubjectResolver {
 	if f.subjectResolver == nil {
+		// ── NEW: single tz provider instance used by all resolvers.
+		tzProvider := f.TimezoneProvider()
+
 		// Employee resolver
 		hrEmployeeRepo := f.HREmployeeRepository()
 		employeeProvider := resolver.NewEmployeeDataProvider(
@@ -482,6 +502,7 @@ func (f *AttendanceFactory) SubjectResolver() resolver.SubjectResolver {
 			f.PolicyRepository(),
 			employeeProvider,
 			leaveProvider,
+			tzProvider, // ── NEW
 			f.logger,
 		)
 
@@ -492,6 +513,7 @@ func (f *AttendanceFactory) SubjectResolver() resolver.SubjectResolver {
 			f.TimetableDataProvider(),
 			f.SessionDataProvider(),
 			f.WorkCenterRepository(),
+			tzProvider, // ── NEW
 			f.logger,
 		)
 
@@ -512,12 +534,16 @@ func (f *AttendanceFactory) SubjectResolver() resolver.SubjectResolver {
 				f.customerRepo,
 				f.subscriptionRepo,
 				f.trialRepo,
+				tzProvider, // ── NEW
 				f.logger,
 			)
 			resolvers["customer"] = customerResolver
 			f.logger.Info("Customer resolver with subscription checks enabled")
 		} else {
-			customerResolver := resolver.NewCustomerResolver(f.logger)
+			customerResolver := resolver.NewCustomerResolver(
+				tzProvider, // ── NEW
+				f.logger,
+			)
 			resolvers["customer"] = customerResolver
 			f.logger.Info("Using fallback customer resolver (no subscription checks)")
 		}
@@ -530,6 +556,7 @@ func (f *AttendanceFactory) SubjectResolver() resolver.SubjectResolver {
 // scheduleSubjectResolverAdapter adapts SubjectResolver to ScheduleSubjectResolver.
 type scheduleSubjectResolverAdapter struct {
 	subjectResolver resolver.SubjectResolver
+	tzProvider      resolver.TimezoneProvider // ── NEW: fallback for CompanyTimezone
 	logger          *zap.Logger
 }
 
@@ -541,6 +568,17 @@ func (a *scheduleSubjectResolverAdapter) ResolveSubject(ctx context.Context, com
 	if resolved == nil {
 		return nil, fmt.Errorf("resolve returned nil")
 	}
+
+	// ── Resolve company default tz as a hint. If this fails, leave it
+	//    empty — the caller's ScheduleSubjectInfo.CompanyTimezone being
+	//    empty signals "go ask TimezoneProvider yourself".
+	companyTz := ""
+	if a.tzProvider != nil {
+		if tz, err := a.tzProvider.ResolveTimezone(ctx, companyID, nil, nil, nil); err == nil {
+			companyTz = tz
+		}
+	}
+
 	info := &resolver.ScheduleSubjectInfo{
 		SubjectID:          subjectID,
 		SubjectType:        subjectType,
@@ -553,8 +591,14 @@ func (a *scheduleSubjectResolverAdapter) ResolveSubject(ctx context.Context, com
 		DepartmentID:       resolved.DepartmentID,
 		WorkCenterCode:     resolved.WorkCenterCode,
 		WorkCenterName:     "",
+		// ── CHANGED: WorkCenterTimezone gets the resolved tz from the
+		//    subject resolver (which already walked the chain). This is
+		//    what scheduling uses to compute shift windows.
 		WorkCenterTimezone: resolved.Timezone,
-		CompanyID:          companyID,
+		// ── NEW: CompanyTimezone is the ultimate fallback. Populated so
+		//    callers can fall back if WorkCenterTimezone is empty.
+		CompanyTimezone: companyTz,
+		CompanyID:       companyID,
 	}
 	return info, nil
 }
@@ -594,6 +638,7 @@ func (f *AttendanceFactory) ScheduleSubjectResolver() resolver.ScheduleSubjectRe
 		subjectResolver := f.SubjectResolver()
 		f.scheduleSubjectResolver = &scheduleSubjectResolverAdapter{
 			subjectResolver: subjectResolver,
+			tzProvider:      f.TimezoneProvider(), // ── NEW
 			logger:          f.logger,
 		}
 	}
@@ -615,27 +660,8 @@ func (f *AttendanceFactory) OMService() ingest.OMService {
 	return f.omService
 }
 
-// IngestService — now includes the subject location resolver so events are
+// IngestService — includes the subject location resolver so events are
 // stamped with the subject's location and out-of-scope writes are rejected.
-func (f *AttendanceFactory) IngestService() ingest.IngestService {
-	if f.ingestService == nil {
-		f.ingestService = ingest.NewIngestService(
-			f.EventRepository(),
-			f.DeviceRepository(),
-			f.SourceRepository(),
-			f.EnrollmentService(),
-			f.SourceResolver(),
-			f.AdminService(),
-			f.OMService(),
-			f.auditService,
-			f.logger,
-			f.SessionSummaryRepository(),
-			f.usageIntegrationService,
-			f.LocationResolver(), // 👈 NEW
-		)
-	}
-	return f.ingestService
-}
 
 func (f *AttendanceFactory) AdminService() admin.AdminService {
 	if f.adminService == nil {
@@ -668,8 +694,49 @@ func (f *AttendanceFactory) QueryService() query.QueryService {
 	return f.queryService
 }
 
-// ResolutionService — now includes the subject location resolver so daily
+// ResolutionService — includes the subject location resolver so daily
 // summaries are stamped with the subject's location.
+// ── IngestService
+func (f *AttendanceFactory) IngestService() ingest.IngestService {
+	if f.ingestService == nil {
+		f.ingestService = ingest.NewIngestService(
+			f.EventRepository(),
+			f.DeviceRepository(),
+			f.SourceRepository(),
+			f.EnrollmentService(),
+			f.SourceResolver(),
+			f.AdminService(),
+			f.OMService(),
+			f.auditService,
+			f.logger,
+			f.SessionSummaryRepository(),
+			f.usageIntegrationService,
+			f.LocationResolver(),
+			f.TimezoneProvider(), // ── NEW
+		)
+	}
+	return f.ingestService
+}
+
+// ── CorrectionService
+func (f *AttendanceFactory) CorrectionService() admin.CorrectionService {
+	if f.correctionService == nil {
+		f.correctionService = admin.NewCorrectionService(
+			f.EventRepository(),
+			f.SummaryRepository(),
+			f.AdminService(),
+			f.SubjectResolver(),
+			f.LocationResolver(),
+			f.ResolutionService(),
+			f.logger,
+			f.auditService,
+			f.TimezoneProvider(), // ── NEW
+		)
+	}
+	return f.correctionService
+}
+
+// ── ResolutionService
 func (f *AttendanceFactory) ResolutionService() resolution.ResolutionService {
 	if f.resolutionService == nil {
 		f.resolutionService = resolution.NewResolutionService(
@@ -678,33 +745,19 @@ func (f *AttendanceFactory) ResolutionService() resolution.ResolutionService {
 			f.ScheduleRepository(),
 			f.PolicyRepository(),
 			f.SubjectResolver(),
-			f.LocationResolver(), // 👈 NEW (between subjectRes and adminSvc)
+			f.LocationResolver(),
 			f.AdminService(),
 			f.ExemptionRepository(),
 			f.logger,
 			f.auditService,
+			f.TimezoneProvider(), // ── NEW
 		)
 	}
 	return f.resolutionService
 }
 
-// CorrectionService — now includes the subject location resolver so corrections
+// CorrectionService — includes the subject location resolver so corrections
 // are stamped and out-of-scope corrections are rejected.
-func (f *AttendanceFactory) CorrectionService() admin.CorrectionService {
-	if f.correctionService == nil {
-		f.correctionService = admin.NewCorrectionService(
-			f.EventRepository(),
-			f.SummaryRepository(),
-			f.AdminService(),
-			f.SubjectResolver(),
-			f.LocationResolver(), // 👈 NEW (between resolver and resolution)
-			f.ResolutionService(),
-			f.logger,
-			f.auditService,
-		)
-	}
-	return f.correctionService
-}
 
 func (f *AttendanceFactory) EnrollmentService() enrollment.EnrollmentService {
 	if f.enrollmentService == nil {
@@ -877,9 +930,21 @@ func (f *AttendanceFactory) BiometricSyncService() biometricSvc.BiometricSyncSer
 	return f.biometricSyncSvc
 }
 
+// ExemptionService builds the exemption service.
+func (f *AttendanceFactory) ExemptionService() exemption.ExemptionService {
+	if f.exemptionService == nil {
+		f.exemptionService = exemption.NewExemptionService(
+			f.ExemptionRepository(),
+			f.LocationResolver(),
+			f.auditService,
+			f.logger,
+		)
+	}
+	return f.exemptionService
+}
+
 // ---------- Outbox & Consumer ----------
 
-// ResolutionConsumer creates or returns the attendance resolution consumer.
 func (f *AttendanceFactory) ResolutionConsumer() *consumer.AttendanceResolutionConsumer {
 	if f.resolutionConsumer == nil && f.kafkaProducer != nil {
 		kafkaConsumer, err := client.NewKafkaConsumer(
@@ -1074,7 +1139,7 @@ func (f *AttendanceFactory) ReportHandler() *handler.AttendanceReportHandler {
 func (f *AttendanceFactory) ExemptionHandler() *handler.AttendanceExemptionHandler {
 	if f.exemptionHandler == nil {
 		f.exemptionHandler = handler.NewAttendanceExemptionHandler(
-			f.ExemptionRepository(),
+			f.ExemptionService(),
 			f.logger,
 		)
 	}

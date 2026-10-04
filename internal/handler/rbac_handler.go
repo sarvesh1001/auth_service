@@ -2289,3 +2289,68 @@ func (h *RBACHandler) GetMyDepartments(w http.ResponseWriter, r *http.Request) {
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Your departments retrieved successfully"))
 }
+// ============================================================
+// GetEmployeeFormOptions — GET /companies/{companyID}/me/employee-form-options
+//
+// Self-service prefetch for Add / Edit Employee.
+//
+// The caller's own identity comes from the JWT — the URL never
+// carries user_id.
+//
+// The `X-Location-ID` header is OPTIONAL and its value determines
+// the scope of positions / work centers returned:
+//
+//   • empty            → caller's full scope (back-compat)
+//   • "ALL"            → caller's full scope
+//   • concrete UUID    → only that location (+ universal rows)
+//
+// Because this route lives OUTSIDE LocationValidationMiddleware,
+// the header is not middleware-validated — the service re-checks
+// it against the caller's allowed set and 403s on a mismatch.
+// ============================================================
+// @Summary Get HR employee form options
+// @Description Single-call prefetch for Add/Edit Employee screens, optionally narrowed by X-Location-ID.
+// @Tags hr
+// @Produce json
+// @Param companyID path string true "Company UUID"
+// @Param X-Location-ID header string false "Either a location UUID or 'ALL'"
+// @Success 200 {object} map[string]interface{} "Form options retrieved"
+// @Failure 400 {object} map[string]interface{} "Invalid company ID or location ID"
+// @Failure 401 {object} map[string]interface{} "Authentication required"
+// @Failure 403 {object} map[string]interface{} "Caller is not an active member, or location is outside scope"
+// @Failure 500 {object} map[string]interface{} "Internal error"
+// @Router /api/v1/companies/{companyID}/me/employee-form-options [get]
+func (h *RBACHandler) GetEmployeeFormOptions(w http.ResponseWriter, r *http.Request) {
+	ctx := h.injectClientIP(r.Context(), r)
+
+	// 1. Company ID from URL
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	// 2. Caller identity from JWT — never from the URL
+	callerID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Authentication required")
+		return
+	}
+
+	// 3. Optional X-Location-ID header. Empty / "ALL" → caller's full scope.
+	//    Concrete UUID → narrow positions & WCs to that location only.
+	locationHeader := strings.TrimSpace(r.Header.Get("X-Location-ID"))
+
+	// 4. Delegate to service
+	options, err := h.companyService.GetEmployeeFormOptions(
+		ctx, companyID, callerID, locationHeader,
+	)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, err, msg)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(options, "Form options retrieved successfully"))
+}

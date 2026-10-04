@@ -29,12 +29,14 @@ func NewSummaryRepository(pg *client.PostgresClient, logger *zap.Logger) reposit
 	}
 }
 
+// ── CHANGED: added timezone, offset_minutes
 const summaryColumns = `
 	attendance_summary_id, company_id, subject_type, subject_id,
 	employment_location_id,
 	attendance_date, status, worked_minutes, expected_minutes,
 	overtime_minutes, late_minutes, is_finalized, is_payable,
-	is_payroll_locked, metadata, generated_at, generated_by
+	is_payroll_locked, timezone, offset_minutes,
+	metadata, generated_at, generated_by
 `
 
 func (r *summaryRepository) UpsertSummary(ctx context.Context, tx *sql.Tx, summary *models.AttendanceDailySummary) error {
@@ -44,6 +46,18 @@ func (r *summaryRepository) UpsertSummary(ctx context.Context, tx *sql.Tx, summa
 	if summary.GeneratedAt.IsZero() {
 		summary.GeneratedAt = time.Now().UTC()
 	}
+
+	// ── Guard: writer MUST have resolved the tz.
+	if summary.Timezone == "" {
+		r.logger.Error("UpsertSummary: Timezone empty; defaulting to UTC",
+			zap.String("summary_id", summary.AttendanceSummaryID.String()),
+			zap.String("company_id", summary.CompanyID.String()),
+			zap.String("subject_id", summary.SubjectID.String()),
+		)
+		summary.Timezone = "UTC"
+		summary.OffsetMinutes = 0
+	}
+
 	metadataJSON, err := json.Marshal(summary.Metadata)
 	if err != nil {
 		return fmt.Errorf("marshal metadata: %w", err)
@@ -55,11 +69,14 @@ func (r *summaryRepository) UpsertSummary(ctx context.Context, tx *sql.Tx, summa
 			employment_location_id,
 			attendance_date, status, worked_minutes, expected_minutes,
 			overtime_minutes, late_minutes, is_finalized, is_payable,
-			is_payroll_locked, metadata, generated_at, generated_by
+			is_payroll_locked, timezone, offset_minutes,
+			metadata, generated_at, generated_by
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7,
-			$8, $9, $10, $11, $12, $13,
-			$14, $15, $16, $17
+			$1, $2, $3, $4, $5,
+			$6, $7, $8, $9,
+			$10, $11, $12, $13,
+			$14, $15, $16,
+			$17, $18, $19
 		)
 		ON CONFLICT (company_id, subject_type, subject_id, attendance_date)
 		DO UPDATE SET
@@ -71,6 +88,8 @@ func (r *summaryRepository) UpsertSummary(ctx context.Context, tx *sql.Tx, summa
 			late_minutes = EXCLUDED.late_minutes,
 			is_finalized = EXCLUDED.is_finalized,
 			is_payable = EXCLUDED.is_payable,
+			timezone = EXCLUDED.timezone,
+			offset_minutes = EXCLUDED.offset_minutes,
 			metadata = EXCLUDED.metadata,
 			generated_at = EXCLUDED.generated_at,
 			generated_by = EXCLUDED.generated_by
@@ -98,6 +117,8 @@ func (r *summaryRepository) UpsertSummary(ctx context.Context, tx *sql.Tx, summa
 		summary.IsFinalized,
 		summary.IsPayable,
 		summary.IsPayrollLocked,
+		summary.Timezone,
+		summary.OffsetMinutes,
 		metadataJSON,
 		summary.GeneratedAt,
 		summary.GeneratedBy,
@@ -105,6 +126,7 @@ func (r *summaryRepository) UpsertSummary(ctx context.Context, tx *sql.Tx, summa
 	if err != nil {
 		r.logger.Error("failed to upsert daily summary",
 			util.String("summary_id", summary.AttendanceSummaryID.String()),
+			util.String("timezone", summary.Timezone),
 			util.ErrorField(err))
 		return fmt.Errorf("upsert summary: %w", err)
 	}
@@ -138,7 +160,6 @@ func (r *summaryRepository) GetBySubjectRange(ctx context.Context, companyID, su
 	return r.scanSummaries(rows)
 }
 
-// GetByCompanyRange — locationID == nil means no filter (ALL scope).
 func (r *summaryRepository) GetByCompanyRange(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -146,7 +167,6 @@ func (r *summaryRepository) GetByCompanyRange(
 	from, to time.Time,
 	limit, offset int,
 ) ([]*models.AttendanceDailySummary, int64, error) {
-	// Normalise: pass nil through to SQL as NULL.
 	var locArg interface{}
 	if locationID != nil {
 		locArg = *locationID
@@ -303,6 +323,8 @@ func (r *summaryRepository) scanSummary(row *sql.Row) (*models.AttendanceDailySu
 		&s.IsFinalized,
 		&s.IsPayable,
 		&s.IsPayrollLocked,
+		&s.Timezone,
+		&s.OffsetMinutes,
 		&metadataJSON,
 		&s.GeneratedAt,
 		&s.GeneratedBy,
@@ -348,6 +370,8 @@ func (r *summaryRepository) scanSummaries(rows *sql.Rows) ([]*models.AttendanceD
 			&s.IsFinalized,
 			&s.IsPayable,
 			&s.IsPayrollLocked,
+			&s.Timezone,
+			&s.OffsetMinutes,
 			&metadataJSON,
 			&s.GeneratedAt,
 			&s.GeneratedBy,

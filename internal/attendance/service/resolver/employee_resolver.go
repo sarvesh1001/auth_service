@@ -26,7 +26,11 @@ type EmployeeResolver struct {
 	policyRepo     repository.PolicyRepository
 	employeeRepo   EmployeeDataProvider
 	leaveRepo      LeaveDataProvider
-	logger         *zap.Logger
+
+	// ── NEW: canonical tz resolution. Never hardcode "UTC".
+	tzProvider TimezoneProvider
+
+	logger *zap.Logger
 }
 
 func NewEmployeeResolver(
@@ -35,6 +39,7 @@ func NewEmployeeResolver(
 	policyRepo repository.PolicyRepository,
 	employeeRepo EmployeeDataProvider,
 	leaveRepo LeaveDataProvider,
+	tzProvider TimezoneProvider,
 	logger *zap.Logger,
 ) *EmployeeResolver {
 	return &EmployeeResolver{
@@ -43,11 +48,18 @@ func NewEmployeeResolver(
 		policyRepo:     policyRepo,
 		employeeRepo:   employeeRepo,
 		leaveRepo:      leaveRepo,
+		tzProvider:     tzProvider,
 		logger:         logger,
 	}
 }
 
-func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, subjectType string, subjectID uuid.UUID, date time.Time) (*ResolvedSubject, error) {
+func (r *EmployeeResolver) Resolve(
+	ctx context.Context,
+	companyID uuid.UUID,
+	subjectType string,
+	subjectID uuid.UUID,
+	date time.Time,
+) (*ResolvedSubject, error) {
 	if subjectType != SubjectTypeEmployee {
 		return nil, fmt.Errorf("employee resolver called with subject_type=%s", subjectType)
 	}
@@ -64,38 +76,22 @@ func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 		return nil, fmt.Errorf("get employee: %w", err)
 	}
 	if !active {
-		r.logger.Warn("Employee inactive", zap.String("subject_id", subjectID.String()))
 		return &ResolvedSubject{IsActive: false}, nil
 	}
 
-	r.logger.Info("Employee resolved",
-		zap.String("position_id", func() string {
-			if positionID != nil {
-				return positionID.String()
-			}
-			return "<nil>"
-		}()),
-		zap.String("work_center", func() string {
-			if workCenterCode != nil {
-				return *workCenterCode
-			}
-			return "<nil>"
-		}()),
-	)
-
-	// If work center still nil, try assignment again (though provider already did)
 	if workCenterCode == nil {
-		assigned, err := r.employeeRepo.GetWorkCenterAssignment(ctx, subjectID, date)
-		if err == nil && assigned != nil {
+		if assigned, err := r.employeeRepo.GetWorkCenterAssignment(ctx, subjectID, date); err == nil && assigned != nil {
 			workCenterCode = assigned
-			r.logger.Info("Work center from assignment (fallback)", zap.String("work_center", *workCenterCode))
 		}
 	}
 
-	var expectedStart, expectedEnd *time.Time
-	var scheduleStatus string
-	var scheduleInstanceID *uuid.UUID
-	var timezone string
+	var (
+		expectedStart      *time.Time
+		expectedEnd        *time.Time
+		scheduleStatus     string
+		scheduleInstanceID *uuid.UUID
+		timezone           string
+	)
 
 	instances, err := r.scheduleRepo.GetScheduleInstancesByUserDate(ctx, subjectID, date)
 	if err == nil && len(instances) > 0 {
@@ -107,12 +103,29 @@ func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 		scheduleStatus = "working"
 		if inst.WorkCenterCode != nil {
 			workCenterCode = inst.WorkCenterCode
-			r.logger.Info("Work center from existing schedule instance", zap.String("work_center", *workCenterCode))
 		}
 	} else {
 		scheduleStatus = "not_schedulable"
-		timezone = "UTC"
-		r.logger.Debug("No schedule instances found for user on date")
+	}
+
+	// ── NEW: always resolve tz via the chain. Even when we have a
+	//    schedule instance, prefer the resolved tz if the instance's tz
+	//    is empty. When there's no instance, this is the only source.
+	if timezone == "" {
+		resolvedTz, tzErr := r.tzProvider.ResolveTimezone(
+			ctx, companyID, positionID, workCenterCode, nil,
+		)
+		if tzErr != nil {
+			r.logger.Warn("tz resolution failed, defaulting to UTC",
+				zap.String("subject_id", subjectID.String()),
+				zap.Error(tzErr),
+			)
+			timezone = "UTC"
+		} else if resolvedTz == "" {
+			timezone = "UTC"
+		} else {
+			timezone = resolvedTz
+		}
 	}
 
 	isOnLeave := false
@@ -149,8 +162,6 @@ func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 			policyCode = &wcPolicy.PolicyCode
 			policyType = &wcPolicy.PolicyType
 			policyRules = wcPolicy.Rules
-		} else {
-			r.logger.Warn("Work center policy not found", zap.String("work_center", *workCenterCode), zap.Error(err))
 		}
 	} else if positionID != nil {
 		posPolicy, err := r.policyRepo.GetPositionPolicy(ctx, *positionID)
@@ -159,14 +170,9 @@ func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 			policyCode = &posPolicy.PolicyCode
 			policyType = &posPolicy.PolicyType
 			policyRules = posPolicy.Rules
-		} else {
-			r.logger.Warn("Position policy not found", zap.String("position_id", positionID.String()), zap.Error(err))
 		}
-	} else {
-		r.logger.Warn("No policy source: both workCenterCode and positionID are nil")
 	}
 
-	// Override handling
 	var isOverride bool
 	var overrideType *string
 	override, err := r.scheduleRepo.GetScheduleOverride(ctx, subjectID, date)
@@ -181,10 +187,9 @@ func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 		case "holiday_override":
 			scheduleStatus = "holiday"
 		}
-		r.logger.Info("Schedule override applied", zap.String("type", override.OverrideType))
 	}
 
-	resolved := &ResolvedSubject{
+	return &ResolvedSubject{
 		IsActive:           active,
 		Timezone:           timezone,
 		ScheduleStatus:     scheduleStatus,
@@ -193,7 +198,6 @@ func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 		ScheduleInstanceID: scheduleInstanceID,
 		WorkCenterCode:     workCenterCode,
 		PositionID:         positionID,
-		DepartmentID:       nil,
 		IsOnLeave:          isOnLeave,
 		IsLeavePaid:        isLeavePaid,
 		LeaveTypeID:        leaveTypeID,
@@ -204,23 +208,5 @@ func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 		PolicyCode:         policyCode,
 		PolicyType:         policyType,
 		PolicyRules:        policyRules,
-	}
-
-	r.logger.Info("Resolved subject",
-		zap.String("position_id", func() string {
-			if resolved.PositionID != nil {
-				return resolved.PositionID.String()
-			}
-			return "<nil>"
-		}()),
-		zap.String("work_center", func() string {
-			if resolved.WorkCenterCode != nil {
-				return *resolved.WorkCenterCode
-			}
-			return "<nil>"
-		}()),
-		zap.String("schedule_status", resolved.ScheduleStatus),
-	)
-
-	return resolved, nil
+	}, nil
 }

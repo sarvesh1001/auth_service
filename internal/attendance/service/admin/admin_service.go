@@ -17,9 +17,16 @@ import (
 	auditservice "auth-service/internal/infrastructure/audit"
 )
 
-// AdminService handles policy, rule, profile, and correction administration.
+// defaultAllowedSourceTypes is the fallback list used when company rules
+// are absent. Keep in sync with service/source/canonicalSourceRules.
+//
+// FIX (Tier 1): "rfid" is not a canonical source type. It previously
+// appeared here, which caused every device punch under default rules to
+// pass rule resolution and then hard-fail in SourceResolver.Resolve with
+// "unsupported source type: rfid". Removed.
+var defaultAllowedSourceTypes = []string{"mobile", "web", "biometric"}
+
 type AdminService interface {
-	// Policy management
 	CreateAttendancePolicy(ctx context.Context, policy *models.AttendancePolicy, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.AttendancePolicy, error)
 	UpdateAttendancePolicy(ctx context.Context, policy *models.AttendancePolicy) error
 	DeleteAttendancePolicy(ctx context.Context, policyID uuid.UUID) error
@@ -28,30 +35,23 @@ type AdminService interface {
 	GetPositionAttendancePolicy(ctx context.Context, positionID uuid.UUID) (*models.AttendancePolicy, error)
 	GetUsersByAttendancePolicy(ctx context.Context, policyID uuid.UUID, effectiveDate time.Time) ([]uuid.UUID, error)
 
-	// NEW: Polymorphic policy methods
 	AssignPolicyToSubject(ctx context.Context, subjectType string, subjectID uuid.UUID, policyID uuid.UUID, effectiveFrom time.Time, effectiveTo *time.Time, assignedBy *uuid.UUID) error
 	EndPolicyForSubject(ctx context.Context, subjectType string, subjectID uuid.UUID, policyID uuid.UUID, endDate time.Time) error
 	GetActivePolicyForSubject(ctx context.Context, subjectType string, subjectID uuid.UUID, date time.Time) (*models.AttendancePolicy, error)
 
-	// Company & department rules
 	GetCompanyAttendanceRules(ctx context.Context, companyID uuid.UUID) (*models.CompanyAttendanceRules, error)
 	UpdateCompanyAttendanceRules(ctx context.Context, rules *models.CompanyAttendanceRules, updatedBy uuid.UUID) error
 	GetDepartmentAttendanceRules(ctx context.Context, companyID, departmentID uuid.UUID) (*models.DepartmentAttendanceRules, error)
 	UpsertDepartmentAttendanceRules(ctx context.Context, rules *models.DepartmentAttendanceRules) error
 
-	// User attendance profile (overrides)
 	GetUserAttendanceProfile(ctx context.Context, userID uuid.UUID) (*models.UserAttendanceProfile, error)
 	UpsertUserAttendanceProfile(ctx context.Context, profile *models.UserAttendanceProfile) error
 
-	// Rule resolution (used by ingest)
-	// CHANGED: added subjectType parameter
 	ResolveAttendanceRules(ctx context.Context, userID, companyID uuid.UUID, subjectType string, workCenterCode string, positionID *uuid.UUID, date time.Time) (*models.ResolvedAttendanceRules, error)
 
-	// Validation helpers
 	ValidateAttendanceEventType(ctx context.Context, eventType string) error
 	ValidateAttendanceSourceType(ctx context.Context, sourceType string, sourceID *uuid.UUID) error
 
-	// Health
 	HealthCheck(ctx context.Context) error
 }
 
@@ -60,7 +60,7 @@ type adminService struct {
 	policyRepo   repository.PolicyRepository
 	ruleRepo     repository.RuleRepository
 	sourceRepo   repository.SourceRepository
-	scheduleRepo repository.ScheduleRepository // for work center lookup, etc.
+	scheduleRepo repository.ScheduleRepository
 	resolver     resolver.SubjectResolver
 	logger       *zap.Logger
 	audit        *auditservice.AuditService
@@ -96,7 +96,6 @@ func (s *adminService) CreateAttendancePolicy(ctx context.Context, policy *model
 	if err := s.validatePolicy(policy); err != nil {
 		return nil, err
 	}
-	// Check duplicate policy code
 	existing, err := s.policyRepo.GetPoliciesByCompany(ctx, policy.CompanyID, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check existing policies: %w", err)
@@ -144,7 +143,6 @@ func (s *adminService) UpdateAttendancePolicy(ctx context.Context, policy *model
 	if existing == nil {
 		return fmt.Errorf("policy not found")
 	}
-	// Duplicate code check (excluding self)
 	all, err := s.policyRepo.GetPoliciesByCompany(ctx, policy.CompanyID, false)
 	if err != nil {
 		return fmt.Errorf("list policies: %w", err)
@@ -176,7 +174,6 @@ func (s *adminService) DeleteAttendancePolicy(ctx context.Context, policyID uuid
 	if policy == nil {
 		return fmt.Errorf("policy not found")
 	}
-	// Check if assigned to any users
 	users, err := s.policyRepo.GetUsersByPolicy(ctx, policyID, time.Now())
 	if err != nil {
 		return fmt.Errorf("check users: %w", err)
@@ -184,9 +181,6 @@ func (s *adminService) DeleteAttendancePolicy(ctx context.Context, policyID uuid
 	if len(users) > 0 {
 		return fmt.Errorf("cannot delete policy assigned to %d users", len(users))
 	}
-	// Also check for other subjects (students, teachers)
-	// TODO: implement cross-subject check if needed
-
 	tx, err := s.eventRepo.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -199,10 +193,9 @@ func (s *adminService) DeleteAttendancePolicy(ctx context.Context, policyID uuid
 }
 
 // =============================================================================
-// NEW POLYMORPHIC POLICY METHODS (for any subject)
+// Polymorphic policy assignment
 // =============================================================================
 
-// AssignPolicyToSubject assigns a policy to any subject (employee, student, teacher, etc.)
 func (s *adminService) AssignPolicyToSubject(ctx context.Context, subjectType string, subjectID uuid.UUID, policyID uuid.UUID, effectiveFrom time.Time, effectiveTo *time.Time, assignedBy *uuid.UUID) error {
 	if subjectType == "" || subjectID == uuid.Nil {
 		return errors.New("subject_type and subject_id are required")
@@ -213,7 +206,6 @@ func (s *adminService) AssignPolicyToSubject(ctx context.Context, subjectType st
 	if effectiveFrom.IsZero() {
 		effectiveFrom = time.Now().UTC()
 	}
-	// Validate policy exists and is active
 	policy, err := s.policyRepo.GetPolicyByID(ctx, policyID)
 	if err != nil {
 		return fmt.Errorf("get policy: %w", err)
@@ -222,11 +214,8 @@ func (s *adminService) AssignPolicyToSubject(ctx context.Context, subjectType st
 		return errors.New("policy not active or not found")
 	}
 
-	// Idempotency: check if exact assignment already exists
-	// We'll use a helper method to find assignment by subject
 	existing, err := s.policyRepo.GetActivePolicyBySubject(ctx, subjectType, subjectID, effectiveFrom)
 	if err == nil && existing != nil {
-		// If the active policy at that date is the same, return success
 		if existing.PolicyID == policyID {
 			s.logger.Info("Policy already assigned to subject (idempotent)",
 				zap.String("subject_type", subjectType),
@@ -235,7 +224,6 @@ func (s *adminService) AssignPolicyToSubject(ctx context.Context, subjectType st
 				zap.Time("effective_from", effectiveFrom))
 			return nil
 		}
-		// Otherwise, end the current active policy before assigning the new one
 		_ = s.EndPolicyForSubject(ctx, subjectType, subjectID, existing.PolicyID, effectiveFrom)
 	}
 
@@ -260,7 +248,6 @@ func (s *adminService) AssignPolicyToSubject(ctx context.Context, subjectType st
 	return nil
 }
 
-// EndPolicyForSubject ends an active policy for a given subject
 func (s *adminService) EndPolicyForSubject(ctx context.Context, subjectType string, subjectID uuid.UUID, policyID uuid.UUID, endDate time.Time) error {
 	if endDate.IsZero() {
 		endDate = time.Now().UTC()
@@ -284,17 +271,14 @@ func (s *adminService) EndPolicyForSubject(ctx context.Context, subjectType stri
 	return nil
 }
 
-// GetActivePolicyForSubject retrieves the active policy for a given subject at a given date
 func (s *adminService) GetActivePolicyForSubject(ctx context.Context, subjectType string, subjectID uuid.UUID, date time.Time) (*models.AttendancePolicy, error) {
 	return s.policyRepo.GetActivePolicyBySubject(ctx, subjectType, subjectID, date)
 }
 
 // =============================================================================
-// LEGACY EMPLOYEE METHODS (kept for backward compatibility)
+// Legacy employee assignment (kept for backward compat)
 // =============================================================================
 
-// AssignUserAttendancePolicy is the legacy employee-only assignment method.
-// It now populates SubjectType="employee" and SubjectID=userID before calling the repository.
 func (s *adminService) AssignUserAttendancePolicy(ctx context.Context, userPolicy *models.UserAttendancePolicy, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error {
 	if userPolicy.UserID == uuid.Nil || userPolicy.PolicyID == uuid.Nil {
 		return fmt.Errorf("user_id and policy_id required")
@@ -302,14 +286,12 @@ func (s *adminService) AssignUserAttendancePolicy(ctx context.Context, userPolic
 	if userPolicy.EffectiveFrom.IsZero() {
 		userPolicy.EffectiveFrom = time.Now().UTC()
 	}
-	// Set polymorphic fields for employees
 	if userPolicy.SubjectType == "" {
 		userPolicy.SubjectType = "employee"
 	}
 	if userPolicy.SubjectID == nil {
 		userPolicy.SubjectID = &userPolicy.UserID
 	}
-
 	policy, err := s.policyRepo.GetPolicyByID(ctx, userPolicy.PolicyID)
 	if err != nil {
 		return fmt.Errorf("get policy: %w", err)
@@ -317,8 +299,6 @@ func (s *adminService) AssignUserAttendancePolicy(ctx context.Context, userPolic
 	if policy == nil || !policy.IsActive {
 		return fmt.Errorf("policy not active")
 	}
-
-	// Idempotency check
 	existing, err := s.policyRepo.GetUserPolicyAssignment(ctx, userPolicy.UserID, userPolicy.PolicyID, userPolicy.EffectiveFrom)
 	if err != nil {
 		return fmt.Errorf("check existing assignment: %w", err)
@@ -330,33 +310,27 @@ func (s *adminService) AssignUserAttendancePolicy(ctx context.Context, userPolic
 			zap.Time("effective_from", userPolicy.EffectiveFrom))
 		return nil
 	}
-
-	// End any previous active policy (if different)
 	active, err := s.policyRepo.GetActivePolicyBySubject(ctx, "employee", userPolicy.UserID, userPolicy.EffectiveFrom)
 	if err == nil && active != nil && active.PolicyID != userPolicy.PolicyID {
 		_ = s.policyRepo.EndPolicyForSubject(ctx, "employee", userPolicy.UserID, active.PolicyID, userPolicy.EffectiveFrom)
 	}
-
 	if userPolicy.AssignedBy == nil {
 		userPolicy.AssignedBy = &actorID
 	}
 	if userPolicy.CreatedAt.IsZero() {
 		userPolicy.CreatedAt = time.Now().UTC()
 	}
-
 	tx, err := s.eventRepo.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
 	if err := s.policyRepo.AssignUserPolicy(ctx, tx, userPolicy); err != nil {
 		return fmt.Errorf("assign policy: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
-
 	s.logAudit(ctx, policy.CompanyID, "user_attendance_policy.assign", userPolicy.PolicyID,
 		actorType, actorID, nil, userPolicy, metadata)
 	s.logger.Info("User attendance policy assigned",
@@ -365,8 +339,6 @@ func (s *adminService) AssignUserAttendancePolicy(ctx context.Context, userPolic
 	return nil
 }
 
-// EndUserAttendancePolicy is the legacy employee-only end method.
-// It now uses the polymorphic EndPolicyForSubject with subjectType="employee".
 func (s *adminService) EndUserAttendancePolicy(ctx context.Context, userID, policyID uuid.UUID, endDate time.Time) error {
 	if endDate.IsZero() {
 		endDate = time.Now().UTC()
@@ -397,7 +369,6 @@ func (s *adminService) UpdateCompanyAttendanceRules(ctx context.Context, rules *
 	if rules == nil || rules.CompanyID == uuid.Nil {
 		return fmt.Errorf("company rules and company_id required")
 	}
-	// Validate source types
 	srcTypes, err := s.sourceRepo.GetSourceTypes(ctx, true)
 	if err != nil {
 		return fmt.Errorf("load source types: %w", err)
@@ -407,7 +378,8 @@ func (s *adminService) UpdateCompanyAttendanceRules(ctx context.Context, rules *
 		valid[st.SourceType] = struct{}{}
 	}
 	if len(rules.AllowedSourceTypes) == 0 {
-		rules.AllowedSourceTypes = []string{"mobile", "web", "biometric", "rfid"}
+		// FIX (Tier 1): no longer injects "rfid".
+		rules.AllowedSourceTypes = append([]string{}, defaultAllowedSourceTypes...)
 	} else {
 		seen := make(map[string]struct{})
 		var validated []string
@@ -448,7 +420,6 @@ func (s *adminService) UpsertDepartmentAttendanceRules(ctx context.Context, rule
 	if rules == nil || rules.CompanyID == uuid.Nil || rules.DepartmentID == uuid.Nil {
 		return fmt.Errorf("rules, company_id, department_id required")
 	}
-	// Validate against company allowed sources
 	companyRules, err := s.ruleRepo.GetCompanyRules(ctx, rules.CompanyID)
 	if err != nil {
 		return fmt.Errorf("get company rules: %w", err)
@@ -462,7 +433,6 @@ func (s *adminService) UpsertDepartmentAttendanceRules(ctx context.Context, rule
 			return fmt.Errorf("source type %s not allowed by company", src)
 		}
 	}
-	// Validate event types (we can use a predefined list)
 	for _, et := range rules.AllowedEventTypes {
 		if !isValidEventType(et) {
 			return fmt.Errorf("invalid event type: %s", et)
@@ -483,7 +453,7 @@ func (s *adminService) UpsertDepartmentAttendanceRules(ctx context.Context, rule
 }
 
 // ------------------------------------------------------------
-// User attendance profile (overrides)
+// User profile
 // ------------------------------------------------------------
 
 func (s *adminService) GetUserAttendanceProfile(ctx context.Context, userID uuid.UUID) (*models.UserAttendanceProfile, error) {
@@ -509,9 +479,9 @@ func (s *adminService) UpsertUserAttendanceProfile(ctx context.Context, profile 
 }
 
 // ------------------------------------------------------------
-// Rule resolution (used by ingest)
-// CHANGED: now uses polymorphic policy lookup
+// Rule resolution
 // ------------------------------------------------------------
+
 func (s *adminService) ResolveAttendanceRules(ctx context.Context, userID, companyID uuid.UUID, subjectType string, workCenterCode string, positionID *uuid.UUID, date time.Time) (*models.ResolvedAttendanceRules, error) {
 	now := time.Now().UTC()
 	resolved := &models.ResolvedAttendanceRules{
@@ -523,7 +493,6 @@ func (s *adminService) ResolveAttendanceRules(ctx context.Context, userID, compa
 		PolicySource:          "company",
 	}
 
-	// 1. Company rules (baseline)
 	companyRules, err := s.ruleRepo.GetCompanyRules(ctx, companyID)
 	if err != nil {
 		return nil, fmt.Errorf("get company rules: %w", err)
@@ -533,7 +502,8 @@ func (s *adminService) ResolveAttendanceRules(ctx context.Context, userID, compa
 			zap.String("company_id", companyID.String()))
 		resolved.Timezone = "UTC"
 		resolved.AllowMultipleCheckins = false
-		resolved.AllowedSourceTypes = []string{"mobile", "web", "biometric", "rfid"}
+		// FIX (Tier 1): use the shared default list (no "rfid").
+		resolved.AllowedSourceTypes = append([]string{}, defaultAllowedSourceTypes...)
 		for _, src := range resolved.AllowedSourceTypes {
 			resolved.AllowedSourceTypesMap[src] = true
 		}
@@ -546,10 +516,7 @@ func (s *adminService) ResolveAttendanceRules(ctx context.Context, userID, compa
 		}
 	}
 
-	// 2. Resolve policy: subject-specific > work_center > position
 	var resolvedPolicy *models.AttendancePolicy
-
-	// 2a. Try subject-specific policy (polymorphic)
 	if userID != uuid.Nil && subjectType != "" {
 		if p, err := s.policyRepo.GetActivePolicyBySubject(ctx, subjectType, userID, date); err == nil && p != nil && p.IsActive {
 			resolvedPolicy = p
@@ -561,28 +528,18 @@ func (s *adminService) ResolveAttendanceRules(ctx context.Context, userID, compa
 				zap.String("policy_code", p.PolicyCode))
 		}
 	}
-
-	// 2b. Fallback to work center policy
 	if resolvedPolicy == nil && workCenterCode != "" {
 		if p, err := s.policyRepo.GetWorkCenterPolicy(ctx, companyID, workCenterCode); err == nil && p != nil && p.IsActive {
 			resolvedPolicy = p
 			resolved.PolicySource = "work_center"
 			resolved.WorkCenterCode = &workCenterCode
-			s.logger.Debug("Resolved policy from work center",
-				zap.String("work_center", workCenterCode),
-				zap.String("policy_id", p.PolicyID.String()))
 		}
 	}
-
-	// 2c. Fallback to position policy
 	if resolvedPolicy == nil && positionID != nil {
 		if p, err := s.policyRepo.GetPositionPolicy(ctx, *positionID); err == nil && p != nil && p.IsActive {
 			resolvedPolicy = p
 			resolved.PolicySource = "position"
 			resolved.PositionID = positionID
-			s.logger.Debug("Resolved policy from position",
-				zap.String("position_id", positionID.String()),
-				zap.String("policy_id", p.PolicyID.String()))
 		}
 	}
 
@@ -613,7 +570,6 @@ func (s *adminService) ResolveAttendanceRules(ctx context.Context, userID, compa
 			zap.String("work_center", workCenterCode))
 	}
 
-	// 3. User profile overrides (still employee‑centric; could be extended)
 	if userID != uuid.Nil {
 		profile, err := s.ruleRepo.GetUserProfile(ctx, userID)
 		if err == nil && profile != nil {
@@ -644,10 +600,6 @@ func (s *adminService) ResolveAttendanceRules(ctx context.Context, userID, compa
 	return resolved, nil
 }
 
-// ------------------------------------------------------------
-// Validation helpers
-// ------------------------------------------------------------
-
 func (s *adminService) ValidateAttendanceEventType(ctx context.Context, eventType string) error {
 	types, err := s.sourceRepo.GetEventTypes(ctx, true)
 	if err != nil {
@@ -675,20 +627,12 @@ func (s *adminService) ValidateAttendanceSourceType(ctx context.Context, sourceT
 	return nil
 }
 
-// ------------------------------------------------------------
-// Health
-// ------------------------------------------------------------
-
 func (s *adminService) HealthCheck(ctx context.Context) error {
 	if err := s.eventRepo.HealthCheck(ctx); err != nil {
 		return fmt.Errorf("event repo health: %w", err)
 	}
 	return nil
 }
-
-// ------------------------------------------------------------
-// helpers
-// ------------------------------------------------------------
 
 func (s *adminService) validatePolicy(policy *models.AttendancePolicy) error {
 	if policy.CompanyID == uuid.Nil {

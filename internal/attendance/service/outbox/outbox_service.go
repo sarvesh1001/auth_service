@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,6 +17,17 @@ type KafkaProducer interface {
 	ProduceMessage(ctx context.Context, topic string, key []byte, value []byte, headers map[string]string) error
 }
 
+// OutboxService polls the outbox table and publishes events to Kafka.
+//
+// Lifecycle is safe against:
+//   - calling Stop() multiple times
+//   - calling Stop() before Start()
+//   - Start -> Stop -> Start (a new run creates a fresh cancel func)
+//
+// FIX (Tier 1): the previous implementation closed a channel that was
+// created once in the constructor and guarded by a plain bool. That led to
+// panics on the second Stop() and to a data race between the loop goroutine
+// and Stop() callers. Replaced with a mutex-guarded context.CancelFunc.
 type OutboxService struct {
 	outboxRepo   repository.OutboxRepository
 	kafka        KafkaProducer
@@ -23,8 +35,10 @@ type OutboxService struct {
 	batchSize    int
 	pollInterval time.Duration
 	topicName    string
-	stopChan     chan struct{}
-	isRunning    bool
+
+	mu       sync.Mutex
+	running  bool
+	cancelFn context.CancelFunc
 }
 
 func NewOutboxService(
@@ -42,36 +56,69 @@ func NewOutboxService(
 		batchSize:    batchSize,
 		pollInterval: pollInterval,
 		topicName:    topicName,
-		stopChan:     make(chan struct{}),
 	}
 }
 
+// IsRunning reports whether the service loop is currently active.
+func (s *OutboxService) IsRunning() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.running
+}
+
 func (s *OutboxService) Start(ctx context.Context) error {
+	s.mu.Lock()
+	if s.running {
+		s.mu.Unlock()
+		return fmt.Errorf("outbox service already running")
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	s.cancelFn = cancel
+	s.running = true
+	s.mu.Unlock()
+
 	s.logger.Info("Starting outbox service",
 		zap.String("topic", s.topicName),
 		zap.Int("batch_size", s.batchSize),
 		zap.Duration("poll_interval", s.pollInterval),
 	)
-	s.isRunning = true
+
+	defer func() {
+		s.mu.Lock()
+		s.running = false
+		s.cancelFn = nil
+		s.mu.Unlock()
+		cancel()
+	}()
+
 	ticker := time.NewTicker(s.pollInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-runCtx.Done():
 			s.logger.Info("Outbox service stopped via context")
-			s.isRunning = false
-			return nil
-		case <-s.stopChan:
-			s.logger.Info("Outbox service stopped")
-			s.isRunning = false
 			return nil
 		case <-ticker.C:
-			if err := s.processBatch(ctx); err != nil {
+			if err := s.processBatch(runCtx); err != nil {
 				s.logger.Error("Failed to process outbox batch", zap.Error(err))
 			}
 		}
 	}
+}
+
+// Stop requests the running loop to exit. Safe to call multiple times and
+// safe to call when the service is not running.
+func (s *OutboxService) Stop() {
+	s.mu.Lock()
+	cancel := s.cancelFn
+	s.mu.Unlock()
+
+	if cancel == nil {
+		return
+	}
+	s.logger.Info("Outbox service stopping...")
+	cancel()
 }
 
 func (s *OutboxService) processBatch(ctx context.Context) error {
@@ -85,7 +132,6 @@ func (s *OutboxService) processBatch(ctx context.Context) error {
 
 	var processedIDs []uuid.UUID
 	for _, evt := range events {
-		// Build Kafka message
 		msg := map[string]interface{}{
 			"event_id":     evt.EventID,
 			"aggregate_id": evt.AggregateID,
@@ -98,7 +144,6 @@ func (s *OutboxService) processBatch(ctx context.Context) error {
 			s.logger.Error("marshal outbox event", zap.String("event_id", evt.EventID.String()), zap.Error(err))
 			continue
 		}
-		// Publish
 		err = s.kafka.ProduceMessage(
 			ctx,
 			s.topicName,
@@ -124,14 +169,6 @@ func (s *OutboxService) processBatch(ctx context.Context) error {
 		s.logger.Info("Processed outbox batch", zap.Int("count", len(processedIDs)))
 	}
 	return nil
-}
-
-func (s *OutboxService) Stop() {
-	if s.isRunning {
-		close(s.stopChan)
-		s.isRunning = false
-		s.logger.Info("Outbox service stopping...")
-	}
 }
 
 func (s *OutboxService) HealthCheck(ctx context.Context) error {

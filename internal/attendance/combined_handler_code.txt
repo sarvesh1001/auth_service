@@ -12,7 +12,6 @@ import (
 
 	"auth-service/internal/attendance/biometric/models"
 	"auth-service/internal/attendance/biometric/service"
-
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 )
@@ -32,97 +31,77 @@ func NewBiometricSyncHandler(
 	}
 }
 
-// getCompanyIDFromContext extracts the company UUID from the request context.
-
-// ---------------------------------------------------------------------
-// SyncEmbeddings – main device endpoint
-// ---------------------------------------------------------------------
+// SyncEmbeddings returns embeddings for a device to sync.
+//
+// FIX (Handler hygiene): previously required `input.CompanyID` to match the
+// caller's company from context. Clients frequently omitted it, and the
+// field was never actually needed. The context company now wins; any value
+// in the body is overwritten.
 func (h *BiometricSyncHandler) SyncEmbeddings(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
 	var input models.SyncEmbeddingsInput
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
-
-	if input.CompanyID != companyID {
-		h.respondWithError(w, http.StatusForbidden, "company_id mismatch")
-		return
-	}
+	// Always trust the context — ignore any company_id the client sent.
+	input.CompanyID = companyID
 
 	resp, err := h.syncService.SyncEmbeddings(ctx, &input)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, resp)
 }
 
-// ---------------------------------------------------------------------
-// FullSync – admin triggered full sync for a device
-// ---------------------------------------------------------------------
 func (h *BiometricSyncHandler) FullSync(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
 	deviceID := chi.URLParam(r, "deviceID")
 	if deviceID == "" {
 		h.respondWithError(w, http.StatusBadRequest, "device_id required")
 		return
 	}
-
 	modelVersion := r.URL.Query().Get("model_version")
 	if modelVersion == "" {
 		h.respondWithError(w, http.StatusBadRequest, "model_version query param required")
 		return
 	}
-
 	resp, err := h.syncService.FullSync(ctx, companyID, deviceID, modelVersion)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, resp)
 }
 
-// ---------------------------------------------------------------------
-// IncrementalSync – admin triggered incremental sync
-// ---------------------------------------------------------------------
 func (h *BiometricSyncHandler) IncrementalSync(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
 	deviceID := chi.URLParam(r, "deviceID")
 	if deviceID == "" {
 		h.respondWithError(w, http.StatusBadRequest, "device_id required")
 		return
 	}
-
 	modelVersion := r.URL.Query().Get("model_version")
 	if modelVersion == "" {
 		h.respondWithError(w, http.StatusBadRequest, "model_version query param required")
 		return
 	}
-
 	sinceStr := r.URL.Query().Get("since")
 	if sinceStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "since query param required (RFC3339)")
@@ -133,48 +112,35 @@ func (h *BiometricSyncHandler) IncrementalSync(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusBadRequest, "invalid since format, use RFC3339")
 		return
 	}
-
 	resp, err := h.syncService.IncrementalSync(ctx, companyID, deviceID, modelVersion, since)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, resp)
 }
 
-// ---------------------------------------------------------------------
-// ForceDeviceResync – reset a device's sync state
-// ---------------------------------------------------------------------
 func (h *BiometricSyncHandler) ForceDeviceResync(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
 	deviceID := chi.URLParam(r, "deviceID")
 	if deviceID == "" {
 		h.respondWithError(w, http.StatusBadRequest, "device_id required")
 		return
 	}
-
-	err = h.syncService.ForceDeviceResync(ctx, companyID, deviceID)
-	if err != nil {
+	if err := h.syncService.ForceDeviceResync(ctx, companyID, deviceID); err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]string{
 		"message": "Device sync state reset, next request will be a full sync",
 	})
 }
 
-// ---------------------------------------------------------------------
-// Health check
-// ---------------------------------------------------------------------
 func (h *BiometricSyncHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	h.respondWithJSON(w, http.StatusOK, map[string]string{
 		"status":  "healthy",
@@ -182,9 +148,6 @@ func (h *BiometricSyncHandler) HealthCheck(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-// ---------------------------------------------------------------------
-// Response helpers
-// ---------------------------------------------------------------------
 func (h *BiometricSyncHandler) respondWithJSON(w http.ResponseWriter, status int, payload interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -199,7 +162,6 @@ func (h *BiometricSyncHandler) respondWithError(w http.ResponseWriter, status in
 		"error":   message,
 	})
 }
-
 
 
 ================================================================================
@@ -237,10 +199,12 @@ func NewAttendanceDeviceEnrollmentHandler(
 }
 
 // enrollmentRequest represents the body for enrolling a user.
+// SubjectType is optional; defaults to "employee" if omitted.
 type enrollmentRequest struct {
 	UserID         uuid.UUID `json:"user_id"`
 	DeviceUserCode string    `json:"device_user_code"`
 	SourceType     string    `json:"source_type"`
+	SubjectType    string    `json:"subject_type,omitempty"`
 }
 
 // revokeRequest represents the body for revoking an enrollment.
@@ -295,10 +259,18 @@ func (h *AttendanceDeviceEnrollmentHandler) EnrollUser(w http.ResponseWriter, r 
 		return
 	}
 
+	// Use provided subject_type, default to "employee" for backward compatibility.
+	subjectType := req.SubjectType
+	if subjectType == "" {
+		subjectType = "employee"
+	}
+	// Optional: validate against allowed types (employee, student, teacher, etc.)
+	// if !isValidSubjectType(subjectType) { ... }
+
 	err = h.enrollmentService.EnrollSubject(
 		ctx,
 		companyID,
-		"employee", // subject_type; could be made flexible
+		subjectType,
 		req.UserID,
 		deviceID,
 		req.SourceType,
@@ -527,13 +499,11 @@ import (
 	"auth-service/internal/attendance/service/source"
 )
 
-// AttendanceSourceAdminHandler handles attendance source management.
 type AttendanceSourceAdminHandler struct {
 	sourceService source.SourceAdminService
 	logger        *zap.Logger
 }
 
-// NewAttendanceSourceAdminHandler creates a new handler.
 func NewAttendanceSourceAdminHandler(
 	sourceService source.SourceAdminService,
 	logger *zap.Logger,
@@ -544,7 +514,30 @@ func NewAttendanceSourceAdminHandler(
 	}
 }
 
-// ---- DTOs ----
+// canonicalSourceTypes is the whitelist used to normalize and validate
+// source_type on both create and update. Keep in sync with
+// service/source/canonicalSourceRules.
+var canonicalSourceTypes = map[string]struct{}{
+	"manual":     {},
+	"mobile":     {},
+	"web":        {},
+	"biometric":  {},
+	"kiosk":      {},
+	"classroom":  {},
+	"auto":       {},
+	"system":     {},
+	"correction": {},
+}
+
+// normalizeSourceType trims and lowercases a source type, then verifies it
+// against the canonical list. Returns ("", false) if invalid.
+func normalizeSourceType(raw string) (string, bool) {
+	v := strings.ToLower(strings.TrimSpace(raw))
+	if _, ok := canonicalSourceTypes[v]; !ok {
+		return v, false
+	}
+	return v, true
+}
 
 type CreateAttendanceSourceRequest struct {
 	SourceType string `json:"source_type"`
@@ -555,125 +548,129 @@ type UpdateAttendanceSourceStatusRequest struct {
 	IsActive bool `json:"is_active"`
 }
 
-// ---- ListSources ----
-
 func (h *AttendanceSourceAdminHandler) ListSources(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
 		return
 	}
-
+	ctxCompany, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if !assertPathCompany(w, ctxCompany, companyID, h.logger) {
+		return
+	}
 	activeOnly := r.URL.Query().Get("active_only") == "true"
-
 	sources, err := h.sourceService.GetSourcesByCompany(ctx, companyID, activeOnly)
 	if err != nil {
 		h.logger.Error("Failed to list attendance sources", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    sources,
 	})
 }
 
-// ---- CreateSource ----
-
 func (h *AttendanceSourceAdminHandler) CreateSource(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
 		return
 	}
-
+	ctxCompany, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if !assertPathCompany(w, ctxCompany, companyID, h.logger) {
+		return
+	}
 	actorID, err := h.getAdminActor(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
 	var req CreateAttendanceSourceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
-	req.SourceType = strings.TrimSpace(req.SourceType)
-	if req.SourceType == "" {
-		h.respondWithError(w, http.StatusBadRequest, "source_type required")
+	normalized, ok := normalizeSourceType(req.SourceType)
+	if !ok {
+		h.respondWithError(w, http.StatusBadRequest, "invalid source_type")
 		return
 	}
-
-	source, err := h.sourceService.CreateSource(ctx, companyID, req.SourceType, req.Name, &actorID)
+	req.SourceType = normalized
+	src, err := h.sourceService.CreateSource(ctx, companyID, req.SourceType, req.Name, &actorID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
-		"data":    source,
+		"data":    src,
 	})
 }
 
-// ---- UpdateSourceStatus ----
-
+// UpdateSourceStatus toggles a source's active state.
+//
+// FIX (Handler hygiene): previously accepted the raw `sourceType` from the
+// URL with no trimming, lowercasing, or validation. `" MANUAL "` did not
+// match `"manual"` punches. The path value is now normalized and validated
+// against the same canonical list used by CreateSource.
 func (h *AttendanceSourceAdminHandler) UpdateSourceStatus(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
 		return
 	}
-
-	sourceType := chi.URLParam(r, "sourceType")
-	if sourceType == "" {
-		h.respondWithError(w, http.StatusBadRequest, "source_type required")
+	ctxCompany, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
+	if !assertPathCompany(w, ctxCompany, companyID, h.logger) {
+		return
+	}
+	rawSourceType := chi.URLParam(r, "sourceType")
+	normalized, ok := normalizeSourceType(rawSourceType)
+	if !ok {
+		h.respondWithError(w, http.StatusBadRequest, "invalid source_type")
+		return
+	}
 	actorID, err := h.getAdminActor(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
 	var req UpdateAttendanceSourceStatusRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
-	if err := h.sourceService.UpdateSourceStatus(ctx, companyID, sourceType, req.IsActive, &actorID); err != nil {
+	if err := h.sourceService.UpdateSourceStatus(ctx, companyID, normalized, req.IsActive, &actorID); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "attendance source updated",
 	})
 }
 
-// ---- Helpers ----
-
 func (h *AttendanceSourceAdminHandler) getAdminActor(ctx context.Context) (uuid.UUID, error) {
 	sessionType, ok := ctx.Value("session_type").(string)
 	if !ok || sessionType != "admin" {
 		return uuid.Nil, errors.New("admin authentication required")
 	}
-	userIDStr, ok := ctx.Value("user_id").(string)
-	if !ok {
-		return uuid.Nil, errors.New("user_id missing from context")
-	}
-	return uuid.Parse(userIDStr)
+	return getUserIDFromContext(ctx)
 }
 
 func (h *AttendanceSourceAdminHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
@@ -690,7 +687,6 @@ func (h *AttendanceSourceAdminHandler) respondWithError(w http.ResponseWriter, s
 		"time":    time.Now().UTC(),
 	})
 }
-
 
 
 ================================================================================
@@ -739,6 +735,7 @@ type ResolveDayRequest struct {
 	UserID      uuid.UUID `json:"user_id"`
 	Date        time.Time `json:"date"`
 	Recalculate bool      `json:"recalculate,omitempty"`
+	SubjectType string    `json:"subject_type,omitempty"` // added – defaults to "employee"
 }
 
 type BatchResolveRequest struct {
@@ -750,6 +747,7 @@ type BatchResolveByPeriodRequest struct {
 	StartDate   time.Time   `json:"start_date"`
 	EndDate     time.Time   `json:"end_date"`
 	Recalculate bool        `json:"recalculate,omitempty"`
+	SubjectType string      `json:"subject_type,omitempty"` // added – defaults to "employee"
 }
 
 // ---- Handlers ----
@@ -808,10 +806,17 @@ func (h *AttendanceResolutionHandler) ResolveDay(w http.ResponseWriter, r *http.
 		req.Date = time.Now()
 	}
 
+	// Default to "employee" if not provided
+	subjectType := req.SubjectType
+	if subjectType == "" {
+		subjectType = "employee"
+	}
+
 	if req.Recalculate {
-		if err := h.resolutionService.RecalculateDay(ctx, companyID, req.UserID, "employee", req.Date); err != nil {
+		if err := h.resolutionService.RecalculateDay(ctx, companyID, req.UserID, subjectType, req.Date); err != nil {
 			h.logger.Error("Failed to recalculate day",
 				zap.String("user_id", req.UserID.String()),
+				zap.String("subject_type", subjectType),
 				zap.Time("date", req.Date),
 				zap.Error(err))
 			h.respondWithError(w, http.StatusInternalServerError, "failed to recalculate day")
@@ -824,9 +829,10 @@ func (h *AttendanceResolutionHandler) ResolveDay(w http.ResponseWriter, r *http.
 		return
 	}
 
-	if err := h.resolutionService.ResolveDay(ctx, companyID, req.UserID, "employee", req.Date); err != nil {
+	if err := h.resolutionService.ResolveDay(ctx, companyID, req.UserID, subjectType, req.Date); err != nil {
 		h.logger.Error("Failed to resolve day",
 			zap.String("user_id", req.UserID.String()),
+			zap.String("subject_type", subjectType),
 			zap.Time("date", req.Date),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to resolve day")
@@ -896,10 +902,17 @@ func (h *AttendanceResolutionHandler) ResolveDayByPath(w http.ResponseWriter, r 
 	}
 	recalculate := r.URL.Query().Get("recalculate") == "true"
 
+	// Read subject_type from query, default to "employee"
+	subjectType := r.URL.Query().Get("subject_type")
+	if subjectType == "" {
+		subjectType = "employee"
+	}
+
 	if recalculate {
-		if err := h.resolutionService.RecalculateDay(ctx, companyID, userID, "employee", date); err != nil {
+		if err := h.resolutionService.RecalculateDay(ctx, companyID, userID, subjectType, date); err != nil {
 			h.logger.Error("Failed to recalculate day via path",
 				zap.String("user_id", userID.String()),
+				zap.String("subject_type", subjectType),
 				zap.Time("date", date),
 				zap.Error(err))
 			h.respondWithError(w, http.StatusInternalServerError, "failed to recalculate day")
@@ -912,9 +925,10 @@ func (h *AttendanceResolutionHandler) ResolveDayByPath(w http.ResponseWriter, r 
 		return
 	}
 
-	if err := h.resolutionService.ResolveDay(ctx, companyID, userID, "employee", date); err != nil {
+	if err := h.resolutionService.ResolveDay(ctx, companyID, userID, subjectType, date); err != nil {
 		h.logger.Error("Failed to resolve day via path",
 			zap.String("user_id", userID.String()),
+			zap.String("subject_type", subjectType),
 			zap.Time("date", date),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to resolve day")
@@ -953,9 +967,15 @@ func (h *AttendanceResolutionHandler) BatchResolveByPeriod(w http.ResponseWriter
 		return
 	}
 
-	if err := h.resolutionService.ResolvePeriod(ctx, companyID, req.UserIDs, "employee", req.StartDate, req.EndDate, req.Recalculate); err != nil {
+	subjectType := req.SubjectType
+	if subjectType == "" {
+		subjectType = "employee"
+	}
+
+	if err := h.resolutionService.ResolvePeriod(ctx, companyID, req.UserIDs, subjectType, req.StartDate, req.EndDate, req.Recalculate); err != nil {
 		h.logger.Error("Failed to resolve period",
 			zap.Int("user_count", len(req.UserIDs)),
+			zap.String("subject_type", subjectType),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to resolve period")
 		return
@@ -992,6 +1012,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
@@ -999,184 +1020,156 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
-	"auth-service/internal/attendance/models"
-	"auth-service/internal/attendance/repository"
+	"auth-service/internal/attendance/service/exemption"
+	"auth-service/internal/attendance/service/resolver"
 )
 
-// AttendanceExemptionHandler handles exemption CRUD operations.
 type AttendanceExemptionHandler struct {
-	exemptionRepo repository.AttendanceExemptionRepository
-	logger        *zap.Logger
+	exemptionService exemption.ExemptionService
+	logger           *zap.Logger
 }
 
-// NewAttendanceExemptionHandler creates a new handler.
 func NewAttendanceExemptionHandler(
-	exemptionRepo repository.AttendanceExemptionRepository,
+	exemptionService exemption.ExemptionService,
 	logger *zap.Logger,
 ) *AttendanceExemptionHandler {
 	return &AttendanceExemptionHandler{
-		exemptionRepo: exemptionRepo,
-		logger:        logger,
+		exemptionService: exemptionService,
+		logger:           logger,
 	}
 }
 
-// CreateExemptionRequest defines the payload for creating an exemption.
-type CreateExemptionRequest struct {
-	CompanyID   uuid.UUID  `json:"company_id"`
+// ---------------------------------------------------------------------------
+// Request DTOs — note the ABSENCE of company_id / created_by.
+// ---------------------------------------------------------------------------
+
+type createExemptionRequest struct {
 	SubjectType string     `json:"subject_type"`
 	SubjectID   uuid.UUID  `json:"subject_id"`
 	FromDate    time.Time  `json:"from_date"`
 	ToDate      time.Time  `json:"to_date"`
-	Reason      *string    `json:"reason"`
-	ApprovedBy  *uuid.UUID `json:"approved_by"`
-	CreatedBy   *uuid.UUID `json:"created_by"`
+	Reason      *string    `json:"reason,omitempty"`
+	ApprovedBy  *uuid.UUID `json:"approved_by,omitempty"`
 }
 
-// CreateExemption creates a new attendance exemption.
+type updateExemptionRequest struct {
+	FromDate   *time.Time `json:"from_date,omitempty"`
+	ToDate     *time.Time `json:"to_date,omitempty"`
+	Reason     *string    `json:"reason,omitempty"`
+	ApprovedBy *uuid.UUID `json:"approved_by,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
 func (h *AttendanceExemptionHandler) CreateExemption(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	var req CreateExemptionRequest
+
+	companyID, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	actorID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	actorType := getSessionTypeFromContext(ctx)
+
+	var req createExemptionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	// Validate
-	if req.CompanyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "company_id is required")
-		return
-	}
-	if req.SubjectType == "" {
-		h.respondWithError(w, http.StatusBadRequest, "subject_type is required")
-		return
-	}
-	if req.SubjectID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "subject_id is required")
-		return
-	}
-	if req.FromDate.IsZero() || req.ToDate.IsZero() {
-		h.respondWithError(w, http.StatusBadRequest, "from_date and to_date are required")
-		return
-	}
-	if req.FromDate.After(req.ToDate) {
-		h.respondWithError(w, http.StatusBadRequest, "from_date must be before or equal to to_date")
-		return
-	}
-
-	exemption := &models.AttendanceExemption{
-		CompanyID:   req.CompanyID,
+	created, err := h.exemptionService.Create(ctx, companyID, &exemption.CreateExemptionInput{
 		SubjectType: req.SubjectType,
 		SubjectID:   req.SubjectID,
 		FromDate:    req.FromDate,
 		ToDate:      req.ToDate,
 		Reason:      req.Reason,
 		ApprovedBy:  req.ApprovedBy,
-		CreatedBy:   req.CreatedBy,
-	}
-
-	if err := h.exemptionRepo.Create(ctx, nil, exemption); err != nil {
-		h.logger.Error("Failed to create exemption", zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, "failed to create exemption")
+	}, actorType, actorID)
+	if err != nil {
+		h.writeServiceError(w, err, "create exemption")
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
-		"data":    exemption,
+		"data":    created,
 	})
 }
 
-// UpdateExemptionRequest defines the payload for updating an exemption.
-type UpdateExemptionRequest struct {
-	FromDate   *time.Time `json:"from_date"`
-	ToDate     *time.Time `json:"to_date"`
-	Reason     *string    `json:"reason"`
-	ApprovedBy *uuid.UUID `json:"approved_by"`
-}
-
-// UpdateExemption updates an existing exemption.
 func (h *AttendanceExemptionHandler) UpdateExemption(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
+	companyID, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	actorID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	actorType := getSessionTypeFromContext(ctx)
+
 	exemptionID, err := uuid.Parse(chi.URLParam(r, "exemptionID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid exemption ID")
 		return
 	}
 
-	var req UpdateExemptionRequest
+	var req updateExemptionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	// Fetch existing
-	existing, err := h.exemptionRepo.GetByID(ctx, nil, exemptionID)
+	updated, err := h.exemptionService.Update(ctx, companyID, exemptionID, &exemption.UpdateExemptionInput{
+		FromDate:   req.FromDate,
+		ToDate:     req.ToDate,
+		Reason:     req.Reason,
+		ApprovedBy: req.ApprovedBy,
+	}, actorType, actorID)
 	if err != nil {
-		h.logger.Error("Failed to get exemption", zap.String("exemption_id", exemptionID.String()), zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve exemption")
-		return
-	}
-	if existing == nil {
-		h.respondWithError(w, http.StatusNotFound, "exemption not found")
-		return
-	}
-
-	// Apply updates
-	if req.FromDate != nil {
-		existing.FromDate = *req.FromDate
-	}
-	if req.ToDate != nil {
-		existing.ToDate = *req.ToDate
-	}
-	if req.Reason != nil {
-		existing.Reason = req.Reason
-	}
-	if req.ApprovedBy != nil {
-		existing.ApprovedBy = req.ApprovedBy
-	}
-
-	// Validate dates after update
-	if existing.FromDate.After(existing.ToDate) {
-		h.respondWithError(w, http.StatusBadRequest, "from_date must be before or equal to to_date")
-		return
-	}
-
-	if err := h.exemptionRepo.Update(ctx, nil, existing); err != nil {
-		h.logger.Error("Failed to update exemption", zap.String("exemption_id", exemptionID.String()), zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, "failed to update exemption")
+		h.writeServiceError(w, err, "update exemption")
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
-		"data":    existing,
+		"data":    updated,
 	})
 }
 
-// DeleteExemption deletes an exemption by ID.
 func (h *AttendanceExemptionHandler) DeleteExemption(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
+	companyID, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	actorID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	actorType := getSessionTypeFromContext(ctx)
+
 	exemptionID, err := uuid.Parse(chi.URLParam(r, "exemptionID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid exemption ID")
 		return
 	}
 
-	// Check if exists
-	existing, err := h.exemptionRepo.GetByID(ctx, nil, exemptionID)
-	if err != nil {
-		h.logger.Error("Failed to get exemption", zap.String("exemption_id", exemptionID.String()), zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve exemption")
-		return
-	}
-	if existing == nil {
-		h.respondWithError(w, http.StatusNotFound, "exemption not found")
-		return
-	}
-
-	if err := h.exemptionRepo.Delete(ctx, nil, exemptionID); err != nil {
-		h.logger.Error("Failed to delete exemption", zap.String("exemption_id", exemptionID.String()), zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, "failed to delete exemption")
+	if err := h.exemptionService.Delete(ctx, companyID, exemptionID, actorType, actorID); err != nil {
+		h.writeServiceError(w, err, "delete exemption")
 		return
 	}
 
@@ -1186,7 +1179,36 @@ func (h *AttendanceExemptionHandler) DeleteExemption(w http.ResponseWriter, r *h
 	})
 }
 
-// ---- Helpers ----
+// ---------------------------------------------------------------------------
+// Error mapping
+// ---------------------------------------------------------------------------
+
+func (h *AttendanceExemptionHandler) writeServiceError(w http.ResponseWriter, err error, op string) {
+	switch {
+	case errors.Is(err, exemption.ErrExemptionNotFound):
+		h.respondWithError(w, http.StatusNotFound, "exemption not found")
+	case errors.Is(err, exemption.ErrInvalidSubject):
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, exemption.ErrInvalidDateRange):
+		h.respondWithError(w, http.StatusBadRequest, "from_date must be on or before to_date")
+	case errors.Is(err, exemption.ErrOverlap):
+		h.respondWithError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, resolver.ErrSubjectOutsideScope):
+		h.respondWithError(w, http.StatusForbidden,
+			"subject belongs to a different location than your current scope")
+	case errors.Is(err, resolver.ErrSubjectHasNoLocation):
+		h.respondWithError(w, http.StatusBadRequest,
+			"target subject has no employment location assigned")
+	case errors.Is(err, exemption.ErrUnauthorized):
+		h.respondWithError(w, http.StatusForbidden, "not authorized")
+	default:
+		h.logger.Error("Exemption service error",
+			zap.String("op", op),
+			zap.Error(err),
+		)
+		h.respondWithError(w, http.StatusInternalServerError, "internal error")
+	}
+}
 
 func (h *AttendanceExemptionHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -1202,12 +1224,10 @@ func (h *AttendanceExemptionHandler) respondWithError(w http.ResponseWriter, sta
 }
 
 
-
 ================================================================================
 FILE: ./handler/scheduling_handler.go
 ================================================================================
 
-// internal/attendance/handler/scheduling_handler.go
 package handler
 
 import (
@@ -1222,16 +1242,15 @@ import (
 
 	"auth-service/internal/attendance/models"
 	"auth-service/internal/attendance/service/scheduling"
+	"auth-service/internal/locationctx"
 )
 
-// SchedulingHandler handles all scheduling-related HTTP endpoints.
 type SchedulingHandler struct {
 	schedulingService      scheduling.SchedulingService
 	schedulingQueryService scheduling.SchedulingQueryService
 	logger                 *zap.Logger
 }
 
-// NewSchedulingHandler creates a new scheduling handler.
 func NewSchedulingHandler(
 	schedulingService scheduling.SchedulingService,
 	schedulingQueryService scheduling.SchedulingQueryService,
@@ -1244,9 +1263,6 @@ func NewSchedulingHandler(
 	}
 }
 
-// ---- Helper functions ----
-
-// normalizeBusinessDateFromString parses a date string in the given timezone and returns a normalized date (midnight).
 func normalizeBusinessDateFromString(dateStr, tz string) (time.Time, error) {
 	loc, err := time.LoadLocation(tz)
 	if err != nil {
@@ -1259,7 +1275,6 @@ func normalizeBusinessDateFromString(dateStr, tz string) (time.Time, error) {
 	return time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, loc), nil
 }
 
-// normalizeBusinessDate normalizes a time to midnight in the given timezone.
 func normalizeBusinessDate(t time.Time, tz string) (time.Time, error) {
 	loc, err := time.LoadLocation(tz)
 	if err != nil {
@@ -1269,30 +1284,48 @@ func normalizeBusinessDate(t time.Time, tz string) (time.Time, error) {
 	return time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, loc), nil
 }
 
-// getUserTimezone attempts to resolve a user's timezone from their schedule.
 func (h *SchedulingHandler) getUserTimezone(ctx context.Context, userID uuid.UUID) string {
-	// Try to get timezone from today's schedule instance.
 	today := time.Now().UTC().Truncate(24 * time.Hour)
 	instances, err := h.schedulingQueryService.GetScheduleInstancesByUser(ctx, userID, today, today)
 	if err == nil && len(instances) > 0 && instances[0].Timezone != "" {
 		return instances[0].Timezone
 	}
-	// Fallback to UTC
 	return "UTC"
 }
 
-// getCompanyDefaultTimezone returns the timezone of the first work calendar for the company.
 func (h *SchedulingHandler) getCompanyDefaultTimezone(ctx context.Context, companyID uuid.UUID) string {
-	calendars, err := h.schedulingQueryService.GetWorkCalendarsByCompany(ctx, companyID)
+	calendars, err := h.schedulingQueryService.GetWorkCalendarsByCompany(ctx, companyID, nil)
 	if err != nil || len(calendars) == 0 {
 		return "UTC"
 	}
 	return calendars[0].Timezone
 }
 
-// ---- Work Calendar Handlers ----
+// pathCompanyMatchesContext fetches the caller's company from context and
+// compares it to the company in the URL path. Returns (companyID, true) on
+// success; writes the appropriate error and returns (uuid.Nil, false) on
+// failure.
+func (h *SchedulingHandler) pathCompanyMatchesContext(
+	w http.ResponseWriter,
+	r *http.Request,
+) (uuid.UUID, bool) {
+	ctx := r.Context()
+	pathCompany, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return uuid.Nil, false
+	}
+	ctxCompany, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return uuid.Nil, false
+	}
+	if !assertPathCompany(w, ctxCompany, pathCompany, h.logger) {
+		return uuid.Nil, false
+	}
+	return pathCompany, true
+}
 
-// CreateWorkCalendar creates a new work calendar.
 func (h *SchedulingHandler) CreateWorkCalendar(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -1306,14 +1339,12 @@ func (h *SchedulingHandler) CreateWorkCalendar(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var calendar models.WorkCalendar
 	if err := json.NewDecoder(r.Body).Decode(&calendar); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
 	calendar.CompanyID = companyID
-
 	result, err := h.schedulingService.CreateWorkCalendar(ctx, &calendar, actorType, actorID, nil)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -1322,11 +1353,9 @@ func (h *SchedulingHandler) CreateWorkCalendar(w http.ResponseWriter, r *http.Re
 	h.respondWithJSON(w, http.StatusCreated, result)
 }
 
-// GetWorkCalendar returns a work calendar by ID.
 func (h *SchedulingHandler) GetWorkCalendar(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	calendarIDStr := chi.URLParam(r, "calendarID")
-	calendarID, err := uuid.Parse(calendarIDStr)
+	calendarID, err := uuid.Parse(chi.URLParam(r, "calendarID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid calendar ID")
 		return
@@ -1339,11 +1368,9 @@ func (h *SchedulingHandler) GetWorkCalendar(w http.ResponseWriter, r *http.Reque
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// UpdateWorkCalendar updates an existing work calendar.
 func (h *SchedulingHandler) UpdateWorkCalendar(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	calendarIDStr := chi.URLParam(r, "calendarID")
-	calendarID, err := uuid.Parse(calendarIDStr)
+	calendarID, err := uuid.Parse(chi.URLParam(r, "calendarID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid calendar ID")
 		return
@@ -1354,13 +1381,11 @@ func (h *SchedulingHandler) UpdateWorkCalendar(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var update scheduling.WorkCalendarUpdate
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
-
 	result, err := h.schedulingService.UpdateWorkCalendar(ctx, calendarID, update, actorType, actorID, nil)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -1369,11 +1394,9 @@ func (h *SchedulingHandler) UpdateWorkCalendar(w http.ResponseWriter, r *http.Re
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// DeleteWorkCalendar deletes a work calendar.
 func (h *SchedulingHandler) DeleteWorkCalendar(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	calendarIDStr := chi.URLParam(r, "calendarID")
-	calendarID, err := uuid.Parse(calendarIDStr)
+	calendarID, err := uuid.Parse(chi.URLParam(r, "calendarID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid calendar ID")
 		return
@@ -1384,7 +1407,6 @@ func (h *SchedulingHandler) DeleteWorkCalendar(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if err := h.schedulingService.DeleteWorkCalendar(ctx, calendarID, actorType, actorID, nil); err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1392,16 +1414,14 @@ func (h *SchedulingHandler) DeleteWorkCalendar(w http.ResponseWriter, r *http.Re
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Work calendar deleted successfully"})
 }
 
-// ListWorkCalendars lists all work calendars for a company.
 func (h *SchedulingHandler) ListWorkCalendars(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	companyID, ok := h.pathCompanyMatchesContext(w, r)
+	if !ok {
 		return
 	}
-	result, err := h.schedulingQueryService.GetWorkCalendarsByCompany(ctx, companyID)
+	locFilter := locationctx.Filter(ctx)
+	result, err := h.schedulingQueryService.GetWorkCalendarsByCompany(ctx, companyID, locFilter)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1409,11 +1429,9 @@ func (h *SchedulingHandler) ListWorkCalendars(w http.ResponseWriter, r *http.Req
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// GetCalendarAvailability returns working days and holidays for a calendar.
 func (h *SchedulingHandler) GetCalendarAvailability(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	calendarIDStr := chi.URLParam(r, "calendarID")
-	calendarID, err := uuid.Parse(calendarIDStr)
+	calendarID, err := uuid.Parse(chi.URLParam(r, "calendarID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid calendar ID")
 		return
@@ -1447,9 +1465,6 @@ func (h *SchedulingHandler) GetCalendarAvailability(w http.ResponseWriter, r *ht
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// ---- Schedule Template Handlers ----
-
-// CreateScheduleTemplate creates a new schedule template.
 func (h *SchedulingHandler) CreateScheduleTemplate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -1463,14 +1478,12 @@ func (h *SchedulingHandler) CreateScheduleTemplate(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var template models.ScheduleTemplate
 	if err := json.NewDecoder(r.Body).Decode(&template); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
 	template.CompanyID = companyID
-
 	result, err := h.schedulingService.CreateScheduleTemplate(ctx, &template, actorType, actorID, nil)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -1479,11 +1492,9 @@ func (h *SchedulingHandler) CreateScheduleTemplate(w http.ResponseWriter, r *htt
 	h.respondWithJSON(w, http.StatusCreated, result)
 }
 
-// GetScheduleTemplate returns a schedule template by ID.
 func (h *SchedulingHandler) GetScheduleTemplate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	templateIDStr := chi.URLParam(r, "templateID")
-	templateID, err := uuid.Parse(templateIDStr)
+	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid template ID")
 		return
@@ -1496,11 +1507,9 @@ func (h *SchedulingHandler) GetScheduleTemplate(w http.ResponseWriter, r *http.R
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// UpdateScheduleTemplate updates an existing schedule template.
 func (h *SchedulingHandler) UpdateScheduleTemplate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	templateIDStr := chi.URLParam(r, "templateID")
-	templateID, err := uuid.Parse(templateIDStr)
+	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid template ID")
 		return
@@ -1511,13 +1520,11 @@ func (h *SchedulingHandler) UpdateScheduleTemplate(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var update scheduling.ScheduleTemplateUpdate
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
-
 	result, err := h.schedulingService.UpdateScheduleTemplate(ctx, templateID, update, actorType, actorID, nil)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -1526,11 +1533,9 @@ func (h *SchedulingHandler) UpdateScheduleTemplate(w http.ResponseWriter, r *htt
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// DeleteScheduleTemplate deletes a schedule template.
 func (h *SchedulingHandler) DeleteScheduleTemplate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	templateIDStr := chi.URLParam(r, "templateID")
-	templateID, err := uuid.Parse(templateIDStr)
+	templateID, err := uuid.Parse(chi.URLParam(r, "templateID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid template ID")
 		return
@@ -1541,7 +1546,6 @@ func (h *SchedulingHandler) DeleteScheduleTemplate(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if err := h.schedulingService.DeleteScheduleTemplate(ctx, templateID, actorType, actorID, nil); err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1549,25 +1553,21 @@ func (h *SchedulingHandler) DeleteScheduleTemplate(w http.ResponseWriter, r *htt
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Schedule template deleted successfully"})
 }
 
-// ListScheduleTemplates lists all schedule templates for a company.
 func (h *SchedulingHandler) ListScheduleTemplates(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	companyID, ok := h.pathCompanyMatchesContext(w, r)
+	if !ok {
 		return
 	}
 	activeOnly := r.URL.Query().Get("active_only") != "false"
-	result, err := h.schedulingQueryService.GetScheduleTemplatesByCompany(ctx, companyID, activeOnly)
+	locFilter := locationctx.Filter(ctx)
+	result, err := h.schedulingQueryService.GetScheduleTemplatesByCompany(ctx, companyID, locFilter, activeOnly)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	h.respondWithJSON(w, http.StatusOK, result)
 }
-
-// ---- Schedule Instance Handlers ----
 
 type CreateScheduleInstanceRequest struct {
 	UserID             uuid.UUID                `json:"user_id"`
@@ -1577,7 +1577,6 @@ type CreateScheduleInstanceRequest struct {
 	Metadata           *models.InstanceMetadata `json:"metadata,omitempty"`
 }
 
-// CreateScheduleInstance manually creates a schedule instance.
 func (h *SchedulingHandler) CreateScheduleInstance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -1591,7 +1590,6 @@ func (h *SchedulingHandler) CreateScheduleInstance(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var req CreateScheduleInstanceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
@@ -1629,7 +1627,6 @@ func (h *SchedulingHandler) CreateScheduleInstance(w http.ResponseWriter, r *htt
 	h.respondWithJSON(w, http.StatusCreated, result)
 }
 
-// CreateScheduleInstanceFromPosition creates a schedule instance based on position resolution.
 func (h *SchedulingHandler) CreateScheduleInstanceFromPosition(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -1643,7 +1640,6 @@ func (h *SchedulingHandler) CreateScheduleInstanceFromPosition(w http.ResponseWr
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var req struct {
 		UserID   string `json:"user_id"`
 		Date     string `json:"date"`
@@ -1683,11 +1679,9 @@ func (h *SchedulingHandler) CreateScheduleInstanceFromPosition(w http.ResponseWr
 	h.respondWithJSON(w, http.StatusCreated, result)
 }
 
-// GetScheduleInstance returns a schedule instance by ID.
 func (h *SchedulingHandler) GetScheduleInstance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	instanceIDStr := chi.URLParam(r, "instanceID")
-	instanceID, err := uuid.Parse(instanceIDStr)
+	instanceID, err := uuid.Parse(chi.URLParam(r, "instanceID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid instance ID")
 		return
@@ -1700,11 +1694,9 @@ func (h *SchedulingHandler) GetScheduleInstance(w http.ResponseWriter, r *http.R
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// UpdateScheduleInstance updates a schedule instance (metadata only).
 func (h *SchedulingHandler) UpdateScheduleInstance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	instanceIDStr := chi.URLParam(r, "instanceID")
-	instanceID, err := uuid.Parse(instanceIDStr)
+	instanceID, err := uuid.Parse(chi.URLParam(r, "instanceID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid instance ID")
 		return
@@ -1715,7 +1707,6 @@ func (h *SchedulingHandler) UpdateScheduleInstance(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var update scheduling.ScheduleInstanceUpdate
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
@@ -1729,11 +1720,9 @@ func (h *SchedulingHandler) UpdateScheduleInstance(w http.ResponseWriter, r *htt
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// DeleteScheduleInstance deletes a schedule instance.
 func (h *SchedulingHandler) DeleteScheduleInstance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	instanceIDStr := chi.URLParam(r, "instanceID")
-	instanceID, err := uuid.Parse(instanceIDStr)
+	instanceID, err := uuid.Parse(chi.URLParam(r, "instanceID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid instance ID")
 		return
@@ -1744,7 +1733,6 @@ func (h *SchedulingHandler) DeleteScheduleInstance(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if err := h.schedulingService.DeleteScheduleInstance(ctx, instanceID, actorType, actorID, nil); err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1752,13 +1740,10 @@ func (h *SchedulingHandler) DeleteScheduleInstance(w http.ResponseWriter, r *htt
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Schedule instance deleted successfully"})
 }
 
-// ListScheduleInstances lists schedule instances with various filters.
 func (h *SchedulingHandler) ListScheduleInstances(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	companyID, ok := h.pathCompanyMatchesContext(w, r)
+	if !ok {
 		return
 	}
 	userIDStr := r.URL.Query().Get("user_id")
@@ -1767,13 +1752,10 @@ func (h *SchedulingHandler) ListScheduleInstances(w http.ResponseWriter, r *http
 	workCenterCode := r.URL.Query().Get("work_center_code")
 	startDateStr := r.URL.Query().Get("start_date")
 	endDateStr := r.URL.Query().Get("end_date")
-
 	if startDateStr == "" || endDateStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "start_date and end_date are required")
 		return
 	}
-
-	// Determine timezone for date parsing
 	timezone := "UTC"
 	if userIDStr != "" {
 		userID, err := uuid.Parse(userIDStr)
@@ -1794,7 +1776,6 @@ func (h *SchedulingHandler) ListScheduleInstances(w http.ResponseWriter, r *http
 	} else {
 		timezone = h.getCompanyDefaultTimezone(ctx, companyID)
 	}
-
 	startDate, err := normalizeBusinessDateFromString(startDateStr, timezone)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid start date format")
@@ -1805,7 +1786,6 @@ func (h *SchedulingHandler) ListScheduleInstances(w http.ResponseWriter, r *http
 		h.respondWithError(w, http.StatusBadRequest, "Invalid end date format")
 		return
 	}
-
 	var result []*models.ScheduleInstance
 	switch {
 	case userIDStr != "":
@@ -1832,7 +1812,8 @@ func (h *SchedulingHandler) ListScheduleInstances(w http.ResponseWriter, r *http
 	case workCenterCode != "":
 		result, err = h.schedulingQueryService.GetScheduleInstancesByWorkCenter(ctx, companyID, workCenterCode, startDate, endDate)
 	default:
-		result, err = h.schedulingQueryService.GetScheduleInstancesByCompany(ctx, companyID, startDate, endDate)
+		locFilter := locationctx.Filter(ctx)
+		result, err = h.schedulingQueryService.GetScheduleInstancesByCompany(ctx, companyID, locFilter, startDate, endDate)
 	}
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -1840,8 +1821,6 @@ func (h *SchedulingHandler) ListScheduleInstances(w http.ResponseWriter, r *http
 	}
 	h.respondWithJSON(w, http.StatusOK, result)
 }
-
-// ---- Schedule Generation Handlers ----
 
 type GenerateScheduleRequest struct {
 	StartDate       string `json:"start_date"`
@@ -1852,13 +1831,16 @@ type GenerateScheduleRequest struct {
 	BatchSize       int    `json:"batch_size"`
 }
 
-// GenerateScheduleForUser generates schedule instances for a specific user.
 func (h *SchedulingHandler) GenerateScheduleForUser(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
+	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
+		return
+	}
+	companyID, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 	actorType := getSessionTypeFromContext(ctx)
@@ -1867,7 +1849,6 @@ func (h *SchedulingHandler) GenerateScheduleForUser(w http.ResponseWriter, r *ht
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var req GenerateScheduleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
@@ -1897,7 +1878,6 @@ func (h *SchedulingHandler) GenerateScheduleForUser(w http.ResponseWriter, r *ht
 	if req.BatchSize <= 0 {
 		req.BatchSize = 100
 	}
-
 	config := scheduling.ScheduleGenerationConfig{
 		StartDate:       startDate,
 		EndDate:         endDate,
@@ -1906,7 +1886,7 @@ func (h *SchedulingHandler) GenerateScheduleForUser(w http.ResponseWriter, r *ht
 		Overwrite:       req.Overwrite,
 		BatchSize:       req.BatchSize,
 	}
-	result, err := h.schedulingService.GenerateScheduleForUser(ctx, userID, config, actorType, actorID)
+	result, err := h.schedulingService.GenerateScheduleForUser(ctx, companyID, userID, config, actorType, actorID)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1918,13 +1898,10 @@ func (h *SchedulingHandler) GenerateScheduleForUser(w http.ResponseWriter, r *ht
 	})
 }
 
-// GenerateScheduleForCompany generates schedule instances for all employees in a company.
 func (h *SchedulingHandler) GenerateScheduleForCompany(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	companyID, ok := h.pathCompanyMatchesContext(w, r)
+	if !ok {
 		return
 	}
 	actorType := getSessionTypeFromContext(ctx)
@@ -1933,7 +1910,6 @@ func (h *SchedulingHandler) GenerateScheduleForCompany(w http.ResponseWriter, r 
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var req GenerateScheduleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
@@ -1983,8 +1959,6 @@ func (h *SchedulingHandler) GenerateScheduleForCompany(w http.ResponseWriter, r 
 	})
 }
 
-// ---- Schedule Override Handlers ----
-
 type CreateScheduleOverrideRequest struct {
 	UserID       uuid.UUID `json:"user_id"`
 	OverrideDate string    `json:"override_date"`
@@ -1992,7 +1966,6 @@ type CreateScheduleOverrideRequest struct {
 	Reason       *string   `json:"reason,omitempty"`
 }
 
-// CreateScheduleOverride creates a schedule override for a user.
 func (h *SchedulingHandler) CreateScheduleOverride(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -2006,7 +1979,6 @@ func (h *SchedulingHandler) CreateScheduleOverride(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var req CreateScheduleOverrideRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
@@ -2026,7 +1998,6 @@ func (h *SchedulingHandler) CreateScheduleOverride(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusBadRequest, "override_date must be in YYYY-MM-DD format")
 		return
 	}
-	// Check if override already exists
 	existing, _ := h.schedulingQueryService.GetScheduleOverrideByUserDate(ctx, req.UserID, overrideDate)
 	if existing != nil {
 		h.respondWithError(w, http.StatusConflict, "Schedule override already exists for this date")
@@ -2050,25 +2021,20 @@ func (h *SchedulingHandler) CreateScheduleOverride(w http.ResponseWriter, r *htt
 	h.respondWithJSON(w, http.StatusCreated, result)
 }
 
-// GetScheduleOverrides returns schedule overrides for a user or company.
 func (h *SchedulingHandler) GetScheduleOverrides(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	companyID, ok := h.pathCompanyMatchesContext(w, r)
+	if !ok {
 		return
 	}
 	userIDStr := r.URL.Query().Get("user_id")
 	startDateStr := r.URL.Query().Get("start_date")
 	endDateStr := r.URL.Query().Get("end_date")
 	overrideType := r.URL.Query().Get("override_type")
-
 	if startDateStr == "" || endDateStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "start_date and end_date are required")
 		return
 	}
-	// Determine timezone
 	timezone := "UTC"
 	if userIDStr != "" {
 		userID, err := uuid.Parse(userIDStr)
@@ -2090,7 +2056,6 @@ func (h *SchedulingHandler) GetScheduleOverrides(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusBadRequest, "Invalid end date format")
 		return
 	}
-
 	var overrideTypePtr *string
 	if overrideType != "" {
 		overrideTypePtr = &overrideType
@@ -2103,21 +2068,23 @@ func (h *SchedulingHandler) GetScheduleOverrides(w http.ResponseWriter, r *http.
 			return
 		}
 		result, err = h.schedulingQueryService.GetScheduleOverridesByUser(ctx, userID, startDate, endDate, overrideTypePtr)
+		if err != nil {
+			h.respondWithError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	} else {
 		result, err = h.schedulingQueryService.GetScheduleOverridesByCompany(ctx, companyID, startDate, endDate, overrideTypePtr)
-	}
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
-		return
+		if err != nil {
+			h.respondWithError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// GetScheduleOverrideByID returns a specific override.
 func (h *SchedulingHandler) GetScheduleOverrideByID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	overrideIDStr := chi.URLParam(r, "overrideID")
-	overrideID, err := uuid.Parse(overrideIDStr)
+	overrideID, err := uuid.Parse(chi.URLParam(r, "overrideID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid override ID")
 		return
@@ -2130,11 +2097,9 @@ func (h *SchedulingHandler) GetScheduleOverrideByID(w http.ResponseWriter, r *ht
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// UpdateScheduleOverride updates an existing override.
 func (h *SchedulingHandler) UpdateScheduleOverride(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	overrideIDStr := chi.URLParam(r, "overrideID")
-	overrideID, err := uuid.Parse(overrideIDStr)
+	overrideID, err := uuid.Parse(chi.URLParam(r, "overrideID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid override ID")
 		return
@@ -2145,13 +2110,11 @@ func (h *SchedulingHandler) UpdateScheduleOverride(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var update scheduling.ScheduleOverrideUpdate
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
-	// Validate override type if provided
 	if update.OverrideType != nil && *update.OverrideType != "" {
 		valid := map[string]bool{"off": true, "force_work": true, "holiday_override": true}
 		if !valid[*update.OverrideType] {
@@ -2167,11 +2130,9 @@ func (h *SchedulingHandler) UpdateScheduleOverride(w http.ResponseWriter, r *htt
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// DeleteScheduleOverride deletes an override.
 func (h *SchedulingHandler) DeleteScheduleOverride(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	overrideIDStr := chi.URLParam(r, "overrideID")
-	overrideID, err := uuid.Parse(overrideIDStr)
+	overrideID, err := uuid.Parse(chi.URLParam(r, "overrideID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid override ID")
 		return
@@ -2189,15 +2150,10 @@ func (h *SchedulingHandler) DeleteScheduleOverride(w http.ResponseWriter, r *htt
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Schedule override deleted successfully"})
 }
 
-// ---- Work Center Handlers ----
-
-// GetWorkCenter returns a work center by code.
 func (h *SchedulingHandler) GetWorkCenter(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	companyID, ok := h.pathCompanyMatchesContext(w, r)
+	if !ok {
 		return
 	}
 	workCenterCode := chi.URLParam(r, "workCenterCode")
@@ -2209,13 +2165,10 @@ func (h *SchedulingHandler) GetWorkCenter(w http.ResponseWriter, r *http.Request
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// ListWorkCenters lists work centers for a company.
 func (h *SchedulingHandler) ListWorkCenters(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	companyID, ok := h.pathCompanyMatchesContext(w, r)
+	if !ok {
 		return
 	}
 	activeOnly := r.URL.Query().Get("active_only") != "false"
@@ -2227,13 +2180,10 @@ func (h *SchedulingHandler) ListWorkCenters(w http.ResponseWriter, r *http.Reque
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// GetWorkCenterShifts returns the active shift mapping for a work center.
 func (h *SchedulingHandler) GetWorkCenterShifts(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	companyID, ok := h.pathCompanyMatchesContext(w, r)
+	if !ok {
 		return
 	}
 	workCenterCode := r.URL.Query().Get("work_center_code")
@@ -2265,9 +2215,6 @@ func (h *SchedulingHandler) GetWorkCenterShifts(w http.ResponseWriter, r *http.R
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// ---- Work Center Shift Mapping Handlers ----
-
-// CreateWorkCenterShiftMapping creates a new work center shift mapping.
 func (h *SchedulingHandler) CreateWorkCenterShiftMapping(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -2281,7 +2228,6 @@ func (h *SchedulingHandler) CreateWorkCenterShiftMapping(w http.ResponseWriter, 
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var mapping models.WorkCenterShift
 	if err := json.NewDecoder(r.Body).Decode(&mapping); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
@@ -2295,7 +2241,6 @@ func (h *SchedulingHandler) CreateWorkCenterShiftMapping(w http.ResponseWriter, 
 	h.respondWithJSON(w, http.StatusCreated, map[string]string{"message": "Work center shift mapping created successfully"})
 }
 
-// UpdateWorkCenterShiftMapping updates an existing work center shift mapping by key.
 func (h *SchedulingHandler) UpdateWorkCenterShiftMapping(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -2309,7 +2254,6 @@ func (h *SchedulingHandler) UpdateWorkCenterShiftMapping(w http.ResponseWriter, 
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var req struct {
 		WorkCenterCode string    `json:"work_center_code"`
 		EffectiveTo    time.Time `json:"effective_to"`
@@ -2332,13 +2276,9 @@ func (h *SchedulingHandler) UpdateWorkCenterShiftMapping(w http.ResponseWriter, 
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Work center shift mapping updated successfully"})
 }
 
-// ---- Position & Assignment Handlers ----
-
-// GetUserScheduledPosition returns the position a user is scheduled for on a date.
 func (h *SchedulingHandler) GetUserScheduledPosition(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
+	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
 		return
@@ -2376,11 +2316,9 @@ func (h *SchedulingHandler) GetUserScheduledPosition(w http.ResponseWriter, r *h
 	h.respondWithJSON(w, http.StatusOK, response)
 }
 
-// GetUserCurrentAssignment returns the user's current work center assignment.
 func (h *SchedulingHandler) GetUserCurrentAssignment(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
+	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
 		return
@@ -2417,15 +2355,9 @@ func (h *SchedulingHandler) GetUserCurrentAssignment(w http.ResponseWriter, r *h
 	})
 }
 
-// ---- Holiday Handlers ----
-
-// AddHolidayToCalendar adds a holiday to an existing calendar.
 func (h *SchedulingHandler) AddHolidayToCalendar(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	_, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	if _, ok := h.pathCompanyMatchesContext(w, r); !ok {
 		return
 	}
 	actorType := getSessionTypeFromContext(ctx)
@@ -2434,7 +2366,6 @@ func (h *SchedulingHandler) AddHolidayToCalendar(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var req struct {
 		CalendarID uuid.UUID `json:"calendar_id"`
 		Date       string    `json:"date"`
@@ -2451,13 +2382,10 @@ func (h *SchedulingHandler) AddHolidayToCalendar(w http.ResponseWriter, r *http.
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Holiday added to calendar successfully"})
 }
 
-// ProcessHolidayForDate processes a holiday for a specific date (cancels schedules).
 func (h *SchedulingHandler) ProcessHolidayForDate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	companyID, ok := h.pathCompanyMatchesContext(w, r)
+	if !ok {
 		return
 	}
 	actorType := getSessionTypeFromContext(ctx)
@@ -2485,15 +2413,16 @@ func (h *SchedulingHandler) ProcessHolidayForDate(w http.ResponseWriter, r *http
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Holiday processed successfully"})
 }
 
-// ---- Stats & Query Handlers ----
-
 // GetScheduleStats returns aggregated scheduling statistics.
+//
+// FIX (Handler hygiene):
+//   - previously discarded the errors from normalizeBusinessDate, silently
+//     falling back to zero-value time.Time on a bad timezone.
+//   - path company is now asserted against the caller's company.
 func (h *SchedulingHandler) GetScheduleStats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	companyID, ok := h.pathCompanyMatchesContext(w, r)
+	if !ok {
 		return
 	}
 	startDateStr := r.URL.Query().Get("start_date")
@@ -2501,6 +2430,8 @@ func (h *SchedulingHandler) GetScheduleStats(w http.ResponseWriter, r *http.Requ
 	timezone := h.getCompanyDefaultTimezone(ctx, companyID)
 
 	var startDate, endDate time.Time
+	var err error
+
 	if startDateStr != "" {
 		startDate, err = normalizeBusinessDateFromString(startDateStr, timezone)
 		if err != nil {
@@ -2508,8 +2439,13 @@ func (h *SchedulingHandler) GetScheduleStats(w http.ResponseWriter, r *http.Requ
 			return
 		}
 	} else {
-		startDate, _ = normalizeBusinessDate(time.Now().AddDate(0, -1, 0), timezone)
+		startDate, err = normalizeBusinessDate(time.Now().AddDate(0, -1, 0), timezone)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "Invalid default start date")
+			return
+		}
 	}
+
 	if endDateStr != "" {
 		endDate, err = normalizeBusinessDateFromString(endDateStr, timezone)
 		if err != nil {
@@ -2517,9 +2453,15 @@ func (h *SchedulingHandler) GetScheduleStats(w http.ResponseWriter, r *http.Requ
 			return
 		}
 	} else {
-		endDate, _ = normalizeBusinessDate(time.Now(), timezone)
+		endDate, err = normalizeBusinessDate(time.Now(), timezone)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "Invalid default end date")
+			return
+		}
 	}
-	result, err := h.schedulingQueryService.GetScheduleStats(ctx, companyID, startDate, endDate)
+
+	locFilter := locationctx.Filter(ctx)
+	result, err := h.schedulingQueryService.GetScheduleStats(ctx, companyID, locFilter, startDate, endDate)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2527,7 +2469,6 @@ func (h *SchedulingHandler) GetScheduleStats(w http.ResponseWriter, r *http.Requ
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// CheckScheduleAvailability returns the expected start/end times for a user on a date.
 func (h *SchedulingHandler) CheckScheduleAvailability(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userIDParam := r.URL.Query().Get("user_id")
@@ -2572,7 +2513,6 @@ func (h *SchedulingHandler) CheckScheduleAvailability(w http.ResponseWriter, r *
 	})
 }
 
-// ValidateScheduleConflict checks if a proposed time range conflicts with existing schedules.
 func (h *SchedulingHandler) ValidateScheduleConflict(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userIDStr := r.URL.Query().Get("user_id")
@@ -2628,9 +2568,6 @@ func (h *SchedulingHandler) ValidateScheduleConflict(w http.ResponseWriter, r *h
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{"has_conflict": hasConflict})
 }
 
-// ---- Health Check ----
-
-// HealthCheck returns the health status of the scheduling service.
 func (h *SchedulingHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	if err := h.schedulingQueryService.HealthCheck(ctx); err != nil {
@@ -2639,8 +2576,6 @@ func (h *SchedulingHandler) HealthCheck(w http.ResponseWriter, r *http.Request) 
 	}
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"status": "healthy", "service": "scheduling"})
 }
-
-// ---- Response Helpers ----
 
 func (h *SchedulingHandler) respondWithJSON(w http.ResponseWriter, status int, payload interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -2658,7 +2593,6 @@ func (h *SchedulingHandler) respondWithError(w http.ResponseWriter, status int, 
 }
 
 
-
 ================================================================================
 FILE: ./handler/batch_failure_handler.go
 ================================================================================
@@ -2670,8 +2604,10 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"auth-service/internal/attendance/models"
 	"auth-service/internal/attendance/service/batch"
 )
 
@@ -2691,47 +2627,73 @@ func NewBatchFailureHandler(
 }
 
 // GET /attendance-device/batch/{batchRef}/failures
+//
+// Company scope is resolved from the request context:
+//   - device sessions → device_auth_context.CompanyID
+//   - admin sessions  → company_id context value
+//
+// Any other caller is rejected with 401.
 func (h *BatchFailureHandler) GetFailures(
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
 	ctx := r.Context()
 
-	batchRef := chi.URLParam(r, "batchRef")
-	if batchRef == "" {
-		http.Error(w, "batch_ref is required", http.StatusBadRequest)
+	var companyID uuid.UUID
+	if authCtx, ok := ctx.Value("device_auth_context").(*models.DeviceAuthContext); ok && authCtx != nil {
+		companyID = authCtx.CompanyID
+	} else if cid, err := getCompanyIDFromContext(ctx); err == nil {
+		companyID = cid
+	}
+	if companyID == uuid.Nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
 
-	failures, err := h.service.GetFailures(ctx, batchRef)
+	batchRef := chi.URLParam(r, "batchRef")
+	if batchRef == "" {
+		h.respondWithError(w, http.StatusBadRequest, "batch_ref is required")
+		return
+	}
+
+	failures, err := h.service.GetFailures(ctx, companyID, batchRef)
 	if err != nil {
 		h.logger.Error(
 			"failed to fetch attendance batch failures",
 			zap.String("batch_ref", batchRef),
+			zap.String("company_id", companyID.String()),
 			zap.Error(err),
 		)
-		http.Error(w, "failed to fetch failures", http.StatusInternalServerError)
+		h.respondWithError(w, http.StatusInternalServerError, "failed to fetch failures")
 		return
 	}
 
-	resp := map[string]interface{}{
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"batch_ref": batchRef,
 		"count":     len(failures),
 		"failures":  failures,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(resp)
+	})
 }
 
+func (h *BatchFailureHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		h.logger.Error("failed to encode response", zap.Error(err))
+	}
+}
+
+func (h *BatchFailureHandler) respondWithError(w http.ResponseWriter, status int, message string) {
+	h.respondWithJSON(w, status, map[string]interface{}{
+		"success": false,
+		"error":   message,
+	})
+}
 
 
 ================================================================================
 FILE: ./handler/device_handler.go
 ================================================================================
-
-// internal/attendance/handler/device_handler.go
 
 package handler
 
@@ -2756,7 +2718,6 @@ import (
 	"auth-service/internal/infrastructure/audit"
 )
 
-// DeviceHandler handles HTTP requests for attendance device management.
 type DeviceHandler struct {
 	deviceService       device.DeviceService
 	attendanceSourceSvc source.SourceAdminService
@@ -2764,7 +2725,6 @@ type DeviceHandler struct {
 	logger              *zap.Logger
 }
 
-// NewDeviceHandler creates a new DeviceHandler.
 func NewDeviceHandler(
 	deviceService device.DeviceService,
 	attendanceSourceSvc source.SourceAdminService,
@@ -2779,7 +2739,6 @@ func NewDeviceHandler(
 	}
 }
 
-// Request/response DTOs
 type DeviceRequest struct {
 	SourceType     string                 `json:"source_type"`
 	DeviceCode     string                 `json:"device_code"`
@@ -2787,7 +2746,7 @@ type DeviceRequest struct {
 	Manufacturer   *string                `json:"manufacturer,omitempty"`
 	Model          *string                `json:"model,omitempty"`
 	WorkCenterCode *string                `json:"work_center_code,omitempty"`
-	LocationID     *uuid.UUID             `json:"location_id,omitempty"`
+	GeofenceID     *uuid.UUID             `json:"geofence_id,omitempty"`
 	IPAddress      *string                `json:"ip_address,omitempty"`
 	MacAddress     *string                `json:"mac_address,omitempty"`
 	IsActive       *bool                  `json:"is_active,omitempty"`
@@ -2804,7 +2763,7 @@ type DeviceResponse struct {
 	Manufacturer   *string                `json:"manufacturer,omitempty"`
 	Model          *string                `json:"model,omitempty"`
 	WorkCenterCode *string                `json:"work_center_code,omitempty"`
-	LocationID     *uuid.UUID             `json:"location_id,omitempty"`
+	GeofenceID     *uuid.UUID             `json:"geofence_id,omitempty"`
 	IPAddress      *string                `json:"ip_address,omitempty"`
 	MacAddress     *string                `json:"mac_address,omitempty"`
 	IsActive       bool                   `json:"is_active"`
@@ -2815,15 +2774,22 @@ type DeviceResponse struct {
 	CreatedAt      time.Time              `json:"created_at"`
 }
 
-type DeviceListResponse struct {
-	Devices    []DeviceResponse `json:"devices"`
-	Total      int              `json:"total"`
-	Page       int              `json:"page"`
-	PageSize   int              `json:"page_size"`
-	TotalPages int              `json:"total_pages"`
+// deviceUUID parses a device_id string into a UUID for audit purposes.
+// Device IDs are generated as UUID strings (see CreateDevice), so parse
+// failures are logged and returned as uuid.Nil rather than aborting.
+func (h *DeviceHandler) deviceUUID(deviceID string, logger *zap.Logger) uuid.UUID {
+	id, err := uuid.Parse(deviceID)
+	if err != nil {
+		if logger != nil {
+			logger.Warn("device_id is not a UUID; audit will use uuid.Nil",
+				zap.String("device_id", deviceID),
+				zap.Error(err))
+		}
+		return uuid.Nil
+	}
+	return id
 }
 
-// panic recovery helper
 func (h *DeviceHandler) panicRecovery(w http.ResponseWriter, method string) {
 	if r := recover(); r != nil {
 		h.logger.Error("panic recovered in DeviceHandler",
@@ -2835,37 +2801,38 @@ func (h *DeviceHandler) panicRecovery(w http.ResponseWriter, method string) {
 	}
 }
 
-// CreateDevice registers a new attendance device.
 func (h *DeviceHandler) CreateDevice(w http.ResponseWriter, r *http.Request) {
 	defer h.panicRecovery(w, "CreateDevice")
 	startTime := time.Now()
 	ctx := r.Context()
-
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
-
+	ctxCompany, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if !assertPathCompany(w, ctxCompany, companyID, h.logger) {
+		return
+	}
 	actorType, actorID, err := h.getActorInfo(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
-
 	if actorType != "admin" {
 		h.respondWithError(w, http.StatusForbidden, "only admins can manage devices")
 		return
 	}
-
 	var req DeviceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
-
-	// Validation
 	if req.SourceType == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Source type is required")
 		return
@@ -2884,24 +2851,20 @@ func (h *DeviceHandler) CreateDevice(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
-	// Ensure attendance source exists (hybrid core)
 	_, err = h.attendanceSourceSvc.CreateSource(
 		ctx,
 		companyID,
 		req.SourceType,
-		"", // default name
+		"",
 		&actorID,
 	)
 	if err != nil && !strings.Contains(err.Error(), "already exists") {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
-	// Build device
 	deviceID := uuid.New().String()
 	metadata := map[string]interface{}{
-		"ip_address":     r.RemoteAddr,
+		"ip_address":     clientIP(r),
 		"user_agent":     r.UserAgent(),
 		"endpoint":       r.URL.Path,
 		"request_method": r.Method,
@@ -2912,8 +2875,7 @@ func (h *DeviceHandler) CreateDevice(w http.ResponseWriter, r *http.Request) {
 	if req.DeviceName != nil {
 		metadata["device_name"] = *req.DeviceName
 	}
-
-	device := &models.AttendanceDevice{
+	dev := &models.AttendanceDevice{
 		DeviceID:       deviceID,
 		CompanyID:      companyID,
 		SourceType:     req.SourceType,
@@ -2922,24 +2884,22 @@ func (h *DeviceHandler) CreateDevice(w http.ResponseWriter, r *http.Request) {
 		Manufacturer:   req.Manufacturer,
 		Model:          req.Model,
 		WorkCenterCode: req.WorkCenterCode,
-		LocationID:     req.LocationID,
+		GeofenceID:     req.GeofenceID,
 		IPAddress:      req.IPAddress,
 		MacAddress:     req.MacAddress,
 		Metadata:       req.Metadata,
 		IsTrusted:      false,
 	}
 	if req.IsActive != nil {
-		device.IsActive = *req.IsActive
+		dev.IsActive = *req.IsActive
 	} else {
-		device.IsActive = true
+		dev.IsActive = true
 	}
 	if req.InstalledAt != nil {
-		device.InstalledAt = req.InstalledAt
+		dev.InstalledAt = req.InstalledAt
 	}
-
-	afterState, _ := json.Marshal(device)
-
-	if err := h.deviceService.RegisterDevice(ctx, device); err != nil {
+	afterState, _ := json.Marshal(dev)
+	if err := h.deviceService.RegisterDevice(ctx, dev); err != nil {
 		statusCode := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "already exists") {
 			statusCode = http.StatusConflict
@@ -2954,25 +2914,14 @@ func (h *DeviceHandler) CreateDevice(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, statusCode, err.Error())
 		return
 	}
-
 	if h.auditService != nil {
+		entityUUID := h.deviceUUID(deviceID, h.logger)
 		_ = h.auditService.LogAction(
-			ctx,
-			nil,
-			&companyID,
-			"device",
-			"create",
-			"device",
-			nil,
-			actorType,
-			&actorID,
-			nil,
-			afterState,
-			metadata,
+			ctx, nil, &companyID, "device", "create", "device",
+			&entityUUID, actorType, &actorID, nil, afterState, metadata,
 		)
 	}
-
-	response := h.buildDeviceResponse(device)
+	response := h.buildDeviceResponse(dev)
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
 		"data":    response,
@@ -2983,16 +2932,22 @@ func (h *DeviceHandler) CreateDevice(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GetDevice returns a specific device.
 func (h *DeviceHandler) GetDevice(w http.ResponseWriter, r *http.Request) {
 	defer h.panicRecovery(w, "GetDevice")
 	startTime := time.Now()
 	ctx := r.Context()
-
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+	ctxCompany, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if !assertPathCompany(w, ctxCompany, companyID, h.logger) {
 		return
 	}
 	deviceID := chi.URLParam(r, "deviceID")
@@ -3000,8 +2955,7 @@ func (h *DeviceHandler) GetDevice(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Device ID is required")
 		return
 	}
-
-	device, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
+	dev, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
 	if err != nil {
 		if errors.Is(err, repository.ErrDeviceNotFound) {
 			h.respondWithError(w, http.StatusNotFound, "Device not found")
@@ -3015,12 +2969,11 @@ func (h *DeviceHandler) GetDevice(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve device")
 		return
 	}
-	if device == nil {
+	if dev == nil {
 		h.respondWithError(w, http.StatusNotFound, "Device not found")
 		return
 	}
-
-	response := h.buildDeviceResponse(device)
+	response := h.buildDeviceResponse(dev)
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    response,
@@ -3030,16 +2983,22 @@ func (h *DeviceHandler) GetDevice(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// UpdateDevice updates an existing device.
 func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 	defer h.panicRecovery(w, "UpdateDevice")
 	startTime := time.Now()
 	ctx := r.Context()
-
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+	ctxCompany, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if !assertPathCompany(w, ctxCompany, companyID, h.logger) {
 		return
 	}
 	deviceID := chi.URLParam(r, "deviceID")
@@ -3047,7 +3006,6 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Device ID is required")
 		return
 	}
-
 	actorType, actorID, err := h.getActorInfo(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
@@ -3057,7 +3015,6 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusForbidden, "only admins can manage devices")
 		return
 	}
-
 	existingDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
 	if err != nil {
 		if errors.Is(err, repository.ErrDeviceNotFound) {
@@ -3075,21 +3032,18 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusNotFound, "Device not found")
 		return
 	}
-
 	var req DeviceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
-
 	if req.SourceType == "" && req.DeviceCode == "" && req.DeviceName == nil &&
 		req.Manufacturer == nil && req.Model == nil && req.WorkCenterCode == nil &&
-		req.LocationID == nil && req.IPAddress == nil && req.MacAddress == nil &&
+		req.GeofenceID == nil && req.IPAddress == nil && req.MacAddress == nil &&
 		req.IsActive == nil && req.InstalledAt == nil && req.Metadata == nil {
 		h.respondWithError(w, http.StatusBadRequest, "No update fields provided")
 		return
 	}
-
 	if req.SourceType != "" && req.SourceType != existingDevice.SourceType {
 		h.respondWithError(w, http.StatusBadRequest, "source_type cannot be changed")
 		return
@@ -3104,16 +3058,14 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
 	metadata := map[string]interface{}{
-		"ip_address":     r.RemoteAddr,
+		"ip_address":     clientIP(r),
 		"user_agent":     r.UserAgent(),
 		"endpoint":       r.URL.Path,
 		"request_method": r.Method,
 		"device_id":      deviceID,
 	}
-
-	device := &models.AttendanceDevice{
+	dev := &models.AttendanceDevice{
 		DeviceID:       deviceID,
 		CompanyID:      companyID,
 		SourceType:     existingDevice.SourceType,
@@ -3122,56 +3074,52 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 		Manufacturer:   req.Manufacturer,
 		Model:          req.Model,
 		WorkCenterCode: req.WorkCenterCode,
-		LocationID:     req.LocationID,
+		GeofenceID:     req.GeofenceID,
 		IPAddress:      req.IPAddress,
 		MacAddress:     req.MacAddress,
 		Metadata:       req.Metadata,
 	}
-
-	// Preserve existing values for omitted fields
 	if req.DeviceCode == "" {
-		device.DeviceCode = existingDevice.DeviceCode
+		dev.DeviceCode = existingDevice.DeviceCode
 	}
 	if req.DeviceName == nil {
-		device.DeviceName = existingDevice.DeviceName
+		dev.DeviceName = existingDevice.DeviceName
 	}
 	if req.Manufacturer == nil {
-		device.Manufacturer = existingDevice.Manufacturer
+		dev.Manufacturer = existingDevice.Manufacturer
 	}
 	if req.Model == nil {
-		device.Model = existingDevice.Model
+		dev.Model = existingDevice.Model
 	}
 	if req.WorkCenterCode == nil {
-		device.WorkCenterCode = existingDevice.WorkCenterCode
+		dev.WorkCenterCode = existingDevice.WorkCenterCode
 	}
-	if req.LocationID == nil {
-		device.LocationID = existingDevice.LocationID
+	if req.GeofenceID == nil {
+		dev.GeofenceID = existingDevice.GeofenceID
 	}
 	if req.IPAddress == nil {
-		device.IPAddress = existingDevice.IPAddress
+		dev.IPAddress = existingDevice.IPAddress
 	}
 	if req.MacAddress == nil {
-		device.MacAddress = existingDevice.MacAddress
+		dev.MacAddress = existingDevice.MacAddress
 	}
 	if req.Metadata == nil {
-		device.Metadata = existingDevice.Metadata
+		dev.Metadata = existingDevice.Metadata
 	}
 	if req.IsActive != nil {
-		device.IsActive = *req.IsActive
+		dev.IsActive = *req.IsActive
 	} else {
-		device.IsActive = existingDevice.IsActive
+		dev.IsActive = existingDevice.IsActive
 	}
-	device.IsTrusted = existingDevice.IsTrusted
+	dev.IsTrusted = existingDevice.IsTrusted
 	if req.InstalledAt != nil {
-		device.InstalledAt = req.InstalledAt
+		dev.InstalledAt = req.InstalledAt
 	} else {
-		device.InstalledAt = existingDevice.InstalledAt
+		dev.InstalledAt = existingDevice.InstalledAt
 	}
-
 	beforeState, _ := json.Marshal(existingDevice)
-	afterState, _ := json.Marshal(device)
-
-	if err := h.deviceService.UpdateDevice(ctx, device); err != nil {
+	afterState, _ := json.Marshal(dev)
+	if err := h.deviceService.UpdateDevice(ctx, dev); err != nil {
 		statusCode := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "not found") {
 			statusCode = http.StatusNotFound
@@ -3183,23 +3131,13 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, statusCode, err.Error())
 		return
 	}
-
-	entityUUID := uuid.Nil
-	_ = h.auditService.LogAction(
-		ctx,
-		nil,
-		&companyID,
-		"device",
-		"update",
-		"device",
-		&entityUUID,
-		actorType,
-		&actorID,
-		beforeState,
-		afterState,
-		metadata,
-	)
-
+	if h.auditService != nil {
+		entityUUID := h.deviceUUID(deviceID, h.logger)
+		_ = h.auditService.LogAction(
+			ctx, nil, &companyID, "device", "update", "device",
+			&entityUUID, actorType, &actorID, beforeState, afterState, metadata,
+		)
+	}
 	updatedDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
 	if err != nil {
 		h.logger.Error("Failed to get updated device",
@@ -3213,7 +3151,6 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusNotFound, "Device not found after update")
 		return
 	}
-
 	response := h.buildDeviceResponse(updatedDevice)
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -3225,16 +3162,22 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// DeleteDevice deactivates a device.
 func (h *DeviceHandler) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 	defer h.panicRecovery(w, "DeleteDevice")
 	startTime := time.Now()
 	ctx := r.Context()
-
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+	ctxCompany, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if !assertPathCompany(w, ctxCompany, companyID, h.logger) {
 		return
 	}
 	deviceID := chi.URLParam(r, "deviceID")
@@ -3242,7 +3185,6 @@ func (h *DeviceHandler) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Device ID is required")
 		return
 	}
-
 	actorType, actorID, err := h.getActorInfo(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
@@ -3252,7 +3194,6 @@ func (h *DeviceHandler) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusForbidden, "only admins can manage devices")
 		return
 	}
-
 	existingDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
 	if err != nil {
 		if errors.Is(err, repository.ErrDeviceNotFound) || strings.Contains(err.Error(), "not found") {
@@ -3270,9 +3211,8 @@ func (h *DeviceHandler) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusNotFound, "Device not found")
 		return
 	}
-
 	metadata := map[string]interface{}{
-		"ip_address":     r.RemoteAddr,
+		"ip_address":     clientIP(r),
 		"user_agent":     r.UserAgent(),
 		"endpoint":       r.URL.Path,
 		"request_method": r.Method,
@@ -3281,7 +3221,6 @@ func (h *DeviceHandler) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 		"source_type":    existingDevice.SourceType,
 	}
 	beforeState, _ := json.Marshal(existingDevice)
-
 	if err := h.deviceService.DeleteDevice(ctx, companyID, deviceID); err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			h.respondWithError(w, http.StatusNotFound, "Device not found")
@@ -3294,23 +3233,13 @@ func (h *DeviceHandler) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-
-	entityUUID := uuid.Nil
-	_ = h.auditService.LogAction(
-		ctx,
-		nil,
-		&companyID,
-		"device",
-		"delete",
-		"device",
-		&entityUUID,
-		actorType,
-		&actorID,
-		beforeState,
-		nil,
-		metadata,
-	)
-
+	if h.auditService != nil {
+		entityUUID := h.deviceUUID(deviceID, h.logger)
+		_ = h.auditService.LogAction(
+			ctx, nil, &companyID, "device", "delete", "device",
+			&entityUUID, actorType, &actorID, beforeState, nil, metadata,
+		)
+	}
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "Device deleted successfully",
@@ -3320,19 +3249,24 @@ func (h *DeviceHandler) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ListDevices lists devices with pagination and filters.
 func (h *DeviceHandler) ListDevices(w http.ResponseWriter, r *http.Request) {
 	defer h.panicRecovery(w, "ListDevices")
 	startTime := time.Now()
 	ctx := r.Context()
-
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
-
+	ctxCompany, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if !assertPathCompany(w, ctxCompany, companyID, h.logger) {
+		return
+	}
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	if page < 1 {
 		page = 1
@@ -3341,21 +3275,19 @@ func (h *DeviceHandler) ListDevices(w http.ResponseWriter, r *http.Request) {
 	if pageSize < 1 || pageSize > 100 {
 		pageSize = 50
 	}
-
 	filter := device.DeviceFilter{
 		Page:     page,
 		PageSize: pageSize,
 	}
-
 	if sourceType := r.URL.Query().Get("source_type"); sourceType != "" {
 		filter.SourceType = &sourceType
 	}
 	if workCenterCode := r.URL.Query().Get("work_center_code"); workCenterCode != "" {
 		filter.WorkCenterCode = &workCenterCode
 	}
-	if locationIDStr := r.URL.Query().Get("location_id"); locationIDStr != "" {
-		if locID, err := uuid.Parse(locationIDStr); err == nil {
-			filter.LocationID = &locID
+	if geofenceIDStr := r.URL.Query().Get("geofence_id"); geofenceIDStr != "" {
+		if gfID, err := uuid.Parse(geofenceIDStr); err == nil {
+			filter.GeofenceID = &gfID
 		}
 	}
 	if isActive := r.URL.Query().Get("is_active"); isActive != "" {
@@ -3373,7 +3305,6 @@ func (h *DeviceHandler) ListDevices(w http.ResponseWriter, r *http.Request) {
 			filter.IncludeInactive = include
 		}
 	}
-
 	devices, err := h.deviceService.ListDevices(ctx, companyID, filter)
 	if err != nil {
 		h.logger.Error("Failed to list devices",
@@ -3382,15 +3313,12 @@ func (h *DeviceHandler) ListDevices(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusInternalServerError, "Failed to list devices")
 		return
 	}
-
 	deviceResponses := make([]DeviceResponse, len(devices))
 	for i, d := range devices {
 		deviceResponses[i] = h.buildDeviceResponse(d)
 	}
-
 	total := len(devices)
 	totalPages := (total + pageSize - 1) / pageSize
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data": map[string]interface{}{
@@ -3408,16 +3336,22 @@ func (h *DeviceHandler) ListDevices(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ActivateDevice activates a device.
 func (h *DeviceHandler) ActivateDevice(w http.ResponseWriter, r *http.Request) {
 	defer h.panicRecovery(w, "ActivateDevice")
 	startTime := time.Now()
 	ctx := r.Context()
-
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+	ctxCompany, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if !assertPathCompany(w, ctxCompany, companyID, h.logger) {
 		return
 	}
 	deviceID := chi.URLParam(r, "deviceID")
@@ -3425,7 +3359,6 @@ func (h *DeviceHandler) ActivateDevice(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Device ID is required")
 		return
 	}
-
 	actorType, actorID, err := h.getActorInfo(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
@@ -3435,7 +3368,6 @@ func (h *DeviceHandler) ActivateDevice(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusForbidden, "only admins can manage devices")
 		return
 	}
-
 	existingDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
 	if err != nil {
 		if errors.Is(err, repository.ErrDeviceNotFound) || strings.Contains(err.Error(), "not found") {
@@ -3453,9 +3385,8 @@ func (h *DeviceHandler) ActivateDevice(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusNotFound, "Device not found")
 		return
 	}
-
 	metadata := map[string]interface{}{
-		"ip_address":     r.RemoteAddr,
+		"ip_address":     clientIP(r),
 		"user_agent":     r.UserAgent(),
 		"endpoint":       r.URL.Path,
 		"request_method": r.Method,
@@ -3463,7 +3394,6 @@ func (h *DeviceHandler) ActivateDevice(w http.ResponseWriter, r *http.Request) {
 		"device_code":    existingDevice.DeviceCode,
 	}
 	beforeState, _ := json.Marshal(existingDevice)
-
 	if err := h.deviceService.ActivateDevice(ctx, companyID, deviceID); err != nil {
 		statusCode := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "not found") {
@@ -3478,7 +3408,6 @@ func (h *DeviceHandler) ActivateDevice(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, statusCode, err.Error())
 		return
 	}
-
 	updatedDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
 	if err != nil {
 		h.logger.Error("Failed to get updated device after activation",
@@ -3492,24 +3421,14 @@ func (h *DeviceHandler) ActivateDevice(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusNotFound, "Device not found after activation")
 		return
 	}
-
 	afterState, _ := json.Marshal(updatedDevice)
-	entityUUID := uuid.Nil
-	_ = h.auditService.LogAction(
-		ctx,
-		nil,
-		&companyID,
-		"device",
-		"activate",
-		"device",
-		&entityUUID,
-		actorType,
-		&actorID,
-		beforeState,
-		afterState,
-		metadata,
-	)
-
+	if h.auditService != nil {
+		entityUUID := h.deviceUUID(deviceID, h.logger)
+		_ = h.auditService.LogAction(
+			ctx, nil, &companyID, "device", "activate", "device",
+			&entityUUID, actorType, &actorID, beforeState, afterState, metadata,
+		)
+	}
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "Device activated successfully",
@@ -3519,16 +3438,22 @@ func (h *DeviceHandler) ActivateDevice(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// DeactivateDevice deactivates a device.
 func (h *DeviceHandler) DeactivateDevice(w http.ResponseWriter, r *http.Request) {
 	defer h.panicRecovery(w, "DeactivateDevice")
 	startTime := time.Now()
 	ctx := r.Context()
-
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+	ctxCompany, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if !assertPathCompany(w, ctxCompany, companyID, h.logger) {
 		return
 	}
 	deviceID := chi.URLParam(r, "deviceID")
@@ -3536,7 +3461,6 @@ func (h *DeviceHandler) DeactivateDevice(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusBadRequest, "Device ID is required")
 		return
 	}
-
 	actorType, actorID, err := h.getActorInfo(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
@@ -3546,7 +3470,6 @@ func (h *DeviceHandler) DeactivateDevice(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusForbidden, "only admins can manage devices")
 		return
 	}
-
 	existingDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
 	if err != nil {
 		if errors.Is(err, repository.ErrDeviceNotFound) || strings.Contains(err.Error(), "not found") {
@@ -3564,9 +3487,8 @@ func (h *DeviceHandler) DeactivateDevice(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusNotFound, "Device not found")
 		return
 	}
-
 	metadata := map[string]interface{}{
-		"ip_address":     r.RemoteAddr,
+		"ip_address":     clientIP(r),
 		"user_agent":     r.UserAgent(),
 		"endpoint":       r.URL.Path,
 		"request_method": r.Method,
@@ -3574,7 +3496,6 @@ func (h *DeviceHandler) DeactivateDevice(w http.ResponseWriter, r *http.Request)
 		"device_code":    existingDevice.DeviceCode,
 	}
 	beforeState, _ := json.Marshal(existingDevice)
-
 	if err := h.deviceService.DeactivateDevice(ctx, companyID, deviceID); err != nil {
 		statusCode := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "not found") {
@@ -3589,7 +3510,6 @@ func (h *DeviceHandler) DeactivateDevice(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, statusCode, err.Error())
 		return
 	}
-
 	updatedDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
 	if err != nil {
 		h.logger.Error("Failed to get updated device after deactivation",
@@ -3603,24 +3523,14 @@ func (h *DeviceHandler) DeactivateDevice(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusNotFound, "Device not found after deactivation")
 		return
 	}
-
 	afterState, _ := json.Marshal(updatedDevice)
-	entityUUID := uuid.Nil
-	_ = h.auditService.LogAction(
-		ctx,
-		nil,
-		&companyID,
-		"device",
-		"deactivate",
-		"device",
-		&entityUUID,
-		actorType,
-		&actorID,
-		beforeState,
-		afterState,
-		metadata,
-	)
-
+	if h.auditService != nil {
+		entityUUID := h.deviceUUID(deviceID, h.logger)
+		_ = h.auditService.LogAction(
+			ctx, nil, &companyID, "device", "deactivate", "device",
+			&entityUUID, actorType, &actorID, beforeState, afterState, metadata,
+		)
+	}
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "Device deactivated successfully",
@@ -3630,16 +3540,22 @@ func (h *DeviceHandler) DeactivateDevice(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// MarkAsTrusted marks a device as trusted.
 func (h *DeviceHandler) MarkAsTrusted(w http.ResponseWriter, r *http.Request) {
 	defer h.panicRecovery(w, "MarkAsTrusted")
 	startTime := time.Now()
 	ctx := r.Context()
-
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+	ctxCompany, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if !assertPathCompany(w, ctxCompany, companyID, h.logger) {
 		return
 	}
 	deviceID := chi.URLParam(r, "deviceID")
@@ -3647,7 +3563,6 @@ func (h *DeviceHandler) MarkAsTrusted(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Device ID is required")
 		return
 	}
-
 	actorType, actorID, err := h.getActorInfo(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
@@ -3657,7 +3572,6 @@ func (h *DeviceHandler) MarkAsTrusted(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusForbidden, "only admins can manage devices")
 		return
 	}
-
 	existingDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
 	if err != nil {
 		if errors.Is(err, repository.ErrDeviceNotFound) || strings.Contains(err.Error(), "not found") {
@@ -3675,9 +3589,8 @@ func (h *DeviceHandler) MarkAsTrusted(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusNotFound, "Device not found")
 		return
 	}
-
 	metadata := map[string]interface{}{
-		"ip_address":     r.RemoteAddr,
+		"ip_address":     clientIP(r),
 		"user_agent":     r.UserAgent(),
 		"endpoint":       r.URL.Path,
 		"request_method": r.Method,
@@ -3685,7 +3598,6 @@ func (h *DeviceHandler) MarkAsTrusted(w http.ResponseWriter, r *http.Request) {
 		"device_code":    existingDevice.DeviceCode,
 	}
 	beforeState, _ := json.Marshal(existingDevice)
-
 	if err := h.deviceService.MarkAsTrusted(ctx, companyID, deviceID); err != nil {
 		statusCode := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "not found") {
@@ -3700,7 +3612,6 @@ func (h *DeviceHandler) MarkAsTrusted(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, statusCode, err.Error())
 		return
 	}
-
 	updatedDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
 	if err != nil {
 		h.logger.Error("Failed to get updated device after marking as trusted",
@@ -3714,24 +3625,14 @@ func (h *DeviceHandler) MarkAsTrusted(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusNotFound, "Device not found after marking as trusted")
 		return
 	}
-
 	afterState, _ := json.Marshal(updatedDevice)
-	entityUUID := uuid.Nil
-	_ = h.auditService.LogAction(
-		ctx,
-		nil,
-		&companyID,
-		"device",
-		"mark_trusted",
-		"device",
-		&entityUUID,
-		actorType,
-		&actorID,
-		beforeState,
-		afterState,
-		metadata,
-	)
-
+	if h.auditService != nil {
+		entityUUID := h.deviceUUID(deviceID, h.logger)
+		_ = h.auditService.LogAction(
+			ctx, nil, &companyID, "device", "mark_trusted", "device",
+			&entityUUID, actorType, &actorID, beforeState, afterState, metadata,
+		)
+	}
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "Device marked as trusted successfully",
@@ -3741,16 +3642,22 @@ func (h *DeviceHandler) MarkAsTrusted(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// RevokeTrust revokes trust from a device.
 func (h *DeviceHandler) RevokeTrust(w http.ResponseWriter, r *http.Request) {
 	defer h.panicRecovery(w, "RevokeTrust")
 	startTime := time.Now()
 	ctx := r.Context()
-
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+	ctxCompany, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if !assertPathCompany(w, ctxCompany, companyID, h.logger) {
 		return
 	}
 	deviceID := chi.URLParam(r, "deviceID")
@@ -3758,7 +3665,6 @@ func (h *DeviceHandler) RevokeTrust(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Device ID is required")
 		return
 	}
-
 	actorType, actorID, err := h.getActorInfo(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
@@ -3768,7 +3674,6 @@ func (h *DeviceHandler) RevokeTrust(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusForbidden, "only admins can manage devices")
 		return
 	}
-
 	existingDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
 	if err != nil {
 		if errors.Is(err, repository.ErrDeviceNotFound) || strings.Contains(err.Error(), "not found") {
@@ -3786,9 +3691,8 @@ func (h *DeviceHandler) RevokeTrust(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusNotFound, "Device not found")
 		return
 	}
-
 	metadata := map[string]interface{}{
-		"ip_address":     r.RemoteAddr,
+		"ip_address":     clientIP(r),
 		"user_agent":     r.UserAgent(),
 		"endpoint":       r.URL.Path,
 		"request_method": r.Method,
@@ -3796,7 +3700,6 @@ func (h *DeviceHandler) RevokeTrust(w http.ResponseWriter, r *http.Request) {
 		"device_code":    existingDevice.DeviceCode,
 	}
 	beforeState, _ := json.Marshal(existingDevice)
-
 	if err := h.deviceService.RevokeTrust(ctx, companyID, deviceID); err != nil {
 		statusCode := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "not found") {
@@ -3811,7 +3714,6 @@ func (h *DeviceHandler) RevokeTrust(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, statusCode, err.Error())
 		return
 	}
-
 	updatedDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
 	if err != nil {
 		h.logger.Error("Failed to get updated device after revoking trust",
@@ -3825,24 +3727,14 @@ func (h *DeviceHandler) RevokeTrust(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusNotFound, "Device not found after revoking trust")
 		return
 	}
-
 	afterState, _ := json.Marshal(updatedDevice)
-	entityUUID := uuid.Nil
-	_ = h.auditService.LogAction(
-		ctx,
-		nil,
-		&companyID,
-		"device",
-		"revoke_trust",
-		"device",
-		&entityUUID,
-		actorType,
-		&actorID,
-		beforeState,
-		afterState,
-		metadata,
-	)
-
+	if h.auditService != nil {
+		entityUUID := h.deviceUUID(deviceID, h.logger)
+		_ = h.auditService.LogAction(
+			ctx, nil, &companyID, "device", "revoke_trust", "device",
+			&entityUUID, actorType, &actorID, beforeState, afterState, metadata,
+		)
+	}
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "Device trust revoked successfully",
@@ -3852,19 +3744,24 @@ func (h *DeviceHandler) RevokeTrust(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GetDeviceStatistics returns device statistics.
 func (h *DeviceHandler) GetDeviceStatistics(w http.ResponseWriter, r *http.Request) {
 	defer h.panicRecovery(w, "GetDeviceStatistics")
 	startTime := time.Now()
 	ctx := r.Context()
-
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
-
+	ctxCompany, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if !assertPathCompany(w, ctxCompany, companyID, h.logger) {
+		return
+	}
 	stats, err := h.deviceService.GetDeviceStatistics(ctx, companyID)
 	if err != nil {
 		h.logger.Error("Failed to get device statistics",
@@ -3873,7 +3770,6 @@ func (h *DeviceHandler) GetDeviceStatistics(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusInternalServerError, "Failed to get device statistics")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    stats,
@@ -3883,7 +3779,6 @@ func (h *DeviceHandler) GetDeviceStatistics(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// HealthCheck returns the health status of the device service.
 func (h *DeviceHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	defer h.panicRecovery(w, "HealthCheck")
 	_ = r.Context()
@@ -3894,20 +3789,14 @@ func (h *DeviceHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Helper functions
-
 func (h *DeviceHandler) getActorInfo(ctx context.Context) (string, uuid.UUID, error) {
 	sessionType, ok := ctx.Value("session_type").(string)
 	if !ok {
 		return "", uuid.Nil, fmt.Errorf("session type not found in context")
 	}
-	userIDStr, ok := ctx.Value("user_id").(string)
-	if !ok {
-		return "", uuid.Nil, fmt.Errorf("user ID not found in context")
-	}
-	userID, err := uuid.Parse(userIDStr)
+	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
-		return "", uuid.Nil, fmt.Errorf("invalid user ID in context: %v", err)
+		return "", uuid.Nil, err
 	}
 	actorType := "user"
 	if sessionType == "admin" {
@@ -3916,32 +3805,32 @@ func (h *DeviceHandler) getActorInfo(ctx context.Context) (string, uuid.UUID, er
 	return actorType, userID, nil
 }
 
-func (h *DeviceHandler) buildDeviceResponse(device *models.AttendanceDevice) DeviceResponse {
-	if device == nil {
+func (h *DeviceHandler) buildDeviceResponse(dev *models.AttendanceDevice) DeviceResponse {
+	if dev == nil {
 		return DeviceResponse{}
 	}
 	var deviceNamePtr *string
-	if device.DeviceName != nil && *device.DeviceName != "" {
-		deviceNamePtr = device.DeviceName
+	if dev.DeviceName != nil && *dev.DeviceName != "" {
+		deviceNamePtr = dev.DeviceName
 	}
 	return DeviceResponse{
-		DeviceID:       device.DeviceID,
-		CompanyID:      device.CompanyID,
-		SourceType:     device.SourceType,
-		DeviceCode:     device.DeviceCode,
+		DeviceID:       dev.DeviceID,
+		CompanyID:      dev.CompanyID,
+		SourceType:     dev.SourceType,
+		DeviceCode:     dev.DeviceCode,
 		DeviceName:     deviceNamePtr,
-		Manufacturer:   device.Manufacturer,
-		Model:          device.Model,
-		WorkCenterCode: device.WorkCenterCode,
-		LocationID:     device.LocationID,
-		IPAddress:      device.IPAddress,
-		MacAddress:     device.MacAddress,
-		IsActive:       device.IsActive,
-		IsTrusted:      device.IsTrusted,
-		LastSeenAt:     device.LastSeenAt,
-		InstalledAt:    device.InstalledAt,
-		Metadata:       device.Metadata,
-		CreatedAt:      device.CreatedAt,
+		Manufacturer:   dev.Manufacturer,
+		Model:          dev.Model,
+		WorkCenterCode: dev.WorkCenterCode,
+		GeofenceID:     dev.GeofenceID,
+		IPAddress:      dev.IPAddress,
+		MacAddress:     dev.MacAddress,
+		IsActive:       dev.IsActive,
+		IsTrusted:      dev.IsTrusted,
+		LastSeenAt:     dev.LastSeenAt,
+		InstalledAt:    dev.InstalledAt,
+		Metadata:       dev.Metadata,
+		CreatedAt:      dev.CreatedAt,
 	}
 }
 
@@ -3960,7 +3849,6 @@ func (h *DeviceHandler) respondWithError(w http.ResponseWriter, statusCode int, 
 		"code":    statusCode,
 	})
 }
-
 
 
 ================================================================================
@@ -3987,6 +3875,7 @@ import (
 	"auth-service/internal/attendance/models"
 	"auth-service/internal/attendance/service/workcenter"
 	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/locationctx"
 )
 
 // WorkCenterHandler handles HTTP requests for work center management.
@@ -4015,11 +3904,12 @@ func NewWorkCenterHandler(
 // ---- Request/Response DTOs ----
 
 type CreateWorkCenterRequest struct {
-	WorkCenterCode string  `json:"work_center_code"`
-	Name           string  `json:"name"`
-	Description    *string `json:"description,omitempty"`
-	Timezone       string  `json:"timezone"`
-	IsActive       bool    `json:"is_active"`
+	WorkCenterCode string     `json:"work_center_code"`
+	LocationID     *uuid.UUID `json:"location_id,omitempty"` // 🆕
+	Name           string     `json:"name"`
+	Description    *string    `json:"description,omitempty"`
+	Timezone       string     `json:"timezone"`
+	IsActive       bool       `json:"is_active"`
 }
 
 type UpdateWorkCenterRequest struct {
@@ -4027,6 +3917,7 @@ type UpdateWorkCenterRequest struct {
 	Description *string `json:"description,omitempty"`
 	Timezone    *string `json:"timezone,omitempty"`
 	IsActive    *bool   `json:"is_active,omitempty"`
+	// NOTE: location_id is intentionally NOT updatable.
 }
 
 // ---- Handlers ----
@@ -4065,6 +3956,35 @@ func (h *WorkCenterHandler) CreateWorkCenter(w http.ResponseWriter, r *http.Requ
 		req.Timezone = "UTC"
 	}
 
+	// 🆕 Resolve the target location.
+	//    Prefer the body's location_id (client explicitly chose it),
+	//    fall back to the X-Location-ID header scope, else nil.
+	headerLocationID := locationctx.Filter(ctx)
+	targetLocationID := req.LocationID
+	if targetLocationID == nil {
+		targetLocationID = headerLocationID
+	}
+
+	// Log resolution for debugging
+	h.logger.Info("WorkCenter create — location resolution",
+		zap.String("company_id", companyID.String()),
+		zap.String("work_center_code", req.WorkCenterCode),
+		zap.Any("body_location_id", req.LocationID),
+		zap.Any("header_location_id", headerLocationID),
+		zap.Any("resolved_location_id", targetLocationID),
+	)
+
+	// Reject the write if the client is in "ALL" mode and didn't pick
+	// a specific location — the backend cannot guess one.
+	if targetLocationID == nil {
+		h.respondWithError(
+			w,
+			http.StatusBadRequest,
+			"location_id is required — select a specific location before creating a work center",
+		)
+		return
+	}
+
 	metadata := map[string]interface{}{
 		"ip_address":     r.RemoteAddr,
 		"user_agent":     r.UserAgent(),
@@ -4075,6 +3995,7 @@ func (h *WorkCenterHandler) CreateWorkCenter(w http.ResponseWriter, r *http.Requ
 	workCenter := &models.WorkCenter{
 		WorkCenterCode: req.WorkCenterCode,
 		CompanyID:      companyID,
+		LocationID:     targetLocationID, // 🆕 THIS WAS MISSING
 		Name:           req.Name,
 		Description:    req.Description,
 		Timezone:       req.Timezone,
@@ -4096,6 +4017,11 @@ func (h *WorkCenterHandler) CreateWorkCenter(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusInternalServerError, "Failed to create work center")
 		return
 	}
+
+	h.logger.Info("WorkCenter created",
+		zap.String("work_center_code", result.WorkCenterCode),
+		zap.Any("location_id", result.LocationID),
+	)
 
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
@@ -4275,6 +4201,7 @@ func (h *WorkCenterHandler) DeleteWorkCenter(w http.ResponseWriter, r *http.Requ
 	})
 }
 
+// ListWorkCenters — location scope read from X-Location-ID.
 func (h *WorkCenterHandler) ListWorkCenters(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	ctx := r.Context()
@@ -4294,7 +4221,9 @@ func (h *WorkCenterHandler) ListWorkCenters(w http.ResponseWriter, r *http.Reque
 		pageSize = 50
 	}
 
-	workCenters, totalCount, err := h.workCenterQueryService.ListWorkCenters(ctx, companyID, page, pageSize)
+	locFilter := locationctx.Filter(ctx)
+
+	workCenters, totalCount, err := h.workCenterQueryService.ListWorkCenters(ctx, companyID, locFilter, page, pageSize)
 	if err != nil {
 		h.logger.Error("Failed to list work centers",
 			zap.String("company_id", companyID.String()),
@@ -4320,6 +4249,7 @@ func (h *WorkCenterHandler) ListWorkCenters(w http.ResponseWriter, r *http.Reque
 	})
 }
 
+// SearchWorkCenters — location scope read from X-Location-ID.
 func (h *WorkCenterHandler) SearchWorkCenters(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	ctx := r.Context()
@@ -4352,7 +4282,9 @@ func (h *WorkCenterHandler) SearchWorkCenters(w http.ResponseWriter, r *http.Req
 		filters["work_center_code"] = code
 	}
 
-	workCenters, totalCount, err := h.workCenterQueryService.SearchWorkCenters(ctx, companyID, filters, page, pageSize)
+	locFilter := locationctx.Filter(ctx)
+
+	workCenters, totalCount, err := h.workCenterQueryService.SearchWorkCenters(ctx, companyID, locFilter, filters, page, pageSize)
 	if err != nil {
 		h.logger.Error("Failed to search work centers",
 			zap.String("company_id", companyID.String()),
@@ -4379,6 +4311,7 @@ func (h *WorkCenterHandler) SearchWorkCenters(w http.ResponseWriter, r *http.Req
 	})
 }
 
+// GetActiveWorkCenters — location scope read from X-Location-ID.
 func (h *WorkCenterHandler) GetActiveWorkCenters(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	ctx := r.Context()
@@ -4389,7 +4322,9 @@ func (h *WorkCenterHandler) GetActiveWorkCenters(w http.ResponseWriter, r *http.
 		return
 	}
 
-	workCenters, err := h.workCenterQueryService.GetActiveWorkCenters(ctx, companyID)
+	locFilter := locationctx.Filter(ctx)
+
+	workCenters, err := h.workCenterQueryService.GetActiveWorkCenters(ctx, companyID, locFilter)
 	if err != nil {
 		h.logger.Error("Failed to get active work centers",
 			zap.String("company_id", companyID.String()),
@@ -4465,11 +4400,12 @@ func (h *WorkCenterHandler) respondWithError(w http.ResponseWriter, status int, 
 
 
 
+
+
 ================================================================================
 FILE: ./handler/report_handler.go
 ================================================================================
 
-// internal/attendance/handler/report_handler.go
 package handler
 
 import (
@@ -4484,16 +4420,15 @@ import (
 
 	"auth-service/internal/attendance/service/query"
 	"auth-service/internal/attendance/service/report"
+	"auth-service/internal/locationctx"
 )
 
-// AttendanceReportHandler handles report generation and streaming.
 type AttendanceReportHandler struct {
 	reportService report.ReportService
 	queryService  query.QueryService
 	logger        *zap.Logger
 }
 
-// NewAttendanceReportHandler creates a new report handler.
 func NewAttendanceReportHandler(
 	reportService report.ReportService,
 	queryService query.QueryService,
@@ -4506,16 +4441,42 @@ func NewAttendanceReportHandler(
 	}
 }
 
-// GenerateReport generates a report (CSV or JSON) for events or summaries.
+// statusCapturingWriter wraps http.ResponseWriter and remembers whether
+// WriteHeader has already been called. The report handler uses it to detect
+// a partial-body situation where we can no longer set a 500.
+type statusCapturingWriter struct {
+	http.ResponseWriter
+	statusCode  int
+	wroteHeader bool
+}
+
+func (s *statusCapturingWriter) WriteHeader(code int) {
+	if !s.wroteHeader {
+		s.statusCode = code
+		s.wroteHeader = true
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusCapturingWriter) Write(p []byte) (int, error) {
+	if !s.wroteHeader {
+		s.statusCode = http.StatusOK
+		s.wroteHeader = true
+	}
+	return s.ResponseWriter.Write(p)
+}
+
+func (s *statusCapturingWriter) Header() http.Header {
+	return s.ResponseWriter.Header()
+}
+
 func (h *AttendanceReportHandler) GenerateReport(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
 	reportType := r.URL.Query().Get("type")
 	if reportType == "" {
 		reportType = "csv"
@@ -4524,13 +4485,11 @@ func (h *AttendanceReportHandler) GenerateReport(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusBadRequest, "unsupported report type, use 'csv' or 'json'")
 		return
 	}
-
 	startDate, endDate, err := parseDateRange(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	subjectType := r.URL.Query().Get("subject_type")
 	var subjectID *uuid.UUID
 	if v := r.URL.Query().Get("subject_id"); v != "" {
@@ -4541,9 +4500,7 @@ func (h *AttendanceReportHandler) GenerateReport(w http.ResponseWriter, r *http.
 		}
 		subjectID = &id
 	}
-
 	includeEvents := r.URL.Query().Get("include_events") == "true"
-
 	req := &report.ReportRequest{
 		CompanyID:     companyID,
 		SubjectType:   &subjectType,
@@ -4552,8 +4509,8 @@ func (h *AttendanceReportHandler) GenerateReport(w http.ResponseWriter, r *http.
 		EndDate:       endDate,
 		ReportType:    reportType,
 		IncludeEvents: includeEvents,
+		LocationID:    locationctx.Filter(ctx),
 	}
-
 	data, contentType, err := h.reportService.GenerateReport(ctx, req)
 	if err != nil {
 		h.logger.Error("Failed to generate report",
@@ -4562,7 +4519,6 @@ func (h *AttendanceReportHandler) GenerateReport(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusInternalServerError, "failed to generate report")
 		return
 	}
-
 	filename := fmt.Sprintf(
 		"attendance_report_%s_%s_to_%s.%s",
 		companyID.String()[:8],
@@ -4570,23 +4526,26 @@ func (h *AttendanceReportHandler) GenerateReport(w http.ResponseWriter, r *http.
 		endDate.Format("20060102"),
 		reportType,
 	)
-
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", "attachment; filename="+filename)
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	_, _ = w.Write(data)
 }
 
-// StreamEvents streams attendance events in CSV or JSONL format.
+// StreamEvents streams attendance events as CSV or JSONL.
+//
+// FIX (Handler hygiene): the previous implementation called http.Error on
+// failure, which does nothing if StreamEvents already wrote a 200 and some
+// bytes. We now wrap the ResponseWriter in a status tracker. If the first
+// byte was already emitted, the only honest thing to do is log the failure
+// and stop — the client will see a truncated stream, which is detectable.
 func (h *AttendanceReportHandler) StreamEvents(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
 	format := r.URL.Query().Get("format")
 	if format == "" {
 		format = "csv"
@@ -4595,13 +4554,11 @@ func (h *AttendanceReportHandler) StreamEvents(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusBadRequest, "unsupported format, use 'csv' or 'jsonl'")
 		return
 	}
-
 	startDate, endDate, err := parseDateRange(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	filter := query.EventFilter{
 		CompanyID: companyID,
 		StartDate: startDate,
@@ -4609,7 +4566,6 @@ func (h *AttendanceReportHandler) StreamEvents(w http.ResponseWriter, r *http.Re
 		Page:      1,
 		PageSize:  1000,
 	}
-
 	if v := r.URL.Query().Get("subject_type"); v != "" {
 		filter.SubjectType = &v
 	}
@@ -4630,8 +4586,6 @@ func (h *AttendanceReportHandler) StreamEvents(w http.ResponseWriter, r *http.Re
 	if v := r.URL.Query().Get("device_id"); v != "" {
 		filter.DeviceID = &v
 	}
-
-	// Fix: Replace ternary with if/else
 	if format == "csv" {
 		w.Header().Set("Content-Type", "text/csv")
 		filename := fmt.Sprintf("attendance_events_%s_to_%s.csv", startDate.Format("20060102"), endDate.Format("20060102"))
@@ -4640,25 +4594,29 @@ func (h *AttendanceReportHandler) StreamEvents(w http.ResponseWriter, r *http.Re
 		w.Header().Set("Content-Type", "application/x-ndjson")
 	}
 
-	if err := h.reportService.StreamEvents(ctx, companyID, filter, w, format); err != nil {
+	sw := &statusCapturingWriter{ResponseWriter: w}
+	locFilter := locationctx.Filter(ctx)
+	if err := h.reportService.StreamEvents(ctx, companyID, locFilter, filter, sw, format); err != nil {
 		h.logger.Error("Failed to stream events",
 			zap.String("company_id", companyID.String()),
+			zap.Int("status_code", sw.statusCode),
+			zap.Bool("headers_flushed", sw.wroteHeader),
 			zap.Error(err))
-		// Since headers may already be written, we can't return JSON
-		http.Error(w, "failed to stream events", http.StatusInternalServerError)
+		if !sw.wroteHeader {
+			// Safe to signal failure — nothing has been sent yet.
+			http.Error(w, "failed to stream events", http.StatusInternalServerError)
+			return
+		}
+		// Partial response already on the wire. Log and stop.
 		return
 	}
 }
 
-// ---- Helpers ----
-
 func parseDateRange(r *http.Request) (time.Time, time.Time, error) {
 	startStr := r.URL.Query().Get("start_date")
 	endStr := r.URL.Query().Get("end_date")
-
 	start := time.Now().AddDate(0, 0, -30)
 	end := time.Now()
-
 	var err error
 	if startStr != "" {
 		start, err = time.Parse("2006-01-02", startStr)
@@ -4692,7 +4650,6 @@ func (h *AttendanceReportHandler) respondWithError(w http.ResponseWriter, status
 }
 
 
-
 ================================================================================
 FILE: ./handler/admin_handler.go
 ================================================================================
@@ -4717,7 +4674,6 @@ import (
 	"auth-service/internal/infrastructure/audit"
 )
 
-// AttendanceAdminHandler handles attendance policy, rules, and assignment endpoints.
 type AttendanceAdminHandler struct {
 	adminService admin.AdminService
 	queryService query.QueryService
@@ -4725,7 +4681,6 @@ type AttendanceAdminHandler struct {
 	logger       *zap.Logger
 }
 
-// NewAttendanceAdminHandler creates a new handler instance.
 func NewAttendanceAdminHandler(
 	adminService admin.AdminService,
 	queryService query.QueryService,
@@ -4740,8 +4695,6 @@ func NewAttendanceAdminHandler(
 	}
 }
 
-// ---- Request/Response DTOs ----
-
 type PolicyRequest struct {
 	PolicyCode     string             `json:"policy_code"`
 	PolicyType     string             `json:"policy_type"`
@@ -4753,10 +4706,12 @@ type PolicyRequest struct {
 }
 
 type AssignPolicyRequest struct {
-	UserID        uuid.UUID  `json:"user_id"`
+	UserID        uuid.UUID  `json:"user_id,omitempty"`
 	PolicyID      uuid.UUID  `json:"policy_id"`
 	EffectiveFrom time.Time  `json:"effective_from"`
 	EffectiveTo   *time.Time `json:"effective_to,omitempty"`
+	SubjectType   string     `json:"subject_type,omitempty"`
+	SubjectID     *uuid.UUID `json:"subject_id,omitempty"`
 }
 
 type CompanyRulesRequest struct {
@@ -4765,8 +4720,6 @@ type CompanyRulesRequest struct {
 	Timezone              string   `json:"timezone"`
 }
 
-// ---- Handlers ----
-
 func (h *AttendanceAdminHandler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -4774,20 +4727,16 @@ func (h *AttendanceAdminHandler) CreatePolicy(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
 	actorType, actorID, err := h.getActorInfo(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var req PolicyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
-	// Validate assignment
 	if req.PositionID != nil && req.WorkCenterCode != nil && *req.WorkCenterCode != "" {
 		h.respondWithError(w, http.StatusBadRequest,
 			"policy can be assigned to either position or work center, not both")
@@ -4806,7 +4755,6 @@ func (h *AttendanceAdminHandler) CreatePolicy(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusBadRequest, "policy type is required")
 		return
 	}
-
 	policy := &models.AttendancePolicy{
 		PolicyID:       uuid.New(),
 		CompanyID:      companyID,
@@ -4819,14 +4767,12 @@ func (h *AttendanceAdminHandler) CreatePolicy(w http.ResponseWriter, r *http.Req
 		CreatedAt:      time.Now().UTC(),
 		UpdatedAt:      time.Now().UTC(),
 	}
-
 	metadata := map[string]interface{}{
 		"ip_address":     r.RemoteAddr,
 		"user_agent":     r.UserAgent(),
 		"endpoint":       r.URL.Path,
 		"request_method": r.Method,
 	}
-
 	createdPolicy, err := h.adminService.CreateAttendancePolicy(ctx, policy, actorType, actorID, metadata)
 	if err != nil {
 		h.logger.Error("Failed to create attendance policy",
@@ -4835,7 +4781,6 @@ func (h *AttendanceAdminHandler) CreatePolicy(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusInternalServerError, "failed to create policy")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
 		"data":    createdPolicy,
@@ -4843,21 +4788,23 @@ func (h *AttendanceAdminHandler) CreatePolicy(w http.ResponseWriter, r *http.Req
 	})
 }
 
+// GetPolicy returns a single attendance policy.
+//
+// FIX (Handler hygiene): previously returned the policy without verifying
+// that it belonged to the caller's company. Now enforces that check and
+// returns 404 for cross-tenant IDs (so existence isn't leaked).
 func (h *AttendanceAdminHandler) GetPolicy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	_, err := getCompanyIDFromContext(ctx)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
-	policyIDStr := chi.URLParam(r, "policyID")
-	policyID, err := uuid.Parse(policyIDStr)
+	policyID, err := uuid.Parse(chi.URLParam(r, "policyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid policy ID")
 		return
 	}
-
 	policy, err := h.queryService.GetAttendancePolicyByID(ctx, policyID)
 	if err != nil {
 		h.logger.Error("Failed to get attendance policy",
@@ -4866,11 +4813,10 @@ func (h *AttendanceAdminHandler) GetPolicy(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve policy")
 		return
 	}
-	if policy == nil {
+	if policy == nil || policy.CompanyID != companyID {
 		h.respondWithError(w, http.StatusNotFound, "policy not found")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    policy,
@@ -4884,15 +4830,12 @@ func (h *AttendanceAdminHandler) ListPolicies(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
 	activeOnly := true
 	if r.URL.Query().Get("include_inactive") == "true" {
 		activeOnly = false
 	}
-
 	positionIDStr := r.URL.Query().Get("position_id")
 	workCenterCode := r.URL.Query().Get("work_center_code")
-
 	policies, err := h.queryService.GetAttendancePoliciesByCompany(ctx, companyID, activeOnly)
 	if err != nil {
 		h.logger.Error("Failed to list attendance policies",
@@ -4901,8 +4844,6 @@ func (h *AttendanceAdminHandler) ListPolicies(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusInternalServerError, "failed to list policies")
 		return
 	}
-
-	// Apply filters
 	var filteredPolicies []*models.AttendancePolicy
 	for _, policy := range policies {
 		if positionIDStr != "" {
@@ -4921,7 +4862,6 @@ func (h *AttendanceAdminHandler) ListPolicies(w http.ResponseWriter, r *http.Req
 		}
 		filteredPolicies = append(filteredPolicies, policy)
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data": map[string]interface{}{
@@ -4936,21 +4876,23 @@ func (h *AttendanceAdminHandler) ListPolicies(w http.ResponseWriter, r *http.Req
 	})
 }
 
+// UpdatePolicy updates an existing attendance policy.
+//
+// FIX (Handler hygiene): previously fetched the policy by ID and applied
+// the caller-supplied fields without checking that the policy belonged to
+// the caller's company. Cross-tenant update is now rejected with 404.
 func (h *AttendanceAdminHandler) UpdatePolicy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	_, err := getCompanyIDFromContext(ctx)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
-	policyIDStr := chi.URLParam(r, "policyID")
-	policyID, err := uuid.Parse(policyIDStr)
+	policyID, err := uuid.Parse(chi.URLParam(r, "policyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid policy ID")
 		return
 	}
-
 	existingPolicy, err := h.queryService.GetAttendancePolicyByID(ctx, policyID)
 	if err != nil {
 		h.logger.Error("Failed to get existing policy",
@@ -4959,17 +4901,15 @@ func (h *AttendanceAdminHandler) UpdatePolicy(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve policy")
 		return
 	}
-	if existingPolicy == nil {
+	if existingPolicy == nil || existingPolicy.CompanyID != companyID {
 		h.respondWithError(w, http.StatusNotFound, "policy not found")
 		return
 	}
-
 	var req PolicyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
 	if req.PositionID != nil && req.WorkCenterCode != nil && *req.WorkCenterCode != "" {
 		h.respondWithError(w, http.StatusBadRequest,
 			"policy can be assigned to either position or work center, not both")
@@ -4980,7 +4920,6 @@ func (h *AttendanceAdminHandler) UpdatePolicy(w http.ResponseWriter, r *http.Req
 			"either position_id or work_center_code is required")
 		return
 	}
-
 	existingPolicy.PolicyCode = req.PolicyCode
 	existingPolicy.PolicyType = req.PolicyType
 	existingPolicy.PositionID = req.PositionID
@@ -4988,7 +4927,6 @@ func (h *AttendanceAdminHandler) UpdatePolicy(w http.ResponseWriter, r *http.Req
 	existingPolicy.Rules = req.Rules
 	existingPolicy.IsActive = req.IsActive
 	existingPolicy.UpdatedAt = time.Now().UTC()
-
 	if err := h.adminService.UpdateAttendancePolicy(ctx, existingPolicy); err != nil {
 		h.logger.Error("Failed to update attendance policy",
 			zap.String("policy_id", policyID.String()),
@@ -4996,7 +4934,6 @@ func (h *AttendanceAdminHandler) UpdatePolicy(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusInternalServerError, "failed to update policy")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    existingPolicy,
@@ -5004,21 +4941,34 @@ func (h *AttendanceAdminHandler) UpdatePolicy(w http.ResponseWriter, r *http.Req
 	})
 }
 
+// DeletePolicy deletes an attendance policy.
+//
+// FIX (Handler hygiene): previously deleted by ID without a company check.
+// Now returns 404 for cross-tenant IDs.
 func (h *AttendanceAdminHandler) DeletePolicy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	_, err := getCompanyIDFromContext(ctx)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
-	policyIDStr := chi.URLParam(r, "policyID")
-	policyID, err := uuid.Parse(policyIDStr)
+	policyID, err := uuid.Parse(chi.URLParam(r, "policyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid policy ID")
 		return
 	}
-
+	existingPolicy, err := h.queryService.GetAttendancePolicyByID(ctx, policyID)
+	if err != nil {
+		h.logger.Error("Failed to get policy before delete",
+			zap.String("policy_id", policyID.String()),
+			zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve policy")
+		return
+	}
+	if existingPolicy == nil || existingPolicy.CompanyID != companyID {
+		h.respondWithError(w, http.StatusNotFound, "policy not found")
+		return
+	}
 	if err := h.adminService.DeleteAttendancePolicy(ctx, policyID); err != nil {
 		h.logger.Error("Failed to delete attendance policy",
 			zap.String("policy_id", policyID.String()),
@@ -5030,7 +4980,6 @@ func (h *AttendanceAdminHandler) DeletePolicy(w http.ResponseWriter, r *http.Req
 		}
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "Policy deleted successfully",
@@ -5039,36 +4988,64 @@ func (h *AttendanceAdminHandler) DeletePolicy(w http.ResponseWriter, r *http.Req
 
 func (h *AttendanceAdminHandler) AssignPolicyToUser(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	_, err := getCompanyIDFromContext(ctx)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
 	actorType, actorID, err := h.getActorInfo(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var req AssignPolicyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
-	if req.UserID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "user ID is required")
-		return
-	}
 	if req.PolicyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "policy ID is required")
+		h.respondWithError(w, http.StatusBadRequest, "policy_id is required")
 		return
 	}
 	if req.EffectiveFrom.IsZero() {
 		req.EffectiveFrom = time.Now().UTC()
 	}
-
+	if req.SubjectType != "" && req.SubjectID != nil && *req.SubjectID != uuid.Nil {
+		err = h.adminService.AssignPolicyToSubject(
+			ctx,
+			req.SubjectType,
+			*req.SubjectID,
+			req.PolicyID,
+			req.EffectiveFrom,
+			req.EffectiveTo,
+			&actorID,
+		)
+		if err != nil {
+			h.logger.Error("Failed to assign policy to subject",
+				zap.String("subject_type", req.SubjectType),
+				zap.String("subject_id", req.SubjectID.String()),
+				zap.String("policy_id", req.PolicyID.String()),
+				zap.Error(err))
+			h.respondWithError(w, http.StatusInternalServerError, "failed to assign policy")
+			return
+		}
+		h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "Policy assigned to subject successfully",
+			"data": map[string]interface{}{
+				"subject_type":   req.SubjectType,
+				"subject_id":     req.SubjectID,
+				"policy_id":      req.PolicyID,
+				"effective_from": req.EffectiveFrom,
+				"assigned_by":    actorID,
+			},
+		})
+		return
+	}
+	if req.UserID == uuid.Nil {
+		h.respondWithError(w, http.StatusBadRequest, "either user_id or (subject_type + subject_id) is required")
+		return
+	}
 	userPolicy := &models.UserAttendancePolicy{
 		UserID:        req.UserID,
 		PolicyID:      req.PolicyID,
@@ -5076,14 +5053,13 @@ func (h *AttendanceAdminHandler) AssignPolicyToUser(w http.ResponseWriter, r *ht
 		EffectiveTo:   req.EffectiveTo,
 		CreatedAt:     time.Now().UTC(),
 	}
-
 	metadata := map[string]interface{}{
 		"ip_address":     r.RemoteAddr,
 		"user_agent":     r.UserAgent(),
 		"endpoint":       r.URL.Path,
 		"request_method": r.Method,
+		"company_id":     companyID,
 	}
-
 	if err := h.adminService.AssignUserAttendancePolicy(ctx, userPolicy, actorType, actorID, metadata); err != nil {
 		h.logger.Error("Failed to assign policy to user",
 			zap.String("user_id", req.UserID.String()),
@@ -5092,10 +5068,9 @@ func (h *AttendanceAdminHandler) AssignPolicyToUser(w http.ResponseWriter, r *ht
 		h.respondWithError(w, http.StatusInternalServerError, "failed to assign policy")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
-		"message": "Policy assigned successfully",
+		"message": "Policy assigned to user successfully",
 		"data": map[string]interface{}{
 			"user_id":        req.UserID,
 			"policy_id":      req.PolicyID,
@@ -5107,14 +5082,19 @@ func (h *AttendanceAdminHandler) AssignPolicyToUser(w http.ResponseWriter, r *ht
 
 func (h *AttendanceAdminHandler) GetCompanyRules(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	pathCompany, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
 		return
 	}
-
+	if !assertPathCompany(w, companyID, pathCompany, h.logger) {
+		return
+	}
 	rules, err := h.adminService.GetCompanyAttendanceRules(ctx, companyID)
 	if err != nil {
 		h.logger.Error("Failed to get company attendance rules",
@@ -5123,7 +5103,6 @@ func (h *AttendanceAdminHandler) GetCompanyRules(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve company rules")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    rules,
@@ -5133,14 +5112,19 @@ func (h *AttendanceAdminHandler) GetCompanyRules(w http.ResponseWriter, r *http.
 func (h *AttendanceAdminHandler) UpdateCompanyRules(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	ctx := r.Context()
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+	pathCompany, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
-
+	companyID, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if !assertPathCompany(w, companyID, pathCompany, h.logger) {
+		return
+	}
 	actorType, actorID, err := h.getActorInfo(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
@@ -5150,7 +5134,6 @@ func (h *AttendanceAdminHandler) UpdateCompanyRules(w http.ResponseWriter, r *ht
 		h.respondWithError(w, http.StatusForbidden, "only admins can update company attendance rules")
 		return
 	}
-
 	var req CompanyRulesRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
@@ -5159,14 +5142,12 @@ func (h *AttendanceAdminHandler) UpdateCompanyRules(w http.ResponseWriter, r *ht
 	if req.Timezone == "" {
 		req.Timezone = "UTC"
 	}
-
 	rules := &models.CompanyAttendanceRules{
 		CompanyID:             companyID,
 		AllowedSourceTypes:    req.AllowedSourceTypes,
 		AllowMultipleCheckins: req.AllowMultipleCheckins,
 		Timezone:              req.Timezone,
 	}
-
 	if err := h.adminService.UpdateCompanyAttendanceRules(ctx, rules, actorID); err != nil {
 		h.logger.Error("Failed to update company attendance rules",
 			zap.String("company_id", companyID.String()),
@@ -5175,7 +5156,6 @@ func (h *AttendanceAdminHandler) UpdateCompanyRules(w http.ResponseWriter, r *ht
 		h.respondWithError(w, http.StatusInternalServerError, "Failed to update company rules")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    rules,
@@ -5188,14 +5168,19 @@ func (h *AttendanceAdminHandler) UpdateCompanyRules(w http.ResponseWriter, r *ht
 
 func (h *AttendanceAdminHandler) GetResolvedRules(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+	pathCompany, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
 		return
 	}
-
+	companyID, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if !assertPathCompany(w, companyID, pathCompany, h.logger) {
+		return
+	}
 	userIDStr := r.URL.Query().Get("user_id")
 	var userID uuid.UUID
 	if userIDStr != "" {
@@ -5227,24 +5212,25 @@ func (h *AttendanceAdminHandler) GetResolvedRules(w http.ResponseWriter, r *http
 		}
 		positionID = &parsedID
 	}
-
-	rules, err := h.adminService.ResolveAttendanceRules(ctx, userID, companyID, workCenterCode, positionID, date)
+	subjectType := r.URL.Query().Get("subject_type")
+	if subjectType == "" {
+		subjectType = "employee"
+	}
+	rules, err := h.adminService.ResolveAttendanceRules(ctx, userID, companyID, subjectType, workCenterCode, positionID, date)
 	if err != nil {
 		h.logger.Error("Failed to resolve attendance rules",
 			zap.String("company_id", companyID.String()),
 			zap.String("user_id", userID.String()),
+			zap.String("subject_type", subjectType),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to resolve attendance rules")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    rules,
 	})
 }
-
-// ---- Helper functions ----
 
 func (h *AttendanceAdminHandler) getActorInfo(ctx context.Context) (string, uuid.UUID, error) {
 	actorID, err := getUserIDFromContext(ctx)
@@ -5255,8 +5241,6 @@ func (h *AttendanceAdminHandler) getActorInfo(ctx context.Context) (string, uuid
 	return actorType, actorID, nil
 }
 
-// getCompanyIDFromContext extracts the company UUID from the context.
-// It expects the middleware to store the company ID as a uuid.UUID under the key "company_id".
 func getCompanyIDFromContext(ctx context.Context) (uuid.UUID, error) {
 	if v := ctx.Value("company_id"); v != nil {
 		if id, ok := v.(uuid.UUID); ok {
@@ -5267,15 +5251,12 @@ func getCompanyIDFromContext(ctx context.Context) (uuid.UUID, error) {
 	return uuid.Nil, errors.New("company_id not found in context")
 }
 
-// getUserIDFromContext extracts the user UUID from context.
 func getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
-	// Try modern key first
 	if v := ctx.Value("current_user_id"); v != nil {
 		if id, ok := v.(uuid.UUID); ok {
 			return id, nil
 		}
 	}
-	// Fallback to old key
 	if v := ctx.Value("user_id"); v != nil {
 		switch raw := v.(type) {
 		case uuid.UUID:
@@ -5289,7 +5270,6 @@ func getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
 	return uuid.Nil, errors.New("user not authenticated")
 }
 
-// getSessionTypeFromContext returns "admin", "user", or "device".
 func getSessionTypeFromContext(ctx context.Context) string {
 	if v := ctx.Value("session_type"); v != nil {
 		if s, ok := v.(string); ok {
@@ -5298,8 +5278,6 @@ func getSessionTypeFromContext(ctx context.Context) string {
 	}
 	return "user"
 }
-
-// ---- Response helpers ----
 
 func (h *AttendanceAdminHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -5315,7 +5293,6 @@ func (h *AttendanceAdminHandler) respondWithError(w http.ResponseWriter, status 
 }
 
 
-
 ================================================================================
 FILE: ./handler/ingest_handler.go
 ================================================================================
@@ -5325,6 +5302,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
@@ -5333,15 +5311,14 @@ import (
 
 	"auth-service/internal/attendance/models"
 	"auth-service/internal/attendance/service/ingest"
+	"auth-service/internal/attendance/service/resolver"
 )
 
-// AttendanceIngestHandler handles attendance punch ingestion.
 type AttendanceIngestHandler struct {
 	ingestService ingest.IngestService
 	logger        *zap.Logger
 }
 
-// NewAttendanceIngestHandler creates a new handler.
 func NewAttendanceIngestHandler(
 	ingestService ingest.IngestService,
 	logger *zap.Logger,
@@ -5352,10 +5329,9 @@ func NewAttendanceIngestHandler(
 	}
 }
 
-// PunchHTTPRequest is the common request for user/admin punches.
 type PunchHTTPRequest struct {
 	TargetUserID uuid.UUID  `json:"target_user_id"`
-	SubjectType  string     `json:"subject_type,omitempty"` // 👈 NEW: allows "student", "employee", etc.
+	SubjectType  string     `json:"subject_type,omitempty"`
 	EventType    string     `json:"event_type"`
 	EventTime    *time.Time `json:"event_time,omitempty"`
 	Source       struct {
@@ -5367,7 +5343,6 @@ type PunchHTTPRequest struct {
 	Context *models.EventContext `json:"context,omitempty"`
 }
 
-// PunchAttendance is the main entry point; it routes to device or user handler.
 func (h *AttendanceIngestHandler) PunchAttendance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	sessionType := getSessionTypeFromContext(ctx)
@@ -5378,7 +5353,6 @@ func (h *AttendanceIngestHandler) PunchAttendance(w http.ResponseWriter, r *http
 	h.handleUserPunch(w, r, ctx)
 }
 
-// handleDevicePunch rejects device requests (use dedicated endpoint).
 func (h *AttendanceIngestHandler) handleDevicePunch(w http.ResponseWriter, r *http.Request, ctx context.Context) {
 	h.respondWithError(
 		w,
@@ -5387,26 +5361,36 @@ func (h *AttendanceIngestHandler) handleDevicePunch(w http.ResponseWriter, r *ht
 	)
 }
 
-// handleUserPunch processes punches from authenticated users (including admins).
+func (h *AttendanceIngestHandler) mapIngestError(w http.ResponseWriter, err error) bool {
+	switch {
+	case errors.Is(err, resolver.ErrSubjectOutsideScope):
+		h.respondWithError(w, http.StatusForbidden,
+			"subject belongs to a different location than your current scope")
+		return true
+	case errors.Is(err, resolver.ErrSubjectHasNoLocation):
+		h.respondWithError(w, http.StatusBadRequest,
+			"target subject has no employment location assigned")
+		return true
+	}
+	return false
+}
+
 func (h *AttendanceIngestHandler) handleUserPunch(w http.ResponseWriter, r *http.Request, ctx context.Context) {
 	actorID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "company context required")
 		return
 	}
-
 	var req PunchHTTPRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
 	if req.TargetUserID == uuid.Nil {
 		h.respondWithError(w, http.StatusBadRequest, "target_user_id is required")
 		return
@@ -5419,23 +5403,19 @@ func (h *AttendanceIngestHandler) handleUserPunch(w http.ResponseWriter, r *http
 		h.respondWithError(w, http.StatusBadRequest, "source_type is required")
 		return
 	}
-
-	// 👇 Determine subject type – default to "employee" if not provided
 	subjectType := req.SubjectType
 	if subjectType == "" {
 		subjectType = "employee"
 	}
-
 	ip := req.Source.IPAddress
 	if ip == nil || *ip == "" {
-		resolvedIP := h.getClientIP(r)
+		resolvedIP := clientIP(r)
 		ip = &resolvedIP
 	}
-
 	punchReq := &ingest.PunchRequest{
 		CompanyID:   companyID,
 		ActorID:     actorID,
-		SubjectType: subjectType, // 👈 dynamic
+		SubjectType: subjectType,
 		SubjectID:   req.TargetUserID,
 		EventType:   req.EventType,
 		EventTime:   req.EventTime,
@@ -5447,35 +5427,32 @@ func (h *AttendanceIngestHandler) handleUserPunch(w http.ResponseWriter, r *http
 		},
 		Context: req.Context,
 	}
-
 	event, err := h.ingestService.IngestPunch(ctx, punchReq)
 	if err != nil {
+		if h.mapIngestError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
 		"data":    event,
 	})
 }
 
-// DevicePunchAttendance handles device-only punches (uses device auth context).
 func (h *AttendanceIngestHandler) DevicePunchAttendance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	sessionType := getSessionTypeFromContext(ctx)
 	if sessionType != "device" {
 		h.respondWithError(w, http.StatusUnauthorized, "device authentication required")
 		return
 	}
-
 	authCtx, ok := ctx.Value("device_auth_context").(*models.DeviceAuthContext)
 	if !ok || authCtx == nil {
 		h.respondWithError(w, http.StatusUnauthorized, "device authentication required")
 		return
 	}
-
 	var req struct {
 		EventType      string               `json:"event_type"`
 		EventTime      *time.Time           `json:"event_time,omitempty"`
@@ -5486,7 +5463,6 @@ func (h *AttendanceIngestHandler) DevicePunchAttendance(w http.ResponseWriter, r
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
 	if req.EventType == "" {
 		h.respondWithError(w, http.StatusBadRequest, "event_type required")
 		return
@@ -5495,7 +5471,6 @@ func (h *AttendanceIngestHandler) DevicePunchAttendance(w http.ResponseWriter, r
 		h.respondWithError(w, http.StatusBadRequest, "device_user_code required")
 		return
 	}
-
 	ctxObj := req.Context
 	if ctxObj == nil {
 		ctxObj = &models.EventContext{}
@@ -5503,10 +5478,8 @@ func (h *AttendanceIngestHandler) DevicePunchAttendance(w http.ResponseWriter, r
 	if authCtx.WorkCenterID != nil && ctxObj.WorkCenterCode == nil {
 		ctxObj.WorkCenterCode = authCtx.WorkCenterID
 	}
-
-	ip := h.getClientIP(r)
+	ip := clientIP(r)
 	deviceID := authCtx.DeviceID
-
 	punchReq := &ingest.PunchRequest{
 		CompanyID:      authCtx.CompanyID,
 		EventType:      req.EventType,
@@ -5519,44 +5492,40 @@ func (h *AttendanceIngestHandler) DevicePunchAttendance(w http.ResponseWriter, r
 		},
 		Context: ctxObj,
 	}
-
 	event, err := h.ingestService.IngestPunch(ctx, punchReq)
 	if err != nil {
+		if h.mapIngestError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
 		"data":    event,
 	})
 }
 
-// SelfPunchAttendance allows a user to punch for themselves.
 func (h *AttendanceIngestHandler) SelfPunchAttendance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	sessionType := getSessionTypeFromContext(ctx)
 	if sessionType == "device" {
 		h.respondWithError(w, http.StatusUnauthorized, "user authentication required")
 		return
 	}
-
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "company context required")
 		return
 	}
-
 	var req struct {
 		EventType   string `json:"event_type"`
-		SubjectType string `json:"subject_type,omitempty"` // 👈 NEW
+		SubjectType string `json:"subject_type,omitempty"`
 		Source      struct {
 			SourceType string  `json:"source_type"`
 			DeviceID   *string `json:"device_id"`
@@ -5568,7 +5537,6 @@ func (h *AttendanceIngestHandler) SelfPunchAttendance(w http.ResponseWriter, r *
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
 	if req.EventType == "" {
 		h.respondWithError(w, http.StatusBadRequest, "event_type required")
 		return
@@ -5577,25 +5545,22 @@ func (h *AttendanceIngestHandler) SelfPunchAttendance(w http.ResponseWriter, r *
 		h.respondWithError(w, http.StatusBadRequest, "source_type required")
 		return
 	}
-
 	subjectType := req.SubjectType
 	if subjectType == "" {
-		subjectType = "employee" // default
+		subjectType = "employee"
 	}
-
 	ip := req.Source.IPAddress
 	if ip == nil || *ip == "" {
-		resolvedIP := h.getClientIP(r)
+		resolvedIP := clientIP(r)
 		ip = &resolvedIP
 	}
-
 	punchReq := &ingest.PunchRequest{
 		CompanyID:   companyID,
 		ActorID:     userID,
 		SubjectType: subjectType,
 		SubjectID:   userID,
 		EventType:   req.EventType,
-		EventTime:   nil, // server time
+		EventTime:   nil,
 		Source: ingest.PunchSource{
 			SourceType: req.Source.SourceType,
 			DeviceID:   req.Source.DeviceID,
@@ -5603,31 +5568,20 @@ func (h *AttendanceIngestHandler) SelfPunchAttendance(w http.ResponseWriter, r *
 		},
 		Context: req.Context,
 	}
-
 	event, err := h.ingestService.IngestPunch(ctx, punchReq)
 	if err != nil {
+		if h.mapIngestError(w, err) {
+			return
+		}
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
 		"data":    event,
 	})
 }
 
-// getClientIP extracts the client IP from the request.
-func (h *AttendanceIngestHandler) getClientIP(r *http.Request) string {
-	if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
-		return ip
-	}
-	if ip := r.Header.Get("X-Real-IP"); ip != "" {
-		return ip
-	}
-	return r.RemoteAddr
-}
-
-// response helpers
 func (h *AttendanceIngestHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -5642,7 +5596,6 @@ func (h *AttendanceIngestHandler) respondWithError(w http.ResponseWriter, status
 }
 
 
-
 ================================================================================
 FILE: ./handler/batch_handler.go
 ================================================================================
@@ -5651,6 +5604,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 
@@ -5681,13 +5635,31 @@ func NewBatchHandler(
 	}
 }
 
+func (h *BatchHandler) requireDeviceAuth(
+	w http.ResponseWriter,
+	r *http.Request,
+) (*models.DeviceAuthContext, bool) {
+	authContext, ok := r.Context().Value("device_auth_context").(*models.DeviceAuthContext)
+	if !ok || authContext == nil {
+		h.logger.Warn("device_auth_context missing on batch endpoint",
+			zap.String("path", r.URL.Path),
+			zap.String("method", r.Method))
+		h.respondWithError(w, http.StatusUnauthorized, "device authentication required")
+		return nil, false
+	}
+	return authContext, true
+}
+
 // POST /attendance/batches
+//
+// FIX (Handler hygiene): surfaces batch.ErrAllEventsFailed as 422 so the
+// device learns that nothing was accepted and can look at /failures.
 func (h *BatchHandler) BatchPunch(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	authContext, ok := ctx.Value("device_auth_context").(*models.DeviceAuthContext)
-	if !ok || authContext == nil {
-		panic("device_auth_context missing: DeviceAuthMiddleware misconfigured")
+	authContext, ok := h.requireDeviceAuth(w, r)
+	if !ok {
+		return
 	}
 
 	var payload BatchPayload
@@ -5714,6 +5686,14 @@ func (h *BatchHandler) BatchPunch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.batchIngestService.IngestBatch(ctx, req); err != nil {
+		if errors.Is(err, batch.ErrAllEventsFailed) {
+			h.logger.Warn("Attendance batch rejected in full",
+				zap.String("batch_ref", payload.BatchRef),
+				zap.String("device_id", authContext.DeviceID),
+			)
+			h.respondWithError(w, http.StatusUnprocessableEntity, "all events in batch failed")
+			return
+		}
 		h.logger.Warn("Attendance batch ingest failed",
 			zap.String("batch_ref", payload.BatchRef),
 			zap.String("device_id", authContext.DeviceID),
@@ -5734,9 +5714,9 @@ func (h *BatchHandler) BatchPunch(w http.ResponseWriter, r *http.Request) {
 func (h *BatchHandler) GetBatchStatus(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	authContext, ok := ctx.Value("device_auth_context").(*models.DeviceAuthContext)
-	if !ok || authContext == nil {
-		panic("device_auth_context missing")
+	authContext, ok := h.requireDeviceAuth(w, r)
+	if !ok {
+		return
 	}
 
 	batchRef := chi.URLParam(r, "batch_ref")
@@ -5765,9 +5745,9 @@ func (h *BatchHandler) GetBatchStatus(w http.ResponseWriter, r *http.Request) {
 func (h *BatchHandler) GetBatchFailures(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	authContext, ok := ctx.Value("device_auth_context").(*models.DeviceAuthContext)
-	if !ok || authContext == nil {
-		panic("device_auth_context missing")
+	authContext, ok := h.requireDeviceAuth(w, r)
+	if !ok {
+		return
 	}
 
 	batchRef := chi.URLParam(r, "batch_ref")
@@ -5825,7 +5805,6 @@ func (h *BatchHandler) respondWithError(w http.ResponseWriter, statusCode int, m
 }
 
 
-
 ================================================================================
 FILE: ./handler/query_handler.go
 ================================================================================
@@ -5844,6 +5823,7 @@ import (
 
 	"auth-service/internal/attendance/repository"
 	"auth-service/internal/attendance/service/query"
+	"auth-service/internal/locationctx"
 )
 
 // AttendanceQueryHandler handles attendance queries.
@@ -5905,6 +5885,9 @@ func (h *AttendanceQueryHandler) GetEvent(w http.ResponseWriter, r *http.Request
 }
 
 // SearchEvents searches attendance events with filters and pagination.
+//
+// Location scope: reads X-Location-ID from the request context. Delhi-scoped
+// admins see only Delhi events; ALL-scope admins see everything.
 func (h *AttendanceQueryHandler) SearchEvents(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -5964,7 +5947,10 @@ func (h *AttendanceQueryHandler) SearchEvents(w http.ResponseWriter, r *http.Req
 		filter.DeviceID = &v
 	}
 
-	events, total, err := h.queryService.ListEvents(ctx, filter)
+	// Location scope from the request context.
+	locFilter := locationctx.Filter(ctx)
+
+	events, total, err := h.queryService.ListEvents(ctx, filter, locFilter)
 	if err != nil {
 		h.logger.Error("Failed to search attendance events",
 			zap.String("company_id", companyID.String()),
@@ -6010,7 +5996,7 @@ func (h *AttendanceQueryHandler) GetDailySummary(w http.ResponseWriter, r *http.
 
 	subjectType := chi.URLParam(r, "subjectType")
 	if subjectType == "" {
-		subjectType = "employee" // default for backward compatibility
+		subjectType = "employee"
 	}
 
 	date, err := time.Parse("2006-01-02", chi.URLParam(r, "date"))
@@ -6030,6 +6016,19 @@ func (h *AttendanceQueryHandler) GetDailySummary(w http.ResponseWriter, r *http.
 	}
 	if summary == nil {
 		h.respondWithError(w, http.StatusNotFound, "daily summary not found")
+		return
+	}
+
+	// Defensive: query service already scopes by company, but never trust
+	// the lower layer to have done the right thing. Reject cross-tenant rows.
+	if summary.CompanyID != companyID {
+		h.logger.Warn("Cross-tenant daily summary access blocked",
+			zap.String("summary_id", summary.AttendanceSummaryID.String()),
+			zap.String("caller_company", companyID.String()),
+			zap.String("row_company", summary.CompanyID.String()),
+			zap.String("subject_id", subjectID.String()),
+		)
+		h.respondWithError(w, http.StatusForbidden, "access denied")
 		return
 	}
 
@@ -6075,11 +6074,31 @@ func (h *AttendanceQueryHandler) GetSubjectSummaries(w http.ResponseWriter, r *h
 		return
 	}
 
+	// Defensive cross-tenant filter: drop (and log) any row whose company
+	// doesn't match the caller. Should never trigger if the query service
+	// is doing its job.
+	filtered := make([]interface{}, 0, len(summaries))
+	for _, s := range summaries {
+		if s == nil {
+			continue
+		}
+		if s.CompanyID != companyID {
+			h.logger.Warn("Cross-tenant summary hidden in list",
+				zap.String("summary_id", s.AttendanceSummaryID.String()),
+				zap.String("caller_company", companyID.String()),
+				zap.String("row_company", s.CompanyID.String()),
+				zap.String("subject_id", subjectID.String()),
+			)
+			continue
+		}
+		filtered = append(filtered, s)
+	}
+
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data": map[string]interface{}{
-			"summaries": summaries,
-			"total":     len(summaries),
+			"summaries": filtered,
+			"total":     len(filtered),
 		},
 	})
 }
@@ -6087,6 +6106,8 @@ func (h *AttendanceQueryHandler) GetSubjectSummaries(w http.ResponseWriter, r *h
 // ---- Stats ----
 
 // GetCompanyStats returns aggregated attendance statistics for a company.
+//
+// Location scope: reads X-Location-ID from the request context.
 func (h *AttendanceQueryHandler) GetCompanyStats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -6101,7 +6122,9 @@ func (h *AttendanceQueryHandler) GetCompanyStats(w http.ResponseWriter, r *http.
 		return
 	}
 
-	stats, err := h.queryService.GetCompanyStats(ctx, companyID, startDate, endDate)
+	locFilter := locationctx.Filter(ctx)
+
+	stats, err := h.queryService.GetCompanyStats(ctx, companyID, locFilter, startDate, endDate)
 	if err != nil {
 		h.logger.Error("Failed to get company stats",
 			zap.String("company_id", companyID.String()),
@@ -6117,6 +6140,10 @@ func (h *AttendanceQueryHandler) GetCompanyStats(w http.ResponseWriter, r *http.
 }
 
 // GetSubjectStats returns attendance statistics for a single subject.
+//
+// Note: the underlying UserAttendanceStats aggregate does not carry a
+// CompanyID. Company scoping is enforced inside the query service, which
+// receives companyID and hands it to the repo.
 func (h *AttendanceQueryHandler) GetSubjectStats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -6206,7 +6233,7 @@ func (h *AttendanceQueryHandler) ListSourceTypes(w http.ResponseWriter, r *http.
 	})
 }
 
-// ---- NEW: Session Summary Endpoints ----
+// ---- Session Summary Endpoints ----
 
 // GetSessionSummary returns a session summary for a specific session and subject.
 func (h *AttendanceQueryHandler) GetSessionSummary(w http.ResponseWriter, r *http.Request) {
@@ -6260,6 +6287,8 @@ func (h *AttendanceQueryHandler) GetSessionSummary(w http.ResponseWriter, r *htt
 }
 
 // ListSessionSummaries returns paginated session summaries with filters.
+//
+// Location scope: reads X-Location-ID from the request context.
 func (h *AttendanceQueryHandler) ListSessionSummaries(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromContext(ctx)
@@ -6279,6 +6308,7 @@ func (h *AttendanceQueryHandler) ListSessionSummaries(w http.ResponseWriter, r *
 
 	filter := repository.SessionSummaryFilter{}
 	filter.CompanyID = &companyID
+	filter.LocationID = locationctx.Filter(ctx)
 
 	if v := r.URL.Query().Get("subject_type"); v != "" {
 		filter.SubjectType = &v
@@ -6335,7 +6365,7 @@ func (h *AttendanceQueryHandler) ListSessionSummaries(w http.ResponseWriter, r *
 	})
 }
 
-// ---- NEW: Exemption Query Endpoints ----
+// ---- Exemption Query Endpoints ----
 
 // GetExemptionsForSubject returns active exemptions for a subject on a specific date.
 func (h *AttendanceQueryHandler) GetExemptionsForSubject(w http.ResponseWriter, r *http.Request) {
@@ -6468,7 +6498,6 @@ func (h *AttendanceQueryHandler) respondWithError(w http.ResponseWriter, status 
 }
 
 
-
 ================================================================================
 FILE: ./handler/biometric_enrollment_handler.go
 ================================================================================
@@ -6476,12 +6505,10 @@ FILE: ./handler/biometric_enrollment_handler.go
 package handler
 
 import (
-	"encoding/json"
-	"net/http"
-
 	"auth-service/internal/attendance/biometric/models"
 	"auth-service/internal/attendance/biometric/service"
-	"auth-service/internal/middleware"
+	"encoding/json"
+	"net/http"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -6503,11 +6530,6 @@ func NewBiometricEnrollmentHandler(
 	}
 }
 
-// getCompanyIDFromContext extracts the company UUID from the request context.
-
-// ---------------------------------------------------------------------
-// EnrollFace
-// ---------------------------------------------------------------------
 type enrollFaceRequest struct {
 	SubjectType     string    `json:"subject_type"`
 	SubjectID       uuid.UUID `json:"subject_id"`
@@ -6517,30 +6539,37 @@ type enrollFaceRequest struct {
 
 func (h *BiometricEnrollmentHandler) EnrollFace(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
-	actorID := middleware.GetUserIDFromContext(ctx)
-	if actorID == uuid.Nil {
+	actorID, err := getUserIDFromContext(ctx)
+	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "user not authenticated")
 		return
 	}
-
+	if getSessionTypeFromContext(ctx) == "device" && !isTrustedDevice(ctx) {
+		h.respondWithError(w, http.StatusForbidden, "device not trusted")
+		return
+	}
 	var req enrollFaceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
-
 	if req.SubjectType == "" || req.SubjectID == uuid.Nil {
 		h.respondWithError(w, http.StatusBadRequest, "subject_type and subject_id are required")
 		return
 	}
-
+	if len(req.EmbeddingVector) == 0 {
+		h.respondWithError(w, http.StatusBadRequest, "embedding_vector cannot be empty")
+		return
+	}
+	if req.ModelVersion == "" {
+		h.respondWithError(w, http.StatusBadRequest, "model_version is required")
+		return
+	}
 	input := &models.EnrollFaceInput{
 		CompanyID:       companyID,
 		SubjectType:     req.SubjectType,
@@ -6549,45 +6578,39 @@ func (h *BiometricEnrollmentHandler) EnrollFace(w http.ResponseWriter, r *http.R
 		ModelVersion:    req.ModelVersion,
 		CreatedBy:       actorID,
 	}
-
 	embedding, err := h.enrollmentService.EnrollFace(ctx, input)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusCreated, embedding)
 }
 
-// ---------------------------------------------------------------------
-// ReEnrollFace
-// ---------------------------------------------------------------------
 func (h *BiometricEnrollmentHandler) ReEnrollFace(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
-	actorID := middleware.GetUserIDFromContext(ctx)
-	if actorID == uuid.Nil {
+	actorID, err := getUserIDFromContext(ctx)
+	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "user not authenticated")
 		return
 	}
-
+	if getSessionTypeFromContext(ctx) == "device" && !isTrustedDevice(ctx) {
+		h.respondWithError(w, http.StatusForbidden, "device not trusted")
+		return
+	}
 	var req enrollFaceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
-
 	if req.SubjectType == "" || req.SubjectID == uuid.Nil {
 		h.respondWithError(w, http.StatusBadRequest, "subject_type and subject_id are required")
 		return
 	}
-
 	input := &models.EnrollFaceInput{
 		CompanyID:       companyID,
 		SubjectType:     req.SubjectType,
@@ -6596,19 +6619,14 @@ func (h *BiometricEnrollmentHandler) ReEnrollFace(w http.ResponseWriter, r *http
 		ModelVersion:    req.ModelVersion,
 		CreatedBy:       actorID,
 	}
-
 	embedding, err := h.enrollmentService.ReEnrollFace(ctx, input)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, embedding)
 }
 
-// ---------------------------------------------------------------------
-// DeactivateFace
-// ---------------------------------------------------------------------
 type deactivateRequest struct {
 	SubjectType string    `json:"subject_type"`
 	SubjectID   uuid.UUID `json:"subject_id"`
@@ -6617,42 +6635,36 @@ type deactivateRequest struct {
 
 func (h *BiometricEnrollmentHandler) DeactivateFace(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
-	actorID := middleware.GetUserIDFromContext(ctx)
-	if actorID == uuid.Nil {
+	actorID, err := getUserIDFromContext(ctx)
+	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "user not authenticated")
 		return
 	}
-
+	if getSessionTypeFromContext(ctx) == "device" && !isTrustedDevice(ctx) {
+		h.respondWithError(w, http.StatusForbidden, "device not trusted")
+		return
+	}
 	var req deactivateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
-
 	if req.SubjectType == "" || req.SubjectID == uuid.Nil {
 		h.respondWithError(w, http.StatusBadRequest, "subject_type and subject_id are required")
 		return
 	}
-
-	err = h.enrollmentService.DeactivateFace(ctx, companyID, req.SubjectID, req.SubjectType, actorID, req.Reason)
-	if err != nil {
+	if err := h.enrollmentService.DeactivateFace(ctx, companyID, req.SubjectID, req.SubjectType, actorID, req.Reason); err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Face embedding deactivated"})
 }
 
-// ---------------------------------------------------------------------
-// ActivateFace
-// ---------------------------------------------------------------------
 type activateRequest struct {
 	SubjectType string    `json:"subject_type"`
 	SubjectID   uuid.UUID `json:"subject_id"`
@@ -6661,59 +6673,49 @@ type activateRequest struct {
 
 func (h *BiometricEnrollmentHandler) ActivateFace(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
-	actorID := middleware.GetUserIDFromContext(ctx)
-	if actorID == uuid.Nil {
+	actorID, err := getUserIDFromContext(ctx)
+	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "user not authenticated")
 		return
 	}
-
+	if getSessionTypeFromContext(ctx) == "device" && !isTrustedDevice(ctx) {
+		h.respondWithError(w, http.StatusForbidden, "device not trusted")
+		return
+	}
 	var req activateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
-
 	if req.SubjectType == "" || req.SubjectID == uuid.Nil {
 		h.respondWithError(w, http.StatusBadRequest, "subject_type and subject_id are required")
 		return
 	}
-
-	err = h.enrollmentService.ActivateFace(ctx, companyID, req.SubjectID, req.SubjectType, actorID, req.Reason)
-	if err != nil {
+	if err := h.enrollmentService.ActivateFace(ctx, companyID, req.SubjectID, req.SubjectType, actorID, req.Reason); err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Face embedding activated"})
 }
 
-// ---------------------------------------------------------------------
-// GetFaceEmbedding
-// ---------------------------------------------------------------------
 func (h *BiometricEnrollmentHandler) GetFaceEmbedding(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
 	subjectType := chi.URLParam(r, "subjectType")
-	subjectIDStr := chi.URLParam(r, "subjectID")
-	subjectID, err := uuid.Parse(subjectIDStr)
+	subjectID, err := uuid.Parse(chi.URLParam(r, "subjectID"))
 	if err != nil || subjectType == "" {
 		h.respondWithError(w, http.StatusBadRequest, "valid subject_type and subject_id required")
 		return
 	}
-
 	embedding, err := h.enrollmentService.GetFaceEmbedding(ctx, companyID, subjectID, subjectType)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -6723,34 +6725,24 @@ func (h *BiometricEnrollmentHandler) GetFaceEmbedding(w http.ResponseWriter, r *
 		h.respondWithError(w, http.StatusNotFound, "Face embedding not found")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, embedding)
 }
 
-// ---------------------------------------------------------------------
-// ListActiveFaceEmbeddings (only by company)
-// ---------------------------------------------------------------------
 func (h *BiometricEnrollmentHandler) ListActiveFaceEmbeddings(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
 	embeddings, err := h.enrollmentService.GetActiveFaceEmbeddingsByCompany(ctx, companyID)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, embeddings)
 }
 
-// ---------------------------------------------------------------------
-// RotateEmbeddingModel
-// ---------------------------------------------------------------------
 type rotateRequest struct {
 	EmbeddingID uuid.UUID `json:"embedding_id"`
 	NewVersion  string    `json:"new_version"`
@@ -6758,42 +6750,36 @@ type rotateRequest struct {
 
 func (h *BiometricEnrollmentHandler) RotateEmbeddingModel(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
-	actorID := middleware.GetUserIDFromContext(ctx)
-	if actorID == uuid.Nil {
+	actorID, err := getUserIDFromContext(ctx)
+	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "user not authenticated")
 		return
 	}
-
+	if getSessionTypeFromContext(ctx) == "device" {
+		h.respondWithError(w, http.StatusForbidden, "device not allowed to rotate models")
+		return
+	}
 	var req rotateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
-
 	if req.EmbeddingID == uuid.Nil || req.NewVersion == "" {
 		h.respondWithError(w, http.StatusBadRequest, "embedding_id and new_version are required")
 		return
 	}
-
-	err = h.enrollmentService.RotateEmbeddingModel(ctx, companyID, req.EmbeddingID, req.NewVersion, actorID)
-	if err != nil {
+	if err := h.enrollmentService.RotateEmbeddingModel(ctx, companyID, req.EmbeddingID, req.NewVersion, actorID); err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Model version updated"})
 }
 
-// ---------------------------------------------------------------------
-// Response helpers
-// ---------------------------------------------------------------------
 func (h *BiometricEnrollmentHandler) respondWithJSON(w http.ResponseWriter, status int, payload interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -6931,6 +6917,7 @@ FILE: ./handler/token_handler.go
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -6960,19 +6947,55 @@ func NewDeviceTokenAdminHandler(
 	}
 }
 
+// requireAdmin resolves the admin actor and the caller's company from context.
+// Returns (actorID, companyID, true) on success; writes an error and returns
+// false otherwise.
+func (h *DeviceTokenAdminHandler) requireAdmin(
+	w http.ResponseWriter,
+	ctx context.Context,
+) (uuid.UUID, uuid.UUID, bool) {
+	if getSessionTypeFromContext(ctx) != "admin" {
+		h.respondWithError(w, http.StatusForbidden, "admin access required")
+		return uuid.Nil, uuid.Nil, false
+	}
+	actorID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return uuid.Nil, uuid.Nil, false
+	}
+	companyID, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "company context required")
+		return uuid.Nil, uuid.Nil, false
+	}
+	return actorID, companyID, true
+}
+
+// assertPathCompany rejects requests where the company in the URL doesn't
+// match the caller's company from context.
+func (h *DeviceTokenAdminHandler) assertPathCompany(
+	w http.ResponseWriter,
+	ctxCompany uuid.UUID,
+	pathCompany uuid.UUID,
+) bool {
+	if ctxCompany != pathCompany {
+		h.logger.Warn("token handler company mismatch",
+			zap.String("ctx_company", ctxCompany.String()),
+			zap.String("path_company", pathCompany.String()),
+		)
+		h.respondWithError(w, http.StatusForbidden, "company mismatch")
+		return false
+	}
+	return true
+}
+
 // ---- IssueDeviceToken ----
 
 func (h *DeviceTokenAdminHandler) IssueDeviceToken(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Admin only
-	if getSessionTypeFromContext(ctx) != "admin" {
-		h.respondWithError(w, http.StatusForbidden, "admin access required")
-		return
-	}
-	actorID, err := getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+	actorID, ctxCompany, ok := h.requireAdmin(w, ctx)
+	if !ok {
 		return
 	}
 
@@ -6982,6 +7005,10 @@ func (h *DeviceTokenAdminHandler) IssueDeviceToken(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
 		return
 	}
+	if !h.assertPathCompany(w, ctxCompany, companyID) {
+		return
+	}
+
 	deviceID := chi.URLParam(r, "deviceID")
 	if deviceID == "" {
 		h.respondWithError(w, http.StatusBadRequest, "device ID required")
@@ -7038,13 +7065,9 @@ func (h *DeviceTokenAdminHandler) IssueDeviceToken(w http.ResponseWriter, r *htt
 
 func (h *DeviceTokenAdminHandler) RevokeDeviceToken(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	if getSessionTypeFromContext(ctx) != "admin" {
-		h.respondWithError(w, http.StatusForbidden, "admin access required")
-		return
-	}
-	actorID, err := getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+
+	actorID, ctxCompany, ok := h.requireAdmin(w, ctx)
+	if !ok {
 		return
 	}
 
@@ -7063,11 +7086,14 @@ func (h *DeviceTokenAdminHandler) RevokeDeviceToken(w http.ResponseWriter, r *ht
 		body.Reason = "revoked by admin"
 	}
 
-	if err := h.tokenService.RevokeToken(ctx, tokenID, &actorID, body.Reason); err != nil {
+	// Service scopes by company and returns "not found" for cross-tenant
+	// tokens, so we don't leak existence.
+	if err := h.tokenService.RevokeToken(ctx, ctxCompany, tokenID, &actorID, body.Reason); err != nil {
 		h.logger.Error("Failed to revoke device token",
 			zap.String("token_id", tokenID.String()),
+			zap.String("company_id", ctxCompany.String()),
 			zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -7086,13 +7112,9 @@ func (h *DeviceTokenAdminHandler) RevokeDeviceToken(w http.ResponseWriter, r *ht
 
 func (h *DeviceTokenAdminHandler) RevokeAllDeviceTokens(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	if getSessionTypeFromContext(ctx) != "admin" {
-		h.respondWithError(w, http.StatusForbidden, "admin access required")
-		return
-	}
-	actorID, err := getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+
+	actorID, ctxCompany, ok := h.requireAdmin(w, ctx)
+	if !ok {
 		return
 	}
 
@@ -7102,6 +7124,10 @@ func (h *DeviceTokenAdminHandler) RevokeAllDeviceTokens(w http.ResponseWriter, r
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
 		return
 	}
+	if !h.assertPathCompany(w, ctxCompany, companyID) {
+		return
+	}
+
 	deviceID := chi.URLParam(r, "deviceID")
 	if deviceID == "" {
 		h.respondWithError(w, http.StatusBadRequest, "device ID required")
@@ -7132,8 +7158,9 @@ func (h *DeviceTokenAdminHandler) RevokeAllDeviceTokens(w http.ResponseWriter, r
 
 func (h *DeviceTokenAdminHandler) GetCurrentDeviceToken(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	if getSessionTypeFromContext(ctx) != "admin" {
-		h.respondWithError(w, http.StatusForbidden, "admin access required")
+
+	_, ctxCompany, ok := h.requireAdmin(w, ctx)
+	if !ok {
 		return
 	}
 
@@ -7143,6 +7170,10 @@ func (h *DeviceTokenAdminHandler) GetCurrentDeviceToken(w http.ResponseWriter, r
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
 		return
 	}
+	if !h.assertPathCompany(w, ctxCompany, companyID) {
+		return
+	}
+
 	deviceID := chi.URLParam(r, "deviceID")
 	if deviceID == "" {
 		h.respondWithError(w, http.StatusBadRequest, "device ID required")
@@ -7201,7 +7232,6 @@ func (h *DeviceTokenAdminHandler) respondWithError(w http.ResponseWriter, status
 }
 
 
-
 ================================================================================
 FILE: ./handler/correction_handler.go
 ================================================================================
@@ -7211,6 +7241,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
@@ -7218,17 +7249,16 @@ import (
 	"go.uber.org/zap"
 
 	"auth-service/internal/attendance/service/admin"
+	"auth-service/internal/attendance/service/resolver"
 )
 
-// AttendanceCorrectionHandler handles attendance correction requests.
 type AttendanceCorrectionHandler struct {
-	correctionSvc admin.CorrectionService // ✅ Use CorrectionService
+	correctionSvc admin.CorrectionService
 	logger        *zap.Logger
 }
 
-// NewAttendanceCorrectionHandler creates a new handler.
 func NewAttendanceCorrectionHandler(
-	correctionSvc admin.CorrectionService, // ✅ inject CorrectionService
+	correctionSvc admin.CorrectionService,
 	logger *zap.Logger,
 ) *AttendanceCorrectionHandler {
 	return &AttendanceCorrectionHandler{
@@ -7237,9 +7267,9 @@ func NewAttendanceCorrectionHandler(
 	}
 }
 
-// CorrectionRequest represents the HTTP request for creating a correction.
 type CorrectionRequest struct {
 	TargetUserID   uuid.UUID `json:"target_user_id"`
+	SubjectType    string    `json:"subject_type,omitempty"`
 	BusinessDate   string    `json:"business_date"`
 	CorrectionType string    `json:"correction_type"`
 	EventTime      string    `json:"event_time,omitempty"`
@@ -7247,29 +7277,46 @@ type CorrectionRequest struct {
 	Reason         string    `json:"reason"`
 }
 
-// CreateCorrection creates a new attendance correction.
+func (h *AttendanceCorrectionHandler) mapCorrectionError(w http.ResponseWriter, err error) bool {
+	switch {
+	case errors.Is(err, resolver.ErrSubjectOutsideScope):
+		h.respondWithError(w, http.StatusForbidden,
+			"subject belongs to a different location than your current scope")
+		return true
+	case errors.Is(err, resolver.ErrSubjectHasNoLocation):
+		h.respondWithError(w, http.StatusBadRequest,
+			"target subject has no employment location assigned")
+		return true
+	}
+	return false
+}
+
+// CreateCorrection creates an attendance correction.
+//
+// FIX (Handler hygiene):
+//   - Accepts `subject_type` from the body (previously hardcoded to
+//     "employee"). Defaults to "employee" when empty for backward compat.
+//   - Removed the naive `businessDate.After(time.Now().UTC())` check. The
+//     service already validates that event_time belongs to business_date
+//     in the subject's timezone — a UTC comparison here rejected valid
+//     corrections near local midnight for non-UTC subjects.
 func (h *AttendanceCorrectionHandler) CreateCorrection(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-
 	actorType, actorID, err := h.getActorInfo(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	var req CorrectionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
-	// Validations
 	if req.TargetUserID == uuid.Nil {
 		h.respondWithError(w, http.StatusBadRequest, "target_user_id is required")
 		return
@@ -7286,17 +7333,11 @@ func (h *AttendanceCorrectionHandler) CreateCorrection(w http.ResponseWriter, r 
 		h.respondWithError(w, http.StatusBadRequest, "reason is required")
 		return
 	}
-
 	businessDate, err := time.Parse("2006-01-02", req.BusinessDate)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid business_date format, use YYYY-MM-DD")
 		return
 	}
-	if businessDate.After(time.Now().UTC()) {
-		h.respondWithError(w, http.StatusBadRequest, "cannot correct future dates")
-		return
-	}
-
 	var eventTime *time.Time
 	if req.EventTime != "" {
 		parsedTime, err := time.Parse(time.RFC3339, req.EventTime)
@@ -7306,12 +7347,15 @@ func (h *AttendanceCorrectionHandler) CreateCorrection(w http.ResponseWriter, r 
 		}
 		eventTime = &parsedTime
 	}
-
+	subjectType := req.SubjectType
+	if subjectType == "" {
+		subjectType = "employee"
+	}
 	corrReq := &admin.CorrectionRequest{
 		CompanyID:      companyID,
 		ActorID:        actorID,
 		ActorType:      actorType,
-		SubjectType:    "employee", // HR employees; can be parameterized later
+		SubjectType:    subjectType,
 		SubjectID:      req.TargetUserID,
 		BusinessDate:   businessDate,
 		CorrectionType: req.CorrectionType,
@@ -7319,25 +7363,27 @@ func (h *AttendanceCorrectionHandler) CreateCorrection(w http.ResponseWriter, r 
 		OverrideStatus: req.OverrideStatus,
 		Reason:         req.Reason,
 	}
-
-	// ✅ Use correctionSvc.CreateCorrection
 	if err := h.correctionSvc.CreateCorrection(ctx, corrReq); err != nil {
+		if h.mapCorrectionError(w, err) {
+			return
+		}
 		h.logger.Error("Failed to create attendance correction",
 			zap.String("company_id", companyID.String()),
 			zap.String("target_user_id", req.TargetUserID.String()),
+			zap.String("subject_type", subjectType),
 			zap.String("actor_id", actorID.String()),
 			zap.Error(err),
 		)
-		h.respondWithError(w, http.StatusInternalServerError, "failed to create attendance correction")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
 		"message": "Attendance correction created successfully",
 		"data": map[string]interface{}{
 			"company_id":      companyID,
 			"target_user_id":  req.TargetUserID,
+			"subject_type":    subjectType,
 			"business_date":   req.BusinessDate,
 			"correction_type": req.CorrectionType,
 			"created_by":      actorID,
@@ -7365,6 +7411,105 @@ func (h *AttendanceCorrectionHandler) respondWithError(w http.ResponseWriter, st
 		"success": false,
 		"error":   message,
 	})
+}
+
+
+================================================================================
+FILE: ./handler/helpers.go
+================================================================================
+
+package handler
+
+import (
+	"context"
+	"net"
+	"net/http"
+	"strings"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	attendancemodels "auth-service/internal/attendance/models"
+)
+
+// assertPathCompany verifies that the company ID in the URL path matches the
+// caller's company from context. On mismatch it writes 403 and returns false.
+func assertPathCompany(
+	w http.ResponseWriter,
+	ctxCompany uuid.UUID,
+	pathCompany uuid.UUID,
+	logger *zap.Logger,
+) bool {
+	if ctxCompany == pathCompany {
+		return true
+	}
+	if logger != nil {
+		logger.Warn("company mismatch between context and URL path",
+			zap.String("ctx_company", ctxCompany.String()),
+			zap.String("path_company", pathCompany.String()),
+		)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+	_, _ = w.Write([]byte(`{"success":false,"error":"company mismatch"}`))
+	return false
+}
+
+// trustedProxyNets is the set of peer networks from which X-Forwarded-For
+// and X-Real-IP are honored. Populate at startup via SetTrustedProxies.
+var trustedProxyNets []*net.IPNet
+
+// SetTrustedProxies configures which peers are allowed to forward client-IP
+// headers. Call once at startup from config. Passing nil disables XFF trust.
+func SetTrustedProxies(nets []*net.IPNet) {
+	trustedProxyNets = nets
+}
+
+func isTrustedProxy(ip net.IP) bool {
+	for _, n := range trustedProxyNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// clientIP returns the caller's IP, honoring XFF only when the immediate
+// peer is a configured trusted proxy. Always returns a bare IP (no port).
+func clientIP(r *http.Request) string {
+	peerIP := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(peerIP); err == nil {
+		peerIP = host
+	}
+	peer := net.ParseIP(peerIP)
+
+	if peer != nil && isTrustedProxy(peer) {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			if idx := strings.IndexByte(xff, ','); idx >= 0 {
+				xff = xff[:idx]
+			}
+			if xff = strings.TrimSpace(xff); xff != "" {
+				return xff
+			}
+		}
+		if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
+			return xri
+		}
+	}
+	return peerIP
+}
+
+// isTrustedDevice reports whether the current request comes from a trusted
+// device. Reads either the boolean "is_trusted_device" context value or the
+// full DeviceAuthContext.
+func isTrustedDevice(ctx context.Context) bool {
+	if v, ok := ctx.Value("is_trusted_device").(bool); ok {
+		return v
+	}
+	if auth, ok := ctx.Value("device_auth_context").(*attendancemodels.DeviceAuthContext); ok && auth != nil {
+		return auth.IsTrusted
+	}
+	return false
 }
 
 

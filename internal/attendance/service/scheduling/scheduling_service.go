@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,13 +12,11 @@ import (
 	"auth-service/internal/attendance/repository"
 	"auth-service/internal/attendance/service/resolver"
 	"auth-service/internal/infrastructure/audit"
-	"strings"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
 
-// Local DTOs (not in models)
 type ScheduleOverrideUpdate struct {
 	OverrideType *string `json:"override_type,omitempty"`
 	Reason       *string `json:"reason,omitempty"`
@@ -28,62 +27,40 @@ type WorkCenterShiftUpdate struct {
 	EffectiveTo *time.Time `json:"effective_to,omitempty"`
 }
 
-// Holiday is a local struct for handling JSONB data
 type Holiday struct {
 	Date string `json:"date"`
 	Name string `json:"name"`
 }
 
-// SchedulingService defines the main scheduling operations.
 type SchedulingService interface {
-	// Work Calendars
 	CreateWorkCalendar(ctx context.Context, calendar *models.WorkCalendar, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.WorkCalendar, error)
 	UpdateWorkCalendar(ctx context.Context, calendarID uuid.UUID, update WorkCalendarUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.WorkCalendar, error)
 	DeleteWorkCalendar(ctx context.Context, calendarID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
 	AddHolidayToCalendar(ctx context.Context, calendarID uuid.UUID, date, name string, actorType string, actorID uuid.UUID) error
 	ProcessHolidayForDate(ctx context.Context, companyID uuid.UUID, date time.Time, actorType string, actorID uuid.UUID) error
-
-	// Schedule Templates
 	CreateScheduleTemplate(ctx context.Context, template *models.ScheduleTemplate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleTemplate, error)
 	UpdateScheduleTemplate(ctx context.Context, templateID uuid.UUID, update ScheduleTemplateUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleTemplate, error)
 	DeleteScheduleTemplate(ctx context.Context, templateID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
-
-	// Schedule Instances
 	CreateScheduleInstance(ctx context.Context, instance *models.ScheduleInstance, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleInstance, error)
 	UpdateScheduleInstance(ctx context.Context, instanceID uuid.UUID, update ScheduleInstanceUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleInstance, error)
 	DeleteScheduleInstance(ctx context.Context, instanceID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
 	BulkCreateScheduleInstances(ctx context.Context, instances []*models.ScheduleInstance, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
-
-	// Leave Integration
 	ApplyApprovedLeave(ctx context.Context, leaveData *LeaveScheduleData, actorType string, actorID uuid.UUID) error
 	RollbackCancelledLeave(ctx context.Context, leaveData *LeaveScheduleData, actorType string, actorID uuid.UUID) error
-
-	// Schedule Generation – FIXED: added companyID parameter
 	GenerateScheduleForUser(ctx context.Context, companyID, userID uuid.UUID, config ScheduleGenerationConfig, actorType string, actorID uuid.UUID) ([]*models.ScheduleInstance, error)
 	GenerateScheduleForCompany(ctx context.Context, companyID uuid.UUID, config ScheduleGenerationConfig, actorType string, actorID uuid.UUID) ([]*models.ScheduleInstance, error)
-
-	// Overrides
 	CreateScheduleOverride(ctx context.Context, companyID uuid.UUID, override *models.ScheduleOverride, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleOverride, error)
 	UpdateScheduleOverride(ctx context.Context, overrideID uuid.UUID, update ScheduleOverrideUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleOverride, error)
 	DeleteScheduleOverride(ctx context.Context, overrideID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
-
-	// Work Center Shift Mappings
 	CreateWorkCenterShiftMapping(ctx context.Context, companyID uuid.UUID, mapping *models.WorkCenterShift, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
 	UpdateWorkCenterShiftMappingByKey(ctx context.Context, companyID uuid.UUID, workCenterCode string, update WorkCenterShiftUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
-
-	// Schedule Resolution
 	ResolveUserDay(ctx context.Context, companyID, userID uuid.UUID, date time.Time) (*PositionBasedResolvedDay, error)
 	CreateScheduleInstanceFromPosition(ctx context.Context, companyID, userID uuid.UUID, date time.Time, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleInstance, error)
-
-	// Availability
 	CheckScheduleAvailability(ctx context.Context, companyID, userID uuid.UUID, date time.Time, timezone string) ([]time.Time, error)
 	ValidateScheduleConflict(ctx context.Context, userID uuid.UUID, startTime, endTime time.Time, excludeInstanceID *uuid.UUID) (bool, error)
-
-	// Health
 	HealthCheck(ctx context.Context) error
 }
 
-// DTOs
 type WorkCalendarUpdate struct {
 	Name        *string   `json:"name,omitempty"`
 	Timezone    *string   `json:"timezone,omitempty"`
@@ -141,7 +118,6 @@ type PositionBasedResolvedDay struct {
 	LeaveTypeID        *uuid.UUID `json:"leave_type_id,omitempty"`
 }
 
-// Implementation
 type schedulingServiceImpl struct {
 	schedulingRepo  repository.ScheduleRepository
 	subjectResolver resolver.ScheduleSubjectResolver
@@ -178,16 +154,6 @@ func (s *schedulingServiceImpl) CreateWorkCalendar(
 		calendar.CalendarID = uuid.New()
 	}
 	calendar.CreatedAt = time.Now().UTC()
-
-	// Duplicate check is scope-aware.
-	//
-	// The DB enforces two partial unique indexes:
-	//   - one company-wide calendar per (company, year)         [location_id IS NULL]
-	//   - one calendar per (company, year, location_id)         [location_id IS NOT NULL]
-	//
-	// We fetch all calendars for the company and filter in Go so that we can
-	// return a clean error instead of a raw constraint violation, and so that
-	// the caller is told which scope collided.
 	existing, _ := s.schedulingRepo.GetWorkCalendarsByCompany(ctx, calendar.CompanyID, nil)
 	for _, e := range existing {
 		if e.Year != calendar.Year {
@@ -202,22 +168,20 @@ func (s *schedulingServiceImpl) CreateWorkCalendar(
 			return nil, fmt.Errorf("calendar for year %d already exists at this location", calendar.Year)
 		}
 	}
-
 	if err := s.schedulingRepo.CreateWorkCalendar(ctx, calendar); err != nil {
 		return nil, err
 	}
-
 	after, _ := json.Marshal(calendar)
 	s.logAudit(ctx, calendar.CompanyID, "work_calendar.create", calendar.CalendarID, actorType, actorID, nil, after, metadata)
 	return calendar, nil
 }
+
 func (s *schedulingServiceImpl) UpdateWorkCalendar(ctx context.Context, calendarID uuid.UUID, update WorkCalendarUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.WorkCalendar, error) {
 	calendar, err := s.schedulingRepo.GetWorkCalendarByID(ctx, calendarID)
 	if err != nil {
 		return nil, err
 	}
 	before, _ := json.Marshal(calendar)
-
 	if update.Name != nil {
 		calendar.Name = *update.Name
 	}
@@ -237,14 +201,12 @@ func (s *schedulingServiceImpl) UpdateWorkCalendar(ctx context.Context, calendar
 	if update.IsActive != nil {
 		calendar.IsActive = *update.IsActive
 	}
-
 	if err := s.validateWorkCalendar(calendar); err != nil {
 		return nil, err
 	}
 	if err := s.schedulingRepo.UpdateWorkCalendar(ctx, calendar); err != nil {
 		return nil, err
 	}
-
 	after, _ := json.Marshal(calendar)
 	s.logAudit(ctx, calendar.CompanyID, "work_calendar.update", calendarID, actorType, actorID, before, after, metadata)
 	return calendar, nil
@@ -256,12 +218,10 @@ func (s *schedulingServiceImpl) DeleteWorkCalendar(ctx context.Context, calendar
 		return err
 	}
 	before, _ := json.Marshal(calendar)
-
 	templates, _ := s.schedulingRepo.GetScheduleTemplatesByCalendar(ctx, calendarID)
 	if len(templates) > 0 {
 		return fmt.Errorf("cannot delete calendar used by %d templates", len(templates))
 	}
-
 	if err := s.schedulingRepo.DeleteWorkCalendar(ctx, calendarID); err != nil {
 		return err
 	}
@@ -269,21 +229,42 @@ func (s *schedulingServiceImpl) DeleteWorkCalendar(ctx context.Context, calendar
 	return nil
 }
 
-func (s *schedulingServiceImpl) AddHolidayToCalendar(ctx context.Context, calendarID uuid.UUID, date, name string, actorType string, actorID uuid.UUID) error {
+func (s *schedulingServiceImpl) AddHolidayToCalendar(
+	ctx context.Context,
+	calendarID uuid.UUID,
+	date, name string,
+	actorType string,
+	actorID uuid.UUID,
+) error {
+	if date == "" {
+		return fmt.Errorf("date is required")
+	}
+	if name == "" {
+		return fmt.Errorf("name is required")
+	}
+	if _, err := time.Parse("2006-01-02", date); err != nil {
+		return fmt.Errorf("invalid date %q: must be YYYY-MM-DD", date)
+	}
 	calendar, err := s.schedulingRepo.GetWorkCalendarByID(ctx, calendarID)
 	if err != nil {
 		return err
 	}
-	if calendar.Holidays == nil {
-		calendar.Holidays = make(map[string]interface{})
+	before, _ := json.Marshal(calendar)
+	if _, exists := calendar.Holidays[date]; exists {
+		return fmt.Errorf("holiday already exists on %s", date)
 	}
-	for k := range calendar.Holidays {
-		if k == date {
-			return fmt.Errorf("holiday already exists on %s", date)
-		}
+	newHolidays := make(map[string]interface{}, len(calendar.Holidays)+1)
+	for k, v := range calendar.Holidays {
+		newHolidays[k] = v
 	}
-	calendar.Holidays[date] = map[string]interface{}{"date": date, "name": name}
-	return s.schedulingRepo.UpdateWorkCalendar(ctx, calendar)
+	newHolidays[date] = map[string]interface{}{"date": date, "name": name}
+	calendar.Holidays = newHolidays
+	if err := s.schedulingRepo.UpdateWorkCalendar(ctx, calendar); err != nil {
+		return err
+	}
+	after, _ := json.Marshal(calendar)
+	s.logAudit(ctx, calendar.CompanyID, "work_calendar.add_holiday", calendarID, actorType, actorID, before, after, nil)
+	return nil
 }
 
 func (s *schedulingServiceImpl) ProcessHolidayForDate(
@@ -293,9 +274,6 @@ func (s *schedulingServiceImpl) ProcessHolidayForDate(
 	actorType string,
 	actorID uuid.UUID,
 ) error {
-	// nil = no location filter. Holiday processing applies to every employee
-	// in the company — a declared holiday cancels schedules company-wide,
-	// not per-location.
 	instances, err := s.schedulingRepo.GetScheduleInstancesByCompany(ctx, companyID, nil, date, date)
 	if err != nil {
 		return err
@@ -309,8 +287,6 @@ func (s *schedulingServiceImpl) ProcessHolidayForDate(
 	}
 	return nil
 }
-
-// ---- Schedule Template CRUD ----
 
 func (s *schedulingServiceImpl) CreateScheduleTemplate(ctx context.Context, template *models.ScheduleTemplate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleTemplate, error) {
 	if err := s.validateScheduleTemplate(template); err != nil {
@@ -334,7 +310,6 @@ func (s *schedulingServiceImpl) UpdateScheduleTemplate(ctx context.Context, temp
 		return nil, err
 	}
 	before, _ := json.Marshal(template)
-
 	if update.Name != nil {
 		template.Name = *update.Name
 	}
@@ -350,14 +325,12 @@ func (s *schedulingServiceImpl) UpdateScheduleTemplate(ctx context.Context, temp
 	if update.IsActive != nil {
 		template.IsActive = *update.IsActive
 	}
-
 	if err := s.validateScheduleTemplate(template); err != nil {
 		return nil, err
 	}
 	if err := s.schedulingRepo.UpdateScheduleTemplate(ctx, template); err != nil {
 		return nil, err
 	}
-
 	after, _ := json.Marshal(template)
 	s.logAudit(ctx, template.CompanyID, "schedule_template.update", templateID, actorType, actorID, before, after, metadata)
 	return template, nil
@@ -369,7 +342,6 @@ func (s *schedulingServiceImpl) DeleteScheduleTemplate(ctx context.Context, temp
 		return err
 	}
 	before, _ := json.Marshal(template)
-
 	mappings, _ := s.schedulingRepo.GetWorkCenterShiftMappingsByShift(ctx, templateID)
 	if len(mappings) > 0 {
 		return fmt.Errorf("cannot delete template used by %d work center mappings", len(mappings))
@@ -380,8 +352,6 @@ func (s *schedulingServiceImpl) DeleteScheduleTemplate(ctx context.Context, temp
 	s.logAudit(ctx, template.CompanyID, "schedule_template.delete", templateID, actorType, actorID, before, nil, metadata)
 	return nil
 }
-
-// ---- Schedule Instances ----
 
 func (s *schedulingServiceImpl) CreateScheduleInstance(ctx context.Context, instance *models.ScheduleInstance, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleInstance, error) {
 	if instance.ScheduleTemplateID == uuid.Nil {
@@ -395,7 +365,6 @@ func (s *schedulingServiceImpl) CreateScheduleInstance(ctx context.Context, inst
 	}
 	instance.GeneratedAt = time.Now().UTC()
 	instance.Status = "active"
-
 	if err := s.schedulingRepo.CreateScheduleInstance(ctx, nil, instance); err != nil {
 		return nil, err
 	}
@@ -436,39 +405,54 @@ func (s *schedulingServiceImpl) DeleteScheduleInstance(ctx context.Context, inst
 	return nil
 }
 
-func (s *schedulingServiceImpl) BulkCreateScheduleInstances(ctx context.Context, instances []*models.ScheduleInstance, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error {
+func (s *schedulingServiceImpl) BulkCreateScheduleInstances(
+	ctx context.Context,
+	instances []*models.ScheduleInstance,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) error {
 	if len(instances) == 0 {
 		return nil
 	}
 	companyID := instances[0].CompanyID
-	created := 0
+	now := time.Now().UTC()
 	for _, inst := range instances {
 		if inst.ScheduleInstanceID == uuid.Nil {
 			inst.ScheduleInstanceID = uuid.New()
 		}
-		inst.GeneratedAt = time.Now().UTC()
+		inst.GeneratedAt = now
 		inst.Status = "active"
-		if err := s.schedulingRepo.CreateScheduleInstance(ctx, nil, inst); err != nil {
-			s.logger.Warn("Failed to create instance in bulk", zap.Error(err))
-			continue
-		}
-		created++
 	}
-	summary := map[string]interface{}{"created": created}
+	tx, err := s.schedulingRepo.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+	for _, inst := range instances {
+		if err := s.schedulingRepo.CreateScheduleInstance(ctx, tx, inst); err != nil {
+			s.logger.Error("Bulk create failed; transaction will be rolled back",
+				zap.String("instance_id", inst.ScheduleInstanceID.String()),
+				zap.String("user_id", inst.UserID.String()),
+				zap.Time("schedule_date", inst.ScheduleDate),
+				zap.Error(err))
+			return fmt.Errorf("create instance %s: %w", inst.ScheduleInstanceID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit bulk create: %w", err)
+	}
+	summary := map[string]interface{}{"created": len(instances)}
 	summaryJSON, _ := json.Marshal(summary)
 	s.logAudit(ctx, companyID, "schedule_instance.bulk_create", uuid.Nil, actorType, actorID, nil, summaryJSON, metadata)
 	return nil
 }
 
-// ---- Generation ----
-
-// GenerateScheduleForUser – FIXED: companyID is passed as parameter
 func (s *schedulingServiceImpl) GenerateScheduleForUser(ctx context.Context, companyID, userID uuid.UUID, config ScheduleGenerationConfig, actorType string, actorID uuid.UUID) ([]*models.ScheduleInstance, error) {
 	subject, err := s.subjectResolver.ResolveSubject(ctx, companyID, userID, "employee", config.StartDate)
 	if err != nil || subject == nil {
 		return nil, fmt.Errorf("failed to resolve subject: %w", err)
 	}
-	// Use the passed companyID, not from subject
 	instances := s.generateInstancesForUser(ctx, companyID, userID, config, actorType, actorID)
 	if len(instances) == 0 {
 		return []*models.ScheduleInstance{}, nil
@@ -500,35 +484,45 @@ func (s *schedulingServiceImpl) GenerateScheduleForCompany(ctx context.Context, 
 
 func (s *schedulingServiceImpl) generateInstancesForUser(ctx context.Context, companyID, userID uuid.UUID, config ScheduleGenerationConfig, actorType string, actorID uuid.UUID) []*models.ScheduleInstance {
 	var instances []*models.ScheduleInstance
-	loc, _ := time.LoadLocation(config.Timezone)
+
+	// ── Resolve the user's tz once via the subject resolver.
+	//    Falls back to config.Timezone, then "UTC".
+	refTime := config.StartDate
+	subjectInfo, _ := s.subjectResolver.ResolveSubject(ctx, companyID, userID, "employee", refTime)
+
+	tz := ""
+	if subjectInfo != nil && subjectInfo.WorkCenterTimezone != "" {
+		tz = subjectInfo.WorkCenterTimezone
+	} else if config.Timezone != "" {
+		tz = config.Timezone
+	} else {
+		tz = "UTC"
+	}
+
+	loc, _ := time.LoadLocation(tz)
+	if loc == nil {
+		loc = time.UTC
+	}
 	now := time.Now().In(loc)
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 
 	s.logger.Info("Starting schedule generation for user",
 		zap.String("user_id", userID.String()),
+		zap.String("tz", tz),
 		zap.String("start_date", config.StartDate.Format("2006-01-02")),
 		zap.String("end_date", config.EndDate.Format("2006-01-02")),
 		zap.Bool("overwrite", config.Overwrite),
 	)
-
 	for d := config.StartDate; !d.After(config.EndDate); d = d.AddDate(0, 0, 1) {
 		if !d.After(today) {
-			s.logger.Debug("Skipping past date",
-				zap.String("date", d.Format("2006-01-02")),
-				zap.String("today", today.Format("2006-01-02")))
 			continue
 		}
-
 		if !config.Overwrite {
 			exists, _ := s.schedulingRepo.HasActiveSchedule(ctx, companyID, userID, d)
 			if exists {
-				s.logger.Debug("Active schedule exists, skipping",
-					zap.String("user", userID.String()),
-					zap.String("date", d.Format("2006-01-02")))
 				continue
 			}
 		}
-
 		resolved, err := s.ResolveUserDay(ctx, companyID, userID, d)
 		if err != nil {
 			s.logger.Warn("ResolveUserDay failed",
@@ -537,36 +531,19 @@ func (s *schedulingServiceImpl) generateInstancesForUser(ctx context.Context, co
 				zap.String("date", d.Format("2006-01-02")))
 			continue
 		}
-
-		s.logger.Debug("ResolveUserDay result",
-			zap.String("user", userID.String()),
-			zap.String("date", d.Format("2006-01-02")),
-			zap.String("status", resolved.ScheduleStatus),
-			zap.Bool("is_schedulable", resolved.IsSchedulable),
-			zap.String("work_center", func() string {
-				if resolved.WorkCenterCode != nil {
-					return *resolved.WorkCenterCode
-				}
-				return "<nil>"
-			}()),
-			zap.Any("shift_id", resolved.ShiftID),
-		)
-
 		if resolved.ScheduleStatus != "scheduled" {
-			s.logger.Debug("Day not schedulable, skipping",
-				zap.String("user", userID.String()),
-				zap.String("date", d.Format("2006-01-02")),
-				zap.String("status", resolved.ScheduleStatus))
 			continue
 		}
-
 		if resolved.ShiftID == nil {
 			s.logger.Warn("Resolved day has no shift ID, skipping",
 				zap.String("user", userID.String()),
 				zap.String("date", d.Format("2006-01-02")))
 			continue
 		}
-
+		instTz := resolved.Timezone
+		if instTz == "" {
+			instTz = tz
+		}
 		inst := &models.ScheduleInstance{
 			ScheduleInstanceID: uuid.New(),
 			CompanyID:          companyID,
@@ -575,24 +552,15 @@ func (s *schedulingServiceImpl) generateInstancesForUser(ctx context.Context, co
 			ScheduleTemplateID: *resolved.ShiftID,
 			ExpectedStart:      resolved.ExpectedStart,
 			ExpectedEnd:        resolved.ExpectedEnd,
-			Timezone:           resolved.Timezone,
+			Timezone:           instTz,
 			WorkCenterCode:     resolved.WorkCenterCode,
 			GeneratedAt:        time.Now().UTC(),
 			Status:             "active",
 		}
 		instances = append(instances, inst)
-		s.logger.Debug("Created instance for date",
-			zap.String("date", d.Format("2006-01-02")),
-			zap.String("template_id", resolved.ShiftID.String()))
 	}
-
-	s.logger.Info("Generated schedule instances",
-		zap.String("user_id", userID.String()),
-		zap.Int("count", len(instances)))
 	return instances
 }
-
-// ---- Overrides ----
 
 func (s *schedulingServiceImpl) CreateScheduleOverride(ctx context.Context, companyID uuid.UUID, override *models.ScheduleOverride, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleOverride, error) {
 	if err := s.validateScheduleOverride(override); err != nil {
@@ -603,7 +571,6 @@ func (s *schedulingServiceImpl) CreateScheduleOverride(ctx context.Context, comp
 	}
 	override.CompanyID = companyID
 	override.CreatedAt = time.Now().UTC()
-
 	existing, _ := s.schedulingRepo.GetScheduleOverrideByUserDate(ctx, override.UserID, override.OverrideDate)
 	if existing != nil {
 		return nil, fmt.Errorf("override already exists for this date")
@@ -655,8 +622,6 @@ func (s *schedulingServiceImpl) DeleteScheduleOverride(ctx context.Context, over
 	return nil
 }
 
-// ---- Work Center Shift Mappings ----
-
 func (s *schedulingServiceImpl) CreateWorkCenterShiftMapping(ctx context.Context, companyID uuid.UUID, mapping *models.WorkCenterShift, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error {
 	if mapping.WorkCenterCode == "" || mapping.ShiftID == uuid.Nil {
 		return fmt.Errorf("work_center_code and shift_id required")
@@ -686,8 +651,7 @@ func (s *schedulingServiceImpl) UpdateWorkCenterShiftMappingByKey(ctx context.Co
 	return s.schedulingRepo.UpdateWorkCenterShiftMapping(ctx, mapping)
 }
 
-// ---- Schedule Resolution ----
-
+// ResolveUserDay — fully tz-aware. Never hardcodes UTC.
 func (s *schedulingServiceImpl) ResolveUserDay(ctx context.Context, companyID, userID uuid.UUID, date time.Time) (*PositionBasedResolvedDay, error) {
 	s.logger.Info("Resolving user day",
 		zap.String("user_id", userID.String()),
@@ -703,36 +667,24 @@ func (s *schedulingServiceImpl) ResolveUserDay(ctx context.Context, companyID, u
 		return &PositionBasedResolvedDay{IsSchedulable: false, ScheduleStatus: "subject_not_found"}, nil
 	}
 
-	s.logger.Info("Subject resolved",
-		zap.String("user_id", userID.String()),
-		zap.String("position_id", func() string {
-			if subject.PositionID != nil {
-				return subject.PositionID.String()
-			}
-			return "<nil>"
-		}()),
-		zap.String("work_center_code", func() string {
-			if subject.WorkCenterCode != nil {
-				return *subject.WorkCenterCode
-			}
-			return "<nil>"
-		}()),
-		zap.Bool("is_active", subject.IsActive),
-		zap.Bool("attendance_required", subject.AttendanceRequired),
-		zap.Bool("overtime_allowed", subject.OvertimeAllowed),
-	)
+	// ── Resolve effective tz via chain: subject's WC tz > company default > UTC.
+	effectiveTz := subject.WorkCenterTimezone
+	if effectiveTz == "" {
+		effectiveTz = subject.CompanyTimezone
+	}
+	if effectiveTz == "" {
+		effectiveTz = "UTC"
+	}
 
 	if !subject.IsActive {
-		s.logger.Info("Subject is inactive", zap.String("user_id", userID.String()))
 		return &PositionBasedResolvedDay{IsSchedulable: false, ScheduleStatus: "inactive"}, nil
 	}
 
 	overrideInfo, _ := s.subjectResolver.ResolveOverride(ctx, companyID, userID, "employee", date)
 	if overrideInfo != nil && overrideInfo.IsOnLeave {
-		s.logger.Info("User on leave", zap.String("user_id", userID.String()))
 		return &PositionBasedResolvedDay{
 			Date:           date,
-			Timezone:       "UTC",
+			Timezone:       effectiveTz,
 			IsSchedulable:  false,
 			ScheduleStatus: "on_leave",
 			IsOnLeave:      true,
@@ -744,7 +696,6 @@ func (s *schedulingServiceImpl) ResolveUserDay(ctx context.Context, companyID, u
 
 	schOverride, _ := s.schedulingRepo.GetScheduleOverrideByUserDate(ctx, userID, date)
 	if schOverride != nil && schOverride.OverrideType == "off" {
-		s.logger.Info("Schedule override 'off' found", zap.String("user_id", userID.String()))
 		return &PositionBasedResolvedDay{
 			IsSchedulable:  false,
 			ScheduleStatus: "override_off",
@@ -759,12 +710,13 @@ func (s *schedulingServiceImpl) ResolveUserDay(ctx context.Context, companyID, u
 		instance = instances[0]
 	}
 	if instance != nil && instance.Status == "active" {
-		s.logger.Info("Active schedule instance exists",
-			zap.String("user_id", userID.String()),
-			zap.String("instance_id", instance.ScheduleInstanceID.String()))
+		instTz := instance.Timezone
+		if instTz == "" {
+			instTz = effectiveTz
+		}
 		return &PositionBasedResolvedDay{
 			Date:               instance.ScheduleDate,
-			Timezone:           instance.Timezone,
+			Timezone:           instTz,
 			IsSchedulable:      true,
 			AttendanceRequired: subject.AttendanceRequired,
 			OvertimeAllowed:    subject.OvertimeAllowed,
@@ -781,9 +733,9 @@ func (s *schedulingServiceImpl) ResolveUserDay(ctx context.Context, companyID, u
 	}
 
 	if subject.WorkCenterCode == nil {
-		s.logger.Info("Subject has no work center code", zap.String("user_id", userID.String()))
 		return &PositionBasedResolvedDay{
 			Date:           date,
+			Timezone:       effectiveTz,
 			IsSchedulable:  false,
 			ScheduleStatus: "no_work_center",
 			PositionID:     subject.PositionID,
@@ -799,13 +751,9 @@ func (s *schedulingServiceImpl) ResolveUserDay(ctx context.Context, companyID, u
 		return nil, err
 	}
 	if mapping == nil {
-		s.logger.Info("No shift mapping found for work center",
-			zap.String("work_center", *subject.WorkCenterCode),
-			zap.String("user_id", userID.String()),
-			zap.String("date", date.Format("2006-01-02")))
 		return &PositionBasedResolvedDay{
 			Date:               date,
-			Timezone:           "UTC",
+			Timezone:           effectiveTz,
 			IsSchedulable:      true,
 			AttendanceRequired: subject.AttendanceRequired,
 			OvertimeAllowed:    subject.OvertimeAllowed,
@@ -832,7 +780,8 @@ func (s *schedulingServiceImpl) ResolveUserDay(ctx context.Context, companyID, u
 		}, nil
 	}
 
-	expectedStart, expectedEnd, err := s.calculateExpectedTimes(date, template, "UTC")
+	// ── Build expected times in the shift's tz.
+	expectedStart, expectedEnd, err := s.calculateExpectedTimes(date, template, effectiveTz)
 	if err != nil {
 		s.logger.Error("Failed to calculate expected times",
 			zap.Error(err),
@@ -840,16 +789,9 @@ func (s *schedulingServiceImpl) ResolveUserDay(ctx context.Context, companyID, u
 		return nil, err
 	}
 
-	s.logger.Info("Resolved to scheduled",
-		zap.String("user_id", userID.String()),
-		zap.String("work_center", *subject.WorkCenterCode),
-		zap.String("shift_id", mapping.ShiftID.String()),
-		zap.Time("expected_start", *expectedStart),
-		zap.Time("expected_end", *expectedEnd))
-
 	return &PositionBasedResolvedDay{
 		Date:               date,
-		Timezone:           "UTC",
+		Timezone:           effectiveTz,
 		IsSchedulable:      true,
 		AttendanceRequired: subject.AttendanceRequired,
 		OvertimeAllowed:    subject.OvertimeAllowed,
@@ -901,8 +843,6 @@ func (s *schedulingServiceImpl) CreateScheduleInstanceFromPosition(ctx context.C
 	return instance, nil
 }
 
-// ---- Availability ----
-
 func (s *schedulingServiceImpl) CheckScheduleAvailability(ctx context.Context, companyID, userID uuid.UUID, date time.Time, timezone string) ([]time.Time, error) {
 	resolved, err := s.ResolveUserDay(ctx, companyID, userID, date)
 	if err != nil || resolved.ScheduleStatus != "scheduled" {
@@ -911,10 +851,18 @@ func (s *schedulingServiceImpl) CheckScheduleAvailability(ctx context.Context, c
 	if resolved.ExpectedStart == nil || resolved.ExpectedEnd == nil {
 		return []time.Time{}, nil
 	}
-	loc, _ := time.LoadLocation(timezone)
-	start := resolved.ExpectedStart.In(loc)
-	end := resolved.ExpectedEnd.In(loc)
-	return []time.Time{start, end}, nil
+	tz := resolved.Timezone
+	if tz == "" {
+		tz = timezone
+	}
+	loc, _ := time.LoadLocation(tz)
+	if loc == nil {
+		loc = time.UTC
+	}
+	return []time.Time{
+		resolved.ExpectedStart.In(loc),
+		resolved.ExpectedEnd.In(loc),
+	}, nil
 }
 
 func (s *schedulingServiceImpl) ValidateScheduleConflict(ctx context.Context, userID uuid.UUID, startTime, endTime time.Time, excludeInstanceID *uuid.UUID) (bool, error) {
@@ -938,13 +886,9 @@ func (s *schedulingServiceImpl) ValidateScheduleConflict(ctx context.Context, us
 	return false, nil
 }
 
-// ---- Health ----
-
 func (s *schedulingServiceImpl) HealthCheck(ctx context.Context) error {
 	return s.schedulingRepo.HealthCheck(ctx)
 }
-
-// ---- Internal helpers ----
 
 func (s *schedulingServiceImpl) validateWorkCalendar(calendar *models.WorkCalendar) error {
 	if calendar.CompanyID == uuid.Nil {
@@ -959,8 +903,7 @@ func (s *schedulingServiceImpl) validateWorkCalendar(calendar *models.WorkCalend
 	if len(calendar.WorkingDays) == 0 {
 		return fmt.Errorf("working days required")
 	}
-	_, err := time.LoadLocation(calendar.Timezone)
-	if err != nil {
+	if _, err := time.LoadLocation(calendar.Timezone); err != nil {
 		return fmt.Errorf("invalid timezone: %w", err)
 	}
 	return nil
@@ -1004,24 +947,47 @@ func (s *schedulingServiceImpl) validateScheduleOverride(override *models.Schedu
 }
 
 func (s *schedulingServiceImpl) isFutureDate(date time.Time, timezone string) bool {
-	loc, _ := time.LoadLocation(timezone)
+	loc, err := time.LoadLocation(timezone)
+	if err != nil || loc == nil {
+		loc = time.UTC
+	}
 	now := time.Now().In(loc)
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 	return date.After(today)
 }
 
+// calculateExpectedTimes — builds instants from wall-clock rules in the shift tz.
 func (s *schedulingServiceImpl) calculateExpectedTimes(date time.Time, template *models.ScheduleTemplate, timezone string) (*time.Time, *time.Time, error) {
-	loc, _ := time.LoadLocation(timezone)
+	loc, err := time.LoadLocation(timezone)
+	if err != nil || loc == nil {
+		loc = time.UTC
+	}
+
 	day := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, loc)
+
 	var start, end time.Time
 	switch template.TemplateType {
 	case "office":
-		startClock, _ := time.Parse("15:04", *template.Rules.StartTime)
-		endClock, _ := time.Parse("15:04", *template.Rules.EndTime)
+		if template.Rules.StartTime == nil || template.Rules.EndTime == nil {
+			return nil, nil, fmt.Errorf("office template missing start_time/end_time")
+		}
+		startClock, err := time.Parse("15:04", *template.Rules.StartTime)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse start_time: %w", err)
+		}
+		endClock, err := time.Parse("15:04", *template.Rules.EndTime)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse end_time: %w", err)
+		}
 		start = time.Date(day.Year(), day.Month(), day.Day(), startClock.Hour(), startClock.Minute(), 0, 0, loc)
 		end = time.Date(day.Year(), day.Month(), day.Day(), endClock.Hour(), endClock.Minute(), 0, 0, loc)
+
+		// Overnight shift: end < start → belongs to next day.
+		if !end.After(start) {
+			end = end.AddDate(0, 0, 1)
+		}
 	default:
-		return nil, nil, fmt.Errorf("unsupported template type")
+		return nil, nil, fmt.Errorf("unsupported template type: %s", template.TemplateType)
 	}
 	return &start, &end, nil
 }
@@ -1033,7 +999,6 @@ func (s *schedulingServiceImpl) logAudit(ctx context.Context, companyID uuid.UUI
 	_ = s.auditService.LogAction(ctx, nil, &companyID, "scheduling", action, "scheduling", &resourceID, actorType, &actorID, before, after, metadata)
 }
 
-// LeaveScheduleData contains the minimal data needed for leave scheduling integration.
 type LeaveScheduleData struct {
 	LeaveRequestID uuid.UUID
 	UserID         uuid.UUID
@@ -1042,7 +1007,6 @@ type LeaveScheduleData struct {
 	EndDate        time.Time
 }
 
-// ApplyApprovedLeave creates "off" schedule overrides for each day in the leave date range.
 func (s *schedulingServiceImpl) ApplyApprovedLeave(ctx context.Context, leaveData *LeaveScheduleData, actorType string, actorID uuid.UUID) error {
 	if leaveData == nil {
 		return fmt.Errorf("leave data is nil")
@@ -1056,7 +1020,6 @@ func (s *schedulingServiceImpl) ApplyApprovedLeave(ctx context.Context, leaveDat
 	if leaveData.EndDate.Before(leaveData.StartDate) {
 		return fmt.Errorf("end date cannot be before start date")
 	}
-
 	reason := fmt.Sprintf("leave_%s", leaveData.LeaveRequestID.String())
 	for d := leaveData.StartDate; !d.After(leaveData.EndDate); d = d.AddDate(0, 0, 1) {
 		override := &models.ScheduleOverride{
@@ -1076,7 +1039,6 @@ func (s *schedulingServiceImpl) ApplyApprovedLeave(ctx context.Context, leaveDat
 	return nil
 }
 
-// RollbackCancelledLeave deletes all schedule overrides for the leave request and regenerates schedules for future dates.
 func (s *schedulingServiceImpl) RollbackCancelledLeave(ctx context.Context, leaveData *LeaveScheduleData, actorType string, actorID uuid.UUID) error {
 	if leaveData == nil {
 		return fmt.Errorf("leave data is nil")
@@ -1085,11 +1047,9 @@ func (s *schedulingServiceImpl) RollbackCancelledLeave(ctx context.Context, leav
 		return fmt.Errorf("company and user are required")
 	}
 	reason := fmt.Sprintf("leave_%s", leaveData.LeaveRequestID.String())
-
 	if err := s.schedulingRepo.DeleteScheduleOverridesByReason(ctx, leaveData.CompanyID, leaveData.UserID, reason); err != nil {
 		return fmt.Errorf("failed to delete leave overrides: %w", err)
 	}
-
 	now := time.Now().UTC()
 	for d := leaveData.StartDate; !d.After(leaveData.EndDate); d = d.AddDate(0, 0, 1) {
 		if d.After(now) {

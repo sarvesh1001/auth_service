@@ -50,7 +50,7 @@ func (s *leaveAccrualService) AccrueMonthlyLeave(
 
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
-		idempKey = fmt.Sprintf("accrue_monthly-%s-%s", companyID.String(), accrualDate.Format("2006-01"))
+		idempKey = fmt.Sprintf("accrue_monthly-%s-%s", companyID.String(), accrualDate.Format("2006-01-02"))
 	}
 	var processed int
 	if err := s.idempotencyStore.Get(ctx, nil, idempKey, &processed); err == nil {

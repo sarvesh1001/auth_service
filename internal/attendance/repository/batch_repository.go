@@ -59,7 +59,7 @@ type AttendancePunchFailureView struct {
 type AttendanceBatchRepository interface {
 	// CreateBatch inserts a new batch record
 	CreateBatch(ctx context.Context, batch *AttendancePunchBatch) error
-	ListFailuresByBatchRef(ctx context.Context, batchRef string) ([]*AttendancePunchFailureView, error)
+	ListFailuresByBatchRef(ctx context.Context, companyID uuid.UUID, batchRef string) ([]*AttendancePunchFailureView, error)
 
 	// MarkProcessed updates batch status to 'processed'
 	MarkProcessed(ctx context.Context, batchID uuid.UUID) error

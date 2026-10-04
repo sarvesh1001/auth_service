@@ -15,6 +15,7 @@ import (
 	"auth-service/internal/attendance/models"
 	"auth-service/internal/attendance/repository"
 	"auth-service/internal/client"
+	"auth-service/internal/util"
 )
 
 type calendarRepository struct {
@@ -35,6 +36,11 @@ const calendarColumns = `
 `
 
 func (r *calendarRepository) Create(ctx context.Context, calendar *models.WorkCalendar) error {
+	// ── NEW: validate IANA name.
+	if err := util.ValidateTimezone(calendar.Timezone); err != nil {
+		return fmt.Errorf("work calendar timezone: %w", err)
+	}
+
 	if calendar.CalendarID == uuid.Nil {
 		calendar.CalendarID = uuid.New()
 	}
@@ -66,9 +72,10 @@ func (r *calendarRepository) Create(ctx context.Context, calendar *models.WorkCa
 	)
 	if err != nil {
 		r.logger.Error("failed to create calendar",
-			zap.String("company_id", calendar.CompanyID.String()),
-			zap.Int("year", calendar.Year),
-			zap.Error(err))
+			util.String("company_id", calendar.CompanyID.String()),
+			util.Int("year", calendar.Year),
+			util.String("timezone", calendar.Timezone),
+			util.ErrorField(err))
 		return fmt.Errorf("create calendar: %w", err)
 	}
 	return nil
@@ -81,7 +88,6 @@ func (r *calendarRepository) GetByID(ctx context.Context, calendarID uuid.UUID) 
 }
 
 func (r *calendarRepository) GetByCompanyAndYear(ctx context.Context, companyID uuid.UUID, year int) (*models.WorkCalendar, error) {
-	// Prefer location-scoped calendars: get the newest active one for this year.
 	row := r.client.QueryRow(ctx, `SELECT `+calendarColumns+`
 		FROM attendance.work_calendars
 		WHERE company_id = $1 AND year = $2
@@ -106,6 +112,11 @@ func (r *calendarRepository) GetByCompany(ctx context.Context, companyID uuid.UU
 }
 
 func (r *calendarRepository) Update(ctx context.Context, calendar *models.WorkCalendar) error {
+	// ── NEW: validate IANA name.
+	if err := util.ValidateTimezone(calendar.Timezone); err != nil {
+		return fmt.Errorf("work calendar timezone: %w", err)
+	}
+
 	query := `
 		UPDATE attendance.work_calendars
 		SET location_id = $1, name = $2, timezone = $3,
@@ -156,7 +167,6 @@ func (r *calendarRepository) Exists(ctx context.Context, companyID uuid.UUID, ye
 	return exists, nil
 }
 
-// List — honors CalendarFilter.LocationID when set.
 func (r *calendarRepository) List(ctx context.Context, companyID uuid.UUID, filter repository.CalendarFilter, pagination repository.Pagination) ([]*models.WorkCalendar, int64, error) {
 	var conditions []string
 	var args []interface{}
@@ -181,7 +191,6 @@ func (r *calendarRepository) List(ctx context.Context, companyID uuid.UUID, filt
 		args = append(args, "%"+filter.Name+"%")
 		argIdx++
 	}
-	// 👇 NEW — location scope
 	if filter.LocationID != nil {
 		conditions = append(conditions, fmt.Sprintf("location_id = $%d", argIdx))
 		args = append(args, *filter.LocationID)

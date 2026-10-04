@@ -22,13 +22,17 @@ type sessionSummaryRepo struct {
 }
 
 func NewAttendanceSessionSummaryRepository(pg *client.PostgresClient, logger *zap.Logger) repository.AttendanceSessionSummaryRepository {
-	return &sessionSummaryRepo{client: pg, logger: logger.Named("session_summary_repo")}
+	return &sessionSummaryRepo{
+		client: pg,
+		logger: logger.Named("session_summary_repo"),
+	}
 }
 
+// ── CHANGED: added timezone
 const sessionSummaryColumns = `
 	summary_id, company_id, subject_type, subject_id,
 	employment_location_id,
-	session_id, session_date, status, marked_at, marked_by,
+	session_id, session_date, timezone, status, marked_at, marked_by,
 	source_type, device_id, is_auto, remarks,
 	metadata, created_at, updated_at
 `
@@ -41,22 +45,35 @@ func (r *sessionSummaryRepo) Upsert(ctx context.Context, tx *sql.Tx, summary *mo
 	summary.CreatedAt = now
 	summary.UpdatedAt = now
 
+	// ── Guard: writer must supply tz.
+	if summary.Timezone == "" {
+		r.logger.Error("SessionSummary.Upsert: timezone empty; defaulting to UTC",
+			zap.String("summary_id", summary.SummaryID.String()),
+			zap.String("company_id", summary.CompanyID.String()),
+			zap.String("subject_id", summary.SubjectID.String()),
+		)
+		summary.Timezone = "UTC"
+	}
+
 	metadataJSON, _ := json.Marshal(summary.Metadata)
 
 	query := `
 		INSERT INTO attendance.attendance_session_summary (
 			summary_id, company_id, subject_type, subject_id,
 			employment_location_id,
-			session_id, session_date, status, marked_at, marked_by,
+			session_id, session_date, timezone, status, marked_at, marked_by,
 			source_type, device_id, is_auto, remarks,
 			metadata, created_at, updated_at
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-			$11, $12, $13, $14, $15, $16, $17
+			$1, $2, $3, $4, $5,
+			$6, $7, $8, $9, $10, $11,
+			$12, $13, $14, $15,
+			$16, $17, $18
 		)
 		ON CONFLICT (company_id, subject_type, subject_id, session_id) DO UPDATE SET
 			employment_location_id = EXCLUDED.employment_location_id,
 			session_date = EXCLUDED.session_date,
+			timezone = EXCLUDED.timezone,
 			status = EXCLUDED.status,
 			marked_at = EXCLUDED.marked_at,
 			marked_by = EXCLUDED.marked_by,
@@ -66,14 +83,12 @@ func (r *sessionSummaryRepo) Upsert(ctx context.Context, tx *sql.Tx, summary *mo
 			remarks = EXCLUDED.remarks,
 			metadata = EXCLUDED.metadata,
 			updated_at = EXCLUDED.updated_at`
-
 	exec := func(q string, a ...interface{}) (sql.Result, error) {
 		if tx != nil {
 			return tx.ExecContext(ctx, q, a...)
 		}
 		return r.client.Exec(ctx, q, a...)
 	}
-
 	_, err := exec(query,
 		summary.SummaryID,
 		summary.CompanyID,
@@ -82,6 +97,7 @@ func (r *sessionSummaryRepo) Upsert(ctx context.Context, tx *sql.Tx, summary *mo
 		summary.EmploymentLocationID,
 		summary.SessionID,
 		summary.SessionDate,
+		summary.Timezone,
 		summary.Status,
 		summary.MarkedAt,
 		summary.MarkedBy,
@@ -93,6 +109,12 @@ func (r *sessionSummaryRepo) Upsert(ctx context.Context, tx *sql.Tx, summary *mo
 		summary.CreatedAt,
 		summary.UpdatedAt,
 	)
+	if err != nil {
+		r.logger.Error("failed to upsert session summary",
+			zap.String("summary_id", summary.SummaryID.String()),
+			zap.String("timezone", summary.Timezone),
+			zap.Error(err))
+	}
 	return err
 }
 
@@ -137,7 +159,6 @@ func (r *sessionSummaryRepo) List(ctx context.Context, tx *sql.Tx, filter reposi
 		WHERE 1=1`
 	args := []interface{}{}
 	argPos := 1
-
 	if filter.CompanyID != nil {
 		query += fmt.Sprintf(" AND company_id = $%d", argPos)
 		args = append(args, *filter.CompanyID)
@@ -168,19 +189,16 @@ func (r *sessionSummaryRepo) List(ctx context.Context, tx *sql.Tx, filter reposi
 		args = append(args, *filter.Status)
 		argPos++
 	}
-	// 👇 NEW — location scope
 	if filter.LocationID != nil {
 		query += fmt.Sprintf(" AND employment_location_id = $%d", argPos)
 		args = append(args, *filter.LocationID)
 		argPos++
 	}
-
 	query += " ORDER BY session_date DESC, subject_type, subject_id"
 	if pag.Limit > 0 {
 		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argPos, argPos+1)
 		args = append(args, pag.Limit, pag.Offset)
 	}
-
 	rows, err := r.getRows(ctx, tx, query, args...)
 	if err != nil {
 		return nil, err
@@ -193,7 +211,6 @@ func (r *sessionSummaryRepo) Count(ctx context.Context, tx *sql.Tx, filter repos
 	query := `SELECT COUNT(*) FROM attendance.attendance_session_summary WHERE 1=1`
 	args := []interface{}{}
 	argPos := 1
-
 	if filter.CompanyID != nil {
 		query += fmt.Sprintf(" AND company_id = $%d", argPos)
 		args = append(args, *filter.CompanyID)
@@ -229,13 +246,10 @@ func (r *sessionSummaryRepo) Count(ctx context.Context, tx *sql.Tx, filter repos
 		args = append(args, *filter.LocationID)
 		argPos++
 	}
-
 	var count int64
 	err := r.getRow(ctx, tx, query, args...).Scan(&count)
 	return count, err
 }
-
-// --- helpers ---
 
 func (r *sessionSummaryRepo) getRow(ctx context.Context, tx *sql.Tx, query string, args ...interface{}) *sql.Row {
 	if tx != nil {
@@ -257,7 +271,6 @@ func (r *sessionSummaryRepo) scanSummary(row *sql.Row) (*models.AttendanceSessio
 	var deviceIDStr, remarks sql.NullString
 	var metadataJSON []byte
 	var employmentLocID sql.NullString
-
 	err := row.Scan(
 		&s.SummaryID,
 		&s.CompanyID,
@@ -266,6 +279,7 @@ func (r *sessionSummaryRepo) scanSummary(row *sql.Row) (*models.AttendanceSessio
 		&employmentLocID,
 		&s.SessionID,
 		&s.SessionDate,
+		&s.Timezone,
 		&s.Status,
 		&s.MarkedAt,
 		&markedByUUID,
@@ -295,7 +309,6 @@ func (r *sessionSummaryRepo) scanSummaries(rows *sql.Rows) ([]*models.Attendance
 		var deviceIDStr, remarks sql.NullString
 		var metadataJSON []byte
 		var employmentLocID sql.NullString
-
 		err := rows.Scan(
 			&s.SummaryID,
 			&s.CompanyID,
@@ -304,6 +317,7 @@ func (r *sessionSummaryRepo) scanSummaries(rows *sql.Rows) ([]*models.Attendance
 			&employmentLocID,
 			&s.SessionID,
 			&s.SessionDate,
+			&s.Timezone,
 			&s.Status,
 			&s.MarkedAt,
 			&markedByUUID,

@@ -22,7 +22,12 @@ type TokenService interface {
 	IssueToken(ctx context.Context, req *models.IssueTokenRequest) (*models.DeviceToken, string, error)
 	ValidateToken(ctx context.Context, rawToken string, deviceID string) (*models.DeviceAuthContext, error)
 	ValidateTokenForRequest(ctx context.Context, req *models.ValidateTokenRequest) (*models.TokenValidationResult, error)
-	RevokeToken(ctx context.Context, tokenID uuid.UUID, revokedBy *uuid.UUID, reason string) error
+
+	// RevokeToken revokes a single token. The companyID scopes the operation
+	// to the caller's tenant: tokens belonging to a different company are
+	// reported as "not found" to avoid leaking existence.
+	RevokeToken(ctx context.Context, companyID uuid.UUID, tokenID uuid.UUID, revokedBy *uuid.UUID, reason string) error
+
 	RevokeAllDeviceTokens(ctx context.Context, companyID uuid.UUID, deviceID string, revokedBy *uuid.UUID, reason string) error
 	RotateToken(ctx context.Context, oldTokenID uuid.UUID, revokedBy *uuid.UUID, reason string) (*models.DeviceToken, string, error)
 	GetCurrentDeviceToken(ctx context.Context, companyID uuid.UUID, deviceID string) (*models.DeviceToken, error)
@@ -31,7 +36,7 @@ type TokenService interface {
 type tokenService struct {
 	tokenRepo     repository.TokenRepository
 	deviceRepo    repository.DeviceRepository
-	pgClient      *client.PostgresClient // ✅ added
+	pgClient      *client.PostgresClient
 	logger        *zap.Logger
 	tokenPrefix   string
 	tokenSecret   string
@@ -47,7 +52,7 @@ type TokenServiceConfig struct {
 func NewTokenService(
 	tokenRepo repository.TokenRepository,
 	deviceRepo repository.DeviceRepository,
-	pgClient *client.PostgresClient, // ✅ added
+	pgClient *client.PostgresClient,
 	logger *zap.Logger,
 	config TokenServiceConfig,
 ) TokenService {
@@ -65,23 +70,31 @@ func NewTokenService(
 	}
 }
 
+// -----------------------------------------------------------------------------
+// Issue
+// -----------------------------------------------------------------------------
+
 func (s *tokenService) IssueToken(ctx context.Context, req *models.IssueTokenRequest) (*models.DeviceToken, string, error) {
 	if req.CompanyID == uuid.Nil || req.DeviceID == "" || req.SourceType == "" {
 		return nil, "", errors.New("company_id, device_id, source_type required")
 	}
+
 	device, err := s.deviceRepo.GetActiveDevice(ctx, req.CompanyID, req.DeviceID)
 	if err != nil || device == nil || !device.IsTrusted {
 		return nil, "", errors.New("invalid or untrusted device")
 	}
-	// revoke existing tokens
+
+	// Revoke any existing tokens for this device before issuing a new one.
 	_ = s.tokenRepo.RevokeAllDeviceTokens(ctx, req.CompanyID, req.DeviceID, req.IssuedBy, "new token issuance")
 
 	rawToken := s.generateRawToken()
 	tokenHash := s.generateTokenHash(rawToken)
+
 	expiry := time.Now().UTC().Add(s.tokenValidity)
 	if req.ExpiresIn != nil && *req.ExpiresIn > 0 {
 		expiry = time.Now().UTC().Add(time.Duration(*req.ExpiresIn) * time.Second)
 	}
+
 	token := &models.DeviceToken{
 		TokenID:      uuid.New(),
 		CompanyID:    req.CompanyID,
@@ -100,7 +113,6 @@ func (s *tokenService) IssueToken(ctx context.Context, req *models.IssueTokenReq
 		CreatedAt: time.Now().UTC(),
 	}
 
-	// ✅ Begin transaction
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, "", fmt.Errorf("begin tx: %w", err)
@@ -110,7 +122,6 @@ func (s *tokenService) IssueToken(ctx context.Context, req *models.IssueTokenReq
 	if err := s.tokenRepo.CreateToken(ctx, tx, token); err != nil {
 		return nil, "", fmt.Errorf("create token: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return nil, "", fmt.Errorf("commit tx: %w", err)
 	}
@@ -118,26 +129,35 @@ func (s *tokenService) IssueToken(ctx context.Context, req *models.IssueTokenReq
 	return token, s.formatRawToken(req.CompanyID, rawToken), nil
 }
 
+// -----------------------------------------------------------------------------
+// Validate
+// -----------------------------------------------------------------------------
+
 func (s *tokenService) ValidateToken(ctx context.Context, formattedToken string, deviceID string) (*models.DeviceAuthContext, error) {
 	if deviceID == "" {
 		return nil, errors.New("device_id required")
 	}
+
 	companyID, rawToken, err := s.parseRawToken(formattedToken)
 	if err != nil {
 		return nil, err
 	}
+
 	tokenHash := s.generateTokenHash(rawToken)
 	token, err := s.tokenRepo.GetActiveTokenByHash(ctx, companyID, deviceID, tokenHash)
 	if err != nil || token == nil {
 		return nil, errors.New("invalid or expired token")
 	}
-	// update last used asynchronously
+
+	// Fire-and-forget last-used update.
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = s.tokenRepo.UpdateTokenLastUsed(ctx, token.TokenID)
 	}()
+
 	device, _ := s.deviceRepo.GetActiveDevice(ctx, companyID, token.DeviceID)
+
 	auth := &models.DeviceAuthContext{
 		CompanyID:    companyID,
 		DeviceID:     token.DeviceID,
@@ -154,54 +174,110 @@ func (s *tokenService) ValidateToken(ctx context.Context, formattedToken string,
 
 func (s *tokenService) ValidateTokenForRequest(ctx context.Context, req *models.ValidateTokenRequest) (*models.TokenValidationResult, error) {
 	result := &models.TokenValidationResult{IsValid: false}
+
 	auth, err := s.ValidateToken(ctx, req.RawToken, req.DeviceID)
 	if err != nil {
 		result.Error = err.Error()
 		return result, nil
 	}
+
 	if auth.CompanyID != req.CompanyID || auth.DeviceID != req.DeviceID {
 		result.Error = "token mismatch"
 		return result, nil
 	}
+
 	token, err := s.tokenRepo.GetTokenByID(ctx, auth.TokenID)
 	if err != nil {
 		result.Error = err.Error()
 		return result, nil
 	}
+
 	result.IsValid = true
 	result.Token = token
 	result.AuthContext = auth
 	return result, nil
 }
 
-// The rest of the methods (RevokeToken, RevokeAllDeviceTokens, RotateToken, GetCurrentDeviceToken) remain unchanged
-// because they either don't need a transaction or already handle it.
-// For RotateToken, it calls tokenRepo.RotateToken which probably expects a transaction,
-// but we'll keep it as is for now; you may need to add transaction handling there as well.
+// -----------------------------------------------------------------------------
+// Revoke
+// -----------------------------------------------------------------------------
 
-func (s *tokenService) RevokeToken(ctx context.Context, tokenID uuid.UUID, revokedBy *uuid.UUID, reason string) error {
+// RevokeToken revokes a single token, scoped to companyID.
+//
+// Returns "token not found" both when the token doesn't exist and when it
+// belongs to a different company, so callers cannot probe for the existence
+// of tokens in other tenants.
+func (s *tokenService) RevokeToken(
+	ctx context.Context,
+	companyID uuid.UUID,
+	tokenID uuid.UUID,
+	revokedBy *uuid.UUID,
+	reason string,
+) error {
 	if tokenID == uuid.Nil {
 		return errors.New("token_id required")
 	}
-	return s.tokenRepo.RevokeToken(ctx, tokenID, revokedBy, reason)
+	if companyID == uuid.Nil {
+		return errors.New("company_id required")
+	}
+
+	token, err := s.tokenRepo.GetTokenByID(ctx, tokenID)
+	if err != nil {
+		return fmt.Errorf("get token: %w", err)
+	}
+	if token == nil || token.CompanyID != companyID {
+		return errors.New("token not found")
+	}
+
+	if err := s.tokenRepo.RevokeToken(ctx, tokenID, revokedBy, reason); err != nil {
+		return fmt.Errorf("revoke token: %w", err)
+	}
+
+	s.logger.Info("Device token revoked",
+		zap.String("token_id", tokenID.String()),
+		zap.String("company_id", companyID.String()),
+		zap.String("device_id", token.DeviceID),
+	)
+	return nil
 }
 
-func (s *tokenService) RevokeAllDeviceTokens(ctx context.Context, companyID uuid.UUID, deviceID string, revokedBy *uuid.UUID, reason string) error {
+func (s *tokenService) RevokeAllDeviceTokens(
+	ctx context.Context,
+	companyID uuid.UUID,
+	deviceID string,
+	revokedBy *uuid.UUID,
+	reason string,
+) error {
+	if companyID == uuid.Nil || deviceID == "" {
+		return errors.New("company_id and device_id required")
+	}
 	return s.tokenRepo.RevokeAllDeviceTokens(ctx, companyID, deviceID, revokedBy, reason)
 }
 
-func (s *tokenService) RotateToken(ctx context.Context, oldTokenID uuid.UUID, revokedBy *uuid.UUID, reason string) (*models.DeviceToken, string, error) {
+// -----------------------------------------------------------------------------
+// Rotate
+// -----------------------------------------------------------------------------
+
+func (s *tokenService) RotateToken(
+	ctx context.Context,
+	oldTokenID uuid.UUID,
+	revokedBy *uuid.UUID,
+	reason string,
+) (*models.DeviceToken, string, error) {
 	oldToken, err := s.tokenRepo.GetTokenByID(ctx, oldTokenID)
 	if err != nil || oldToken == nil {
 		return nil, "", errors.New("token not found")
 	}
+
 	newRaw := s.generateRawToken()
 	newHash := s.generateTokenHash(newRaw)
+
 	exp := oldToken.ExpiresAt
 	if exp == nil {
 		t := time.Now().UTC().Add(s.tokenValidity)
 		exp = &t
 	}
+
 	newToken := &models.DeviceToken{
 		TokenID:      uuid.New(),
 		CompanyID:    oldToken.CompanyID,
@@ -218,7 +294,7 @@ func (s *tokenService) RotateToken(ctx context.Context, oldTokenID uuid.UUID, re
 		},
 		CreatedAt: time.Now().UTC(),
 	}
-	// RotateToken may also need a transaction – for consistency, we'll create one.
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, "", fmt.Errorf("begin tx: %w", err)
@@ -228,7 +304,6 @@ func (s *tokenService) RotateToken(ctx context.Context, oldTokenID uuid.UUID, re
 	if err := s.tokenRepo.RotateToken(ctx, oldTokenID, newToken, revokedBy, reason); err != nil {
 		return nil, "", err
 	}
-
 	if err := tx.Commit(); err != nil {
 		return nil, "", fmt.Errorf("commit tx: %w", err)
 	}
@@ -236,7 +311,15 @@ func (s *tokenService) RotateToken(ctx context.Context, oldTokenID uuid.UUID, re
 	return newToken, s.formatRawToken(newToken.CompanyID, newRaw), nil
 }
 
-func (s *tokenService) GetCurrentDeviceToken(ctx context.Context, companyID uuid.UUID, deviceID string) (*models.DeviceToken, error) {
+// -----------------------------------------------------------------------------
+// Read
+// -----------------------------------------------------------------------------
+
+func (s *tokenService) GetCurrentDeviceToken(
+	ctx context.Context,
+	companyID uuid.UUID,
+	deviceID string,
+) (*models.DeviceToken, error) {
 	if companyID == uuid.Nil || deviceID == "" {
 		return nil, errors.New("company_id and device_id required")
 	}
@@ -247,7 +330,10 @@ func (s *tokenService) GetCurrentDeviceToken(ctx context.Context, companyID uuid
 	return tokens[0], nil
 }
 
-// helpers remain unchanged
+// -----------------------------------------------------------------------------
+// Token helpers
+// -----------------------------------------------------------------------------
+
 func (s *tokenService) generateTokenHash(rawToken string) string {
 	sum := sha256.Sum256([]byte(rawToken + s.tokenSecret))
 	return hex.EncodeToString(sum[:])
@@ -256,6 +342,8 @@ func (s *tokenService) generateTokenHash(rawToken string) string {
 func (s *tokenService) generateRawToken() string {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
+		// crypto/rand failing means the system is broken; a panic here is
+		// intentional. Replace with an error return if the call path allows.
 		panic("secure token generation failed")
 	}
 	return hex.EncodeToString(b)

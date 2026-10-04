@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -30,19 +31,55 @@ func NewDeviceTokenAdminHandler(
 	}
 }
 
+// requireAdmin resolves the admin actor and the caller's company from context.
+// Returns (actorID, companyID, true) on success; writes an error and returns
+// false otherwise.
+func (h *DeviceTokenAdminHandler) requireAdmin(
+	w http.ResponseWriter,
+	ctx context.Context,
+) (uuid.UUID, uuid.UUID, bool) {
+	if getSessionTypeFromContext(ctx) != "admin" {
+		h.respondWithError(w, http.StatusForbidden, "admin access required")
+		return uuid.Nil, uuid.Nil, false
+	}
+	actorID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return uuid.Nil, uuid.Nil, false
+	}
+	companyID, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "company context required")
+		return uuid.Nil, uuid.Nil, false
+	}
+	return actorID, companyID, true
+}
+
+// assertPathCompany rejects requests where the company in the URL doesn't
+// match the caller's company from context.
+func (h *DeviceTokenAdminHandler) assertPathCompany(
+	w http.ResponseWriter,
+	ctxCompany uuid.UUID,
+	pathCompany uuid.UUID,
+) bool {
+	if ctxCompany != pathCompany {
+		h.logger.Warn("token handler company mismatch",
+			zap.String("ctx_company", ctxCompany.String()),
+			zap.String("path_company", pathCompany.String()),
+		)
+		h.respondWithError(w, http.StatusForbidden, "company mismatch")
+		return false
+	}
+	return true
+}
+
 // ---- IssueDeviceToken ----
 
 func (h *DeviceTokenAdminHandler) IssueDeviceToken(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Admin only
-	if getSessionTypeFromContext(ctx) != "admin" {
-		h.respondWithError(w, http.StatusForbidden, "admin access required")
-		return
-	}
-	actorID, err := getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+	actorID, ctxCompany, ok := h.requireAdmin(w, ctx)
+	if !ok {
 		return
 	}
 
@@ -52,6 +89,10 @@ func (h *DeviceTokenAdminHandler) IssueDeviceToken(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
 		return
 	}
+	if !h.assertPathCompany(w, ctxCompany, companyID) {
+		return
+	}
+
 	deviceID := chi.URLParam(r, "deviceID")
 	if deviceID == "" {
 		h.respondWithError(w, http.StatusBadRequest, "device ID required")
@@ -108,13 +149,9 @@ func (h *DeviceTokenAdminHandler) IssueDeviceToken(w http.ResponseWriter, r *htt
 
 func (h *DeviceTokenAdminHandler) RevokeDeviceToken(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	if getSessionTypeFromContext(ctx) != "admin" {
-		h.respondWithError(w, http.StatusForbidden, "admin access required")
-		return
-	}
-	actorID, err := getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+
+	actorID, ctxCompany, ok := h.requireAdmin(w, ctx)
+	if !ok {
 		return
 	}
 
@@ -133,11 +170,14 @@ func (h *DeviceTokenAdminHandler) RevokeDeviceToken(w http.ResponseWriter, r *ht
 		body.Reason = "revoked by admin"
 	}
 
-	if err := h.tokenService.RevokeToken(ctx, tokenID, &actorID, body.Reason); err != nil {
+	// Service scopes by company and returns "not found" for cross-tenant
+	// tokens, so we don't leak existence.
+	if err := h.tokenService.RevokeToken(ctx, ctxCompany, tokenID, &actorID, body.Reason); err != nil {
 		h.logger.Error("Failed to revoke device token",
 			zap.String("token_id", tokenID.String()),
+			zap.String("company_id", ctxCompany.String()),
 			zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -156,13 +196,9 @@ func (h *DeviceTokenAdminHandler) RevokeDeviceToken(w http.ResponseWriter, r *ht
 
 func (h *DeviceTokenAdminHandler) RevokeAllDeviceTokens(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	if getSessionTypeFromContext(ctx) != "admin" {
-		h.respondWithError(w, http.StatusForbidden, "admin access required")
-		return
-	}
-	actorID, err := getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+
+	actorID, ctxCompany, ok := h.requireAdmin(w, ctx)
+	if !ok {
 		return
 	}
 
@@ -172,6 +208,10 @@ func (h *DeviceTokenAdminHandler) RevokeAllDeviceTokens(w http.ResponseWriter, r
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
 		return
 	}
+	if !h.assertPathCompany(w, ctxCompany, companyID) {
+		return
+	}
+
 	deviceID := chi.URLParam(r, "deviceID")
 	if deviceID == "" {
 		h.respondWithError(w, http.StatusBadRequest, "device ID required")
@@ -202,8 +242,9 @@ func (h *DeviceTokenAdminHandler) RevokeAllDeviceTokens(w http.ResponseWriter, r
 
 func (h *DeviceTokenAdminHandler) GetCurrentDeviceToken(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	if getSessionTypeFromContext(ctx) != "admin" {
-		h.respondWithError(w, http.StatusForbidden, "admin access required")
+
+	_, ctxCompany, ok := h.requireAdmin(w, ctx)
+	if !ok {
 		return
 	}
 
@@ -213,6 +254,10 @@ func (h *DeviceTokenAdminHandler) GetCurrentDeviceToken(w http.ResponseWriter, r
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
 		return
 	}
+	if !h.assertPathCompany(w, ctxCompany, companyID) {
+		return
+	}
+
 	deviceID := chi.URLParam(r, "deviceID")
 	if deviceID == "" {
 		h.respondWithError(w, http.StatusBadRequest, "device ID required")

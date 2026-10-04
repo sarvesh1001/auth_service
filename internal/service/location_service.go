@@ -1,6 +1,7 @@
 package service
 
 import (
+	"auth-service/internal/util" // ← NEW
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -100,6 +101,16 @@ func (s *LocationService) CreateLocation(ctx context.Context, req *models.Create
 		return nil, fmt.Errorf("%w: location_name is required", apperrors.ErrInvalidInput)
 	}
 
+	// ── NEW: timezone validation.
+	//   * nil            → inherit company.default_timezone (stored as NULL)
+	//   * ""             → treated as nil (client sent empty field)
+	//   * any other string must be a valid IANA name.
+	if req.Timezone != nil && *req.Timezone != "" {
+		if err := util.ValidateTimezone(*req.Timezone); err != nil {
+			return nil, fmt.Errorf("%w: timezone: %v", apperrors.ErrInvalidInput, err)
+		}
+	}
+
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
 		idempKey = fmt.Sprintf("create_location:%s:%s", req.CompanyID.String(), req.LocationCode)
@@ -120,6 +131,13 @@ func (s *LocationService) CreateLocation(ctx context.Context, req *models.Create
 	}
 
 	now := time.Now().UTC()
+
+	// Normalise: empty string → nil pointer (inherit company default).
+	var tz *string
+	if req.Timezone != nil && *req.Timezone != "" {
+		tz = req.Timezone
+	}
+
 	loc := &models.Location{
 		LocationID:   uuid.New(),
 		CompanyID:    req.CompanyID,
@@ -131,6 +149,7 @@ func (s *LocationService) CreateLocation(ctx context.Context, req *models.Create
 		State:        req.State,
 		Country:      req.Country,
 		Pincode:      req.Pincode,
+		Timezone:     tz, // ← NEW (nil → inherit company.default_timezone)
 		IsActive:     true,
 		CreatedAt:    now,
 		UpdatedAt:    now,
@@ -139,6 +158,10 @@ func (s *LocationService) CreateLocation(ctx context.Context, req *models.Create
 	if err := s.locationRepo.CreateLocation(ctx, s.pgClient.Pool(), loc); err != nil {
 		if err == apperrors.ErrDuplicate {
 			return nil, fmt.Errorf("%w: location with code '%s' already exists for this company", apperrors.ErrDuplicate, req.LocationCode)
+		}
+		if err == apperrors.ErrInvalidInput {
+			// repo converted chk_locations_tz_format violation
+			return nil, fmt.Errorf("%w: invalid timezone format rejected by database", apperrors.ErrInvalidInput)
 		}
 		return nil, fmt.Errorf("%w: %v", apperrors.ErrInternal, err)
 	}
@@ -150,12 +173,12 @@ func (s *LocationService) CreateLocation(ctx context.Context, req *models.Create
 			&loc.LocationID, "system", nil, nil, nil, map[string]interface{}{
 				"company_id": req.CompanyID,
 				"code":       req.LocationCode,
+				"timezone":   tz, // ← NEW (nil in audit = inherits)
 				"ip_address": ip,
 			})
 	}
 	return loc, nil
 }
-
 func (s *LocationService) GetLocation(ctx context.Context, locationID uuid.UUID) (*models.Location, error) {
 	if locationID == uuid.Nil {
 		return nil, fmt.Errorf("%w: location_id is required", apperrors.ErrInvalidInput)
@@ -204,6 +227,26 @@ func (s *LocationService) UpdateLocation(ctx context.Context, locationID uuid.UU
 	if req.Pincode != nil {
 		loc.Pincode = req.Pincode
 	}
+
+	// ── NEW: timezone update semantics.
+	//   req.Timezone == nil       → preserve current tz
+	//   req.Timezone != nil && "" → clear (revert to inheriting company default)
+	//   req.Timezone != nil && s  → validate + set
+	//
+	// Only run the tz branch when the caller actually sent the field, so
+	// a PUT that omits timezone doesn't accidentally clear it.
+	if req.Timezone != nil {
+		if *req.Timezone == "" {
+			loc.Timezone = nil // clear → inherit company.default_timezone
+		} else {
+			if err := util.ValidateTimezone(*req.Timezone); err != nil {
+				return nil, fmt.Errorf("%w: timezone: %v", apperrors.ErrInvalidInput, err)
+			}
+			tz := *req.Timezone
+			loc.Timezone = &tz
+		}
+	}
+
 	if req.IsActive != nil {
 		loc.IsActive = *req.IsActive
 	}
@@ -213,6 +256,9 @@ func (s *LocationService) UpdateLocation(ctx context.Context, locationID uuid.UU
 		if err == apperrors.ErrDuplicate {
 			return nil, fmt.Errorf("%w: duplicate location code", apperrors.ErrDuplicate)
 		}
+		if err == apperrors.ErrInvalidInput {
+			return nil, fmt.Errorf("%w: invalid timezone format rejected by database", apperrors.ErrInvalidInput)
+		}
 		return nil, fmt.Errorf("%w: %v", apperrors.ErrInternal, err)
 	}
 	after, _ := json.Marshal(loc)
@@ -221,10 +267,20 @@ func (s *LocationService) UpdateLocation(ctx context.Context, locationID uuid.UU
 
 	if s.auditService != nil {
 		ip, _ := ctx.Value("ip_address").(string)
+		meta := map[string]interface{}{
+			"ip_address": ip,
+		}
+		// ── NEW: log tz changes explicitly so the audit trail is searchable.
+		if req.Timezone != nil {
+			meta["timezone_changed"] = true
+			if loc.Timezone != nil {
+				meta["timezone_new"] = *loc.Timezone
+			} else {
+				meta["timezone_new"] = nil // cleared → inherits
+			}
+		}
 		_ = s.auditService.LogAction(ctx, nil, nil, "location", "update", "location",
-			&locationID, "system", nil, before, after, map[string]interface{}{
-				"ip_address": ip,
-			})
+			&locationID, "system", nil, before, after, meta)
 	}
 	return loc, nil
 }
@@ -945,25 +1001,25 @@ func (s *LocationService) CheckLocationAccess(
 // Rules applied, in order:
 //
 //  1. Scope resolution: if req.LocationAccessScope is empty, derive it:
-//       PRIMARY  ← primary_location_id was provided
-//       SELECTED ← selected_locations / selected_location_ids was provided
-//       ALL      ← otherwise
+//     PRIMARY  ← primary_location_id was provided
+//     SELECTED ← selected_locations / selected_location_ids was provided
+//     ALL      ← otherwise
 //
 //  2. Allowed-set construction:
-//       PRIMARY  → { primary_location_id }
-//       SELECTED → { every selected location }
-//       ALL      → { all active locations of the company } — reject if empty
+//     PRIMARY  → { primary_location_id }
+//     SELECTED → { every selected location }
+//     ALL      → { all active locations of the company } — reject if empty
 //
 //  3. Tenancy + scope check on every candidate location:
-//       - primary_location_id
-//       - work center's location (if resolvedWCLoc != nil)
-//       - every selected location
-//       - position location (req.LocationID) — only when WC is not set
+//     - primary_location_id
+//     - work center's location (if resolvedWCLoc != nil)
+//     - every selected location
+//     - position location (req.LocationID) — only when WC is not set
 //     Each must (a) belong to the company & be active, and
 //     (b) be inside the allowed set.
 //
 //  4. Normalisation: if no primary was supplied, derive one:
-//       work center's location → else first selected → else nil.
+//     work center's location → else first selected → else nil.
 func (s *LocationService) ValidateProspectiveLocationAccess(
 	ctx context.Context,
 	companyID uuid.UUID,

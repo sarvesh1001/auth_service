@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 
@@ -32,13 +33,31 @@ func NewBatchHandler(
 	}
 }
 
+func (h *BatchHandler) requireDeviceAuth(
+	w http.ResponseWriter,
+	r *http.Request,
+) (*models.DeviceAuthContext, bool) {
+	authContext, ok := r.Context().Value("device_auth_context").(*models.DeviceAuthContext)
+	if !ok || authContext == nil {
+		h.logger.Warn("device_auth_context missing on batch endpoint",
+			zap.String("path", r.URL.Path),
+			zap.String("method", r.Method))
+		h.respondWithError(w, http.StatusUnauthorized, "device authentication required")
+		return nil, false
+	}
+	return authContext, true
+}
+
 // POST /attendance/batches
+//
+// FIX (Handler hygiene): surfaces batch.ErrAllEventsFailed as 422 so the
+// device learns that nothing was accepted and can look at /failures.
 func (h *BatchHandler) BatchPunch(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	authContext, ok := ctx.Value("device_auth_context").(*models.DeviceAuthContext)
-	if !ok || authContext == nil {
-		panic("device_auth_context missing: DeviceAuthMiddleware misconfigured")
+	authContext, ok := h.requireDeviceAuth(w, r)
+	if !ok {
+		return
 	}
 
 	var payload BatchPayload
@@ -65,6 +84,14 @@ func (h *BatchHandler) BatchPunch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.batchIngestService.IngestBatch(ctx, req); err != nil {
+		if errors.Is(err, batch.ErrAllEventsFailed) {
+			h.logger.Warn("Attendance batch rejected in full",
+				zap.String("batch_ref", payload.BatchRef),
+				zap.String("device_id", authContext.DeviceID),
+			)
+			h.respondWithError(w, http.StatusUnprocessableEntity, "all events in batch failed")
+			return
+		}
 		h.logger.Warn("Attendance batch ingest failed",
 			zap.String("batch_ref", payload.BatchRef),
 			zap.String("device_id", authContext.DeviceID),
@@ -85,9 +112,9 @@ func (h *BatchHandler) BatchPunch(w http.ResponseWriter, r *http.Request) {
 func (h *BatchHandler) GetBatchStatus(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	authContext, ok := ctx.Value("device_auth_context").(*models.DeviceAuthContext)
-	if !ok || authContext == nil {
-		panic("device_auth_context missing")
+	authContext, ok := h.requireDeviceAuth(w, r)
+	if !ok {
+		return
 	}
 
 	batchRef := chi.URLParam(r, "batch_ref")
@@ -116,9 +143,9 @@ func (h *BatchHandler) GetBatchStatus(w http.ResponseWriter, r *http.Request) {
 func (h *BatchHandler) GetBatchFailures(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	authContext, ok := ctx.Value("device_auth_context").(*models.DeviceAuthContext)
-	if !ok || authContext == nil {
-		panic("device_auth_context missing")
+	authContext, ok := h.requireDeviceAuth(w, r)
+	if !ok {
+		return
 	}
 
 	batchRef := chi.URLParam(r, "batch_ref")

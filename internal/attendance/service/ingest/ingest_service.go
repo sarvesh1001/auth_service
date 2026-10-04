@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,11 +21,8 @@ import (
 	"auth-service/internal/attendance/service/usage_integration"
 	auditservice "auth-service/internal/infrastructure/audit"
 	"auth-service/internal/locationctx"
+	"auth-service/internal/util"
 )
-
-// ---------------------------------------------------------------------------
-// Request types
-// ---------------------------------------------------------------------------
 
 type PunchRequest struct {
 	CompanyID      uuid.UUID
@@ -44,10 +42,6 @@ type PunchSource struct {
 	DeviceID   *string
 	IPAddress  *string
 }
-
-// ---------------------------------------------------------------------------
-// Main interface and service struct
-// ---------------------------------------------------------------------------
 
 type IngestService interface {
 	IngestPunch(ctx context.Context, req *PunchRequest) (*models.AttendanceEvent, error)
@@ -70,6 +64,9 @@ type ingestService struct {
 	sessionSummaryRepo repository.AttendanceSessionSummaryRepository
 	usageService       *usage_integration.UsageIntegrationService
 	locationResolver   resolver.SubjectLocationResolver
+
+	// ── NEW: canonical timezone resolver
+	tzProvider resolver.TimezoneProvider
 }
 
 func NewIngestService(
@@ -85,6 +82,7 @@ func NewIngestService(
 	sessionSummaryRepo repository.AttendanceSessionSummaryRepository,
 	usageService *usage_integration.UsageIntegrationService,
 	locationResolver resolver.SubjectLocationResolver,
+	tzProvider resolver.TimezoneProvider, // ── NEW
 ) IngestService {
 	return &ingestService{
 		eventRepo:          eventRepo,
@@ -99,12 +97,9 @@ func NewIngestService(
 		sessionSummaryRepo: sessionSummaryRepo,
 		usageService:       usageService,
 		locationResolver:   locationResolver,
+		tzProvider:         tzProvider,
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Core ingest logic
-// ---------------------------------------------------------------------------
 
 func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*models.AttendanceEvent, error) {
 	start := time.Now().UTC()
@@ -114,7 +109,6 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		zap.String("source_type", req.Source.SourceType),
 	)
 
-	// 1. Basic validation
 	if req.CompanyID == uuid.Nil {
 		return nil, errors.New("company_id required")
 	}
@@ -128,19 +122,16 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		req.Context = &models.EventContext{}
 	}
 
-	// 2. Resolve source rules
 	sourceRules, err := s.sourceResolver.Resolve(ctx, req.Source.SourceType)
 	if err != nil {
 		return nil, fmt.Errorf("invalid source type: %w", err)
 	}
 
-	// 3. Resolve event time
 	eventTime, err := s.resolveEventTime(ctx, req, sourceRules)
 	if err != nil {
 		return nil, err
 	}
 
-	// 4. Determine subject (via enrollment if device)
 	subjectType := req.SubjectType
 	subjectID := req.SubjectID
 	var deviceID *string
@@ -173,24 +164,23 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		}
 	}
 
-	// 5. Resolve attendance rules (policy)
 	resolvedRules, err := s.adminService.ResolveAttendanceRules(
 		ctx,
 		subjectID,
 		req.CompanyID,
 		subjectType,
 		derefString(req.Context.WorkCenterCode),
-		nil, // positionID
+		nil,
 		eventTime,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("resolve attendance rules: %w", err)
 	}
+
 	if !resolvedRules.AllowedSourceTypesMap[req.Source.SourceType] {
 		return nil, fmt.Errorf("source '%s' not allowed by rules", req.Source.SourceType)
 	}
 
-	// 6. Ensure attendance source exists
 	if req.Source.SourceID == nil {
 		src, err := s.sourceRepo.GetByType(ctx, req.CompanyID, req.Source.SourceType)
 		if err != nil {
@@ -202,11 +192,11 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		req.Source.SourceID = &src.SourceID
 	}
 
-	// 7. OM authorization
 	var actorPtr *uuid.UUID
 	if req.ActorID != uuid.Nil {
 		actorPtr = &req.ActorID
 	}
+
 	allowed, reason := s.omService.CanPunchAttendance(
 		ctx,
 		req.CompanyID,
@@ -226,7 +216,6 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		return nil, fmt.Errorf("not authorized: %s", reason)
 	}
 
-	// 7b. Row-level authorization — the actor must have access to the target subject.
 	if err := s.ensureActorCanActOnSubject(ctx, req.CompanyID, req.ActorID, subjectType, subjectID); err != nil {
 		s.logger.Warn("Actor not authorized for subject location",
 			zap.String("actor_id", req.ActorID.String()),
@@ -237,9 +226,6 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		return nil, err
 	}
 
-	// 7c. Resolve and stamp the subject's employment location.
-	// Snapshot: if the subject transfers later, this event keeps the
-	// location it was at when the punch occurred.
 	subjectLocation, err := s.locationResolver.ResolveLocation(ctx, req.CompanyID, subjectType, subjectID)
 	if err != nil {
 		s.logger.Error("Failed to resolve subject location",
@@ -250,24 +236,58 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		return nil, fmt.Errorf("resolve subject location: %w", err)
 	}
 
-	// 8. Build and store the event
-	event := &models.AttendanceEvent{
-		AttendanceEventID: uuid.New(),
-		CompanyID:         req.CompanyID,
-		SubjectType:       subjectType,
-		SubjectID:         subjectID,
-		EventType:         req.EventType,
-		EventTime:         eventTime,
+	// ── NEW: resolve timezone via the canonical chain.
+	//    Priority: position.location → position.work_center →
+	//    work_center.location → company.default_timezone.
+	//
+	//    We pass what we have. For device punches the work center comes
+	//    from the device. For non-device punches it comes from Context.
+	//    The subject's location is the last resort before company default.
+	effectiveTz, tzErr := s.tzProvider.ResolveTimezone(
+		ctx,
+		req.CompanyID,
+		nil, // positionID — we don't have it here; work center wins
+		req.Context.WorkCenterCode,
+		subjectLocation,
+	)
+	if tzErr != nil {
+		s.logger.Error("tz resolution failed, defaulting to UTC",
+			zap.String("company_id", req.CompanyID.String()),
+			zap.String("subject_id", subjectID.String()),
+			zap.Error(tzErr),
+		)
+		effectiveTz = "UTC"
+	}
+	if effectiveTz == "" {
+		effectiveTz = "UTC"
+	}
 
+	// Compute the three tz-derived columns.
+	offsetMinutes := util.OffsetMinutes(eventTime, effectiveTz)
+	eventDateLocal := util.CalendarDateInTz(eventTime, effectiveTz)
+
+	// Optional country code from the location (for tax-residency reports).
+	eventCountry := s.resolveEventCountry(ctx, req.CompanyID, subjectLocation)
+
+	event := &models.AttendanceEvent{
+		AttendanceEventID:    uuid.New(),
+		CompanyID:            req.CompanyID,
+		SubjectType:          subjectType,
+		SubjectID:            subjectID,
+		EventType:            req.EventType,
+		EventTime:            eventTime,
+		EventTZ:              effectiveTz,
+		EventOffsetMinutes:   int16(offsetMinutes),
+		EventDateLocal:       eventDateLocal,
+		EventCountry:         eventCountry,
 		EmploymentLocationID: subjectLocation,
 		GeofenceID:           deviceGeofence(device),
-
-		SourceType:     req.Source.SourceType,
-		SourceID:       req.Source.SourceID,
-		DeviceID:       deviceID,
-		DeviceUserCode: req.DeviceUserCode,
-		IPAddress:      req.Source.IPAddress,
-		Context:        *req.Context,
+		SourceType:           req.Source.SourceType,
+		SourceID:             req.Source.SourceID,
+		DeviceID:             deviceID,
+		DeviceUserCode:       req.DeviceUserCode,
+		IPAddress:            req.Source.IPAddress,
+		Context:              *req.Context,
 		Metadata: models.EventMetadata{
 			IsAutoGenerated: boolPtr(sourceRules.IsSystem),
 		},
@@ -275,17 +295,10 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		CreatedBy: actorPtr,
 	}
 
-	s.logger.Debug("Creating transaction via eventRepo.BeginTx",
-		zap.String("event_id", event.AttendanceEventID.String()),
-	)
 	tx, err := s.eventRepo.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
-	s.logger.Debug("Transaction created",
-		zap.Any("tx_ptr", tx),
-		zap.Bool("tx_is_nil", tx == nil),
-	)
 	if tx == nil {
 		s.logger.Error("Transaction is nil but no error returned from BeginTx")
 		return nil, errors.New("failed to begin transaction: tx is nil")
@@ -295,14 +308,14 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 	if err := s.eventRepo.CreateEvent(ctx, tx, event); err != nil {
 		return nil, fmt.Errorf("create event: %w", err)
 	}
-
 	if deviceID != nil {
 		_ = s.deviceRepo.UpdateLastSeen(ctx, *deviceID)
 	}
 
-	// 9. If this punch is linked to a session, upsert the session summary
 	if req.Context.SessionID != nil && *req.Context.SessionID != uuid.Nil {
-		if err := s.updateSessionSummary(ctx, tx, event, *req.Context.SessionID, subjectLocation); err != nil {
+		// ── CHANGED: pass effectiveTz so the session summary is bucketed
+		//    into the correct local day.
+		if err := s.updateSessionSummary(ctx, tx, event, *req.Context.SessionID, subjectLocation, effectiveTz); err != nil {
 			s.logger.Warn("Failed to update session summary",
 				zap.String("event_id", event.AttendanceEventID.String()),
 				zap.String("session_id", req.Context.SessionID.String()),
@@ -311,24 +324,12 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		}
 	}
 
-	// 10. Process usage for customer check-ins (if applicable)
 	if subjectType == "customer" && req.EventType == "check_in" {
 		featureKey := s.getFeatureKeyForEvent(req.EventType, req.Source.SourceType)
 		if featureKey != "" {
-			s.logger.Debug("Attempting to process usage",
-				zap.String("customer_id", subjectID.String()),
-				zap.String("feature_key", featureKey),
-				zap.Any("tx_ptr", tx),
-				zap.Bool("tx_is_nil", tx == nil),
-				zap.Bool("usageService_is_nil", s.usageService == nil),
-			)
 			if s.usageService == nil {
 				s.logger.Error("usageService is nil; cannot process usage")
 				return nil, errors.New("usage service not available")
-			}
-			if tx == nil {
-				s.logger.Error("Transaction is nil before calling ProcessCheckIn")
-				return nil, errors.New("transaction is nil")
 			}
 			if err := s.usageService.ProcessCheckIn(
 				ctx,
@@ -345,10 +346,6 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 				)
 				return nil, fmt.Errorf("usage processing failed: %w", err)
 			}
-		} else {
-			s.logger.Debug("No feature key mapped for this event; skipping usage",
-				zap.String("event_type", req.EventType),
-			)
 		}
 	}
 
@@ -360,26 +357,46 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		zap.String("event_id", event.AttendanceEventID.String()),
 		zap.String("subject_type", subjectType),
 		zap.String("subject_id", subjectID.String()),
+		zap.String("event_tz", effectiveTz),
+		zap.Int("offset_minutes", offsetMinutes),
+		zap.Time("event_date_local", eventDateLocal),
 		zap.Duration("duration", time.Since(start)),
 	)
 	return event, nil
 }
 
-// ---------------------------------------------------------------------------
-// Row-level authorization + location helpers
-// ---------------------------------------------------------------------------
+// resolveEventCountry looks up locations.country for the subject's location.
+// Returns nil if not resolvable. Never fails the write — country is optional.
+func (s *ingestService) resolveEventCountry(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+) *string {
+	if locationID == nil || *locationID == uuid.Nil {
+		return nil
+	}
+	var country sql.NullString
+	err := s.eventRepo.(interface {
+		QueryRow(ctx context.Context, query string, args ...interface{}) *sql.Row
+	}).QueryRow(ctx, `
+		SELECT country FROM locations
+		WHERE company_id = $1 AND location_id = $2
+	`, companyID, *locationID).Scan(&country)
+	if err != nil {
+		return nil
+	}
+	if !country.Valid || country.String == "" {
+		return nil
+	}
+	// Truncate to alpha-2
+	c := country.String
+	if len(c) > 2 {
+		c = c[:2]
+	}
+	c = strings.ToUpper(c)
+	return &c
+}
 
-// ensureActorCanActOnSubject verifies that, when an actor is present and
-// differs from the target subject, the target subject is within the caller's
-// current location scope.
-//
-// Device-authenticated requests (actorID == uuid.Nil) skip the check —
-// the device is bound to a geofence, and the geofence determines location.
-//
-// Self-service punches (actorID == subjectID) skip the check.
-//
-// Requests without a location context (internal callers) skip the check.
-// This preserves compatibility with device-authenticated and internal paths.
 func (s *ingestService) ensureActorCanActOnSubject(
 	ctx context.Context,
 	companyID, actorID uuid.UUID,
@@ -387,21 +404,18 @@ func (s *ingestService) ensureActorCanActOnSubject(
 	subjectID uuid.UUID,
 ) error {
 	if actorID == uuid.Nil {
-		return nil // device / system
+		return nil
 	}
 	if actorID == subjectID {
-		return nil // self
+		return nil
 	}
-
 	locCtx, err := locationctx.FromContext(ctx)
 	if err != nil {
-		// Not location-scoped — internal or device path. Permit.
-		return nil
+		return fmt.Errorf("location context missing for cross-subject write: %w", resolver.ErrSubjectOutsideScope)
 	}
 	if locCtx.Mode == locationctx.ScopeAll {
 		return nil
 	}
-
 	subjectLoc, err := s.locationResolver.ResolveLocation(ctx, companyID, subjectType, subjectID)
 	if err != nil {
 		return err
@@ -409,24 +423,18 @@ func (s *ingestService) ensureActorCanActOnSubject(
 	if subjectLoc == nil {
 		return resolver.ErrSubjectHasNoLocation
 	}
-	if *subjectLoc != *locCtx.LocationID {
+	if locCtx.LocationID == nil || *subjectLoc != *locCtx.LocationID {
 		return resolver.ErrSubjectOutsideScope
 	}
 	return nil
 }
 
-// deviceGeofence returns the device's geofence ID, if the device is set.
-// Returns nil for non-device sources or devices with no geofence.
 func deviceGeofence(device *models.AttendanceDevice) *uuid.UUID {
 	if device == nil {
 		return nil
 	}
 	return device.GeofenceID
 }
-
-// ---------------------------------------------------------------------------
-// Helper functions
-// ---------------------------------------------------------------------------
 
 func derefString(s *string) string {
 	if s != nil {
@@ -439,60 +447,44 @@ func boolPtr(b bool) *bool {
 	return &b
 }
 
-// resolveEventTime determines the event timestamp based on source rules and company timezone.
-// If company attendance rules are missing, it falls back to UTC and logs a warning.
-func (s *ingestService) resolveEventTime(ctx context.Context, req *PunchRequest, rules *source.ResolvedSourceRules) (time.Time, error) {
-	companyRules, err := s.adminService.GetCompanyAttendanceRules(ctx, req.CompanyID)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("get company rules: %w", err)
-	}
-
-	if companyRules == nil {
-		s.logger.Warn("No company attendance rules found; falling back to UTC timezone",
-			zap.String("company_id", req.CompanyID.String()))
-		if rules.RequiresDevice {
-			if req.EventTime == nil {
-				return time.Time{}, errors.New("event_time required for device events")
-			}
-			return req.EventTime.UTC(), nil
-		}
-		if rules.IsSystem {
-			return time.Now().UTC(), nil
-		}
-		return time.Now().UTC(), nil
-	}
-
-	loc, err := time.LoadLocation(companyRules.Timezone)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("invalid timezone: %w", err)
-	}
+func (s *ingestService) resolveEventTime(
+	ctx context.Context,
+	req *PunchRequest,
+	rules *source.ResolvedSourceRules,
+) (time.Time, error) {
 	if rules.RequiresDevice {
 		if req.EventTime == nil {
 			return time.Time{}, errors.New("event_time required for device events")
 		}
-		return req.EventTime.In(loc).UTC(), nil
+		if _, offset := req.EventTime.Zone(); offset == 0 {
+			s.logger.Warn("Device event_time has zero offset; timezone may be missing from payload",
+				zap.String("company_id", req.CompanyID.String()),
+				zap.Time("event_time", *req.EventTime),
+			)
+		}
+		return req.EventTime.UTC(), nil
 	}
 	if rules.IsSystem {
 		return time.Now().UTC(), nil
 	}
-	nowUTC := time.Now().UTC()
-	nowInLoc := nowUTC.In(loc)
-	return nowInLoc.UTC(), nil
+	if req.EventTime != nil {
+		return req.EventTime.UTC(), nil
+	}
+	return time.Now().UTC(), nil
 }
 
-// updateSessionSummary creates or updates the session summary based on the event.
-// The employment_location_id is stamped here as a snapshot from the event.
+// updateSessionSummary buckets the session into the subject's LOCAL day
+// (per `tz`), not UTC.
 func (s *ingestService) updateSessionSummary(
 	ctx context.Context,
 	tx *sql.Tx,
 	event *models.AttendanceEvent,
 	sessionID uuid.UUID,
 	subjectLocation *uuid.UUID,
+	tz string,
 ) error {
-	sessionDate := event.EventTime.UTC().Truncate(24 * time.Hour)
-
+	sessionDate := util.CalendarDateInTz(event.EventTime, tz)
 	status := mapEventTypeToSessionStatus(event.EventType)
-
 	summary := &models.AttendanceSessionSummary{
 		CompanyID:            event.CompanyID,
 		SubjectType:          event.SubjectType,
@@ -500,6 +492,7 @@ func (s *ingestService) updateSessionSummary(
 		EmploymentLocationID: subjectLocation,
 		SessionID:            sessionID,
 		SessionDate:          sessionDate,
+		Timezone:             tz,
 		Status:               status,
 		MarkedAt:             event.EventTime,
 		MarkedBy:             event.CreatedBy,
@@ -509,13 +502,12 @@ func (s *ingestService) updateSessionSummary(
 		Remarks:              nil,
 		Metadata: models.JSONB{
 			"event_id": event.AttendanceEventID.String(),
+			"tz":       tz,
 		},
 	}
-
 	return s.sessionSummaryRepo.Upsert(ctx, tx, summary)
 }
 
-// mapEventTypeToSessionStatus converts an attendance event type to a session status.
 func mapEventTypeToSessionStatus(eventType string) string {
 	switch eventType {
 	case "check_in", "shift_start", "class_start", "session_join", "present":
@@ -531,7 +523,6 @@ func mapEventTypeToSessionStatus(eventType string) string {
 	}
 }
 
-// getFeatureKeyForEvent maps an attendance event to a subscription feature key.
 func (s *ingestService) getFeatureKeyForEvent(eventType, sourceType string) string {
 	switch eventType {
 	case "check_in":
