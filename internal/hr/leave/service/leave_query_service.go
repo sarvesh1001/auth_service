@@ -18,7 +18,13 @@ type LeaveQueryService interface {
 	// Balance — P3 validates the target user
 	GetLeaveBalance(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, asOfDate time.Time, actorType string, actorID uuid.UUID, metadata map[string]interface{}) ([]*models.LeaveBalance, error)
 	GetLeaveBalanceByType(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, leaveTypeID uuid.UUID, asOfDate time.Time, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.LeaveBalance, error)
-
+	// In LeaveQueryService interface:
+	GetCompanyLedger(
+		ctx context.Context,
+		companyID uuid.UUID,
+		locationID *uuid.UUID,
+		filter models.LeaveLedgerFilter,
+	) ([]*models.LeaveLedgerEntry, int64, error)
 	// Internal scheduling resolver — no request ctx, no P3
 	IsUserOnLeave(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, date time.Time) (bool, *models.LeaveRequest, error)
 	GetApprovedLeaveForDate(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, date time.Time) (*models.LeaveRequest, error)
@@ -292,4 +298,26 @@ func (s *leaveQueryService) CheckLeaveAvailability(
 		return false, 0, fmt.Errorf("failed to resolve user position: %w", err)
 	}
 	return s.repo.CheckLeaveAvailability(ctx, userID, leaveTypeID, days, startDate, positionID)
+}
+func (s *leaveQueryService) GetCompanyLedger(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+	filter models.LeaveLedgerFilter,
+) ([]*models.LeaveLedgerEntry, int64, error) {
+	// Force caller scope — never trust the filter's CompanyID/LocationID.
+	filter.CompanyID = companyID
+	filter.LocationID = locationID
+
+	if filter.Page < 1 {
+		filter.Page = 1
+	}
+	if filter.PageSize < 1 {
+		filter.PageSize = 50
+	}
+	if filter.PageSize > 500 {
+		filter.PageSize = 500
+	}
+
+	return s.repo.GetCompanyLedger(ctx, filter)
 }

@@ -16,7 +16,7 @@ type LeaveRepository interface {
 	GetLeaveTypesByCompany(ctx context.Context, companyID uuid.UUID) ([]*models.LeaveType, error)
 	UpdateLeaveType(ctx context.Context, leaveTypeID uuid.UUID, update *models.LeaveTypeUpdate) error
 	DeleteLeaveType(ctx context.Context, leaveTypeID uuid.UUID) error
-
+	GetCompanyLedger(ctx context.Context, filter models.LeaveLedgerFilter) ([]*models.LeaveLedgerEntry, int64, error)
 	CreateLeaveEntitlement(ctx context.Context, entitlement *models.LeaveEntitlement) error
 	GetLeaveEntitlementByID(ctx context.Context, entitlementID uuid.UUID) (*models.LeaveEntitlement, error)
 	GetLeaveEntitlementsByUser(ctx context.Context, userID uuid.UUID, positionID *uuid.UUID,

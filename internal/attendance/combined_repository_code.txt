@@ -1613,12 +1613,14 @@ func NewSummaryRepository(pg *client.PostgresClient, logger *zap.Logger) reposit
 	}
 }
 
+// ── CHANGED: added timezone, offset_minutes
 const summaryColumns = `
 	attendance_summary_id, company_id, subject_type, subject_id,
 	employment_location_id,
 	attendance_date, status, worked_minutes, expected_minutes,
 	overtime_minutes, late_minutes, is_finalized, is_payable,
-	is_payroll_locked, metadata, generated_at, generated_by
+	is_payroll_locked, timezone, offset_minutes,
+	metadata, generated_at, generated_by
 `
 
 func (r *summaryRepository) UpsertSummary(ctx context.Context, tx *sql.Tx, summary *models.AttendanceDailySummary) error {
@@ -1628,6 +1630,18 @@ func (r *summaryRepository) UpsertSummary(ctx context.Context, tx *sql.Tx, summa
 	if summary.GeneratedAt.IsZero() {
 		summary.GeneratedAt = time.Now().UTC()
 	}
+
+	// ── Guard: writer MUST have resolved the tz.
+	if summary.Timezone == "" {
+		r.logger.Error("UpsertSummary: Timezone empty; defaulting to UTC",
+			zap.String("summary_id", summary.AttendanceSummaryID.String()),
+			zap.String("company_id", summary.CompanyID.String()),
+			zap.String("subject_id", summary.SubjectID.String()),
+		)
+		summary.Timezone = "UTC"
+		summary.OffsetMinutes = 0
+	}
+
 	metadataJSON, err := json.Marshal(summary.Metadata)
 	if err != nil {
 		return fmt.Errorf("marshal metadata: %w", err)
@@ -1639,11 +1653,14 @@ func (r *summaryRepository) UpsertSummary(ctx context.Context, tx *sql.Tx, summa
 			employment_location_id,
 			attendance_date, status, worked_minutes, expected_minutes,
 			overtime_minutes, late_minutes, is_finalized, is_payable,
-			is_payroll_locked, metadata, generated_at, generated_by
+			is_payroll_locked, timezone, offset_minutes,
+			metadata, generated_at, generated_by
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7,
-			$8, $9, $10, $11, $12, $13,
-			$14, $15, $16, $17
+			$1, $2, $3, $4, $5,
+			$6, $7, $8, $9,
+			$10, $11, $12, $13,
+			$14, $15, $16,
+			$17, $18, $19
 		)
 		ON CONFLICT (company_id, subject_type, subject_id, attendance_date)
 		DO UPDATE SET
@@ -1655,6 +1672,8 @@ func (r *summaryRepository) UpsertSummary(ctx context.Context, tx *sql.Tx, summa
 			late_minutes = EXCLUDED.late_minutes,
 			is_finalized = EXCLUDED.is_finalized,
 			is_payable = EXCLUDED.is_payable,
+			timezone = EXCLUDED.timezone,
+			offset_minutes = EXCLUDED.offset_minutes,
 			metadata = EXCLUDED.metadata,
 			generated_at = EXCLUDED.generated_at,
 			generated_by = EXCLUDED.generated_by
@@ -1682,6 +1701,8 @@ func (r *summaryRepository) UpsertSummary(ctx context.Context, tx *sql.Tx, summa
 		summary.IsFinalized,
 		summary.IsPayable,
 		summary.IsPayrollLocked,
+		summary.Timezone,
+		summary.OffsetMinutes,
 		metadataJSON,
 		summary.GeneratedAt,
 		summary.GeneratedBy,
@@ -1689,6 +1710,7 @@ func (r *summaryRepository) UpsertSummary(ctx context.Context, tx *sql.Tx, summa
 	if err != nil {
 		r.logger.Error("failed to upsert daily summary",
 			util.String("summary_id", summary.AttendanceSummaryID.String()),
+			util.String("timezone", summary.Timezone),
 			util.ErrorField(err))
 		return fmt.Errorf("upsert summary: %w", err)
 	}
@@ -1722,7 +1744,6 @@ func (r *summaryRepository) GetBySubjectRange(ctx context.Context, companyID, su
 	return r.scanSummaries(rows)
 }
 
-// GetByCompanyRange — locationID == nil means no filter (ALL scope).
 func (r *summaryRepository) GetByCompanyRange(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1730,7 +1751,6 @@ func (r *summaryRepository) GetByCompanyRange(
 	from, to time.Time,
 	limit, offset int,
 ) ([]*models.AttendanceDailySummary, int64, error) {
-	// Normalise: pass nil through to SQL as NULL.
 	var locArg interface{}
 	if locationID != nil {
 		locArg = *locationID
@@ -1887,6 +1907,8 @@ func (r *summaryRepository) scanSummary(row *sql.Row) (*models.AttendanceDailySu
 		&s.IsFinalized,
 		&s.IsPayable,
 		&s.IsPayrollLocked,
+		&s.Timezone,
+		&s.OffsetMinutes,
 		&metadataJSON,
 		&s.GeneratedAt,
 		&s.GeneratedBy,
@@ -1932,6 +1954,8 @@ func (r *summaryRepository) scanSummaries(rows *sql.Rows) ([]*models.AttendanceD
 			&s.IsFinalized,
 			&s.IsPayable,
 			&s.IsPayrollLocked,
+			&s.Timezone,
+			&s.OffsetMinutes,
 			&metadataJSON,
 			&s.GeneratedAt,
 			&s.GeneratedBy,
@@ -2031,6 +2055,11 @@ func (r *ruleRepository) GetCompanyRules(ctx context.Context, companyID uuid.UUI
 }
 
 func (r *ruleRepository) UpsertCompanyRules(ctx context.Context, tx *sql.Tx, rules *models.CompanyAttendanceRules) error {
+	// ── NEW: validate IANA name.
+	if err := util.ValidateTimezone(rules.Timezone); err != nil {
+		return fmt.Errorf("company rules timezone: %w", err)
+	}
+
 	if rules.CreatedAt.IsZero() {
 		rules.CreatedAt = time.Now().UTC()
 	}
@@ -2063,6 +2092,7 @@ func (r *ruleRepository) UpsertCompanyRules(ctx context.Context, tx *sql.Tx, rul
 	if err != nil {
 		r.logger.Error("failed to upsert company attendance rules",
 			util.String("company_id", rules.CompanyID.String()),
+			util.String("timezone", rules.Timezone),
 			util.ErrorField(err))
 		return fmt.Errorf("upsert company rules: %w", err)
 	}
@@ -2070,7 +2100,7 @@ func (r *ruleRepository) UpsertCompanyRules(ctx context.Context, tx *sql.Tx, rul
 }
 
 // ──────────────────────────────────────────────────────────────
-// DEPARTMENT RULES
+// DEPARTMENT RULES (no tz — inherits company)
 // ──────────────────────────────────────────────────────────────
 
 func (r *ruleRepository) GetDepartmentRules(ctx context.Context, companyID, departmentID uuid.UUID) (*models.DepartmentAttendanceRules, error) {
@@ -2160,7 +2190,7 @@ func (r *ruleRepository) UpsertDepartmentRules(ctx context.Context, tx *sql.Tx, 
 }
 
 // ──────────────────────────────────────────────────────────────
-// USER ATTENDANCE PROFILE
+// USER ATTENDANCE PROFILE (no tz)
 // ──────────────────────────────────────────────────────────────
 
 func (r *ruleRepository) GetUserProfile(ctx context.Context, userID uuid.UUID) (*models.UserAttendanceProfile, error) {
@@ -2231,10 +2261,6 @@ func (r *ruleRepository) UpsertUserProfile(ctx context.Context, tx *sql.Tx, prof
 	}
 	return nil
 }
-
-// ──────────────────────────────────────────────────────────────
-// HEALTH CHECK
-// ──────────────────────────────────────────────────────────────
 
 func (r *ruleRepository) HealthCheck(ctx context.Context) error {
 	query := `SELECT 1 FROM attendance.company_attendance_rules LIMIT 1`
@@ -2549,6 +2575,7 @@ import (
 	"auth-service/internal/attendance/models"
 	"auth-service/internal/attendance/repository"
 	"auth-service/internal/client"
+	"auth-service/internal/util"
 )
 
 type calendarRepository struct {
@@ -2569,6 +2596,11 @@ const calendarColumns = `
 `
 
 func (r *calendarRepository) Create(ctx context.Context, calendar *models.WorkCalendar) error {
+	// ── NEW: validate IANA name.
+	if err := util.ValidateTimezone(calendar.Timezone); err != nil {
+		return fmt.Errorf("work calendar timezone: %w", err)
+	}
+
 	if calendar.CalendarID == uuid.Nil {
 		calendar.CalendarID = uuid.New()
 	}
@@ -2600,9 +2632,10 @@ func (r *calendarRepository) Create(ctx context.Context, calendar *models.WorkCa
 	)
 	if err != nil {
 		r.logger.Error("failed to create calendar",
-			zap.String("company_id", calendar.CompanyID.String()),
-			zap.Int("year", calendar.Year),
-			zap.Error(err))
+			util.String("company_id", calendar.CompanyID.String()),
+			util.Int("year", calendar.Year),
+			util.String("timezone", calendar.Timezone),
+			util.ErrorField(err))
 		return fmt.Errorf("create calendar: %w", err)
 	}
 	return nil
@@ -2615,7 +2648,6 @@ func (r *calendarRepository) GetByID(ctx context.Context, calendarID uuid.UUID) 
 }
 
 func (r *calendarRepository) GetByCompanyAndYear(ctx context.Context, companyID uuid.UUID, year int) (*models.WorkCalendar, error) {
-	// Prefer location-scoped calendars: get the newest active one for this year.
 	row := r.client.QueryRow(ctx, `SELECT `+calendarColumns+`
 		FROM attendance.work_calendars
 		WHERE company_id = $1 AND year = $2
@@ -2640,6 +2672,11 @@ func (r *calendarRepository) GetByCompany(ctx context.Context, companyID uuid.UU
 }
 
 func (r *calendarRepository) Update(ctx context.Context, calendar *models.WorkCalendar) error {
+	// ── NEW: validate IANA name.
+	if err := util.ValidateTimezone(calendar.Timezone); err != nil {
+		return fmt.Errorf("work calendar timezone: %w", err)
+	}
+
 	query := `
 		UPDATE attendance.work_calendars
 		SET location_id = $1, name = $2, timezone = $3,
@@ -2690,7 +2727,6 @@ func (r *calendarRepository) Exists(ctx context.Context, companyID uuid.UUID, ye
 	return exists, nil
 }
 
-// List — honors CalendarFilter.LocationID when set.
 func (r *calendarRepository) List(ctx context.Context, companyID uuid.UUID, filter repository.CalendarFilter, pagination repository.Pagination) ([]*models.WorkCalendar, int64, error) {
 	var conditions []string
 	var args []interface{}
@@ -2715,7 +2751,6 @@ func (r *calendarRepository) List(ctx context.Context, companyID uuid.UUID, filt
 		args = append(args, "%"+filter.Name+"%")
 		argIdx++
 	}
-	// 👇 NEW — location scope
 	if filter.LocationID != nil {
 		conditions = append(conditions, fmt.Sprintf("location_id = $%d", argIdx))
 		args = append(args, *filter.LocationID)
@@ -3669,13 +3704,17 @@ type sessionSummaryRepo struct {
 }
 
 func NewAttendanceSessionSummaryRepository(pg *client.PostgresClient, logger *zap.Logger) repository.AttendanceSessionSummaryRepository {
-	return &sessionSummaryRepo{client: pg, logger: logger.Named("session_summary_repo")}
+	return &sessionSummaryRepo{
+		client: pg,
+		logger: logger.Named("session_summary_repo"),
+	}
 }
 
+// ── CHANGED: added timezone
 const sessionSummaryColumns = `
 	summary_id, company_id, subject_type, subject_id,
 	employment_location_id,
-	session_id, session_date, status, marked_at, marked_by,
+	session_id, session_date, timezone, status, marked_at, marked_by,
 	source_type, device_id, is_auto, remarks,
 	metadata, created_at, updated_at
 `
@@ -3688,22 +3727,35 @@ func (r *sessionSummaryRepo) Upsert(ctx context.Context, tx *sql.Tx, summary *mo
 	summary.CreatedAt = now
 	summary.UpdatedAt = now
 
+	// ── Guard: writer must supply tz.
+	if summary.Timezone == "" {
+		r.logger.Error("SessionSummary.Upsert: timezone empty; defaulting to UTC",
+			zap.String("summary_id", summary.SummaryID.String()),
+			zap.String("company_id", summary.CompanyID.String()),
+			zap.String("subject_id", summary.SubjectID.String()),
+		)
+		summary.Timezone = "UTC"
+	}
+
 	metadataJSON, _ := json.Marshal(summary.Metadata)
 
 	query := `
 		INSERT INTO attendance.attendance_session_summary (
 			summary_id, company_id, subject_type, subject_id,
 			employment_location_id,
-			session_id, session_date, status, marked_at, marked_by,
+			session_id, session_date, timezone, status, marked_at, marked_by,
 			source_type, device_id, is_auto, remarks,
 			metadata, created_at, updated_at
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-			$11, $12, $13, $14, $15, $16, $17
+			$1, $2, $3, $4, $5,
+			$6, $7, $8, $9, $10, $11,
+			$12, $13, $14, $15,
+			$16, $17, $18
 		)
 		ON CONFLICT (company_id, subject_type, subject_id, session_id) DO UPDATE SET
 			employment_location_id = EXCLUDED.employment_location_id,
 			session_date = EXCLUDED.session_date,
+			timezone = EXCLUDED.timezone,
 			status = EXCLUDED.status,
 			marked_at = EXCLUDED.marked_at,
 			marked_by = EXCLUDED.marked_by,
@@ -3713,14 +3765,12 @@ func (r *sessionSummaryRepo) Upsert(ctx context.Context, tx *sql.Tx, summary *mo
 			remarks = EXCLUDED.remarks,
 			metadata = EXCLUDED.metadata,
 			updated_at = EXCLUDED.updated_at`
-
 	exec := func(q string, a ...interface{}) (sql.Result, error) {
 		if tx != nil {
 			return tx.ExecContext(ctx, q, a...)
 		}
 		return r.client.Exec(ctx, q, a...)
 	}
-
 	_, err := exec(query,
 		summary.SummaryID,
 		summary.CompanyID,
@@ -3729,6 +3779,7 @@ func (r *sessionSummaryRepo) Upsert(ctx context.Context, tx *sql.Tx, summary *mo
 		summary.EmploymentLocationID,
 		summary.SessionID,
 		summary.SessionDate,
+		summary.Timezone,
 		summary.Status,
 		summary.MarkedAt,
 		summary.MarkedBy,
@@ -3740,6 +3791,12 @@ func (r *sessionSummaryRepo) Upsert(ctx context.Context, tx *sql.Tx, summary *mo
 		summary.CreatedAt,
 		summary.UpdatedAt,
 	)
+	if err != nil {
+		r.logger.Error("failed to upsert session summary",
+			zap.String("summary_id", summary.SummaryID.String()),
+			zap.String("timezone", summary.Timezone),
+			zap.Error(err))
+	}
 	return err
 }
 
@@ -3784,7 +3841,6 @@ func (r *sessionSummaryRepo) List(ctx context.Context, tx *sql.Tx, filter reposi
 		WHERE 1=1`
 	args := []interface{}{}
 	argPos := 1
-
 	if filter.CompanyID != nil {
 		query += fmt.Sprintf(" AND company_id = $%d", argPos)
 		args = append(args, *filter.CompanyID)
@@ -3815,19 +3871,16 @@ func (r *sessionSummaryRepo) List(ctx context.Context, tx *sql.Tx, filter reposi
 		args = append(args, *filter.Status)
 		argPos++
 	}
-	// 👇 NEW — location scope
 	if filter.LocationID != nil {
 		query += fmt.Sprintf(" AND employment_location_id = $%d", argPos)
 		args = append(args, *filter.LocationID)
 		argPos++
 	}
-
 	query += " ORDER BY session_date DESC, subject_type, subject_id"
 	if pag.Limit > 0 {
 		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argPos, argPos+1)
 		args = append(args, pag.Limit, pag.Offset)
 	}
-
 	rows, err := r.getRows(ctx, tx, query, args...)
 	if err != nil {
 		return nil, err
@@ -3840,7 +3893,6 @@ func (r *sessionSummaryRepo) Count(ctx context.Context, tx *sql.Tx, filter repos
 	query := `SELECT COUNT(*) FROM attendance.attendance_session_summary WHERE 1=1`
 	args := []interface{}{}
 	argPos := 1
-
 	if filter.CompanyID != nil {
 		query += fmt.Sprintf(" AND company_id = $%d", argPos)
 		args = append(args, *filter.CompanyID)
@@ -3876,13 +3928,10 @@ func (r *sessionSummaryRepo) Count(ctx context.Context, tx *sql.Tx, filter repos
 		args = append(args, *filter.LocationID)
 		argPos++
 	}
-
 	var count int64
 	err := r.getRow(ctx, tx, query, args...).Scan(&count)
 	return count, err
 }
-
-// --- helpers ---
 
 func (r *sessionSummaryRepo) getRow(ctx context.Context, tx *sql.Tx, query string, args ...interface{}) *sql.Row {
 	if tx != nil {
@@ -3904,7 +3953,6 @@ func (r *sessionSummaryRepo) scanSummary(row *sql.Row) (*models.AttendanceSessio
 	var deviceIDStr, remarks sql.NullString
 	var metadataJSON []byte
 	var employmentLocID sql.NullString
-
 	err := row.Scan(
 		&s.SummaryID,
 		&s.CompanyID,
@@ -3913,6 +3961,7 @@ func (r *sessionSummaryRepo) scanSummary(row *sql.Row) (*models.AttendanceSessio
 		&employmentLocID,
 		&s.SessionID,
 		&s.SessionDate,
+		&s.Timezone,
 		&s.Status,
 		&s.MarkedAt,
 		&markedByUUID,
@@ -3942,7 +3991,6 @@ func (r *sessionSummaryRepo) scanSummaries(rows *sql.Rows) ([]*models.Attendance
 		var deviceIDStr, remarks sql.NullString
 		var metadataJSON []byte
 		var employmentLocID sql.NullString
-
 		err := rows.Scan(
 			&s.SummaryID,
 			&s.CompanyID,
@@ -3951,6 +3999,7 @@ func (r *sessionSummaryRepo) scanSummaries(rows *sql.Rows) ([]*models.Attendance
 			&employmentLocID,
 			&s.SessionID,
 			&s.SessionDate,
+			&s.Timezone,
 			&s.Status,
 			&s.MarkedAt,
 			&markedByUUID,
@@ -4386,9 +4435,15 @@ func NewEventRepository(pg *client.PostgresClient, logger *zap.Logger) repositor
 }
 
 // eventColumns is the canonical SELECT list. Used everywhere.
+//
+// ── CHANGED: added event_tz, event_offset_minutes, event_date_local,
+//
+//	event_country. Removed event_date (was UTC-generated, wrong for
+//	every non-UTC company).
 const eventColumns = `
 	attendance_event_id, company_id, subject_type, subject_id,
 	event_type, event_time,
+	event_tz, event_offset_minutes, event_date_local, event_country,
 	employment_location_id, geofence_id,
 	source_type, source_id,
 	device_id, device_user_code, ip_address,
@@ -4403,19 +4458,40 @@ func (r *eventRepository) CreateEvent(ctx context.Context, tx *sql.Tx, event *mo
 		event.CreatedAt = time.Now().UTC()
 	}
 
+	// ── Guard: the writer MUST have resolved the timezone via the chain
+	//    (position → location → work center → company). If any tz field
+	//    is missing, log loudly so we can trace it upstream.
+	if event.EventTZ == "" {
+		r.logger.Error("CreateEvent: EventTZ empty; defaulting to UTC",
+			zap.String("event_id", event.AttendanceEventID.String()),
+			zap.String("company_id", event.CompanyID.String()),
+			zap.String("subject_id", event.SubjectID.String()),
+		)
+		event.EventTZ = "UTC"
+		event.EventOffsetMinutes = 0
+	}
+	if event.EventDateLocal.IsZero() {
+		r.logger.Error("CreateEvent: EventDateLocal zero; deriving from EventTime in UTC",
+			zap.String("event_id", event.AttendanceEventID.String()),
+		)
+		event.EventDateLocal = event.EventTime.UTC().Truncate(24 * time.Hour)
+	}
+
 	query := `
 		INSERT INTO attendance.attendance_events (
 			attendance_event_id, company_id, subject_type, subject_id,
 			event_type, event_time,
+			event_tz, event_offset_minutes, event_date_local, event_country,
 			employment_location_id, geofence_id,
 			source_type, source_id,
 			device_id, device_user_code, ip_address,
 			context, metadata, raw_event_payload, created_at, created_by
 		) VALUES (
 			$1, $2, $3, $4, $5, $6,
-			$7, $8,
-			$9, $10, $11, $12, $13,
-			$14, $15, $16, $17, $18
+			$7, $8, $9, $10,
+			$11, $12,
+			$13, $14, $15, $16, $17,
+			$18, $19, $20, $21, $22
 		)
 	`
 
@@ -4435,6 +4511,10 @@ func (r *eventRepository) CreateEvent(ctx context.Context, tx *sql.Tx, event *mo
 		event.SubjectID,
 		event.EventType,
 		event.EventTime,
+		event.EventTZ,
+		event.EventOffsetMinutes,
+		event.EventDateLocal,
+		event.EventCountry,
 		event.EmploymentLocationID,
 		event.GeofenceID,
 		event.SourceType,
@@ -4451,6 +4531,8 @@ func (r *eventRepository) CreateEvent(ctx context.Context, tx *sql.Tx, event *mo
 	if err != nil {
 		r.logger.Error("failed to create event",
 			zap.String("event_id", event.AttendanceEventID.String()),
+			zap.String("company_id", event.CompanyID.String()),
+			zap.String("event_tz", event.EventTZ),
 			zap.Error(err),
 		)
 		return fmt.Errorf("create event: %w", err)
@@ -4656,12 +4738,15 @@ func (r *eventRepository) HealthCheck(ctx context.Context) error {
 	return err
 }
 
-// --- helpers ---
+// ──────────────────────────────────────────────────────────────
+// SCAN HELPERS
+// ──────────────────────────────────────────────────────────────
 
 func (r *eventRepository) scanEvent(row *sql.Row) (*models.AttendanceEvent, error) {
 	var e models.AttendanceEvent
 	var contextJSON, metadataJSON, rawPayloadJSON []byte
 	var employmentLocID, geofenceID sql.NullString
+	var eventCountry sql.NullString
 
 	err := row.Scan(
 		&e.AttendanceEventID,
@@ -4670,6 +4755,10 @@ func (r *eventRepository) scanEvent(row *sql.Row) (*models.AttendanceEvent, erro
 		&e.SubjectID,
 		&e.EventType,
 		&e.EventTime,
+		&e.EventTZ,
+		&e.EventOffsetMinutes,
+		&e.EventDateLocal,
+		&eventCountry,
 		&employmentLocID,
 		&geofenceID,
 		&e.SourceType,
@@ -4689,6 +4778,9 @@ func (r *eventRepository) scanEvent(row *sql.Row) (*models.AttendanceEvent, erro
 		}
 		return nil, fmt.Errorf("scan event: %w", err)
 	}
+	if eventCountry.Valid {
+		e.EventCountry = &eventCountry.String
+	}
 	r.assignEventNulls(&e, employmentLocID, geofenceID, contextJSON, metadataJSON, rawPayloadJSON)
 	return &e, nil
 }
@@ -4699,6 +4791,7 @@ func (r *eventRepository) scanEvents(rows *sql.Rows) ([]*models.AttendanceEvent,
 		var e models.AttendanceEvent
 		var contextJSON, metadataJSON, rawPayloadJSON []byte
 		var employmentLocID, geofenceID sql.NullString
+		var eventCountry sql.NullString
 
 		err := rows.Scan(
 			&e.AttendanceEventID,
@@ -4707,6 +4800,10 @@ func (r *eventRepository) scanEvents(rows *sql.Rows) ([]*models.AttendanceEvent,
 			&e.SubjectID,
 			&e.EventType,
 			&e.EventTime,
+			&e.EventTZ,
+			&e.EventOffsetMinutes,
+			&e.EventDateLocal,
+			&eventCountry,
 			&employmentLocID,
 			&geofenceID,
 			&e.SourceType,
@@ -4723,6 +4820,9 @@ func (r *eventRepository) scanEvents(rows *sql.Rows) ([]*models.AttendanceEvent,
 		if err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
+		if eventCountry.Valid {
+			e.EventCountry = &eventCountry.String
+		}
 		r.assignEventNulls(&e, employmentLocID, geofenceID, contextJSON, metadataJSON, rawPayloadJSON)
 		events = append(events, &e)
 	}
@@ -4732,7 +4832,6 @@ func (r *eventRepository) scanEvents(rows *sql.Rows) ([]*models.AttendanceEvent,
 	return events, nil
 }
 
-// assignEventNulls attaches nullable columns to the struct.
 func (r *eventRepository) assignEventNulls(
 	e *models.AttendanceEvent,
 	employmentLoc, geofenceID sql.NullString,
@@ -4802,8 +4901,6 @@ func (r *eventRepository) buildEventFilter(filter repository.EventFilter) (strin
 		args = append(args, *filter.DeviceID)
 		idx++
 	}
-
-	// 👇 NEW — location scope
 	if filter.LocationID != nil {
 		conditions = append(conditions, fmt.Sprintf(
 			"($%d::uuid IS NULL OR employment_location_id = $%d)", idx, idx))
@@ -8048,6 +8145,11 @@ const workCenterColumns = `
 `
 
 func (r *workCenterRepository) Create(ctx context.Context, tx *sql.Tx, wc *models.WorkCenter) error {
+	// ── NEW: validate IANA name before it hits the DB.
+	if err := util.ValidateTimezone(wc.Timezone); err != nil {
+		return fmt.Errorf("work center timezone: %w", err)
+	}
+
 	now := time.Now().UTC()
 	if wc.CreatedAt.IsZero() {
 		wc.CreatedAt = now
@@ -8083,6 +8185,7 @@ func (r *workCenterRepository) Create(ctx context.Context, tx *sql.Tx, wc *model
 	if err != nil {
 		r.logger.Error("failed to create work center",
 			util.String("work_center_code", wc.WorkCenterCode),
+			util.String("timezone", wc.Timezone),
 			util.ErrorField(err))
 		return fmt.Errorf("create work center: %w", err)
 	}
@@ -8098,6 +8201,11 @@ func (r *workCenterRepository) GetByCode(ctx context.Context, companyID uuid.UUI
 }
 
 func (r *workCenterRepository) Update(ctx context.Context, tx *sql.Tx, wc *models.WorkCenter) error {
+	// ── NEW: validate IANA name.
+	if err := util.ValidateTimezone(wc.Timezone); err != nil {
+		return fmt.Errorf("work center timezone: %w", err)
+	}
+
 	wc.UpdatedAt = time.Now().UTC()
 	query := `
 		UPDATE attendance.work_centers SET
@@ -8146,7 +8254,6 @@ func (r *workCenterRepository) Delete(ctx context.Context, companyID uuid.UUID, 
 	return nil
 }
 
-// List — locationID == nil means no filter.
 func (r *workCenterRepository) List(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, limit, offset int) ([]*models.WorkCenter, int, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
@@ -8188,7 +8295,6 @@ func (r *workCenterRepository) List(ctx context.Context, companyID uuid.UUID, lo
 	return wcs, total, nil
 }
 
-// Search — locationID == nil means no filter.
 func (r *workCenterRepository) Search(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID, filters map[string]interface{}, limit, offset int) ([]*models.WorkCenter, int, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
@@ -8253,7 +8359,6 @@ func (r *workCenterRepository) Search(ctx context.Context, companyID uuid.UUID, 
 	return wcs, total, nil
 }
 
-// GetActive — locationID == nil means no filter.
 func (r *workCenterRepository) GetActive(ctx context.Context, companyID uuid.UUID, locationID *uuid.UUID) ([]*models.WorkCenter, error) {
 	var locArg interface{}
 	if locationID != nil {

@@ -2280,14 +2280,25 @@ func (r *leaveRepository) GetPendingLeaveRequests(
 	approverID uuid.UUID,
 	locationID *uuid.UUID,
 ) ([]*models.LeaveRequest, error) {
-	args := []interface{}{companyID, approverID}
-	locationClause := ""
+	// approverID is kept for signature stability but is NOT used in the
+	// query — every company approver sees the same pending pool. If you
+	// later scope by reporting line, wire it back in as $2 and adjust
+	// the placeholders accordingly.
+	_ = approverID
 
+	// ── Location filter ────────────────────────────────────────────────
+	// locationID == nil  →  ALL scope  →  company-wide pending list
+	// locationID != nil  →  specific   →  filter by primary_location_id
+	//
+	// We use $2 for the location parameter (not $3), so the arg count
+	// always matches the placeholder count: 1 arg when nil, 2 args when set.
+	args := []interface{}{companyID}
+	locationClause := ""
 	if locationID != nil {
 		locationClause = ` AND lr.user_id IN (
 			SELECT user_id FROM company_employees
 			WHERE company_id = $1
-			  AND primary_location_id = $3
+			  AND primary_location_id = $2
 			  AND is_active = true
 		)`
 		args = append(args, *locationID)
@@ -2310,8 +2321,8 @@ func (r *leaveRepository) GetPendingLeaveRequests(
 		FROM leave.leave_request lr
 		JOIN leave.leave_type lt ON lr.leave_type_id = lt.leave_type_id
 		WHERE lr.company_id = $1
-		AND lr.status = 'pending'
-		AND lt.requires_approval = true
+		  AND lr.status = 'pending'
+		  AND lt.requires_approval = true
 	` + locationClause + `
 		ORDER BY lr.requested_at
 	`
@@ -4358,4 +4369,191 @@ func (r *leaveRepository) processYearEndChunk(
 		return 0, fmt.Errorf("commit year-end chunk: %w", err)
 	}
 	return len(batch), nil
+}
+
+// GetCompanyLedger returns a paginated, filtered view of every ledger row
+// for a company.
+//
+// Location scope:
+//
+//	filter.LocationID == nil  → ALL scope  → company-wide, no location join
+//
+// GetCompanyLedger returns a paginated, filtered view of every ledger row
+// for a company.
+//
+// Location scope:
+//
+//	filter.LocationID == nil  → ALL scope  → company-wide, no location join
+//	filter.LocationID != nil  → specific    → only employees whose active
+//	                                          company_employees row has that
+//	                                          primary_location_id
+//
+// Entry-type filter accepts a []string. Each value becomes its own scalar
+// placeholder in an IN-list — e.g. entry_type IN ($5, $6, $7) — rather
+// than a single ANY($N::text[]). The array form requires the driver to
+// encode a bare []string, which database/sql cannot do (no driver.Valuer
+// implementation on []string) and pgx-in-stdlib mode also refuses. The
+// IN-list sidesteps both, at the cost of building the placeholder list
+// dynamically.
+func (r *leaveRepository) GetCompanyLedger(
+	ctx context.Context,
+	filter models.LeaveLedgerFilter,
+) ([]*models.LeaveLedgerEntry, int64, error) {
+	var conditions []string
+	var args []interface{}
+	argIdx := 1
+
+	conditions = append(conditions, fmt.Sprintf("le.company_id = $%d", argIdx))
+	args = append(args, filter.CompanyID)
+	argIdx++
+
+	if filter.LocationID != nil {
+		conditions = append(conditions, fmt.Sprintf(
+			"ce.primary_location_id = $%d AND ce.is_active = true", argIdx))
+		args = append(args, *filter.LocationID)
+		argIdx++
+	}
+	if filter.UserID != nil {
+		conditions = append(conditions, fmt.Sprintf("le.user_id = $%d", argIdx))
+		args = append(args, *filter.UserID)
+		argIdx++
+	}
+	if filter.LeaveTypeID != nil {
+		conditions = append(conditions, fmt.Sprintf("le.leave_type_id = $%d", argIdx))
+		args = append(args, *filter.LeaveTypeID)
+		argIdx++
+	}
+	if filter.EntitlementID != nil {
+		conditions = append(conditions, fmt.Sprintf("ll.entitlement_id = $%d", argIdx))
+		args = append(args, *filter.EntitlementID)
+		argIdx++
+	}
+	if filter.LeaveRequestID != nil {
+		conditions = append(conditions, fmt.Sprintf("ll.leave_request_id = $%d", argIdx))
+		args = append(args, *filter.LeaveRequestID)
+		argIdx++
+	}
+
+	if len(filter.EntryTypes) > 0 {
+		// Expand to "ll.entry_type IN ($N, $N+1, ...)".
+		//
+		// Why not ANY($N::text[]):
+		//   The cast tells Postgres the parameter is text[], but the Go
+		//   driver still has to encode the Go value ([]string) into the
+		//   wire format BEFORE Postgres sees the cast. database/sql has
+		//   no encoder for []string (it doesn't implement driver.Valuer),
+		//   so the bind step fails regardless of the cast. Building an
+		//   IN-list means every argument is a Go string, which every
+		//   driver can encode natively.
+		placeholders := make([]string, 0, len(filter.EntryTypes))
+		for _, t := range filter.EntryTypes {
+			placeholders = append(placeholders, fmt.Sprintf("$%d", argIdx))
+			args = append(args, t)
+			argIdx++
+		}
+		conditions = append(conditions,
+			"ll.entry_type IN ("+strings.Join(placeholders, ", ")+")")
+	}
+
+	if filter.FromDate != nil {
+		conditions = append(conditions, fmt.Sprintf("ll.entry_date >= $%d", argIdx))
+		args = append(args, *filter.FromDate)
+		argIdx++
+	}
+	if filter.ToDate != nil {
+		conditions = append(conditions, fmt.Sprintf("ll.entry_date <= $%d", argIdx))
+		args = append(args, *filter.ToDate)
+		argIdx++
+	}
+
+	whereClause := "WHERE " + strings.Join(conditions, " AND ")
+
+	countQuery := fmt.Sprintf(`
+		SELECT COUNT(*)
+		FROM leave.leave_ledger ll
+		JOIN leave.leave_entitlement le ON ll.entitlement_id = le.entitlement_id
+		LEFT JOIN company_employees ce
+		  ON ce.user_id = le.user_id
+		 AND ce.company_id = le.company_id
+		%s
+	`, whereClause)
+
+	var total int64
+	if err := r.client.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("failed to count ledger entries: %w", err)
+	}
+
+	offset := (filter.Page - 1) * filter.PageSize
+	limitPos := argIdx
+	offsetPos := argIdx + 1
+	args = append(args, filter.PageSize, offset)
+
+	query := fmt.Sprintf(`
+		SELECT
+			ll.ledger_id,
+			ll.entitlement_id,
+			le.company_id,
+			le.user_id,
+			COALESCE(u.full_name, '') AS user_full_name,
+			COALESCE(u.username, '')  AS user_username,
+			le.leave_type_id,
+			lt.code        AS leave_type_code,
+			lt.name        AS leave_type_name,
+			ll.entry_type,
+			ll.days,
+			ll.entry_date,
+			ll.leave_request_id,
+			ll.created_at
+		FROM leave.leave_ledger ll
+		JOIN leave.leave_entitlement le ON ll.entitlement_id = le.entitlement_id
+		JOIN leave.leave_type lt       ON le.leave_type_id = lt.leave_type_id
+		LEFT JOIN users u              ON u.user_id = le.user_id
+		LEFT JOIN company_employees ce
+		  ON ce.user_id = le.user_id
+		 AND ce.company_id = le.company_id
+		%s
+		ORDER BY ll.entry_date DESC, ll.created_at DESC
+		LIMIT $%d OFFSET $%d
+	`, whereClause, limitPos, offsetPos)
+
+	rows, err := r.client.Query(ctx, query, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to query ledger: %w", err)
+	}
+	defer rows.Close()
+
+	var entries []*models.LeaveLedgerEntry
+	for rows.Next() {
+		var e models.LeaveLedgerEntry
+		var leaveRequestID sql.NullString
+
+		if err := rows.Scan(
+			&e.LedgerID,
+			&e.EntitlementID,
+			&e.CompanyID,
+			&e.UserID,
+			&e.UserFullName,
+			&e.UserUsername,
+			&e.LeaveTypeID,
+			&e.LeaveTypeCode,
+			&e.LeaveTypeName,
+			&e.EntryType,
+			&e.Days,
+			&e.EntryDate,
+			&leaveRequestID,
+			&e.CreatedAt,
+		); err != nil {
+			return nil, 0, fmt.Errorf("failed to scan ledger entry: %w", err)
+		}
+
+		if leaveRequestID.Valid && leaveRequestID.String != "" {
+			id, _ := uuid.Parse(leaveRequestID.String)
+			e.LeaveRequestID = &id
+		}
+		entries = append(entries, &e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("rows iteration error: %w", err)
+	}
+	return entries, total, nil
 }

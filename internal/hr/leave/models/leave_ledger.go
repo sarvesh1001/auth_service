@@ -59,3 +59,33 @@ type LeavePolicyRuleUpdate struct {
 	AccrualMethod     *string `json:"accrual_method,omitempty"`
 	CarryForwardLimit *int    `json:"carry_forward_limit,omitempty"`
 }
+type LeaveLedgerFilter struct {
+	CompanyID      uuid.UUID
+	LocationID     *uuid.UUID
+	UserID         *uuid.UUID
+	LeaveTypeID    *uuid.UUID
+	EntitlementID  *uuid.UUID
+	LeaveRequestID *uuid.UUID
+	EntryTypes     []string
+	FromDate       *time.Time
+	ToDate         *time.Time
+	Page           int
+	PageSize       int
+}
+
+type LeaveLedgerEntry struct {
+	LedgerID       uuid.UUID  `json:"ledger_id"`
+	EntitlementID  uuid.UUID  `json:"entitlement_id"`
+	CompanyID      uuid.UUID  `json:"company_id"`
+	UserID         uuid.UUID  `json:"user_id"`
+	UserFullName   string     `json:"user_full_name,omitempty"`
+	UserUsername   string     `json:"user_username,omitempty"`
+	LeaveTypeID    uuid.UUID  `json:"leave_type_id"`
+	LeaveTypeCode  string     `json:"leave_type_code"`
+	LeaveTypeName  string     `json:"leave_type_name"`
+	EntryType      string     `json:"entry_type"`
+	Days           float64    `json:"days"`
+	EntryDate      time.Time  `json:"entry_date"`
+	LeaveRequestID *uuid.UUID `json:"leave_request_id,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
+}

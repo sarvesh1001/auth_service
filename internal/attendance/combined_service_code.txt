@@ -795,7 +795,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// Local DTOs (not in models)
 type ScheduleOverrideUpdate struct {
 	OverrideType *string `json:"override_type,omitempty"`
 	Reason       *string `json:"reason,omitempty"`
@@ -806,62 +805,40 @@ type WorkCenterShiftUpdate struct {
 	EffectiveTo *time.Time `json:"effective_to,omitempty"`
 }
 
-// Holiday is a local struct for handling JSONB data
 type Holiday struct {
 	Date string `json:"date"`
 	Name string `json:"name"`
 }
 
-// SchedulingService defines the main scheduling operations.
 type SchedulingService interface {
-	// Work Calendars
 	CreateWorkCalendar(ctx context.Context, calendar *models.WorkCalendar, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.WorkCalendar, error)
 	UpdateWorkCalendar(ctx context.Context, calendarID uuid.UUID, update WorkCalendarUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.WorkCalendar, error)
 	DeleteWorkCalendar(ctx context.Context, calendarID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
 	AddHolidayToCalendar(ctx context.Context, calendarID uuid.UUID, date, name string, actorType string, actorID uuid.UUID) error
 	ProcessHolidayForDate(ctx context.Context, companyID uuid.UUID, date time.Time, actorType string, actorID uuid.UUID) error
-
-	// Schedule Templates
 	CreateScheduleTemplate(ctx context.Context, template *models.ScheduleTemplate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleTemplate, error)
 	UpdateScheduleTemplate(ctx context.Context, templateID uuid.UUID, update ScheduleTemplateUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleTemplate, error)
 	DeleteScheduleTemplate(ctx context.Context, templateID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
-
-	// Schedule Instances
 	CreateScheduleInstance(ctx context.Context, instance *models.ScheduleInstance, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleInstance, error)
 	UpdateScheduleInstance(ctx context.Context, instanceID uuid.UUID, update ScheduleInstanceUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleInstance, error)
 	DeleteScheduleInstance(ctx context.Context, instanceID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
 	BulkCreateScheduleInstances(ctx context.Context, instances []*models.ScheduleInstance, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
-
-	// Leave Integration
 	ApplyApprovedLeave(ctx context.Context, leaveData *LeaveScheduleData, actorType string, actorID uuid.UUID) error
 	RollbackCancelledLeave(ctx context.Context, leaveData *LeaveScheduleData, actorType string, actorID uuid.UUID) error
-
-	// Schedule Generation
 	GenerateScheduleForUser(ctx context.Context, companyID, userID uuid.UUID, config ScheduleGenerationConfig, actorType string, actorID uuid.UUID) ([]*models.ScheduleInstance, error)
 	GenerateScheduleForCompany(ctx context.Context, companyID uuid.UUID, config ScheduleGenerationConfig, actorType string, actorID uuid.UUID) ([]*models.ScheduleInstance, error)
-
-	// Overrides
 	CreateScheduleOverride(ctx context.Context, companyID uuid.UUID, override *models.ScheduleOverride, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleOverride, error)
 	UpdateScheduleOverride(ctx context.Context, overrideID uuid.UUID, update ScheduleOverrideUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleOverride, error)
 	DeleteScheduleOverride(ctx context.Context, overrideID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
-
-	// Work Center Shift Mappings
 	CreateWorkCenterShiftMapping(ctx context.Context, companyID uuid.UUID, mapping *models.WorkCenterShift, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
 	UpdateWorkCenterShiftMappingByKey(ctx context.Context, companyID uuid.UUID, workCenterCode string, update WorkCenterShiftUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
-
-	// Schedule Resolution
 	ResolveUserDay(ctx context.Context, companyID, userID uuid.UUID, date time.Time) (*PositionBasedResolvedDay, error)
 	CreateScheduleInstanceFromPosition(ctx context.Context, companyID, userID uuid.UUID, date time.Time, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleInstance, error)
-
-	// Availability
 	CheckScheduleAvailability(ctx context.Context, companyID, userID uuid.UUID, date time.Time, timezone string) ([]time.Time, error)
 	ValidateScheduleConflict(ctx context.Context, userID uuid.UUID, startTime, endTime time.Time, excludeInstanceID *uuid.UUID) (bool, error)
-
-	// Health
 	HealthCheck(ctx context.Context) error
 }
 
-// DTOs
 type WorkCalendarUpdate struct {
 	Name        *string   `json:"name,omitempty"`
 	Timezone    *string   `json:"timezone,omitempty"`
@@ -919,7 +896,6 @@ type PositionBasedResolvedDay struct {
 	LeaveTypeID        *uuid.UUID `json:"leave_type_id,omitempty"`
 }
 
-// Implementation
 type schedulingServiceImpl struct {
 	schedulingRepo  repository.ScheduleRepository
 	subjectResolver resolver.ScheduleSubjectResolver
@@ -956,7 +932,6 @@ func (s *schedulingServiceImpl) CreateWorkCalendar(
 		calendar.CalendarID = uuid.New()
 	}
 	calendar.CreatedAt = time.Now().UTC()
-
 	existing, _ := s.schedulingRepo.GetWorkCalendarsByCompany(ctx, calendar.CompanyID, nil)
 	for _, e := range existing {
 		if e.Year != calendar.Year {
@@ -971,11 +946,9 @@ func (s *schedulingServiceImpl) CreateWorkCalendar(
 			return nil, fmt.Errorf("calendar for year %d already exists at this location", calendar.Year)
 		}
 	}
-
 	if err := s.schedulingRepo.CreateWorkCalendar(ctx, calendar); err != nil {
 		return nil, err
 	}
-
 	after, _ := json.Marshal(calendar)
 	s.logAudit(ctx, calendar.CompanyID, "work_calendar.create", calendar.CalendarID, actorType, actorID, nil, after, metadata)
 	return calendar, nil
@@ -987,7 +960,6 @@ func (s *schedulingServiceImpl) UpdateWorkCalendar(ctx context.Context, calendar
 		return nil, err
 	}
 	before, _ := json.Marshal(calendar)
-
 	if update.Name != nil {
 		calendar.Name = *update.Name
 	}
@@ -1007,14 +979,12 @@ func (s *schedulingServiceImpl) UpdateWorkCalendar(ctx context.Context, calendar
 	if update.IsActive != nil {
 		calendar.IsActive = *update.IsActive
 	}
-
 	if err := s.validateWorkCalendar(calendar); err != nil {
 		return nil, err
 	}
 	if err := s.schedulingRepo.UpdateWorkCalendar(ctx, calendar); err != nil {
 		return nil, err
 	}
-
 	after, _ := json.Marshal(calendar)
 	s.logAudit(ctx, calendar.CompanyID, "work_calendar.update", calendarID, actorType, actorID, before, after, metadata)
 	return calendar, nil
@@ -1026,12 +996,10 @@ func (s *schedulingServiceImpl) DeleteWorkCalendar(ctx context.Context, calendar
 		return err
 	}
 	before, _ := json.Marshal(calendar)
-
 	templates, _ := s.schedulingRepo.GetScheduleTemplatesByCalendar(ctx, calendarID)
 	if len(templates) > 0 {
 		return fmt.Errorf("cannot delete calendar used by %d templates", len(templates))
 	}
-
 	if err := s.schedulingRepo.DeleteWorkCalendar(ctx, calendarID); err != nil {
 		return err
 	}
@@ -1039,14 +1007,6 @@ func (s *schedulingServiceImpl) DeleteWorkCalendar(ctx context.Context, calendar
 	return nil
 }
 
-// AddHolidayToCalendar adds a holiday to a calendar.
-//
-// FIX (Tier 2):
-//   - copy-on-write the holidays map instead of mutating the object returned
-//     by the repo (which may be cached or shared).
-//   - set UpdatedAt.
-//   - emit an audit row (work_calendar.add_holiday) matching the other
-//     calendar mutations. Previously this endpoint was silently unaudited.
 func (s *schedulingServiceImpl) AddHolidayToCalendar(
 	ctx context.Context,
 	calendarID uuid.UUID,
@@ -1063,33 +1023,28 @@ func (s *schedulingServiceImpl) AddHolidayToCalendar(
 	if _, err := time.Parse("2006-01-02", date); err != nil {
 		return fmt.Errorf("invalid date %q: must be YYYY-MM-DD", date)
 	}
-
 	calendar, err := s.schedulingRepo.GetWorkCalendarByID(ctx, calendarID)
 	if err != nil {
 		return err
 	}
-
 	before, _ := json.Marshal(calendar)
-
 	if _, exists := calendar.Holidays[date]; exists {
 		return fmt.Errorf("holiday already exists on %s", date)
 	}
-
 	newHolidays := make(map[string]interface{}, len(calendar.Holidays)+1)
 	for k, v := range calendar.Holidays {
 		newHolidays[k] = v
 	}
 	newHolidays[date] = map[string]interface{}{"date": date, "name": name}
 	calendar.Holidays = newHolidays
-
 	if err := s.schedulingRepo.UpdateWorkCalendar(ctx, calendar); err != nil {
 		return err
 	}
-
 	after, _ := json.Marshal(calendar)
 	s.logAudit(ctx, calendar.CompanyID, "work_calendar.add_holiday", calendarID, actorType, actorID, before, after, nil)
 	return nil
 }
+
 func (s *schedulingServiceImpl) ProcessHolidayForDate(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1110,8 +1065,6 @@ func (s *schedulingServiceImpl) ProcessHolidayForDate(
 	}
 	return nil
 }
-
-// ---- Schedule Template CRUD ----
 
 func (s *schedulingServiceImpl) CreateScheduleTemplate(ctx context.Context, template *models.ScheduleTemplate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleTemplate, error) {
 	if err := s.validateScheduleTemplate(template); err != nil {
@@ -1135,7 +1088,6 @@ func (s *schedulingServiceImpl) UpdateScheduleTemplate(ctx context.Context, temp
 		return nil, err
 	}
 	before, _ := json.Marshal(template)
-
 	if update.Name != nil {
 		template.Name = *update.Name
 	}
@@ -1151,14 +1103,12 @@ func (s *schedulingServiceImpl) UpdateScheduleTemplate(ctx context.Context, temp
 	if update.IsActive != nil {
 		template.IsActive = *update.IsActive
 	}
-
 	if err := s.validateScheduleTemplate(template); err != nil {
 		return nil, err
 	}
 	if err := s.schedulingRepo.UpdateScheduleTemplate(ctx, template); err != nil {
 		return nil, err
 	}
-
 	after, _ := json.Marshal(template)
 	s.logAudit(ctx, template.CompanyID, "schedule_template.update", templateID, actorType, actorID, before, after, metadata)
 	return template, nil
@@ -1170,7 +1120,6 @@ func (s *schedulingServiceImpl) DeleteScheduleTemplate(ctx context.Context, temp
 		return err
 	}
 	before, _ := json.Marshal(template)
-
 	mappings, _ := s.schedulingRepo.GetWorkCenterShiftMappingsByShift(ctx, templateID)
 	if len(mappings) > 0 {
 		return fmt.Errorf("cannot delete template used by %d work center mappings", len(mappings))
@@ -1181,8 +1130,6 @@ func (s *schedulingServiceImpl) DeleteScheduleTemplate(ctx context.Context, temp
 	s.logAudit(ctx, template.CompanyID, "schedule_template.delete", templateID, actorType, actorID, before, nil, metadata)
 	return nil
 }
-
-// ---- Schedule Instances ----
 
 func (s *schedulingServiceImpl) CreateScheduleInstance(ctx context.Context, instance *models.ScheduleInstance, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleInstance, error) {
 	if instance.ScheduleTemplateID == uuid.Nil {
@@ -1196,7 +1143,6 @@ func (s *schedulingServiceImpl) CreateScheduleInstance(ctx context.Context, inst
 	}
 	instance.GeneratedAt = time.Now().UTC()
 	instance.Status = "active"
-
 	if err := s.schedulingRepo.CreateScheduleInstance(ctx, nil, instance); err != nil {
 		return nil, err
 	}
@@ -1237,18 +1183,6 @@ func (s *schedulingServiceImpl) DeleteScheduleInstance(ctx context.Context, inst
 	return nil
 }
 
-// BulkCreateScheduleInstances inserts a batch of schedule instances.
-//
-// FIX (Tier 2): the previous implementation looped with `continue` on
-// error, leaving partial state — if instance #73 of 100 failed, instances
-// 1..72 and 74..100 were committed and there was no way to retry just the
-// failure. The batch is now wrapped in a single transaction: any error
-// rolls the whole batch back, so the caller can safely retry the entire
-// request.
-//
-// Depends on repository.ScheduleRepository exposing:
-//
-//	BeginTx(ctx, *sql.TxOptions) (*sql.Tx, error)
 func (s *schedulingServiceImpl) BulkCreateScheduleInstances(
 	ctx context.Context,
 	instances []*models.ScheduleInstance,
@@ -1260,9 +1194,6 @@ func (s *schedulingServiceImpl) BulkCreateScheduleInstances(
 		return nil
 	}
 	companyID := instances[0].CompanyID
-
-	// Prepare all instances first. If preparation were going to fail, we
-	// want it to fail before opening a transaction.
 	now := time.Now().UTC()
 	for _, inst := range instances {
 		if inst.ScheduleInstanceID == uuid.Nil {
@@ -1271,13 +1202,11 @@ func (s *schedulingServiceImpl) BulkCreateScheduleInstances(
 		inst.GeneratedAt = now
 		inst.Status = "active"
 	}
-
 	tx, err := s.schedulingRepo.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
 	for _, inst := range instances {
 		if err := s.schedulingRepo.CreateScheduleInstance(ctx, tx, inst); err != nil {
 			s.logger.Error("Bulk create failed; transaction will be rolled back",
@@ -1288,18 +1217,14 @@ func (s *schedulingServiceImpl) BulkCreateScheduleInstances(
 			return fmt.Errorf("create instance %s: %w", inst.ScheduleInstanceID, err)
 		}
 	}
-
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit bulk create: %w", err)
 	}
-
 	summary := map[string]interface{}{"created": len(instances)}
 	summaryJSON, _ := json.Marshal(summary)
 	s.logAudit(ctx, companyID, "schedule_instance.bulk_create", uuid.Nil, actorType, actorID, nil, summaryJSON, metadata)
 	return nil
 }
-
-// ---- Generation ----
 
 func (s *schedulingServiceImpl) GenerateScheduleForUser(ctx context.Context, companyID, userID uuid.UUID, config ScheduleGenerationConfig, actorType string, actorID uuid.UUID) ([]*models.ScheduleInstance, error) {
 	subject, err := s.subjectResolver.ResolveSubject(ctx, companyID, userID, "employee", config.StartDate)
@@ -1329,8 +1254,6 @@ func (s *schedulingServiceImpl) GenerateScheduleForCompany(ctx context.Context, 
 	if len(allInstances) == 0 {
 		return []*models.ScheduleInstance{}, nil
 	}
-	// BulkCreateScheduleInstances is transactional — the entire company
-	// generation is now all-or-nothing.
 	if err := s.BulkCreateScheduleInstances(ctx, allInstances, actorType, actorID, nil); err != nil {
 		return nil, err
 	}
@@ -1339,35 +1262,45 @@ func (s *schedulingServiceImpl) GenerateScheduleForCompany(ctx context.Context, 
 
 func (s *schedulingServiceImpl) generateInstancesForUser(ctx context.Context, companyID, userID uuid.UUID, config ScheduleGenerationConfig, actorType string, actorID uuid.UUID) []*models.ScheduleInstance {
 	var instances []*models.ScheduleInstance
-	loc, _ := time.LoadLocation(config.Timezone)
+
+	// ── Resolve the user's tz once via the subject resolver.
+	//    Falls back to config.Timezone, then "UTC".
+	refTime := config.StartDate
+	subjectInfo, _ := s.subjectResolver.ResolveSubject(ctx, companyID, userID, "employee", refTime)
+
+	tz := ""
+	if subjectInfo != nil && subjectInfo.WorkCenterTimezone != "" {
+		tz = subjectInfo.WorkCenterTimezone
+	} else if config.Timezone != "" {
+		tz = config.Timezone
+	} else {
+		tz = "UTC"
+	}
+
+	loc, _ := time.LoadLocation(tz)
+	if loc == nil {
+		loc = time.UTC
+	}
 	now := time.Now().In(loc)
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 
 	s.logger.Info("Starting schedule generation for user",
 		zap.String("user_id", userID.String()),
+		zap.String("tz", tz),
 		zap.String("start_date", config.StartDate.Format("2006-01-02")),
 		zap.String("end_date", config.EndDate.Format("2006-01-02")),
 		zap.Bool("overwrite", config.Overwrite),
 	)
-
 	for d := config.StartDate; !d.After(config.EndDate); d = d.AddDate(0, 0, 1) {
 		if !d.After(today) {
-			s.logger.Debug("Skipping past date",
-				zap.String("date", d.Format("2006-01-02")),
-				zap.String("today", today.Format("2006-01-02")))
 			continue
 		}
-
 		if !config.Overwrite {
 			exists, _ := s.schedulingRepo.HasActiveSchedule(ctx, companyID, userID, d)
 			if exists {
-				s.logger.Debug("Active schedule exists, skipping",
-					zap.String("user", userID.String()),
-					zap.String("date", d.Format("2006-01-02")))
 				continue
 			}
 		}
-
 		resolved, err := s.ResolveUserDay(ctx, companyID, userID, d)
 		if err != nil {
 			s.logger.Warn("ResolveUserDay failed",
@@ -1376,36 +1309,19 @@ func (s *schedulingServiceImpl) generateInstancesForUser(ctx context.Context, co
 				zap.String("date", d.Format("2006-01-02")))
 			continue
 		}
-
-		s.logger.Debug("ResolveUserDay result",
-			zap.String("user", userID.String()),
-			zap.String("date", d.Format("2006-01-02")),
-			zap.String("status", resolved.ScheduleStatus),
-			zap.Bool("is_schedulable", resolved.IsSchedulable),
-			zap.String("work_center", func() string {
-				if resolved.WorkCenterCode != nil {
-					return *resolved.WorkCenterCode
-				}
-				return "<nil>"
-			}()),
-			zap.Any("shift_id", resolved.ShiftID),
-		)
-
 		if resolved.ScheduleStatus != "scheduled" {
-			s.logger.Debug("Day not schedulable, skipping",
-				zap.String("user", userID.String()),
-				zap.String("date", d.Format("2006-01-02")),
-				zap.String("status", resolved.ScheduleStatus))
 			continue
 		}
-
 		if resolved.ShiftID == nil {
 			s.logger.Warn("Resolved day has no shift ID, skipping",
 				zap.String("user", userID.String()),
 				zap.String("date", d.Format("2006-01-02")))
 			continue
 		}
-
+		instTz := resolved.Timezone
+		if instTz == "" {
+			instTz = tz
+		}
 		inst := &models.ScheduleInstance{
 			ScheduleInstanceID: uuid.New(),
 			CompanyID:          companyID,
@@ -1414,24 +1330,15 @@ func (s *schedulingServiceImpl) generateInstancesForUser(ctx context.Context, co
 			ScheduleTemplateID: *resolved.ShiftID,
 			ExpectedStart:      resolved.ExpectedStart,
 			ExpectedEnd:        resolved.ExpectedEnd,
-			Timezone:           resolved.Timezone,
+			Timezone:           instTz,
 			WorkCenterCode:     resolved.WorkCenterCode,
 			GeneratedAt:        time.Now().UTC(),
 			Status:             "active",
 		}
 		instances = append(instances, inst)
-		s.logger.Debug("Created instance for date",
-			zap.String("date", d.Format("2006-01-02")),
-			zap.String("template_id", resolved.ShiftID.String()))
 	}
-
-	s.logger.Info("Generated schedule instances",
-		zap.String("user_id", userID.String()),
-		zap.Int("count", len(instances)))
 	return instances
 }
-
-// ---- Overrides ----
 
 func (s *schedulingServiceImpl) CreateScheduleOverride(ctx context.Context, companyID uuid.UUID, override *models.ScheduleOverride, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.ScheduleOverride, error) {
 	if err := s.validateScheduleOverride(override); err != nil {
@@ -1442,7 +1349,6 @@ func (s *schedulingServiceImpl) CreateScheduleOverride(ctx context.Context, comp
 	}
 	override.CompanyID = companyID
 	override.CreatedAt = time.Now().UTC()
-
 	existing, _ := s.schedulingRepo.GetScheduleOverrideByUserDate(ctx, override.UserID, override.OverrideDate)
 	if existing != nil {
 		return nil, fmt.Errorf("override already exists for this date")
@@ -1494,8 +1400,6 @@ func (s *schedulingServiceImpl) DeleteScheduleOverride(ctx context.Context, over
 	return nil
 }
 
-// ---- Work Center Shift Mappings ----
-
 func (s *schedulingServiceImpl) CreateWorkCenterShiftMapping(ctx context.Context, companyID uuid.UUID, mapping *models.WorkCenterShift, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error {
 	if mapping.WorkCenterCode == "" || mapping.ShiftID == uuid.Nil {
 		return fmt.Errorf("work_center_code and shift_id required")
@@ -1525,8 +1429,7 @@ func (s *schedulingServiceImpl) UpdateWorkCenterShiftMappingByKey(ctx context.Co
 	return s.schedulingRepo.UpdateWorkCenterShiftMapping(ctx, mapping)
 }
 
-// ---- Schedule Resolution ----
-
+// ResolveUserDay — fully tz-aware. Never hardcodes UTC.
 func (s *schedulingServiceImpl) ResolveUserDay(ctx context.Context, companyID, userID uuid.UUID, date time.Time) (*PositionBasedResolvedDay, error) {
 	s.logger.Info("Resolving user day",
 		zap.String("user_id", userID.String()),
@@ -1542,36 +1445,24 @@ func (s *schedulingServiceImpl) ResolveUserDay(ctx context.Context, companyID, u
 		return &PositionBasedResolvedDay{IsSchedulable: false, ScheduleStatus: "subject_not_found"}, nil
 	}
 
-	s.logger.Info("Subject resolved",
-		zap.String("user_id", userID.String()),
-		zap.String("position_id", func() string {
-			if subject.PositionID != nil {
-				return subject.PositionID.String()
-			}
-			return "<nil>"
-		}()),
-		zap.String("work_center_code", func() string {
-			if subject.WorkCenterCode != nil {
-				return *subject.WorkCenterCode
-			}
-			return "<nil>"
-		}()),
-		zap.Bool("is_active", subject.IsActive),
-		zap.Bool("attendance_required", subject.AttendanceRequired),
-		zap.Bool("overtime_allowed", subject.OvertimeAllowed),
-	)
+	// ── Resolve effective tz via chain: subject's WC tz > company default > UTC.
+	effectiveTz := subject.WorkCenterTimezone
+	if effectiveTz == "" {
+		effectiveTz = subject.CompanyTimezone
+	}
+	if effectiveTz == "" {
+		effectiveTz = "UTC"
+	}
 
 	if !subject.IsActive {
-		s.logger.Info("Subject is inactive", zap.String("user_id", userID.String()))
 		return &PositionBasedResolvedDay{IsSchedulable: false, ScheduleStatus: "inactive"}, nil
 	}
 
 	overrideInfo, _ := s.subjectResolver.ResolveOverride(ctx, companyID, userID, "employee", date)
 	if overrideInfo != nil && overrideInfo.IsOnLeave {
-		s.logger.Info("User on leave", zap.String("user_id", userID.String()))
 		return &PositionBasedResolvedDay{
 			Date:           date,
-			Timezone:       "UTC",
+			Timezone:       effectiveTz,
 			IsSchedulable:  false,
 			ScheduleStatus: "on_leave",
 			IsOnLeave:      true,
@@ -1583,7 +1474,6 @@ func (s *schedulingServiceImpl) ResolveUserDay(ctx context.Context, companyID, u
 
 	schOverride, _ := s.schedulingRepo.GetScheduleOverrideByUserDate(ctx, userID, date)
 	if schOverride != nil && schOverride.OverrideType == "off" {
-		s.logger.Info("Schedule override 'off' found", zap.String("user_id", userID.String()))
 		return &PositionBasedResolvedDay{
 			IsSchedulable:  false,
 			ScheduleStatus: "override_off",
@@ -1598,12 +1488,13 @@ func (s *schedulingServiceImpl) ResolveUserDay(ctx context.Context, companyID, u
 		instance = instances[0]
 	}
 	if instance != nil && instance.Status == "active" {
-		s.logger.Info("Active schedule instance exists",
-			zap.String("user_id", userID.String()),
-			zap.String("instance_id", instance.ScheduleInstanceID.String()))
+		instTz := instance.Timezone
+		if instTz == "" {
+			instTz = effectiveTz
+		}
 		return &PositionBasedResolvedDay{
 			Date:               instance.ScheduleDate,
-			Timezone:           instance.Timezone,
+			Timezone:           instTz,
 			IsSchedulable:      true,
 			AttendanceRequired: subject.AttendanceRequired,
 			OvertimeAllowed:    subject.OvertimeAllowed,
@@ -1620,9 +1511,9 @@ func (s *schedulingServiceImpl) ResolveUserDay(ctx context.Context, companyID, u
 	}
 
 	if subject.WorkCenterCode == nil {
-		s.logger.Info("Subject has no work center code", zap.String("user_id", userID.String()))
 		return &PositionBasedResolvedDay{
 			Date:           date,
+			Timezone:       effectiveTz,
 			IsSchedulable:  false,
 			ScheduleStatus: "no_work_center",
 			PositionID:     subject.PositionID,
@@ -1638,13 +1529,9 @@ func (s *schedulingServiceImpl) ResolveUserDay(ctx context.Context, companyID, u
 		return nil, err
 	}
 	if mapping == nil {
-		s.logger.Info("No shift mapping found for work center",
-			zap.String("work_center", *subject.WorkCenterCode),
-			zap.String("user_id", userID.String()),
-			zap.String("date", date.Format("2006-01-02")))
 		return &PositionBasedResolvedDay{
 			Date:               date,
-			Timezone:           "UTC",
+			Timezone:           effectiveTz,
 			IsSchedulable:      true,
 			AttendanceRequired: subject.AttendanceRequired,
 			OvertimeAllowed:    subject.OvertimeAllowed,
@@ -1671,7 +1558,8 @@ func (s *schedulingServiceImpl) ResolveUserDay(ctx context.Context, companyID, u
 		}, nil
 	}
 
-	expectedStart, expectedEnd, err := s.calculateExpectedTimes(date, template, "UTC")
+	// ── Build expected times in the shift's tz.
+	expectedStart, expectedEnd, err := s.calculateExpectedTimes(date, template, effectiveTz)
 	if err != nil {
 		s.logger.Error("Failed to calculate expected times",
 			zap.Error(err),
@@ -1679,16 +1567,9 @@ func (s *schedulingServiceImpl) ResolveUserDay(ctx context.Context, companyID, u
 		return nil, err
 	}
 
-	s.logger.Info("Resolved to scheduled",
-		zap.String("user_id", userID.String()),
-		zap.String("work_center", *subject.WorkCenterCode),
-		zap.String("shift_id", mapping.ShiftID.String()),
-		zap.Time("expected_start", *expectedStart),
-		zap.Time("expected_end", *expectedEnd))
-
 	return &PositionBasedResolvedDay{
 		Date:               date,
-		Timezone:           "UTC",
+		Timezone:           effectiveTz,
 		IsSchedulable:      true,
 		AttendanceRequired: subject.AttendanceRequired,
 		OvertimeAllowed:    subject.OvertimeAllowed,
@@ -1740,8 +1621,6 @@ func (s *schedulingServiceImpl) CreateScheduleInstanceFromPosition(ctx context.C
 	return instance, nil
 }
 
-// ---- Availability ----
-
 func (s *schedulingServiceImpl) CheckScheduleAvailability(ctx context.Context, companyID, userID uuid.UUID, date time.Time, timezone string) ([]time.Time, error) {
 	resolved, err := s.ResolveUserDay(ctx, companyID, userID, date)
 	if err != nil || resolved.ScheduleStatus != "scheduled" {
@@ -1750,10 +1629,18 @@ func (s *schedulingServiceImpl) CheckScheduleAvailability(ctx context.Context, c
 	if resolved.ExpectedStart == nil || resolved.ExpectedEnd == nil {
 		return []time.Time{}, nil
 	}
-	loc, _ := time.LoadLocation(timezone)
-	start := resolved.ExpectedStart.In(loc)
-	end := resolved.ExpectedEnd.In(loc)
-	return []time.Time{start, end}, nil
+	tz := resolved.Timezone
+	if tz == "" {
+		tz = timezone
+	}
+	loc, _ := time.LoadLocation(tz)
+	if loc == nil {
+		loc = time.UTC
+	}
+	return []time.Time{
+		resolved.ExpectedStart.In(loc),
+		resolved.ExpectedEnd.In(loc),
+	}, nil
 }
 
 func (s *schedulingServiceImpl) ValidateScheduleConflict(ctx context.Context, userID uuid.UUID, startTime, endTime time.Time, excludeInstanceID *uuid.UUID) (bool, error) {
@@ -1777,13 +1664,9 @@ func (s *schedulingServiceImpl) ValidateScheduleConflict(ctx context.Context, us
 	return false, nil
 }
 
-// ---- Health ----
-
 func (s *schedulingServiceImpl) HealthCheck(ctx context.Context) error {
 	return s.schedulingRepo.HealthCheck(ctx)
 }
-
-// ---- Internal helpers ----
 
 func (s *schedulingServiceImpl) validateWorkCalendar(calendar *models.WorkCalendar) error {
 	if calendar.CompanyID == uuid.Nil {
@@ -1798,8 +1681,7 @@ func (s *schedulingServiceImpl) validateWorkCalendar(calendar *models.WorkCalend
 	if len(calendar.WorkingDays) == 0 {
 		return fmt.Errorf("working days required")
 	}
-	_, err := time.LoadLocation(calendar.Timezone)
-	if err != nil {
+	if _, err := time.LoadLocation(calendar.Timezone); err != nil {
 		return fmt.Errorf("invalid timezone: %w", err)
 	}
 	return nil
@@ -1843,24 +1725,47 @@ func (s *schedulingServiceImpl) validateScheduleOverride(override *models.Schedu
 }
 
 func (s *schedulingServiceImpl) isFutureDate(date time.Time, timezone string) bool {
-	loc, _ := time.LoadLocation(timezone)
+	loc, err := time.LoadLocation(timezone)
+	if err != nil || loc == nil {
+		loc = time.UTC
+	}
 	now := time.Now().In(loc)
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 	return date.After(today)
 }
 
+// calculateExpectedTimes — builds instants from wall-clock rules in the shift tz.
 func (s *schedulingServiceImpl) calculateExpectedTimes(date time.Time, template *models.ScheduleTemplate, timezone string) (*time.Time, *time.Time, error) {
-	loc, _ := time.LoadLocation(timezone)
+	loc, err := time.LoadLocation(timezone)
+	if err != nil || loc == nil {
+		loc = time.UTC
+	}
+
 	day := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, loc)
+
 	var start, end time.Time
 	switch template.TemplateType {
 	case "office":
-		startClock, _ := time.Parse("15:04", *template.Rules.StartTime)
-		endClock, _ := time.Parse("15:04", *template.Rules.EndTime)
+		if template.Rules.StartTime == nil || template.Rules.EndTime == nil {
+			return nil, nil, fmt.Errorf("office template missing start_time/end_time")
+		}
+		startClock, err := time.Parse("15:04", *template.Rules.StartTime)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse start_time: %w", err)
+		}
+		endClock, err := time.Parse("15:04", *template.Rules.EndTime)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse end_time: %w", err)
+		}
 		start = time.Date(day.Year(), day.Month(), day.Day(), startClock.Hour(), startClock.Minute(), 0, 0, loc)
 		end = time.Date(day.Year(), day.Month(), day.Day(), endClock.Hour(), endClock.Minute(), 0, 0, loc)
+
+		// Overnight shift: end < start → belongs to next day.
+		if !end.After(start) {
+			end = end.AddDate(0, 0, 1)
+		}
 	default:
-		return nil, nil, fmt.Errorf("unsupported template type")
+		return nil, nil, fmt.Errorf("unsupported template type: %s", template.TemplateType)
 	}
 	return &start, &end, nil
 }
@@ -1872,7 +1777,6 @@ func (s *schedulingServiceImpl) logAudit(ctx context.Context, companyID uuid.UUI
 	_ = s.auditService.LogAction(ctx, nil, &companyID, "scheduling", action, "scheduling", &resourceID, actorType, &actorID, before, after, metadata)
 }
 
-// LeaveScheduleData contains the minimal data needed for leave scheduling integration.
 type LeaveScheduleData struct {
 	LeaveRequestID uuid.UUID
 	UserID         uuid.UUID
@@ -1881,7 +1785,6 @@ type LeaveScheduleData struct {
 	EndDate        time.Time
 }
 
-// ApplyApprovedLeave creates "off" schedule overrides for each day in the leave date range.
 func (s *schedulingServiceImpl) ApplyApprovedLeave(ctx context.Context, leaveData *LeaveScheduleData, actorType string, actorID uuid.UUID) error {
 	if leaveData == nil {
 		return fmt.Errorf("leave data is nil")
@@ -1895,7 +1798,6 @@ func (s *schedulingServiceImpl) ApplyApprovedLeave(ctx context.Context, leaveDat
 	if leaveData.EndDate.Before(leaveData.StartDate) {
 		return fmt.Errorf("end date cannot be before start date")
 	}
-
 	reason := fmt.Sprintf("leave_%s", leaveData.LeaveRequestID.String())
 	for d := leaveData.StartDate; !d.After(leaveData.EndDate); d = d.AddDate(0, 0, 1) {
 		override := &models.ScheduleOverride{
@@ -1915,7 +1817,6 @@ func (s *schedulingServiceImpl) ApplyApprovedLeave(ctx context.Context, leaveDat
 	return nil
 }
 
-// RollbackCancelledLeave deletes all schedule overrides for the leave request and regenerates schedules for future dates.
 func (s *schedulingServiceImpl) RollbackCancelledLeave(ctx context.Context, leaveData *LeaveScheduleData, actorType string, actorID uuid.UUID) error {
 	if leaveData == nil {
 		return fmt.Errorf("leave data is nil")
@@ -1924,11 +1825,9 @@ func (s *schedulingServiceImpl) RollbackCancelledLeave(ctx context.Context, leav
 		return fmt.Errorf("company and user are required")
 	}
 	reason := fmt.Sprintf("leave_%s", leaveData.LeaveRequestID.String())
-
 	if err := s.schedulingRepo.DeleteScheduleOverridesByReason(ctx, leaveData.CompanyID, leaveData.UserID, reason); err != nil {
 		return fmt.Errorf("failed to delete leave overrides: %w", err)
 	}
-
 	now := time.Now().UTC()
 	for d := leaveData.StartDate; !d.After(leaveData.EndDate); d = d.AddDate(0, 0, 1) {
 		if d.After(now) {
@@ -2912,6 +2811,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -2927,6 +2827,7 @@ import (
 	"auth-service/internal/attendance/service/usage_integration"
 	auditservice "auth-service/internal/infrastructure/audit"
 	"auth-service/internal/locationctx"
+	"auth-service/internal/util"
 )
 
 type PunchRequest struct {
@@ -2969,6 +2870,9 @@ type ingestService struct {
 	sessionSummaryRepo repository.AttendanceSessionSummaryRepository
 	usageService       *usage_integration.UsageIntegrationService
 	locationResolver   resolver.SubjectLocationResolver
+
+	// ── NEW: canonical timezone resolver
+	tzProvider resolver.TimezoneProvider
 }
 
 func NewIngestService(
@@ -2984,6 +2888,7 @@ func NewIngestService(
 	sessionSummaryRepo repository.AttendanceSessionSummaryRepository,
 	usageService *usage_integration.UsageIntegrationService,
 	locationResolver resolver.SubjectLocationResolver,
+	tzProvider resolver.TimezoneProvider, // ── NEW
 ) IngestService {
 	return &ingestService{
 		eventRepo:          eventRepo,
@@ -2998,6 +2903,7 @@ func NewIngestService(
 		sessionSummaryRepo: sessionSummaryRepo,
 		usageService:       usageService,
 		locationResolver:   locationResolver,
+		tzProvider:         tzProvider,
 	}
 }
 
@@ -3076,6 +2982,7 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 	if err != nil {
 		return nil, fmt.Errorf("resolve attendance rules: %w", err)
 	}
+
 	if !resolvedRules.AllowedSourceTypesMap[req.Source.SourceType] {
 		return nil, fmt.Errorf("source '%s' not allowed by rules", req.Source.SourceType)
 	}
@@ -3095,6 +3002,7 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 	if req.ActorID != uuid.Nil {
 		actorPtr = &req.ActorID
 	}
+
 	allowed, reason := s.omService.CanPunchAttendance(
 		ctx,
 		req.CompanyID,
@@ -3134,23 +3042,58 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		return nil, fmt.Errorf("resolve subject location: %w", err)
 	}
 
-	event := &models.AttendanceEvent{
-		AttendanceEventID: uuid.New(),
-		CompanyID:         req.CompanyID,
-		SubjectType:       subjectType,
-		SubjectID:         subjectID,
-		EventType:         req.EventType,
-		EventTime:         eventTime,
+	// ── NEW: resolve timezone via the canonical chain.
+	//    Priority: position.location → position.work_center →
+	//    work_center.location → company.default_timezone.
+	//
+	//    We pass what we have. For device punches the work center comes
+	//    from the device. For non-device punches it comes from Context.
+	//    The subject's location is the last resort before company default.
+	effectiveTz, tzErr := s.tzProvider.ResolveTimezone(
+		ctx,
+		req.CompanyID,
+		nil, // positionID — we don't have it here; work center wins
+		req.Context.WorkCenterCode,
+		subjectLocation,
+	)
+	if tzErr != nil {
+		s.logger.Error("tz resolution failed, defaulting to UTC",
+			zap.String("company_id", req.CompanyID.String()),
+			zap.String("subject_id", subjectID.String()),
+			zap.Error(tzErr),
+		)
+		effectiveTz = "UTC"
+	}
+	if effectiveTz == "" {
+		effectiveTz = "UTC"
+	}
 
+	// Compute the three tz-derived columns.
+	offsetMinutes := util.OffsetMinutes(eventTime, effectiveTz)
+	eventDateLocal := util.CalendarDateInTz(eventTime, effectiveTz)
+
+	// Optional country code from the location (for tax-residency reports).
+	eventCountry := s.resolveEventCountry(ctx, req.CompanyID, subjectLocation)
+
+	event := &models.AttendanceEvent{
+		AttendanceEventID:    uuid.New(),
+		CompanyID:            req.CompanyID,
+		SubjectType:          subjectType,
+		SubjectID:            subjectID,
+		EventType:            req.EventType,
+		EventTime:            eventTime,
+		EventTZ:              effectiveTz,
+		EventOffsetMinutes:   int16(offsetMinutes),
+		EventDateLocal:       eventDateLocal,
+		EventCountry:         eventCountry,
 		EmploymentLocationID: subjectLocation,
 		GeofenceID:           deviceGeofence(device),
-
-		SourceType:     req.Source.SourceType,
-		SourceID:       req.Source.SourceID,
-		DeviceID:       deviceID,
-		DeviceUserCode: req.DeviceUserCode,
-		IPAddress:      req.Source.IPAddress,
-		Context:        *req.Context,
+		SourceType:           req.Source.SourceType,
+		SourceID:             req.Source.SourceID,
+		DeviceID:             deviceID,
+		DeviceUserCode:       req.DeviceUserCode,
+		IPAddress:            req.Source.IPAddress,
+		Context:              *req.Context,
 		Metadata: models.EventMetadata{
 			IsAutoGenerated: boolPtr(sourceRules.IsSystem),
 		},
@@ -3171,13 +3114,14 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 	if err := s.eventRepo.CreateEvent(ctx, tx, event); err != nil {
 		return nil, fmt.Errorf("create event: %w", err)
 	}
-
 	if deviceID != nil {
 		_ = s.deviceRepo.UpdateLastSeen(ctx, *deviceID)
 	}
 
 	if req.Context.SessionID != nil && *req.Context.SessionID != uuid.Nil {
-		if err := s.updateSessionSummary(ctx, tx, event, *req.Context.SessionID, subjectLocation); err != nil {
+		// ── CHANGED: pass effectiveTz so the session summary is bucketed
+		//    into the correct local day.
+		if err := s.updateSessionSummary(ctx, tx, event, *req.Context.SessionID, subjectLocation, effectiveTz); err != nil {
 			s.logger.Warn("Failed to update session summary",
 				zap.String("event_id", event.AttendanceEventID.String()),
 				zap.String("session_id", req.Context.SessionID.String()),
@@ -3219,25 +3163,46 @@ func (s *ingestService) IngestPunch(ctx context.Context, req *PunchRequest) (*mo
 		zap.String("event_id", event.AttendanceEventID.String()),
 		zap.String("subject_type", subjectType),
 		zap.String("subject_id", subjectID.String()),
+		zap.String("event_tz", effectiveTz),
+		zap.Int("offset_minutes", offsetMinutes),
+		zap.Time("event_date_local", eventDateLocal),
 		zap.Duration("duration", time.Since(start)),
 	)
 	return event, nil
 }
 
-// ensureActorCanActOnSubject verifies that, when an actor is present and
-// differs from the target subject, the target subject is within the caller's
-// current location scope.
-//
-// Rules:
-//   - actorID == uuid.Nil         → device / system → permitted
-//   - actorID == subjectID        → self-punch      → permitted
-//   - scope == ScopeAll           → permitted
-//   - no location context at all  → DENIED (fail-closed)
-//
-// FIX (Tier 1): previously a missing location context returned nil, silently
-// converting the scope check into a no-op. That is fail-open for a
-// cross-subject write, which is exactly the case that needs to be checked.
-// It now fails closed.
+// resolveEventCountry looks up locations.country for the subject's location.
+// Returns nil if not resolvable. Never fails the write — country is optional.
+func (s *ingestService) resolveEventCountry(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+) *string {
+	if locationID == nil || *locationID == uuid.Nil {
+		return nil
+	}
+	var country sql.NullString
+	err := s.eventRepo.(interface {
+		QueryRow(ctx context.Context, query string, args ...interface{}) *sql.Row
+	}).QueryRow(ctx, `
+		SELECT country FROM locations
+		WHERE company_id = $1 AND location_id = $2
+	`, companyID, *locationID).Scan(&country)
+	if err != nil {
+		return nil
+	}
+	if !country.Valid || country.String == "" {
+		return nil
+	}
+	// Truncate to alpha-2
+	c := country.String
+	if len(c) > 2 {
+		c = c[:2]
+	}
+	c = strings.ToUpper(c)
+	return &c
+}
+
 func (s *ingestService) ensureActorCanActOnSubject(
 	ctx context.Context,
 	companyID, actorID uuid.UUID,
@@ -3245,12 +3210,11 @@ func (s *ingestService) ensureActorCanActOnSubject(
 	subjectID uuid.UUID,
 ) error {
 	if actorID == uuid.Nil {
-		return nil // device / system
+		return nil
 	}
 	if actorID == subjectID {
-		return nil // self-punch
+		return nil
 	}
-
 	locCtx, err := locationctx.FromContext(ctx)
 	if err != nil {
 		return fmt.Errorf("location context missing for cross-subject write: %w", resolver.ErrSubjectOutsideScope)
@@ -3258,7 +3222,6 @@ func (s *ingestService) ensureActorCanActOnSubject(
 	if locCtx.Mode == locationctx.ScopeAll {
 		return nil
 	}
-
 	subjectLoc, err := s.locationResolver.ResolveLocation(ctx, companyID, subjectType, subjectID)
 	if err != nil {
 		return err
@@ -3290,50 +3253,15 @@ func boolPtr(b bool) *bool {
 	return &b
 }
 
-// resolveEventTime determines the event timestamp for a punch.
-//
-// Contract:
-//   - For device sources, req.EventTime MUST be a `time.Time` carrying an
-//     explicit location (i.e. constructed from a string with a tz offset
-//     like RFC3339). It is converted to UTC before being stored.
-//   - For non-device human sources, the event is stamped at "now" in the
-//     company timezone, then stored as UTC.
-//   - For system sources, "now" UTC is used.
-//
-// FIX (Tier 1): the previous implementation returned
-// `req.EventTime.In(loc).UTC()`, which is an identity transform: an instant
-// already in UTC is unchanged, and a naive timestamp (parsed as UTC by Go)
-// is unchanged too. The tz from company rules had no effect. That line is
-// removed. The store-as-UTC contract is now explicit and enforced.
 func (s *ingestService) resolveEventTime(
 	ctx context.Context,
 	req *PunchRequest,
 	rules *source.ResolvedSourceRules,
 ) (time.Time, error) {
-	companyRules, err := s.adminService.GetCompanyAttendanceRules(ctx, req.CompanyID)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("get company rules: %w", err)
-	}
-
-	if companyRules == nil {
-		s.logger.Warn("No company attendance rules found; falling back to UTC timezone",
-			zap.String("company_id", req.CompanyID.String()))
-		if rules.RequiresDevice {
-			if req.EventTime == nil {
-				return time.Time{}, errors.New("event_time required for device events")
-			}
-			return req.EventTime.UTC(), nil
-		}
-		return time.Now().UTC(), nil
-	}
-
 	if rules.RequiresDevice {
 		if req.EventTime == nil {
 			return time.Time{}, errors.New("event_time required for device events")
 		}
-		// Trust the tz information embedded in req.EventTime. If the caller
-		// built it from a tz-less string, that is an upstream bug: this
-		// method cannot reconstruct the intended tz.
 		if _, offset := req.EventTime.Zone(); offset == 0 {
 			s.logger.Warn("Device event_time has zero offset; timezone may be missing from payload",
 				zap.String("company_id", req.CompanyID.String()),
@@ -3342,30 +3270,27 @@ func (s *ingestService) resolveEventTime(
 		}
 		return req.EventTime.UTC(), nil
 	}
-
 	if rules.IsSystem {
 		return time.Now().UTC(), nil
 	}
-
-	// Non-device human punches: stamp "now" in the company tz, store as UTC.
-	loc, err := time.LoadLocation(companyRules.Timezone)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("invalid timezone: %w", err)
+	if req.EventTime != nil {
+		return req.EventTime.UTC(), nil
 	}
-	return time.Now().In(loc).UTC(), nil
+	return time.Now().UTC(), nil
 }
 
+// updateSessionSummary buckets the session into the subject's LOCAL day
+// (per `tz`), not UTC.
 func (s *ingestService) updateSessionSummary(
 	ctx context.Context,
 	tx *sql.Tx,
 	event *models.AttendanceEvent,
 	sessionID uuid.UUID,
 	subjectLocation *uuid.UUID,
+	tz string,
 ) error {
-	sessionDate := event.EventTime.UTC().Truncate(24 * time.Hour)
-
+	sessionDate := util.CalendarDateInTz(event.EventTime, tz)
 	status := mapEventTypeToSessionStatus(event.EventType)
-
 	summary := &models.AttendanceSessionSummary{
 		CompanyID:            event.CompanyID,
 		SubjectType:          event.SubjectType,
@@ -3373,6 +3298,7 @@ func (s *ingestService) updateSessionSummary(
 		EmploymentLocationID: subjectLocation,
 		SessionID:            sessionID,
 		SessionDate:          sessionDate,
+		Timezone:             tz,
 		Status:               status,
 		MarkedAt:             event.EventTime,
 		MarkedBy:             event.CreatedBy,
@@ -3382,9 +3308,9 @@ func (s *ingestService) updateSessionSummary(
 		Remarks:              nil,
 		Metadata: models.JSONB{
 			"event_id": event.AttendanceEventID.String(),
+			"tz":       tz,
 		},
 	}
-
 	return s.sessionSummaryRepo.Upsert(ctx, tx, summary)
 }
 
@@ -3413,6 +3339,7 @@ func (s *ingestService) getFeatureKeyForEvent(eventType, sourceType string) stri
 		return ""
 	}
 }
+
 
 
 ================================================================================
@@ -4489,6 +4416,7 @@ import (
 	"auth-service/internal/attendance/service/resolver"
 	auditservice "auth-service/internal/infrastructure/audit"
 	"auth-service/internal/locationctx"
+	"auth-service/internal/util"
 )
 
 type CorrectionRequest struct {
@@ -4517,6 +4445,9 @@ type correctionService struct {
 	resolution       ResolutionService
 	logger           *zap.Logger
 	audit            *auditservice.AuditService
+
+	// ── NEW: canonical timezone resolver
+	tzProvider resolver.TimezoneProvider
 }
 
 type ResolutionService interface {
@@ -4532,6 +4463,7 @@ func NewCorrectionService(
 	resolution ResolutionService,
 	logger *zap.Logger,
 	audit *auditservice.AuditService,
+	tzProvider resolver.TimezoneProvider, // ── NEW
 ) CorrectionService {
 	return &correctionService{
 		eventRepo:        eventRepo,
@@ -4542,6 +4474,7 @@ func NewCorrectionService(
 		resolution:       resolution,
 		logger:           logger,
 		audit:            audit,
+		tzProvider:       tzProvider,
 	}
 }
 
@@ -4551,7 +4484,6 @@ func (s *correctionService) CreateCorrection(ctx context.Context, req *Correctio
 	if !isValidCorrectionType(req.CorrectionType) {
 		return fmt.Errorf("invalid correction type: %s", req.CorrectionType)
 	}
-
 	if req.CorrectionType == "manual_check_in" || req.CorrectionType == "manual_check_out" {
 		if req.EventTime == nil {
 			return fmt.Errorf("event_time required for %s", req.CorrectionType)
@@ -4566,11 +4498,9 @@ func (s *correctionService) CreateCorrection(ctx context.Context, req *Correctio
 		}
 	}
 
-	// Resolve the subject's timezone so business-date comparisons use the
-	// subject's local day, not UTC. FIX (Tier 1): previously compared
-	// eventTime.UTC() to businessDate.UTC(), which rejected valid
-	// corrections that cross local midnight for non-UTC subjects.
+	// ── NEW: resolve subject tz via the canonical chain.
 	subjectTZ := s.resolveSubjectTimezone(ctx, req.CompanyID, req.SubjectType, req.SubjectID)
+
 	loc, err := time.LoadLocation(subjectTZ)
 	if err != nil {
 		loc = time.UTC
@@ -4579,8 +4509,6 @@ func (s *correctionService) CreateCorrection(ctx context.Context, req *Correctio
 	var eventTime time.Time
 	if req.EventTime != nil {
 		eventTime = *req.EventTime
-
-		// Compare local calendar days.
 		evtLocal := eventTime.In(loc).Format("2006-01-02")
 		bizLocal := req.BusinessDate.In(loc).Format("2006-01-02")
 		if evtLocal != bizLocal {
@@ -4590,7 +4518,7 @@ func (s *correctionService) CreateCorrection(ctx context.Context, req *Correctio
 				subjectTZ)
 		}
 	} else {
-		// Default to midnight at the subject's local business date.
+		// No explicit event time — use midnight of the business date in subject tz.
 		eventTime = time.Date(
 			req.BusinessDate.Year(), req.BusinessDate.Month(), req.BusinessDate.Day(),
 			0, 0, 0, 0, loc,
@@ -4619,20 +4547,25 @@ func (s *correctionService) CreateCorrection(ctx context.Context, req *Correctio
 		return fmt.Errorf("resolve subject location: %w", err)
 	}
 
+	// ── NEW: compute tz-derived columns for the correction event.
+	offsetMinutes := util.OffsetMinutes(eventTime, subjectTZ)
+	eventDateLocal := util.CalendarDateInTz(eventTime, subjectTZ)
+
 	event := &models.AttendanceEvent{
-		AttendanceEventID: uuid.New(),
-		CompanyID:         req.CompanyID,
-		SubjectType:       req.SubjectType,
-		SubjectID:         req.SubjectID,
-		EventType:         req.CorrectionType,
-		EventTime:         eventTime,
-
+		AttendanceEventID:    uuid.New(),
+		CompanyID:            req.CompanyID,
+		SubjectType:          req.SubjectType,
+		SubjectID:            req.SubjectID,
+		EventType:            req.CorrectionType,
+		EventTime:            eventTime,
+		EventTZ:              subjectTZ,
+		EventOffsetMinutes:   int16(offsetMinutes),
+		EventDateLocal:       eventDateLocal,
 		EmploymentLocationID: subjectLocation,
-
-		SourceType: "correction",
-		SourceID:   nil,
-		DeviceID:   nil,
-		IPAddress:  nil,
+		SourceType:           "correction",
+		SourceID:             nil,
+		DeviceID:             nil,
+		IPAddress:            nil,
 		Context: models.EventContext{
 			CorrectionReason: &req.Reason,
 		},
@@ -4673,35 +4606,50 @@ func (s *correctionService) CreateCorrection(ctx context.Context, req *Correctio
 			"event_time":      eventTime.Format(time.RFC3339),
 			"override_status": req.OverrideStatus,
 			"reason":          req.Reason,
+			"event_tz":        subjectTZ,
 		})
-
 	s.logger.Info("Attendance correction created",
 		zap.String("event_id", event.AttendanceEventID.String()),
 		zap.String("subject_type", req.SubjectType),
 		zap.String("subject_id", req.SubjectID.String()),
 		zap.String("correction_type", req.CorrectionType),
-		zap.Time("business_date", req.BusinessDate),
+		zap.String("tz", subjectTZ),
 		zap.Duration("duration", time.Since(startTime)),
 	)
 	return nil
 }
 
-// resolveSubjectTimezone returns the subject's timezone, falling back to UTC.
-// We try the resolver first; if it fails or returns no tz, we fall back.
+// resolveSubjectTimezone uses the TimezoneProvider chain. Falls back to
+// "UTC" only if the chain itself errors.
 func (s *correctionService) resolveSubjectTimezone(
 	ctx context.Context,
 	companyID uuid.UUID,
 	subjectType string,
 	subjectID uuid.UUID,
 ) string {
-	if s.resolver == nil {
-		return "UTC"
-	}
+	// Fetch the subject once to get position + work center hints.
 	resolved, err := s.resolver.Resolve(ctx, companyID, subjectType, subjectID, time.Now())
-	if err != nil || resolved == nil || resolved.Timezone == "" {
-		return "UTC"
+	if err == nil && resolved != nil && resolved.Timezone != "" {
+		return resolved.Timezone
 	}
-	return resolved.Timezone
+
+	// Fall back to provider with what we have.
+	var positionID *uuid.UUID
+	var workCenterCode *string
+	if resolved != nil {
+		positionID = resolved.PositionID
+		workCenterCode = resolved.WorkCenterCode
+	}
+	tz, err := s.tzProvider.ResolveTimezone(ctx, companyID, positionID, workCenterCode, nil)
+	if err == nil && tz != "" {
+		return tz
+	}
+
+	s.logger.Warn("correction tz resolution failed, defaulting to UTC",
+		zap.String("company_id", companyID.String()),
+		zap.String("subject_id", subjectID.String()),
+	)
+	return "UTC"
 }
 
 func (s *correctionService) ensureSubjectInScope(
@@ -4772,6 +4720,7 @@ func (s *correctionService) logAudit(ctx context.Context, companyID uuid.UUID, a
 }
 
 
+
 ================================================================================
 FILE: ./service/resolution/resolution_service.go
 ================================================================================
@@ -4792,13 +4741,13 @@ import (
 	"auth-service/internal/attendance/service/admin"
 	"auth-service/internal/attendance/service/resolver"
 	auditservice "auth-service/internal/infrastructure/audit"
+	"auth-service/internal/util"
 )
 
 const (
 	defaultMaxShiftDurationHours = 20
 )
 
-// PairedEvent represents a matched check‑in/check‑out pair (with optional breaks)
 type PairedEvent struct {
 	CheckIn      *models.AttendanceEvent
 	CheckOut     *models.AttendanceEvent
@@ -4808,7 +4757,6 @@ type PairedEvent struct {
 	BreakEnd     *time.Time
 }
 
-// DailyMetrics holds computed values for a single day
 type DailyMetrics struct {
 	WorkedMinutes   *int
 	OvertimeMinutes *int
@@ -4823,7 +4771,6 @@ type DailyMetrics struct {
 	PairedEvents    []PairedEvent
 }
 
-// ResolutionService is the core engine for turning raw events into daily summaries.
 type ResolutionService interface {
 	ResolveEvent(ctx context.Context, eventID uuid.UUID) error
 	ResolveDay(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) error
@@ -4843,9 +4790,11 @@ type resolutionService struct {
 	exemptionRepo    repository.AttendanceExemptionRepository
 	logger           *zap.Logger
 	audit            *auditservice.AuditService
+
+	// ── NEW
+	tzProvider resolver.TimezoneProvider
 }
 
-// NewResolutionService creates a new resolution service.
 func NewResolutionService(
 	eventRepo repository.EventRepository,
 	summaryRepo repository.SummaryRepository,
@@ -4857,6 +4806,7 @@ func NewResolutionService(
 	exemptionRepo repository.AttendanceExemptionRepository,
 	logger *zap.Logger,
 	audit *auditservice.AuditService,
+	tzProvider resolver.TimezoneProvider, // ── NEW
 ) ResolutionService {
 	return &resolutionService{
 		eventRepo:        eventRepo,
@@ -4869,18 +4819,14 @@ func NewResolutionService(
 		exemptionRepo:    exemptionRepo,
 		logger:           logger,
 		audit:            audit,
+		tzProvider:       tzProvider,
 	}
 }
-
-// ─────────────────────────────────────────────────────────────
-// Public methods
-// ─────────────────────────────────────────────────────────────
 
 func (s *resolutionService) ResolveEvent(ctx context.Context, eventID uuid.UUID) error {
 	if eventID == uuid.Nil {
 		return fmt.Errorf("eventID is required")
 	}
-
 	event, err := s.eventRepo.GetEventByID(ctx, eventID)
 	if err != nil {
 		return fmt.Errorf("get event: %w", err)
@@ -4888,7 +4834,6 @@ func (s *resolutionService) ResolveEvent(ctx context.Context, eventID uuid.UUID)
 	if event == nil {
 		return fmt.Errorf("event not found")
 	}
-
 	return s.resolveSubjectDay(ctx, event.CompanyID, event.SubjectID, event.SubjectType, event.EventTime)
 }
 
@@ -4896,6 +4841,8 @@ func (s *resolutionService) ResolveDay(ctx context.Context, companyID, subjectID
 	return s.resolveSubjectDay(ctx, companyID, subjectID, subjectType, date)
 }
 
+// ResolvePeriod iterates calendar days in the subject's local tz, not UTC.
+// Each subject may have a different tz; we resolve per subject.
 func (s *resolutionService) ResolvePeriod(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -4907,13 +4854,16 @@ func (s *resolutionService) ResolvePeriod(
 	if len(subjectIDs) == 0 {
 		return nil
 	}
-
-	start := startDate.UTC().Truncate(24 * time.Hour)
-	end := endDate.UTC().Truncate(24 * time.Hour)
-
 	for _, subjectID := range subjectIDs {
-		current := start
-		for !current.After(end) {
+		tz := s.resolveSubjectTz(ctx, companyID, subjectType, subjectID, startDate)
+		loc, _ := time.LoadLocation(tz)
+		if loc == nil {
+			loc = time.UTC
+		}
+		// Iterate days in local tz.
+		current := time.Date(startDate.Year(), startDate.Month(), startDate.Day(), 0, 0, 0, 0, loc)
+		last := time.Date(endDate.Year(), endDate.Month(), endDate.Day(), 0, 0, 0, 0, loc)
+		for !current.After(last) {
 			var err error
 			if recalculate {
 				err = s.RecalculateDay(ctx, companyID, subjectID, subjectType, current)
@@ -4925,6 +4875,7 @@ func (s *resolutionService) ResolvePeriod(
 					zap.String("subject_type", subjectType),
 					zap.String("subject_id", subjectID.String()),
 					zap.Time("date", current),
+					zap.String("tz", tz),
 					zap.Error(err),
 				)
 			}
@@ -4934,20 +4885,18 @@ func (s *resolutionService) ResolvePeriod(
 	return nil
 }
 
+// BatchResolveEvents dedups by (subject, local-midnight-in-that-tz).
 func (s *resolutionService) BatchResolveEvents(ctx context.Context, eventIDs []uuid.UUID) error {
 	if len(eventIDs) == 0 {
 		return fmt.Errorf("no event IDs provided")
 	}
-
 	type dayKey struct {
 		CompanyID    uuid.UUID
 		SubjectType  string
 		SubjectID    uuid.UUID
-		BusinessDate time.Time
+		BusinessDate string // YYYY-MM-DD in the subject's tz
 	}
-
 	processed := make(map[dayKey]bool)
-
 	for _, id := range eventIDs {
 		evt, err := s.eventRepo.GetEventByID(ctx, id)
 		if err != nil {
@@ -4957,24 +4906,24 @@ func (s *resolutionService) BatchResolveEvents(ctx context.Context, eventIDs []u
 		if evt == nil {
 			continue
 		}
-
+		tz := s.resolveSubjectTz(ctx, evt.CompanyID, evt.SubjectType, evt.SubjectID, evt.EventTime)
+		businessDate := util.CalendarDateInTz(evt.EventTime, tz)
 		key := dayKey{
 			CompanyID:    evt.CompanyID,
 			SubjectType:  evt.SubjectType,
 			SubjectID:    evt.SubjectID,
-			BusinessDate: evt.EventTime.UTC().Truncate(24 * time.Hour),
+			BusinessDate: businessDate.Format("2006-01-02"),
 		}
-
 		if processed[key] {
 			continue
 		}
 		processed[key] = true
-
 		if err := s.resolveSubjectDay(ctx, evt.CompanyID, evt.SubjectID, evt.SubjectType, evt.EventTime); err != nil {
 			s.logger.Error("Failed to resolve day in batch",
 				zap.String("subject_type", evt.SubjectType),
 				zap.String("subject_id", evt.SubjectID.String()),
 				zap.Time("date", evt.EventTime),
+				zap.String("tz", tz),
 				zap.Error(err),
 			)
 		}
@@ -4983,13 +4932,17 @@ func (s *resolutionService) BatchResolveEvents(ctx context.Context, eventIDs []u
 }
 
 func (s *resolutionService) RecalculateDay(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) error {
-	existing, err := s.summaryRepo.GetBySubjectDate(ctx, companyID, subjectID, subjectType, date)
+	tz := s.resolveSubjectTz(ctx, companyID, subjectType, subjectID, date)
+	normalized := util.CalendarDateInTz(date, tz)
+
+	existing, err := s.summaryRepo.GetBySubjectDate(ctx, companyID, subjectID, subjectType, normalized)
 	if err == nil && existing != nil {
 		if existing.IsPayrollLocked {
 			s.logger.Info("Attendance locked by payroll, skipping recalculation",
 				zap.String("subject_type", subjectType),
 				zap.String("subject_id", subjectID.String()),
-				zap.Time("date", date),
+				zap.Time("date", normalized),
+				zap.String("tz", tz),
 			)
 			return nil
 		}
@@ -4997,12 +4950,38 @@ func (s *resolutionService) RecalculateDay(ctx context.Context, companyID, subje
 			s.logger.Warn("Failed to delete existing summary", zap.String("summary_id", existing.AttendanceSummaryID.String()), zap.Error(err))
 		}
 	}
-	return s.resolveSubjectDay(ctx, companyID, subjectID, subjectType, date)
+	return s.resolveSubjectDay(ctx, companyID, subjectID, subjectType, normalized)
 }
 
-// ─────────────────────────────────────────────────────────────
-// Internal resolution core
-// ─────────────────────────────────────────────────────────────
+// resolveSubjectTz uses the subject resolver first (it already walked the
+// chain), falling back to the provider.
+func (s *resolutionService) resolveSubjectTz(
+	ctx context.Context,
+	companyID uuid.UUID,
+	subjectType string,
+	subjectID uuid.UUID,
+	refTime time.Time,
+) string {
+	resolved, err := s.subjectRes.Resolve(ctx, companyID, subjectType, subjectID, refTime)
+	if err == nil && resolved != nil && resolved.Timezone != "" {
+		return resolved.Timezone
+	}
+	var positionID *uuid.UUID
+	var wcCode *string
+	if resolved != nil {
+		positionID = resolved.PositionID
+		wcCode = resolved.WorkCenterCode
+	}
+	tz, err := s.tzProvider.ResolveTimezone(ctx, companyID, positionID, wcCode, nil)
+	if err == nil && tz != "" {
+		return tz
+	}
+	s.logger.Warn("subject tz unresolved, defaulting to UTC",
+		zap.String("subject_type", subjectType),
+		zap.String("subject_id", subjectID.String()),
+	)
+	return "UTC"
+}
 
 func (s *resolutionService) resolveSubjectDay(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, refTime time.Time) error {
 	resolved, err := s.subjectRes.Resolve(ctx, companyID, subjectType, subjectID, refTime)
@@ -5017,27 +4996,32 @@ func (s *resolutionService) resolveSubjectDay(ctx context.Context, companyID, su
 		return nil
 	}
 
-	loc, err := time.LoadLocation(resolved.Timezone)
-	if err != nil {
-		loc = time.UTC
+	tz := resolved.Timezone
+	if tz == "" {
+		tz, _ = s.tzProvider.ResolveTimezone(ctx, companyID, resolved.PositionID, resolved.WorkCenterCode, nil)
 	}
-	refLocal := refTime.In(loc)
-	businessDate := time.Date(refLocal.Year(), refLocal.Month(), refLocal.Day(), 0, 0, 0, 0, loc)
+	if tz == "" {
+		tz = "UTC"
+	}
 
-	// Fetch the existing summary ONCE and pass it down. Previously this
-	// method fetched it, then applyAttendanceRules fetched it twice more.
+	// ── CHANGED: businessDate is local midnight of the subject's tz.
+	businessDate := util.CalendarDateInTz(refTime, tz)
+
 	existingSummary, _ := s.summaryRepo.GetBySubjectDate(ctx, companyID, subjectID, subjectType, businessDate)
 	if existingSummary != nil && existingSummary.IsPayrollLocked {
 		s.logger.Info("Attendance locked by payroll, skipping resolution",
 			zap.String("subject_type", subjectType),
 			zap.String("subject_id", subjectID.String()),
 			zap.Time("date", businessDate),
+			zap.String("tz", tz),
 		)
 		return nil
 	}
 
+	// Fetch a wide UTC window that covers the local day + DST slack.
 	fetchStart := businessDate.Add(-6 * time.Hour)
-	fetchEnd := businessDate.Add(36 * time.Hour)
+	fetchEnd := businessDate.Add(30 * time.Hour)
+
 	events, err := s.eventRepo.GetEventsBySubject(ctx, companyID, subjectID, subjectType, fetchStart, fetchEnd)
 	if err != nil {
 		return fmt.Errorf("fetch events: %w", err)
@@ -5056,15 +5040,9 @@ func (s *resolutionService) resolveSubjectDay(ctx context.Context, companyID, su
 		return fmt.Errorf("resolve rules: %w", err)
 	}
 
-	return s.applyAttendanceRules(ctx, events, companyID, subjectID, subjectType, businessDate, resolved, rules, existingSummary)
+	return s.applyAttendanceRules(ctx, events, companyID, subjectID, subjectType, businessDate, resolved, rules, existingSummary, tz)
 }
 
-// applyAttendanceRules does the heavy lifting: exemptions, pairing, overrides, metrics, status, upsert.
-//
-// `existingSummary` is passed in from resolveSubjectDay so the upsert paths
-// don't have to re-read it. This removes two redundant GetBySubjectDate
-// calls per resolution and closes a race where a concurrent resolver could
-// see a different summary ID between the two reads.
 func (s *resolutionService) applyAttendanceRules(
 	ctx context.Context,
 	events []*models.AttendanceEvent,
@@ -5074,8 +5052,8 @@ func (s *resolutionService) applyAttendanceRules(
 	resolved *resolver.ResolvedSubject,
 	rules *models.ResolvedAttendanceRules,
 	existingSummary *models.AttendanceDailySummary,
+	tz string,
 ) error {
-	// Resolve the subject's employment location once for this day.
 	subjectLocation, locErr := s.locationResolver.ResolveLocation(ctx, companyID, subjectType, subjectID)
 	if locErr != nil {
 		s.logger.Warn("Failed to resolve subject location, proceeding without",
@@ -5086,14 +5064,13 @@ func (s *resolutionService) applyAttendanceRules(
 		subjectLocation = nil
 	}
 
-	// Helper to upsert a summary with a given status and anomalies.
-	// Reuses `existingSummary` (passed in) instead of re-fetching.
+	offsetMinutes := int16(util.OffsetMinutes(businessDate, tz))
+
 	upsertStatus := func(status string, anomalies []string) error {
 		isPayable := status != models.StatusAbsent &&
 			status != models.StatusLeaveUnpaid &&
 			status != models.StatusNotScheduled &&
 			status != models.StatusExcused
-
 		summary := &models.AttendanceDailySummary{
 			AttendanceSummaryID:  uuid.New(),
 			CompanyID:            companyID,
@@ -5101,6 +5078,8 @@ func (s *resolutionService) applyAttendanceRules(
 			SubjectID:            subjectID,
 			EmploymentLocationID: subjectLocation,
 			AttendanceDate:       businessDate,
+			Timezone:             tz,
+			OffsetMinutes:        offsetMinutes,
 			Status:               status,
 			IsPayrollLocked:      false,
 			IsPayable:            isPayable,
@@ -5108,24 +5087,20 @@ func (s *resolutionService) applyAttendanceRules(
 			GeneratedBy:          "attendance_resolution_service",
 			Metadata: models.SummaryMetadata{
 				ScheduleStatus: &resolved.ScheduleStatus,
-				Timezone:       &resolved.Timezone,
+				Timezone:       &tz,
 				Anomalies:      anomalies,
 			},
 		}
-
 		if existingSummary != nil {
 			summary.AttendanceSummaryID = existingSummary.AttendanceSummaryID
 		}
-
 		return s.summaryRepo.UpsertSummary(ctx, nil, summary)
 	}
 
-	// 1. Sort events chronologically
 	sort.Slice(events, func(i, j int) bool {
 		return events[i].EventTime.Before(events[j].EventTime)
 	})
 
-	// 2. Check exemptions
 	exemptions, err := s.exemptionRepo.GetActiveForSubject(ctx, nil, companyID, subjectID, subjectType, businessDate)
 	if err != nil {
 		s.logger.Warn("Failed to check exemptions", zap.Error(err))
@@ -5140,27 +5115,19 @@ func (s *resolutionService) applyAttendanceRules(
 		return upsertStatus(models.StatusExcused, nil)
 	}
 
-	// 3. Pair check‑in/out
 	pairedEvents := s.pairCheckInCheckOut(events)
 
-	// 4. Filter pairs belonging to this business date
-	loc, _ := time.LoadLocation(resolved.Timezone)
-	if loc == nil {
-		loc = time.UTC
-	}
 	var dayPairs []PairedEvent
 	for _, pair := range pairedEvents {
 		if pair.CheckInTime == nil {
 			continue
 		}
-		checkInLocal := pair.CheckInTime.In(loc)
-		checkInDate := time.Date(checkInLocal.Year(), checkInLocal.Month(), checkInLocal.Day(), 0, 0, 0, 0, loc)
+		checkInDate := util.CalendarDateInTz(*pair.CheckInTime, tz)
 		if checkInDate.Equal(businessDate) {
 			dayPairs = append(dayPairs, pair)
 		}
 	}
 
-	// 5. Manual overrides (highest priority)
 	for _, evt := range events {
 		if evt.Metadata.IsCorrection != nil && *evt.Metadata.IsCorrection {
 			if evt.EventType == "manual_override" && evt.Metadata.OverrideStatus != nil {
@@ -5171,7 +5138,6 @@ func (s *resolutionService) applyAttendanceRules(
 		}
 	}
 
-	// 6. Schedule overrides (leave, holiday, weekly off)
 	if resolved.IsOnLeave {
 		var status string
 		if resolved.IsLeavePaid {
@@ -5181,6 +5147,7 @@ func (s *resolutionService) applyAttendanceRules(
 		}
 		return upsertStatus(status, nil)
 	}
+
 	switch resolved.ScheduleStatus {
 	case "weekly_off":
 		return upsertStatus(models.StatusWeeklyOff, nil)
@@ -5190,33 +5157,20 @@ func (s *resolutionService) applyAttendanceRules(
 		return upsertStatus(models.StatusNotScheduled, nil)
 	}
 
-	// 7. If no events → absent
 	if len(events) == 0 {
 		return upsertStatus(models.StatusAbsent, nil)
 	}
 
-	// 8. Detect anomalies (informational only).
-	//
-	// The multiple_pairs anomaly respects company/policy rules: when
-	// multiple check-ins are allowed, having more than one complete
-	// pair in a day is NOT an anomaly — it's the expected shape for
-	// split-shift workers, gig staff, and multi-visit customers.
 	anomalies := s.detectAnomaliesFromPairs(dayPairs, rules.AllowMultipleCheckins)
 
-	// 9. Resolve policy
 	policy, err := s.resolvePolicy(ctx, companyID, subjectID, subjectType, businessDate, resolved)
 	if err != nil {
 		s.logger.Warn("Failed to resolve policy, using default", zap.Error(err))
 		policy = s.defaultPolicy()
 	}
 
-	// 10. Compute metrics
-	metrics := s.calculateMetrics(dayPairs, resolved, policy, anomalies, businessDate)
-
-	// 11. Determine final status
+	metrics := s.calculateMetrics(dayPairs, resolved, policy, anomalies, businessDate, tz)
 	status := s.determineStatus(metrics, resolved, policy)
-
-	// 12. Build and upsert summary — uses the passed-in existingSummary.
 	isPayable := status != models.StatusAbsent &&
 		status != models.StatusLeaveUnpaid &&
 		status != models.StatusNotScheduled &&
@@ -5229,6 +5183,8 @@ func (s *resolutionService) applyAttendanceRules(
 		SubjectID:            subjectID,
 		EmploymentLocationID: subjectLocation,
 		AttendanceDate:       businessDate,
+		Timezone:             tz,
+		OffsetMinutes:        offsetMinutes,
 		Status:               status,
 		IsPayrollLocked:      false,
 		IsPayable:            isPayable,
@@ -5246,7 +5202,7 @@ func (s *resolutionService) applyAttendanceRules(
 			BreakMinutes:   metrics.BreakMinutes,
 			ScheduleStatus: &resolved.ScheduleStatus,
 			ShiftID:        resolved.ScheduleInstanceID,
-			Timezone:       &resolved.Timezone,
+			Timezone:       &tz,
 			Anomalies:      anomalies,
 			PairedEvents:   convertPairedEvents(dayPairs),
 			LeaveTypeID:    resolved.LeaveTypeID,
@@ -5257,7 +5213,6 @@ func (s *resolutionService) applyAttendanceRules(
 	if existingSummary != nil {
 		summary.AttendanceSummaryID = existingSummary.AttendanceSummaryID
 	}
-
 	if err := s.summaryRepo.UpsertSummary(ctx, nil, summary); err != nil {
 		return fmt.Errorf("upsert summary: %w", err)
 	}
@@ -5267,15 +5222,12 @@ func (s *resolutionService) applyAttendanceRules(
 		zap.String("subject_id", subjectID.String()),
 		zap.String("status", status),
 		zap.Time("date", businessDate),
+		zap.String("tz", tz),
 		zap.Int("worked_minutes", intValue(metrics.WorkedMinutes)),
 		zap.Int("expected_minutes", intValue(metrics.ExpectedMinutes)),
 	)
 	return nil
 }
-
-// ─────────────────────────────────────────────────────────────
-// Helper methods
-// ─────────────────────────────────────────────────────────────
 
 func (s *resolutionService) pairCheckInCheckOut(events []*models.AttendanceEvent) []PairedEvent {
 	sort.Slice(events, func(i, j int) bool {
@@ -5289,11 +5241,9 @@ func (s *resolutionService) pairCheckInCheckOut(events []*models.AttendanceEvent
 
 	var paired []PairedEvent
 	var current *PairedEvent
-
 	for _, evt := range events {
 		eventTime := evt.EventTime
 		evtType := s.normalizeEventType(evt.EventType)
-
 		switch evtType {
 		case "check_in", "shift_start":
 			if current != nil && current.CheckOut == nil {
@@ -5325,7 +5275,6 @@ func (s *resolutionService) pairCheckInCheckOut(events []*models.AttendanceEvent
 			}
 		}
 	}
-
 	if current != nil && current.CheckOut == nil {
 		paired = append(paired, *current)
 	}
@@ -5367,30 +5316,10 @@ func (s *resolutionService) normalizeEventType(t string) string {
 	}
 }
 
-// detectAnomaliesFromPairs reports structural anomalies in a day's pairs.
-//
-// Anomaly rules:
-//   - missing_checkout      — a check-in has no matching check-out
-//   - missing_checkin       — a check-out has no preceding check-in
-//   - excessive_shift_duration — a single pair exceeds max shift hours
-//   - multiple_pairs        — more than one COMPLETE pair in a day,
-//     and the rules do NOT permit it
-//
-// The `allowMultiple` flag is the company-wide or per-policy
-// "AllowMultipleCheckins" setting. When true, having N complete pairs in
-// a day is intentional (split shifts, gig workers, multi-visit customers)
-// and is NOT flagged. When false, only the first pair is expected and
-// extras are surfaced to HR for review.
-//
-// Note: this function only changes the anomaly list. It does NOT change
-// how worked_minutes is computed — all completed pairs always count
-// toward the day's total. Downgrading to "first pair only" would be a
-// separate, explicit change.
 func (s *resolutionService) detectAnomaliesFromPairs(pairs []PairedEvent, allowMultiple bool) []string {
 	var anomalies []string
 	maxDur := time.Duration(defaultMaxShiftDurationHours) * time.Hour
 	completePairs := 0
-
 	for _, p := range pairs {
 		switch {
 		case p.CheckIn != nil && p.CheckOut != nil:
@@ -5400,19 +5329,15 @@ func (s *resolutionService) detectAnomaliesFromPairs(pairs []PairedEvent, allowM
 		case p.CheckOut != nil:
 			anomalies = append(anomalies, "missing_checkin")
 		}
-
 		if p.CheckInTime != nil && p.CheckOutTime != nil {
 			if p.CheckOutTime.Sub(*p.CheckInTime) > maxDur {
 				anomalies = append(anomalies, "excessive_shift_duration")
 			}
 		}
 	}
-
-	// Only flag multiple_pairs when the rules don't allow it.
 	if completePairs > 1 && !allowMultiple {
 		anomalies = append(anomalies, "multiple_pairs")
 	}
-
 	return anomalies
 }
 
@@ -5422,19 +5347,19 @@ func (s *resolutionService) calculateMetrics(
 	policy *models.AttendancePolicy,
 	anomalies []string,
 	businessDate time.Time,
+	tz string,
 ) *DailyMetrics {
 	metrics := &DailyMetrics{
 		Status:       models.StatusPresent,
 		PairedEvents: pairs,
 	}
 
-	loc, _ := time.LoadLocation(resolved.Timezone)
+	loc, _ := time.LoadLocation(tz)
 	if loc == nil {
 		loc = time.UTC
 	}
 
 	var totalWorkedSec, totalBreakSec int64
-
 	var expectedStartLocal, expectedEndLocal *time.Time
 	if resolved.ExpectedStart != nil {
 		t := resolved.ExpectedStart.In(loc)
@@ -5453,7 +5378,6 @@ func (s *resolutionService) calculateMetrics(
 	}
 
 	var earliestCheckIn, latestCheckOut *time.Time
-
 	for _, p := range pairs {
 		if p.CheckIn != nil {
 			metrics.CheckIns++
@@ -5479,7 +5403,6 @@ func (s *resolutionService) calculateMetrics(
 					workDur = maxDur
 				}
 				totalWorkedSec += int64(workDur.Seconds())
-
 				if p.BreakStart != nil && p.BreakEnd != nil {
 					breakDur := p.BreakEnd.Sub(*p.BreakStart)
 					totalBreakSec += int64(breakDur.Seconds())
@@ -5487,7 +5410,6 @@ func (s *resolutionService) calculateMetrics(
 			}
 		}
 	}
-
 	for _, p := range pairs {
 		if p.CheckIn != nil && p.CheckOut == nil {
 			closeTime := expectedEndLocal
@@ -5512,12 +5434,10 @@ func (s *resolutionService) calculateMetrics(
 		zero := 0
 		metrics.WorkedMinutes = &zero
 	}
-
 	if totalBreakSec > 0 {
 		breakMin := int(totalBreakSec / 60)
 		metrics.BreakMinutes = &breakMin
 	}
-
 	if expectedStartLocal != nil && earliestCheckIn != nil {
 		if earliestCheckIn.After(*expectedStartLocal) {
 			lateSec := earliestCheckIn.Sub(*expectedStartLocal).Seconds()
@@ -5532,7 +5452,6 @@ func (s *resolutionService) calculateMetrics(
 		zero := 0
 		metrics.LateMinutes = &zero
 	}
-
 	if expectedEndLocal != nil && latestCheckOut != nil {
 		if latestCheckOut.After(*expectedEndLocal) {
 			otSec := latestCheckOut.Sub(*expectedEndLocal).Seconds()
@@ -5547,7 +5466,6 @@ func (s *resolutionService) calculateMetrics(
 		zero := 0
 		metrics.OvertimeMinutes = &zero
 	}
-
 	if metrics.ExpectedMinutes == nil && expectedStartLocal != nil && expectedEndLocal != nil {
 		expSec := expectedEndLocal.Sub(*expectedStartLocal).Seconds()
 		if expSec > 0 {
@@ -5555,7 +5473,6 @@ func (s *resolutionService) calculateMetrics(
 			metrics.ExpectedMinutes = &expMin
 		}
 	}
-
 	return metrics
 }
 
@@ -5577,24 +5494,20 @@ func (s *resolutionService) determineStatus(
 			return models.StatusLeaveUnpaid
 		}
 	}
-
 	if metrics.CheckIns == 0 {
 		return models.StatusAbsent
 	}
-
 	if metrics.LateMinutes != nil && *metrics.LateMinutes > 0 {
 		if policy != nil && policy.Rules.MaxLateAllowed != nil && *metrics.LateMinutes > *policy.Rules.MaxLateAllowed {
 			return models.StatusAbsent
 		}
 		return models.StatusLate
 	}
-
 	if policy != nil && policy.Rules.HalfDayAfter != nil && metrics.WorkedMinutes != nil && metrics.ExpectedMinutes != nil {
 		if *metrics.WorkedMinutes < *policy.Rules.HalfDayAfter {
 			return models.StatusHalfDay
 		}
 	}
-
 	if metrics.CheckIns > 0 && metrics.CheckOuts == 0 {
 		if policy != nil && policy.Rules.AutoCheckout != nil && *policy.Rules.AutoCheckout {
 			if metrics.WorkedMinutes != nil && *metrics.WorkedMinutes >= 240 {
@@ -5606,11 +5519,9 @@ func (s *resolutionService) determineStatus(
 		}
 		return models.StatusAbsent
 	}
-
 	if metrics.WorkedMinutes != nil && *metrics.WorkedMinutes > 0 {
 		return models.StatusPresent
 	}
-
 	return models.StatusAbsent
 }
 
@@ -5625,7 +5536,6 @@ func (s *resolutionService) resolvePolicy(
 	if err == nil && policy != nil {
 		return policy, nil
 	}
-
 	if subjectType == models.SubjectTypeEmployee {
 		if resolved.PositionID != nil {
 			posPolicy, err := s.policyRepo.GetPositionPolicy(ctx, *resolved.PositionID)
@@ -5640,7 +5550,6 @@ func (s *resolutionService) resolvePolicy(
 			}
 		}
 	}
-
 	return s.defaultPolicy(), nil
 }
 
@@ -5662,10 +5571,6 @@ func (s *resolutionService) defaultPolicy() *models.AttendancePolicy {
 	}
 }
 
-// ─────────────────────────────────────────────────────────────
-// Utilities
-// ─────────────────────────────────────────────────────────────
-
 func derefString(s *string) string {
 	if s != nil {
 		return *s
@@ -5680,13 +5585,8 @@ func intValue(i *int) int {
 	return *i
 }
 
-func intPtr(i int) *int {
-	return &i
-}
-
-func boolPtr(b bool) *bool {
-	return &b
-}
+func intPtr(i int) *int    { return &i }
+func boolPtr(b bool) *bool { return &b }
 
 func convertPairedEvents(pairs []PairedEvent) []models.PairedEvent {
 	result := make([]models.PairedEvent, 0, len(pairs))
@@ -5826,9 +5726,6 @@ type BatchIngestRequest struct {
 	Events     []OfflinePunchEvent
 }
 
-// ErrAllEventsFailed signals that the batch was received and persisted,
-// but zero events could be processed. Callers should surface this so the
-// device knows to look at /failures and retry.
 var ErrAllEventsFailed = errors.New("all events in batch failed")
 
 type BatchIngestService interface {
@@ -5871,16 +5768,6 @@ func (s *batchIngestService) GetStatus(ctx context.Context, companyID uuid.UUID,
 	return s.batchRepo.GetByRef(ctx, companyID, deviceID, batchRef)
 }
 
-// IngestBatch processes a device batch.
-//
-// Returns:
-//   - nil                      → all events processed (or batch was already seen)
-//   - ErrAllEventsFailed       → batch persisted, all events rejected
-//   - other error              → framework error (device, DB, etc.)
-//
-// FIX (Tier 1): previously returned nil even when successCount == 0 and
-// failureCount > 0, so the device received 202 Accepted for a fully-failed
-// batch and had no signal to retry or inspect /failures.
 func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRequest) error {
 	s.logger.Info("IngestBatch START",
 		zap.String("company_id", req.CompanyID.String()),
@@ -5917,10 +5804,12 @@ func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRe
 	if err := s.batchRepo.CreateBatch(ctx, batch); err != nil {
 		return fmt.Errorf("create batch: %w", err)
 	}
+
 	s.logger.Info("Batch record created", zap.String("batch_id", batch.BatchID.String()))
 
 	successCount, failureCount := 0, 0
 
+	// Emit batch.received outbox event.
 	payloadBytes, _ := json.Marshal(map[string]interface{}{
 		"batch_id":     batch.BatchID,
 		"batch_ref":    batch.BatchRef,
@@ -5945,7 +5834,11 @@ func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRe
 	}
 
 	for i, event := range req.Events {
-		s.logger.Info("Processing event", zap.Int("index", i), zap.String("external_ref", event.ExternalRef))
+		s.logger.Info("Processing event",
+			zap.Int("index", i),
+			zap.String("external_ref", event.ExternalRef),
+			zap.Time("event_time", event.EventTime),
+		)
 
 		enrollment, err := s.enrollSvc.ResolveEnrollment(ctx, req.CompanyID, req.DeviceID, req.SourceType, event.ExternalRef)
 		if err != nil {
@@ -5953,9 +5846,13 @@ func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRe
 			failureCount++
 			continue
 		}
+
 		subjectType := enrollment.SubjectType
 		subjectID := enrollment.SubjectID
 
+		// ── CHANGED: pass EventTime as UTC. The IngestService resolves
+		//    the tz via the canonical chain and computes EventTZ,
+		//    EventOffsetMinutes, EventDateLocal.
 		punchReq := &ingest.PunchRequest{
 			CompanyID:      req.CompanyID,
 			ActorID:        uuid.Nil,
@@ -6007,8 +5904,8 @@ func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRe
 		_ = s.centralOutbox.Store(ctx, nil, rawCentralEvent)
 	}
 
-	// Persist final status.
 	allFailed := successCount == 0 && failureCount > 0
+
 	var updateErr error
 	if allFailed {
 		updateErr = s.batchRepo.MarkFailed(ctx, batch.BatchID, "all_events_failed")
@@ -6024,7 +5921,6 @@ func (s *batchIngestService) IngestBatch(ctx context.Context, req *BatchIngestRe
 			zap.Int("failures", failureCount))
 	}
 
-	// Surface total failure to the caller.
 	if allFailed {
 		return fmt.Errorf("%w: %d events rejected; see GET .../failures", ErrAllEventsFailed, failureCount)
 	}
@@ -6038,7 +5934,6 @@ func (s *batchIngestService) recordFailure(ctx context.Context, batch *repositor
 		"external_ref": event.ExternalRef,
 	}
 	rawJSON, _ := json.Marshal(rawEvent)
-
 	failure := &repository.AttendancePunchFailure{
 		FailureID:      uuid.New(),
 		BatchID:        batch.BatchID,
@@ -6061,6 +5956,7 @@ func (s *batchIngestService) recordFailure(ctx context.Context, batch *repositor
 func (s *batchIngestService) GetFailures(ctx context.Context, companyID uuid.UUID, deviceID, batchRef string, limit, offset int) ([]repository.AttendancePunchFailureView, error) {
 	return s.batchRepo.ListFailuresByBatch(ctx, companyID, deviceID, batchRef, limit, offset)
 }
+
 
 
 ================================================================================
@@ -7808,8 +7704,8 @@ type TimetableEntry struct {
 	SubjectID uuid.UUID
 	TeacherID uuid.UUID
 	RoomID    *uuid.UUID
-	StartTime time.Time // only time part (date portion is zero)
-	EndTime   time.Time // only time part (date portion is zero)
+	StartTime time.Time
+	EndTime   time.Time
 	SlotID    uuid.UUID
 	DayOfWeek int
 }
@@ -7828,7 +7724,11 @@ type StudentResolver struct {
 	timetableRepo  TimetableDataProvider
 	sessionRepo    SessionDataProvider
 	workCenterRepo repository.WorkCenterRepository
-	logger         *zap.Logger
+
+	// ── NEW
+	tzProvider TimezoneProvider
+
+	logger *zap.Logger
 }
 
 func NewStudentResolver(
@@ -7837,6 +7737,7 @@ func NewStudentResolver(
 	timetableRepo TimetableDataProvider,
 	sessionRepo SessionDataProvider,
 	workCenterRepo repository.WorkCenterRepository,
+	tzProvider TimezoneProvider,
 	logger *zap.Logger,
 ) *StudentResolver {
 	return &StudentResolver{
@@ -7845,11 +7746,18 @@ func NewStudentResolver(
 		timetableRepo:  timetableRepo,
 		sessionRepo:    sessionRepo,
 		workCenterRepo: workCenterRepo,
+		tzProvider:     tzProvider,
 		logger:         logger,
 	}
 }
 
-func (r *StudentResolver) Resolve(ctx context.Context, companyID uuid.UUID, subjectType string, subjectID uuid.UUID, date time.Time) (*ResolvedSubject, error) {
+func (r *StudentResolver) Resolve(
+	ctx context.Context,
+	companyID uuid.UUID,
+	subjectType string,
+	subjectID uuid.UUID,
+	date time.Time,
+) (*ResolvedSubject, error) {
 	if subjectType != SubjectTypeStudent {
 		return nil, fmt.Errorf("student resolver called with subject_type=%s", subjectType)
 	}
@@ -7859,11 +7767,23 @@ func (r *StudentResolver) Resolve(ctx context.Context, companyID uuid.UUID, subj
 		return &ResolvedSubject{IsActive: active}, err
 	}
 
+	// ── NEW: resolve school tz via chain (students don't have positions,
+	//    so we walk from company default; if a section has a location,
+	//    future work should pass it in).
+	tz, tzErr := r.tzProvider.ResolveTimezone(ctx, companyID, nil, nil, nil)
+	if tzErr != nil || tz == "" {
+		r.logger.Warn("student tz resolution failed, defaulting to UTC",
+			zap.String("student_id", subjectID.String()),
+			zap.Error(tzErr),
+		)
+		tz = "UTC"
+	}
+
 	sectionID, _, err := r.enrollmentRepo.GetActiveEnrollment(ctx, companyID, subjectID, date)
 	if err != nil || sectionID == nil {
 		return &ResolvedSubject{
 			IsActive:       true,
-			Timezone:       "UTC",
+			Timezone:       tz,
 			ScheduleStatus: "not_schedulable",
 		}, nil
 	}
@@ -7872,25 +7792,30 @@ func (r *StudentResolver) Resolve(ctx context.Context, companyID uuid.UUID, subj
 	if err != nil || len(entries) == 0 {
 		return &ResolvedSubject{
 			IsActive:       true,
-			Timezone:       "UTC",
+			Timezone:       tz,
 			ScheduleStatus: "not_schedulable",
 		}, nil
 	}
 
-	// Combine the date from the input `date` with the time from each entry.
-	// Both are in UTC; the business date is already a UTC timestamp at midnight.
+	loc, _ := time.LoadLocation(tz)
+	if loc == nil {
+		loc = time.UTC
+	}
+
 	var earliestStart, latestEnd *time.Time
 	for _, e := range entries {
+		// ── CHANGED: build times in the school's tz, not UTC.
 		start := time.Date(date.Year(), date.Month(), date.Day(),
-			e.StartTime.Hour(), e.StartTime.Minute(), e.StartTime.Second(), e.StartTime.Nanosecond(), time.UTC)
+			e.StartTime.Hour(), e.StartTime.Minute(), e.StartTime.Second(), 0, loc)
 		end := time.Date(date.Year(), date.Month(), date.Day(),
-			e.EndTime.Hour(), e.EndTime.Minute(), e.EndTime.Second(), e.EndTime.Nanosecond(), time.UTC)
-
+			e.EndTime.Hour(), e.EndTime.Minute(), e.EndTime.Second(), 0, loc)
 		if earliestStart == nil || start.Before(*earliestStart) {
-			earliestStart = &start
+			s := start
+			earliestStart = &s
 		}
 		if latestEnd == nil || end.After(*latestEnd) {
-			latestEnd = &end
+			l := end
+			latestEnd = &l
 		}
 	}
 
@@ -7902,12 +7827,9 @@ func (r *StudentResolver) Resolve(ctx context.Context, companyID uuid.UUID, subj
 		}
 	}
 
-	// TODO: fetch company timezone for proper localisation, but UTC works for now.
-	timezone := "UTC"
-
 	return &ResolvedSubject{
 		IsActive:           true,
-		Timezone:           timezone,
+		Timezone:           tz,
 		ScheduleStatus:     "working",
 		ExpectedStart:      earliestStart,
 		ExpectedEnd:        latestEnd,
@@ -8047,6 +7969,260 @@ func (p *sessionDataProvider) GetAcademicSession(
 
 
 ================================================================================
+FILE: ./service/resolver/timezone_provider_pg.go
+================================================================================
+
+package resolver
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"auth-service/internal/client"
+)
+
+type timezoneProvider struct {
+	client *client.PostgresClient
+	logger *zap.Logger
+}
+
+func NewTimezoneProvider(pg *client.PostgresClient, logger *zap.Logger) TimezoneProvider {
+	return &timezoneProvider{
+		client: pg,
+		logger: logger.Named("tz_provider"),
+	}
+}
+
+func (p *timezoneProvider) ResolveTimezone(
+	ctx context.Context,
+	companyID uuid.UUID,
+	positionID *uuid.UUID,
+	workCenterCode *string,
+	locationID *uuid.UUID,
+) (string, error) {
+	// Path 1: position walks everything
+	if positionID != nil && *positionID != uuid.Nil {
+		return p.fromPosition(ctx, companyID, *positionID, workCenterCode)
+	}
+
+	// Path 2: no position, walk from work center
+	if workCenterCode != nil && *workCenterCode != "" {
+		return p.fromWorkCenter(ctx, companyID, *workCenterCode, locationID)
+	}
+
+	// Path 3: no position, no WC, but a location
+	if locationID != nil && *locationID != uuid.Nil {
+		tz, err := p.fromLocation(ctx, companyID, *locationID)
+		if err == nil && tz != "" {
+			return tz, nil
+		}
+	}
+
+	// Path 4: company default
+	return p.fromCompany(ctx, companyID)
+}
+
+func (p *timezoneProvider) ResolveForPosition(
+	ctx context.Context,
+	companyID uuid.UUID,
+	positionID uuid.UUID,
+) (string, error) {
+	return p.fromPosition(ctx, companyID, positionID, nil)
+}
+
+// fromPosition walks: position.location → position.work_center → company
+func (p *timezoneProvider) fromPosition(
+	ctx context.Context,
+	companyID uuid.UUID,
+	positionID uuid.UUID,
+	fallbackWorkCenter *string,
+) (string, error) {
+	var locID sql.NullString
+	var wcCode sql.NullString
+
+	err := p.client.QueryRow(ctx, `
+		SELECT location_id, work_center_code
+		FROM positions
+		WHERE company_id = $1 AND position_id = $2
+	`, companyID, positionID).Scan(&locID, &wcCode)
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Position row missing — treat as config bug, fall through
+			p.logger.Warn("position not found for tz resolution",
+				zap.String("company_id", companyID.String()),
+				zap.String("position_id", positionID.String()),
+			)
+			if fallbackWorkCenter != nil && *fallbackWorkCenter != "" {
+				return p.fromWorkCenter(ctx, companyID, *fallbackWorkCenter, nil)
+			}
+			return p.fromCompany(ctx, companyID)
+		}
+		return "", fmt.Errorf("fetch position for tz: %w", err)
+	}
+
+	// Priority 1: position's own location
+	if locID.Valid && locID.String != "" {
+		if lid, err := uuid.Parse(locID.String); err == nil {
+			if tz, err := p.fromLocation(ctx, companyID, lid); err == nil && tz != "" {
+				p.logger.Debug("tz resolved via position.location",
+					zap.String("position_id", positionID.String()),
+					zap.String("tz", tz),
+				)
+				return tz, nil
+			}
+		}
+	}
+
+	// Priority 2: position's work center (or caller-supplied override)
+	wc := ""
+	if wcCode.Valid {
+		wc = wcCode.String
+	}
+	if wc == "" && fallbackWorkCenter != nil {
+		wc = *fallbackWorkCenter
+	}
+	if wc != "" {
+		return p.fromWorkCenter(ctx, companyID, wc, nil)
+	}
+
+	// Priority 3: company default
+	return p.fromCompany(ctx, companyID)
+}
+
+// fromWorkCenter walks: work_center.timezone → work_center.location → company
+func (p *timezoneProvider) fromWorkCenter(
+	ctx context.Context,
+	companyID uuid.UUID,
+	wcCode string,
+	fallbackLocationID *uuid.UUID,
+) (string, error) {
+	var tz sql.NullString
+	var locID sql.NullString
+
+	err := p.client.QueryRow(ctx, `
+		SELECT timezone, location_id
+		FROM attendance.work_centers
+		WHERE company_id = $1 AND work_center_code = $2
+	`, companyID, wcCode).Scan(&tz, &locID)
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			p.logger.Warn("work center not found for tz resolution",
+				zap.String("company_id", companyID.String()),
+				zap.String("work_center_code", wcCode),
+			)
+			if fallbackLocationID != nil {
+				if ltz, lerr := p.fromLocation(ctx, companyID, *fallbackLocationID); lerr == nil && ltz != "" {
+					return ltz, nil
+				}
+			}
+			return p.fromCompany(ctx, companyID)
+		}
+		return "", fmt.Errorf("fetch work center for tz: %w", err)
+	}
+
+	// Priority 1: work center's own tz
+	if tz.Valid && tz.String != "" {
+		p.logger.Debug("tz resolved via work_center.timezone",
+			zap.String("work_center_code", wcCode),
+			zap.String("tz", tz.String),
+		)
+		return tz.String, nil
+	}
+
+	// Priority 2: work center's location
+	if locID.Valid && locID.String != "" {
+		if lid, err := uuid.Parse(locID.String); err == nil {
+			if ltz, err := p.fromLocation(ctx, companyID, lid); err == nil && ltz != "" {
+				return ltz, nil
+			}
+		}
+	}
+
+	// Priority 3: fallback location
+	if fallbackLocationID != nil && *fallbackLocationID != uuid.Nil {
+		if ltz, err := p.fromLocation(ctx, companyID, *fallbackLocationID); err == nil && ltz != "" {
+			return ltz, nil
+		}
+	}
+
+	return p.fromCompany(ctx, companyID)
+}
+
+// fromLocation fetches locations.timezone. Returns ("", nil) when NULL.
+func (p *timezoneProvider) fromLocation(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID uuid.UUID,
+) (string, error) {
+	var tz sql.NullString
+
+	err := p.client.QueryRow(ctx, `
+		SELECT timezone
+		FROM locations
+		WHERE company_id = $1 AND location_id = $2
+	`, companyID, locationID).Scan(&tz)
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("fetch location tz: %w", err)
+	}
+
+	if tz.Valid && tz.String != "" {
+		p.logger.Debug("tz resolved via location.timezone",
+			zap.String("location_id", locationID.String()),
+			zap.String("tz", tz.String),
+		)
+		return tz.String, nil
+	}
+	return "", nil
+}
+
+// fromCompany fetches companies.default_timezone. Never returns empty.
+func (p *timezoneProvider) fromCompany(ctx context.Context, companyID uuid.UUID) (string, error) {
+	var tz sql.NullString
+
+	err := p.client.QueryRow(ctx, `
+		SELECT default_timezone
+		FROM companies
+		WHERE company_id = $1
+	`, companyID).Scan(&tz)
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			p.logger.Warn("company not found, defaulting tz to UTC",
+				zap.String("company_id", companyID.String()),
+			)
+			return "UTC", nil
+		}
+		return "", fmt.Errorf("fetch company tz: %w", err)
+	}
+
+	if tz.Valid && tz.String != "" {
+		p.logger.Debug("tz resolved via company.default_timezone",
+			zap.String("company_id", companyID.String()),
+			zap.String("tz", tz.String),
+		)
+		return tz.String, nil
+	}
+
+	p.logger.Warn("company has no default_timezone, using UTC",
+		zap.String("company_id", companyID.String()),
+	)
+	return "UTC", nil
+}
+
+
+
+================================================================================
 FILE: ./service/resolver/employee_location_resolver.go
 ================================================================================
 
@@ -8147,10 +8323,9 @@ import (
 	"github.com/google/uuid"
 )
 
-// ScheduleSubjectInfo provides all schedule-related data for a subject.
 type ScheduleSubjectInfo struct {
 	SubjectID          uuid.UUID
-	SubjectType        string // "employee", "student", etc.
+	SubjectType        string
 	IsActive           bool
 	PositionID         *uuid.UUID
 	PositionTitle      string
@@ -8161,14 +8336,26 @@ type ScheduleSubjectInfo struct {
 	DepartmentName     string
 	WorkCenterCode     *string
 	WorkCenterName     string
+
+	// ── NEW: timezone inputs for the resolution chain ──────────────────
+	//
+	// WorkCenterTimezone is the tz declared on the work center record.
+	// CompanyTimezone is the ultimate fallback.
+	//
+	// The resolver populates these so callers (scheduling, ingest) can
+	// compute the effective tz without an extra DB round-trip.
+	//
+	// If either is empty, the caller MUST still call TimezoneProvider.
+	// These are hints, not guarantees.
 	WorkCenterTimezone string
-	CompanyID          uuid.UUID
+	CompanyTimezone    string
+
+	CompanyID uuid.UUID
 }
 
-// ScheduleOverrideInfo provides override/leave info.
 type ScheduleOverrideInfo struct {
 	IsOverride     bool
-	OverrideType   string // "off", "force_work", "holiday_override"
+	OverrideType   string
 	Reason         *string
 	IsOnLeave      bool
 	LeaveTypeID    *uuid.UUID
@@ -8176,19 +8363,65 @@ type ScheduleOverrideInfo struct {
 	LeaveRequestID *uuid.UUID
 }
 
-// ScheduleSubjectResolver resolves schedule-related info for a subject.
 type ScheduleSubjectResolver interface {
-	// ResolveSubject returns schedule-relevant data for a subject on a given date.
 	ResolveSubject(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) (*ScheduleSubjectInfo, error)
-
-	// ResolveOverride returns override/leave info for a subject on a given date.
 	ResolveOverride(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) (*ScheduleOverrideInfo, error)
-
-	// GetUsersByPosition returns subject IDs assigned to a given position.
 	GetUsersByPosition(ctx context.Context, positionID uuid.UUID) ([]uuid.UUID, error)
-
-	// GetActiveSubjectsByCompany returns active subject IDs for a company (optionally filtered by position/work center).
 	GetActiveSubjectsByCompany(ctx context.Context, companyID uuid.UUID, filters map[string]interface{}) ([]uuid.UUID, error)
+}
+
+
+
+================================================================================
+FILE: ./service/resolver/timezone_provider.go
+================================================================================
+
+package resolver
+
+import (
+	"context"
+
+	"github.com/google/uuid"
+)
+
+// TimezoneProvider resolves the effective IANA timezone for a subject by
+// walking the canonical chain:
+//
+//  1. position.location_id         → locations.timezone
+//  2. else position.work_center_code → work_centers.timezone
+//  3. else work_centers.location_id → locations.timezone
+//  4. else companies.default_timezone
+//  5. else "UTC" (last resort, logged)
+//
+// Every writer (ingest, correction, resolution, scheduling) must use this
+// chain. There is exactly one correct tz per event, and this is how we
+// find it.
+//
+// The provider is intentionally read-only — it never mutates config. It
+// is safe to call concurrently.
+type TimezoneProvider interface {
+	// ResolveTimezone returns the IANA tz name for the given subject
+	// coordinates. Never returns an empty string — always falls back to
+	// "UTC" as a last resort and logs a warning.
+	//
+	// Pass what you have. If positionID is set, it wins. Otherwise the
+	// provider walks work center → location → company.
+	ResolveTimezone(
+		ctx context.Context,
+		companyID uuid.UUID,
+		positionID *uuid.UUID,
+		workCenterCode *string,
+		locationID *uuid.UUID,
+	) (string, error)
+
+	// ResolveForPosition is a convenience wrapper for the common case
+	// where you have a position ID but haven't pre-resolved its work
+	// center or location.
+	ResolveForPosition(
+		ctx context.Context,
+		companyID uuid.UUID,
+		positionID uuid.UUID,
+	) (string, error)
 }
 
 
@@ -8196,8 +8429,6 @@ type ScheduleSubjectResolver interface {
 ================================================================================
 FILE: ./service/resolver/customer_resolver_with_subscription.go
 ================================================================================
-
-// file: service/resolver/customer_resolver_with_subscription.go
 
 package resolver
 
@@ -8210,18 +8441,21 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
-	"auth-service/internal/sales/repository"          // customer repo
-	"auth-service/internal/subscription/models/enums" // correct enums package
+	"auth-service/internal/sales/repository"
+	"auth-service/internal/subscription/models/enums"
 	subRepo "auth-service/internal/subscription/repository"
 )
 
-// CustomerResolverWithSubscription validates customer and subscription status.
 type CustomerResolverWithSubscription struct {
 	db               *sql.DB
 	customerRepo     repository.CustomerRepository
 	subscriptionRepo subRepo.SubscriptionRepository
 	trialRepo        subRepo.TrialRepository
-	logger           *zap.Logger
+
+	// ── NEW
+	tzProvider TimezoneProvider
+
+	logger *zap.Logger
 }
 
 func NewCustomerResolverWithSubscription(
@@ -8229,6 +8463,7 @@ func NewCustomerResolverWithSubscription(
 	customerRepo repository.CustomerRepository,
 	subscriptionRepo subRepo.SubscriptionRepository,
 	trialRepo subRepo.TrialRepository,
+	tzProvider TimezoneProvider,
 	logger *zap.Logger,
 ) *CustomerResolverWithSubscription {
 	return &CustomerResolverWithSubscription{
@@ -8236,35 +8471,47 @@ func NewCustomerResolverWithSubscription(
 		customerRepo:     customerRepo,
 		subscriptionRepo: subscriptionRepo,
 		trialRepo:        trialRepo,
+		tzProvider:       tzProvider,
 		logger:           logger,
 	}
 }
 
-// Resolve implements SubjectResolver.
-func (r *CustomerResolverWithSubscription) Resolve(ctx context.Context, companyID uuid.UUID, subjectType string, subjectID uuid.UUID, date time.Time) (*ResolvedSubject, error) {
+func (r *CustomerResolverWithSubscription) Resolve(
+	ctx context.Context,
+	companyID uuid.UUID,
+	subjectType string,
+	subjectID uuid.UUID,
+	date time.Time,
+) (*ResolvedSubject, error) {
 	if subjectType != SubjectTypeCustomer {
 		return nil, fmt.Errorf("customer resolver called with subject_type=%s", subjectType)
 	}
 
-	// 1. Check if customer exists and is active
+	// ── NEW: resolve tz via chain (company default for customers).
+	tz, tzErr := r.tzProvider.ResolveTimezone(ctx, companyID, nil, nil, nil)
+	if tzErr != nil || tz == "" {
+		r.logger.Warn("customer tz resolution failed, defaulting to UTC",
+			zap.String("customer_id", subjectID.String()),
+			zap.Error(tzErr),
+		)
+		tz = "UTC"
+	}
+
 	active, err := r.customerRepo.IsActive(ctx, r.db, companyID, subjectID)
 	if err != nil {
 		r.logger.Error("failed to check customer active status", zap.Error(err))
 		return nil, fmt.Errorf("customer active check: %w", err)
 	}
 	if !active {
-		r.logger.Info("Customer is inactive", zap.String("customer_id", subjectID.String()))
-		return &ResolvedSubject{IsActive: false}, nil
+		return &ResolvedSubject{IsActive: false, Timezone: tz}, nil
 	}
 
-	// 2. Fetch all subscriptions for this customer
 	subs, err := r.subscriptionRepo.GetByCustomer(ctx, r.db, companyID, subjectID)
 	if err != nil {
 		r.logger.Error("failed to get subscriptions for customer", zap.Error(err))
 		return nil, fmt.Errorf("get subscriptions: %w", err)
 	}
 
-	// 3. Determine active subscription and trial status
 	var (
 		hasActiveSub       bool
 		hasActiveTrial     bool
@@ -8272,9 +8519,7 @@ func (r *CustomerResolverWithSubscription) Resolve(ctx context.Context, companyI
 		trialID            *uuid.UUID
 		subscriptionStatus string
 	)
-
 	for _, sub := range subs {
-		// Consider Active, Trial, or maybe Pending as active? We'll treat Active and Trial as valid.
 		if sub.Status == enums.SubStatusActive || sub.Status == enums.SubStatusTrial {
 			hasActiveSub = true
 			activeSubID = &sub.SubscriptionID
@@ -8283,13 +8528,12 @@ func (r *CustomerResolverWithSubscription) Resolve(ctx context.Context, companyI
 			} else {
 				subscriptionStatus = "trial"
 			}
-			// Check if this subscription has an active trial (only if subscription is active)
 			if sub.Status == enums.SubStatusActive {
 				trial, err := r.trialRepo.GetBySubscription(ctx, r.db, sub.SubscriptionID)
 				if err == nil && trial != nil && trial.Status == enums.TrialActive {
 					hasActiveTrial = true
 					trialID = &trial.TrialID
-					subscriptionStatus = "trial" // treat as trial if trial is active
+					subscriptionStatus = "trial"
 				}
 			} else if sub.Status == enums.SubStatusTrial {
 				trial, _ := r.trialRepo.GetBySubscription(ctx, r.db, sub.SubscriptionID)
@@ -8298,18 +8542,16 @@ func (r *CustomerResolverWithSubscription) Resolve(ctx context.Context, companyI
 					trialID = &trial.TrialID
 				}
 			}
-			break // we only need one active subscription; you can refine if multiple
+			break
 		}
 	}
 
-	// 4. Build ResolvedSubject
 	resolved := &ResolvedSubject{
 		IsActive:       true,
-		Timezone:       "UTC",             // optionally fetch from customer or company
-		ScheduleStatus: "not_schedulable", // default for customers
+		Timezone:       tz, // ── CHANGED: was hardcoded "UTC"
+		ScheduleStatus: "not_schedulable",
 	}
 
-	// Set subscription fields
 	if hasActiveSub {
 		resolved.SubscriptionStatus = subscriptionStatus
 		resolved.SubscriptionID = activeSubID
@@ -8323,7 +8565,6 @@ func (r *CustomerResolverWithSubscription) Resolve(ctx context.Context, companyI
 		resolved.HasActiveSubscription = false
 	}
 
-	// Optionally, set ScheduleStatus to reflect subscription state for downstream logic
 	if hasActiveSub && hasActiveTrial {
 		resolved.ScheduleStatus = "trial_active"
 	} else if hasActiveSub {
@@ -8331,11 +8572,6 @@ func (r *CustomerResolverWithSubscription) Resolve(ctx context.Context, companyI
 	} else {
 		resolved.ScheduleStatus = "no_active_subscription"
 	}
-
-	r.logger.Debug("Customer resolved with subscription status",
-		zap.String("customer_id", subjectID.String()),
-		zap.String("subscription_status", resolved.SubscriptionStatus),
-	)
 
 	return resolved, nil
 }
@@ -8705,28 +8941,50 @@ import (
 	"go.uber.org/zap"
 )
 
-// CustomerResolver resolves customers (simple)
 type CustomerResolver struct {
-	// Could fetch company timezone from company repo
+	// ── NEW
+	tzProvider TimezoneProvider
+
 	logger *zap.Logger
 }
 
-func NewCustomerResolver(logger *zap.Logger) *CustomerResolver {
-	return &CustomerResolver{logger: logger}
+func NewCustomerResolver(
+	tzProvider TimezoneProvider,
+	logger *zap.Logger,
+) *CustomerResolver {
+	return &CustomerResolver{
+		tzProvider: tzProvider,
+		logger:     logger,
+	}
 }
 
-func (r *CustomerResolver) Resolve(ctx context.Context, companyID uuid.UUID, subjectType string, subjectID uuid.UUID, date time.Time) (*ResolvedSubject, error) {
+func (r *CustomerResolver) Resolve(
+	ctx context.Context,
+	companyID uuid.UUID,
+	subjectType string,
+	subjectID uuid.UUID,
+	date time.Time,
+) (*ResolvedSubject, error) {
 	if subjectType != SubjectTypeCustomer {
 		return nil, fmt.Errorf("customer resolver called with subject_type=%s", subjectType)
 	}
 
-	// For customers, we assume they are always active and have no schedule.
-	// They can still punch attendance (e.g., visitor check-in/out) but we don't enforce work hours.
+	// ── NEW: use company tz for customers (they're not bound to a
+	//    specific position or work center; the company default is the
+	//    right resolution).
+	tz, tzErr := r.tzProvider.ResolveTimezone(ctx, companyID, nil, nil, nil)
+	if tzErr != nil || tz == "" {
+		r.logger.Warn("customer tz resolution failed, defaulting to UTC",
+			zap.String("customer_id", subjectID.String()),
+			zap.Error(tzErr),
+		)
+		tz = "UTC"
+	}
+
 	return &ResolvedSubject{
 		IsActive:       true,
-		Timezone:       "UTC", // could be from company
+		Timezone:       tz,
 		ScheduleStatus: "not_schedulable",
-		// No schedule, no policies
 	}, nil
 }
 
@@ -8961,7 +9219,11 @@ type EmployeeResolver struct {
 	policyRepo     repository.PolicyRepository
 	employeeRepo   EmployeeDataProvider
 	leaveRepo      LeaveDataProvider
-	logger         *zap.Logger
+
+	// ── NEW: canonical tz resolution. Never hardcode "UTC".
+	tzProvider TimezoneProvider
+
+	logger *zap.Logger
 }
 
 func NewEmployeeResolver(
@@ -8970,6 +9232,7 @@ func NewEmployeeResolver(
 	policyRepo repository.PolicyRepository,
 	employeeRepo EmployeeDataProvider,
 	leaveRepo LeaveDataProvider,
+	tzProvider TimezoneProvider,
 	logger *zap.Logger,
 ) *EmployeeResolver {
 	return &EmployeeResolver{
@@ -8978,11 +9241,18 @@ func NewEmployeeResolver(
 		policyRepo:     policyRepo,
 		employeeRepo:   employeeRepo,
 		leaveRepo:      leaveRepo,
+		tzProvider:     tzProvider,
 		logger:         logger,
 	}
 }
 
-func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, subjectType string, subjectID uuid.UUID, date time.Time) (*ResolvedSubject, error) {
+func (r *EmployeeResolver) Resolve(
+	ctx context.Context,
+	companyID uuid.UUID,
+	subjectType string,
+	subjectID uuid.UUID,
+	date time.Time,
+) (*ResolvedSubject, error) {
 	if subjectType != SubjectTypeEmployee {
 		return nil, fmt.Errorf("employee resolver called with subject_type=%s", subjectType)
 	}
@@ -8999,38 +9269,22 @@ func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 		return nil, fmt.Errorf("get employee: %w", err)
 	}
 	if !active {
-		r.logger.Warn("Employee inactive", zap.String("subject_id", subjectID.String()))
 		return &ResolvedSubject{IsActive: false}, nil
 	}
 
-	r.logger.Info("Employee resolved",
-		zap.String("position_id", func() string {
-			if positionID != nil {
-				return positionID.String()
-			}
-			return "<nil>"
-		}()),
-		zap.String("work_center", func() string {
-			if workCenterCode != nil {
-				return *workCenterCode
-			}
-			return "<nil>"
-		}()),
-	)
-
-	// If work center still nil, try assignment again (though provider already did)
 	if workCenterCode == nil {
-		assigned, err := r.employeeRepo.GetWorkCenterAssignment(ctx, subjectID, date)
-		if err == nil && assigned != nil {
+		if assigned, err := r.employeeRepo.GetWorkCenterAssignment(ctx, subjectID, date); err == nil && assigned != nil {
 			workCenterCode = assigned
-			r.logger.Info("Work center from assignment (fallback)", zap.String("work_center", *workCenterCode))
 		}
 	}
 
-	var expectedStart, expectedEnd *time.Time
-	var scheduleStatus string
-	var scheduleInstanceID *uuid.UUID
-	var timezone string
+	var (
+		expectedStart      *time.Time
+		expectedEnd        *time.Time
+		scheduleStatus     string
+		scheduleInstanceID *uuid.UUID
+		timezone           string
+	)
 
 	instances, err := r.scheduleRepo.GetScheduleInstancesByUserDate(ctx, subjectID, date)
 	if err == nil && len(instances) > 0 {
@@ -9042,12 +9296,29 @@ func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 		scheduleStatus = "working"
 		if inst.WorkCenterCode != nil {
 			workCenterCode = inst.WorkCenterCode
-			r.logger.Info("Work center from existing schedule instance", zap.String("work_center", *workCenterCode))
 		}
 	} else {
 		scheduleStatus = "not_schedulable"
-		timezone = "UTC"
-		r.logger.Debug("No schedule instances found for user on date")
+	}
+
+	// ── NEW: always resolve tz via the chain. Even when we have a
+	//    schedule instance, prefer the resolved tz if the instance's tz
+	//    is empty. When there's no instance, this is the only source.
+	if timezone == "" {
+		resolvedTz, tzErr := r.tzProvider.ResolveTimezone(
+			ctx, companyID, positionID, workCenterCode, nil,
+		)
+		if tzErr != nil {
+			r.logger.Warn("tz resolution failed, defaulting to UTC",
+				zap.String("subject_id", subjectID.String()),
+				zap.Error(tzErr),
+			)
+			timezone = "UTC"
+		} else if resolvedTz == "" {
+			timezone = "UTC"
+		} else {
+			timezone = resolvedTz
+		}
 	}
 
 	isOnLeave := false
@@ -9084,8 +9355,6 @@ func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 			policyCode = &wcPolicy.PolicyCode
 			policyType = &wcPolicy.PolicyType
 			policyRules = wcPolicy.Rules
-		} else {
-			r.logger.Warn("Work center policy not found", zap.String("work_center", *workCenterCode), zap.Error(err))
 		}
 	} else if positionID != nil {
 		posPolicy, err := r.policyRepo.GetPositionPolicy(ctx, *positionID)
@@ -9094,14 +9363,9 @@ func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 			policyCode = &posPolicy.PolicyCode
 			policyType = &posPolicy.PolicyType
 			policyRules = posPolicy.Rules
-		} else {
-			r.logger.Warn("Position policy not found", zap.String("position_id", positionID.String()), zap.Error(err))
 		}
-	} else {
-		r.logger.Warn("No policy source: both workCenterCode and positionID are nil")
 	}
 
-	// Override handling
 	var isOverride bool
 	var overrideType *string
 	override, err := r.scheduleRepo.GetScheduleOverride(ctx, subjectID, date)
@@ -9116,10 +9380,9 @@ func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 		case "holiday_override":
 			scheduleStatus = "holiday"
 		}
-		r.logger.Info("Schedule override applied", zap.String("type", override.OverrideType))
 	}
 
-	resolved := &ResolvedSubject{
+	return &ResolvedSubject{
 		IsActive:           active,
 		Timezone:           timezone,
 		ScheduleStatus:     scheduleStatus,
@@ -9128,7 +9391,6 @@ func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 		ScheduleInstanceID: scheduleInstanceID,
 		WorkCenterCode:     workCenterCode,
 		PositionID:         positionID,
-		DepartmentID:       nil,
 		IsOnLeave:          isOnLeave,
 		IsLeavePaid:        isLeavePaid,
 		LeaveTypeID:        leaveTypeID,
@@ -9139,25 +9401,7 @@ func (r *EmployeeResolver) Resolve(ctx context.Context, companyID uuid.UUID, sub
 		PolicyCode:         policyCode,
 		PolicyType:         policyType,
 		PolicyRules:        policyRules,
-	}
-
-	r.logger.Info("Resolved subject",
-		zap.String("position_id", func() string {
-			if resolved.PositionID != nil {
-				return resolved.PositionID.String()
-			}
-			return "<nil>"
-		}()),
-		zap.String("work_center", func() string {
-			if resolved.WorkCenterCode != nil {
-				return *resolved.WorkCenterCode
-			}
-			return "<nil>"
-		}()),
-		zap.String("schedule_status", resolved.ScheduleStatus),
-	)
-
-	return resolved, nil
+	}, nil
 }
 
 

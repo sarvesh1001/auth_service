@@ -1105,6 +1105,8 @@ func NewRouter(
 						})
 						r.Route("/query", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.leave.view")).
+								Get("/ledger", leaveQueryHandler.GetCompanyLedger)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.leave.view")).
 								Get("/balance", leaveQueryHandler.GetLeaveBalance)
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.leave.view")).
 								Get("/balance/{leaveTypeID}", leaveQueryHandler.GetLeaveBalanceByType)

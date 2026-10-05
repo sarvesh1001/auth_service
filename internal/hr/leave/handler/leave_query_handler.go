@@ -6,7 +6,10 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
+
+	"auth-service/internal/hr/leave/models"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -543,5 +546,145 @@ func (h *LeaveQueryHandler) respondWithError(w http.ResponseWriter, status int, 
 	h.respondWithJSON(w, status, map[string]interface{}{
 		"success": false,
 		"error":   message,
+	})
+}
+
+// =====================================================
+// COMPANY LEDGER — HR-facing browse (uses existing
+// LeaveQueryHandler, no new handler struct needed)
+// =====================================================
+func (h *LeaveQueryHandler) GetCompanyLedger(w http.ResponseWriter, r *http.Request) {
+	ctx := injectCommonContext(r.Context(), r)
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	// ── Build filter from query string ────────────────────────────────
+	q := r.URL.Query()
+	filter := models.LeaveLedgerFilter{}
+
+	if v := q.Get("user_id"); v != "" {
+		id, err := uuid.Parse(v)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid user_id")
+			return
+		}
+		filter.UserID = &id
+	}
+	if v := q.Get("leave_type_id"); v != "" {
+		id, err := uuid.Parse(v)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid leave_type_id")
+			return
+		}
+		filter.LeaveTypeID = &id
+	}
+	if v := q.Get("entitlement_id"); v != "" {
+		id, err := uuid.Parse(v)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid entitlement_id")
+			return
+		}
+		filter.EntitlementID = &id
+	}
+	if v := q.Get("leave_request_id"); v != "" {
+		id, err := uuid.Parse(v)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid leave_request_id")
+			return
+		}
+		filter.LeaveRequestID = &id
+	}
+
+	// ── entry_type ────────────────────────────────────────────────────
+	// Frontend sends a comma-separated list (?entry_type=grant,accrual)
+	// because axios's default serializer wraps JS arrays as
+	// `entry_type[]=grant&entry_type[]=accrual` — a key our parser
+	// never sees. Splitting on commas here keeps the wire format clean
+	// and works with any client that sends either a single value or a
+	// comma-separated list.
+	if vals, ok := q["entry_type"]; ok && len(vals) > 0 {
+		var types []string
+		for _, v := range vals {
+			for _, part := range strings.Split(v, ",") {
+				part = strings.TrimSpace(part)
+				if part != "" {
+					types = append(types, part)
+				}
+			}
+		}
+		if len(types) > 0 {
+			filter.EntryTypes = types
+		}
+	}
+
+	if v := q.Get("from_date"); v != "" {
+		t, err := time.Parse("2006-01-02", v)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid from_date")
+			return
+		}
+		filter.FromDate = &t
+	}
+	if v := q.Get("to_date"); v != "" {
+		t, err := time.Parse("2006-01-02", v)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid to_date")
+			return
+		}
+		filter.ToDate = &t
+	}
+	if v := q.Get("page"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			h.respondWithError(w, http.StatusBadRequest, "invalid page")
+			return
+		}
+		filter.Page = n
+	}
+	if v := q.Get("page_size"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			h.respondWithError(w, http.StatusBadRequest, "invalid page_size")
+			return
+		}
+		filter.PageSize = n
+	}
+
+	// ── Location scope from middleware-populated context ──────────────
+	locFilter := locationctx.Filter(ctx)
+
+	entries, total, err := h.queryService.GetCompanyLedger(
+		ctx, companyID, locFilter, filter,
+	)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, "failed to browse ledger")
+		return
+	}
+
+	page := filter.Page
+	if page < 1 {
+		page = 1
+	}
+	pageSize := filter.PageSize
+	if pageSize < 1 {
+		pageSize = 50
+	}
+	totalPages := int((total + int64(pageSize) - 1) / int64(pageSize))
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"entries": entries,
+			"pagination": map[string]interface{}{
+				"page":        page,
+				"page_size":   pageSize,
+				"total":       total,
+				"total_pages": totalPages,
+			},
+		},
 	})
 }
