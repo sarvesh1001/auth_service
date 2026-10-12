@@ -338,13 +338,12 @@ func (r *leaveRepository) AddPolicyRule(ctx context.Context, rule *models.LeaveP
 	}
 
 	query := `
-		INSERT INTO leave.leave_policy_rule (
-			policy_rule_id, policy_id, leave_type_id,
-			total_days, accrual_method, carry_forward_limit,
-			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-	`
-
+    INSERT INTO leave.leave_policy_rule (
+        policy_rule_id, policy_id, leave_type_id,
+        total_days, accrual_method, carry_forward_limit,
+        created_at, updated_at, effective_from
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_DATE)
+`
 	_, err := r.client.Exec(ctx, query,
 		rule.PolicyRuleID,
 		rule.PolicyID,
@@ -364,19 +363,20 @@ func (r *leaveRepository) AddPolicyRule(ctx context.Context, rule *models.LeaveP
 
 func (r *leaveRepository) GetPolicyRules(ctx context.Context, policyID uuid.UUID) ([]*models.LeavePolicyRule, error) {
 	query := `
-		SELECT
-			policy_rule_id,
-			policy_id,
-			leave_type_id,
-			total_days,
-			accrual_method,
-			carry_forward_limit,
-			created_at,
-			updated_at
-		FROM leave.leave_policy_rule
-		WHERE policy_id = $1
-		ORDER BY leave_type_id
-	`
+    SELECT DISTINCT ON (leave_type_id)
+        policy_rule_id,
+        policy_id,
+        leave_type_id,
+        total_days,
+        accrual_method,
+        carry_forward_limit,
+        created_at,
+        updated_at
+    FROM leave.leave_policy_rule
+    WHERE policy_id = $1
+      AND effective_to IS NULL
+    ORDER BY leave_type_id, effective_from DESC
+`
 
 	rows, err := r.client.Query(ctx, query, policyID)
 	if err != nil {
@@ -4556,4 +4556,754 @@ func (r *leaveRepository) GetCompanyLedger(
 		return nil, 0, fmt.Errorf("rows iteration error: %w", err)
 	}
 	return entries, total, nil
+}
+
+// ============================================================================
+// GetPolicyRuleByID — single-row lookup. Returns ErrLeavePolicyRuleNotFound
+// when missing. Used by RemovePolicyRule to derive the owning company without
+// trusting caller-supplied metadata.
+// ============================================================================
+
+func (r *leaveRepository) GetPolicyRuleByID(
+	ctx context.Context,
+	policyRuleID uuid.UUID,
+) (*models.LeavePolicyRule, error) {
+	const q = `
+    SELECT
+        policy_rule_id, policy_id, leave_type_id,
+        total_days, accrual_method, carry_forward_limit,
+        created_at, updated_at
+    FROM leave.leave_policy_rule
+    WHERE policy_rule_id = $1
+    ORDER BY effective_from DESC
+    LIMIT 1
+`
+	row := r.client.QueryRow(ctx, q, policyRuleID)
+	var rule models.LeavePolicyRule
+	var accrualMethod sql.NullString
+	var carryForwardLimit sql.NullInt32
+	var updatedAt sql.NullTime
+
+	err := row.Scan(
+		&rule.PolicyRuleID,
+		&rule.PolicyID,
+		&rule.LeaveTypeID,
+		&rule.TotalDays,
+		&accrualMethod,
+		&carryForwardLimit,
+		&rule.CreatedAt,
+		&updatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, hrErrors.ErrLeavePolicyRuleNotFound
+		}
+		return nil, fmt.Errorf("failed to get policy rule: %w", err)
+	}
+	if accrualMethod.Valid {
+		rule.AccrualMethod = &accrualMethod.String
+	}
+	if carryForwardLimit.Valid {
+		v := int(carryForwardLimit.Int32)
+		rule.CarryForwardLimit = &v
+	}
+	if updatedAt.Valid {
+		rule.UpdatedAt = &updatedAt.Time
+	}
+	return &rule, nil
+}
+
+func (r *leaveRepository) CreateLeavePolicyTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	policy *models.LeavePolicy,
+) error {
+	if tx == nil {
+		return errors.New("CreateLeavePolicyTx requires a transaction")
+	}
+	if policy.PolicyID == uuid.Nil {
+		policy.PolicyID = uuid.New()
+	}
+	if policy.CreatedAt.IsZero() {
+		policy.CreatedAt = time.Now().UTC()
+	}
+	if policy.UpdatedAt == nil {
+		now := time.Now().UTC()
+		policy.UpdatedAt = &now
+	}
+	const q = `
+		INSERT INTO leave.leave_policy (
+			policy_id, company_id, policy_name, applies_to_type,
+			applies_to_position_id, applies_to_work_center_code,
+			priority, effective_from, effective_to,
+			is_active, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+	`
+	_, err := tx.ExecContext(ctx, q,
+		policy.PolicyID,
+		policy.CompanyID,
+		policy.PolicyName,
+		policy.AppliesToType,
+		policy.AppliesToPositionID,
+		policy.AppliesToWorkCenterCode,
+		policy.Priority,
+		policy.EffectiveFrom,
+		policy.EffectiveTo,
+		policy.IsActive,
+		policy.CreatedAt,
+		policy.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create leave policy (tx): %w", err)
+	}
+	return nil
+}
+
+func (r *leaveRepository) DeactivateLeavePolicyTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	policyID uuid.UUID,
+) error {
+	if tx == nil {
+		return errors.New("DeactivateLeavePolicyTx requires a transaction")
+	}
+	const q = `
+		UPDATE leave.leave_policy
+		SET is_active = false, updated_at = NOW()
+		WHERE policy_id = $1
+		AND is_active = true
+	`
+	result, err := tx.ExecContext(ctx, q, policyID)
+	if err != nil {
+		return fmt.Errorf("failed to deactivate leave policy (tx): %w", err)
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return hrErrors.ErrLeavePolicyNotFound
+	}
+	return nil
+}
+func (r *leaveRepository) UpdateLeavePolicyTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	policyID uuid.UUID,
+	update *models.LeavePolicyUpdate,
+) error {
+	if tx == nil {
+		return errors.New("UpdateLeavePolicyTx requires a transaction")
+	}
+	var setClauses []string
+	var args []interface{}
+	argIdx := 1
+	if update.PolicyName != nil {
+		setClauses = append(setClauses, fmt.Sprintf("policy_name = $%d", argIdx))
+		args = append(args, *update.PolicyName)
+		argIdx++
+	}
+	if update.AppliesToType != nil {
+		setClauses = append(setClauses, fmt.Sprintf("applies_to_type = $%d", argIdx))
+		args = append(args, *update.AppliesToType)
+		argIdx++
+	}
+	if update.AppliesToPositionID != nil {
+		setClauses = append(setClauses, fmt.Sprintf("applies_to_position_id = $%d", argIdx))
+		args = append(args, *update.AppliesToPositionID)
+		argIdx++
+	}
+	if update.AppliesToWorkCenterCode != nil {
+		setClauses = append(setClauses, fmt.Sprintf("applies_to_work_center_code = $%d", argIdx))
+		args = append(args, *update.AppliesToWorkCenterCode)
+		argIdx++
+	}
+	if update.Priority != nil {
+		setClauses = append(setClauses, fmt.Sprintf("priority = $%d", argIdx))
+		args = append(args, *update.Priority)
+		argIdx++
+	}
+	if update.EffectiveFrom != nil {
+		setClauses = append(setClauses, fmt.Sprintf("effective_from = $%d", argIdx))
+		args = append(args, *update.EffectiveFrom)
+		argIdx++
+	}
+	if update.EffectiveTo != nil {
+		setClauses = append(setClauses, fmt.Sprintf("effective_to = $%d", argIdx))
+		args = append(args, *update.EffectiveTo)
+		argIdx++
+	}
+	if update.IsActive != nil {
+		setClauses = append(setClauses, fmt.Sprintf("is_active = $%d", argIdx))
+		args = append(args, *update.IsActive)
+		argIdx++
+	}
+	if len(setClauses) == 0 {
+		return nil
+	}
+	setClauses = append(setClauses, "updated_at = NOW()")
+	q := fmt.Sprintf(`
+		UPDATE leave.leave_policy
+		SET %s
+		WHERE policy_id = $%d
+	`, strings.Join(setClauses, ", "), argIdx)
+	args = append(args, policyID)
+	result, err := tx.ExecContext(ctx, q, args...)
+	if err != nil {
+		return fmt.Errorf("failed to update leave policy (tx): %w", err)
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return hrErrors.ErrLeavePolicyNotFound
+	}
+	return nil
+}
+
+func (r *leaveRepository) AddPolicyRuleTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	rule *models.LeavePolicyRule,
+) error {
+	if tx == nil {
+		return errors.New("AddPolicyRuleTx requires a transaction")
+	}
+	if rule.PolicyRuleID == uuid.Nil {
+		rule.PolicyRuleID = uuid.New()
+	}
+	if rule.CreatedAt.IsZero() {
+		rule.CreatedAt = time.Now().UTC()
+	}
+	if rule.UpdatedAt == nil {
+		now := time.Now().UTC()
+		rule.UpdatedAt = &now
+	}
+	const q = `
+		INSERT INTO leave.leave_policy_rule (
+			policy_rule_id, policy_id, leave_type_id,
+			total_days, accrual_method, carry_forward_limit,
+			created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	`
+	_, err := tx.ExecContext(ctx, q,
+		rule.PolicyRuleID,
+		rule.PolicyID,
+		rule.LeaveTypeID,
+		rule.TotalDays,
+		rule.AccrualMethod,
+		rule.CarryForwardLimit,
+		rule.CreatedAt,
+		rule.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to add policy rule (tx): %w", err)
+	}
+	return nil
+}
+
+func (r *leaveRepository) UpdatePolicyRuleTx(
+    ctx context.Context, tx *sql.Tx,
+    companyID, policyRuleID uuid.UUID,
+    update *models.LeavePolicyRuleUpdate,
+) error {
+    if tx == nil {
+        return errors.New("UpdatePolicyRuleTx requires a transaction")
+    }
+
+    // 1. Confirm the rule belongs to a policy in this company, and grab
+    //    current values for the copy-forward.
+    var (
+        policyID       uuid.UUID
+        leaveTypeID    uuid.UUID
+        totalDays      int
+        accrualMethod  sql.NullString
+        carryForward   sql.NullInt32
+    )
+    err := tx.QueryRowContext(ctx, `
+        SELECT pr.policy_id, pr.leave_type_id,
+               pr.total_days, pr.accrual_method, pr.carry_forward_limit
+        FROM leave.leave_policy_rule pr
+        JOIN leave.leave_policy lp ON lp.policy_id = pr.policy_id
+        WHERE pr.policy_rule_id = $1
+          AND lp.company_id = $2
+          AND pr.effective_to IS NULL
+        ORDER BY pr.effective_from DESC
+        LIMIT 1
+    `, policyRuleID, companyID).Scan(
+        &policyID, &leaveTypeID,
+        &totalDays, &accrualMethod, &carryForward,
+    )
+    if errors.Is(err, sql.ErrNoRows) {
+        return hrErrors.ErrLeavePolicyRuleNotFound
+    }
+    if err != nil {
+        return fmt.Errorf("load policy rule for update: %w", err)
+    }
+
+    // 2. Same-day collapse: if the open version was created today, edit it
+    //    in place. Matches the schedule_templates pattern.
+    res, err := tx.ExecContext(ctx, `
+        UPDATE leave.leave_policy_rule
+        SET total_days          = COALESCE($1, total_days),
+            accrual_method      = COALESCE($2, accrual_method),
+            carry_forward_limit = COALESCE($3, carry_forward_limit),
+            updated_at          = NOW()
+        WHERE policy_rule_id = $4
+          AND effective_to IS NULL
+          AND effective_from = CURRENT_DATE
+    `,
+        update.TotalDays, update.AccrualMethod, update.CarryForwardLimit,
+        policyRuleID,
+    )
+    if err != nil {
+        return fmt.Errorf("update same-day rule version: %w", err)
+    }
+    if n, _ := res.RowsAffected(); n > 0 {
+        return nil
+    }
+
+    // 3. Close current version.
+    if _, err := tx.ExecContext(ctx, `
+        UPDATE leave.leave_policy_rule
+        SET effective_to = CURRENT_DATE - 1,
+            updated_at   = NOW()
+        WHERE policy_rule_id = $1
+          AND effective_to IS NULL
+    `, policyRuleID); err != nil {
+        return fmt.Errorf("close old rule version: %w", err)
+    }
+
+    // 4. Insert new version, copying unmodified fields forward.
+    newTotal := totalDays
+    if update.TotalDays != nil {
+        newTotal = *update.TotalDays
+    }
+    newAccrual := accrualMethod
+    if update.AccrualMethod != nil {
+        newAccrual = sql.NullString{String: *update.AccrualMethod, Valid: true}
+    }
+    newCarry := carryForward
+    if update.CarryForwardLimit != nil {
+        newCarry = sql.NullInt32{Int32: int32(*update.CarryForwardLimit), Valid: true}
+    }
+
+    if _, err := tx.ExecContext(ctx, `
+        INSERT INTO leave.leave_policy_rule (
+            policy_rule_id, policy_id, leave_type_id,
+            total_days, accrual_method, carry_forward_limit,
+            created_at, updated_at, effective_from
+        ) VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW(), CURRENT_DATE)
+    `, uuid.New(), policyID, leaveTypeID,
+        newTotal, newAccrual, newCarry,
+    ); err != nil {
+        return fmt.Errorf("insert new rule version: %w", err)
+    }
+
+    return nil
+}
+func (r *leaveRepository) DeletePolicyRuleTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	policyRuleID uuid.UUID,
+) error {
+	if tx == nil {
+		return errors.New("DeletePolicyRuleTx requires a transaction")
+	}
+	result, err := tx.ExecContext(ctx,
+		`DELETE FROM leave.leave_policy_rule WHERE policy_rule_id = $1`,
+		policyRuleID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to delete policy rule (tx): %w", err)
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return hrErrors.ErrLeavePolicyRuleNotFound
+	}
+	return nil
+}
+
+func (r *leaveRepository) CreateLeaveRequestTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	request *models.LeaveRequest,
+) error {
+	if tx == nil {
+		return errors.New("CreateLeaveRequestTx requires a transaction")
+	}
+	if request.LeaveRequestID == uuid.Nil {
+		request.LeaveRequestID = uuid.New()
+	}
+	if request.RequestedAt.IsZero() {
+		request.RequestedAt = time.Now().UTC()
+	}
+	const q = `
+		INSERT INTO leave.leave_request (
+			leave_request_id, company_id, user_id, leave_type_id,
+			start_date, end_date, total_days, status,
+			requested_by, approved_by, requested_at, approved_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+	`
+	_, err := tx.ExecContext(ctx, q,
+		request.LeaveRequestID,
+		request.CompanyID,
+		request.UserID,
+		request.LeaveTypeID,
+		request.StartDate,
+		request.EndDate,
+		request.TotalDays,
+		request.Status,
+		request.RequestedBy,
+		request.ApprovedBy,
+		request.RequestedAt,
+		request.ApprovedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create leave request (tx): %w", err)
+	}
+	return nil
+}
+
+// ============================================================================
+// ProcessLeaveRequestTx — same body as ProcessLeaveRequest, but runs inside
+// the caller's transaction. Used by the auto-approval path in RequestLeave so
+// the request row and its ledger entry commit atomically.
+//
+// The caller is responsible for BeginTx / Commit / Rollback.
+// ============================================================================
+
+func (r *leaveRepository) ProcessLeaveRequestTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	requestID uuid.UUID,
+	approved bool,
+	approvedBy uuid.UUID,
+) error {
+	if tx == nil {
+		return errors.New("ProcessLeaveRequestTx requires a transaction")
+	}
+
+	const q = `
+		WITH request_data AS (
+			SELECT
+				lr.leave_request_id,
+				lr.company_id,
+				lr.user_id,
+				lr.leave_type_id,
+				lr.start_date,
+				lr.end_date,
+				lr.total_days,
+				lr.status,
+				lr.requested_by,
+				lr.approved_by,
+				lr.requested_at,
+				lr.approved_at,
+				(SELECT position_id
+				 FROM company_employees
+				 WHERE user_id = lr.user_id
+				   AND company_id = lr.company_id
+				   AND is_active = true
+				   AND hire_date <= lr.start_date
+				 ORDER BY hire_date DESC
+				 LIMIT 1) as user_position_id
+			FROM leave.leave_request lr
+			WHERE lr.leave_request_id = $1
+			AND lr.status = 'pending'
+		),
+		applicable_entitlement AS (
+			SELECT le.entitlement_id, le.policy_id, le.source
+			FROM leave.leave_entitlement le
+			JOIN request_data rd ON le.user_id = rd.user_id
+				AND le.leave_type_id = rd.leave_type_id
+				AND le.effective_from <= rd.start_date
+				AND (le.effective_to IS NULL OR le.effective_to >= rd.end_date)
+				AND (
+					le.position_id IS NOT DISTINCT FROM rd.user_position_id
+					OR rd.user_position_id IS NULL
+				)
+			ORDER BY le.effective_from DESC
+			LIMIT 1
+		)
+		SELECT
+			rd.leave_request_id,
+			rd.company_id,
+			rd.user_id,
+			rd.leave_type_id,
+			rd.start_date,
+			rd.end_date,
+			rd.total_days,
+			rd.status,
+			rd.requested_by,
+			rd.approved_by,
+			rd.requested_at,
+			rd.approved_at,
+			rd.user_position_id,
+			ae.entitlement_id,
+			ae.policy_id,
+			ae.source
+		FROM request_data rd
+		LEFT JOIN applicable_entitlement ae ON 1=1
+	`
+
+	row := tx.QueryRowContext(ctx, q, requestID)
+
+	var request models.LeaveRequest
+	var entitlementID uuid.UUID
+	var policyID sql.NullString
+	var source string
+	var approvedByDB sql.NullString
+	var approvedAt sql.NullTime
+	var userPositionID sql.NullString
+
+	err := row.Scan(
+		&request.LeaveRequestID,
+		&request.CompanyID,
+		&request.UserID,
+		&request.LeaveTypeID,
+		&request.StartDate,
+		&request.EndDate,
+		&request.TotalDays,
+		&request.Status,
+		&request.RequestedBy,
+		&approvedByDB,
+		&request.RequestedAt,
+		&approvedAt,
+		&userPositionID,
+		&entitlementID,
+		&policyID,
+		&source,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return hrErrors.ErrLeaveRequestNotFound
+		}
+		return fmt.Errorf("failed to fetch leave request (tx): %w", err)
+	}
+
+	status := "rejected"
+	if approved {
+		status = "approved"
+	}
+
+	const updateQuery = `
+		UPDATE leave.leave_request
+		SET status = $1, approved_by = $2, approved_at = NOW()
+		WHERE leave_request_id = $3
+	`
+	if _, err := tx.ExecContext(ctx, updateQuery, status, approvedBy, requestID); err != nil {
+		return fmt.Errorf("failed to update leave request (tx): %w", err)
+	}
+
+	if approved {
+		const ledgerQuery = `
+			INSERT INTO leave.leave_ledger (
+				ledger_id,
+				entitlement_id,
+				leave_request_id,
+				entry_type,
+				days,
+				entry_date,
+				created_at
+			) VALUES ($1, $2, $3, 'consumption', $4, $5, $6)
+		`
+		now := time.Now().UTC()
+		if _, err := tx.ExecContext(ctx, ledgerQuery,
+			uuid.New(),
+			entitlementID,
+			requestID,
+			request.TotalDays,
+			now,
+			now,
+		); err != nil {
+			return fmt.Errorf("failed to create ledger entry (tx): %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (r *leaveRepository) EndActivePolicyEntitlementsByLeaveTypeTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+	leaveTypeID uuid.UUID,
+	endDate time.Time,
+	positionID *uuid.UUID,
+) error {
+	if tx == nil {
+		return errors.New("EndActivePolicyEntitlementsByLeaveTypeTx requires a transaction")
+	}
+	_ = positionID // preserved for API symmetry; query currently ignores it
+	const q = `
+		UPDATE leave.leave_entitlement
+		SET effective_to = $4, updated_at = NOW()
+		WHERE company_id = $1
+		AND user_id = $2
+		AND leave_type_id = $3
+		AND source = 'policy'
+		AND (effective_to IS NULL OR effective_to > $4)
+	`
+	_, err := tx.ExecContext(ctx, q, companyID, userID, leaveTypeID, endDate)
+	if err != nil {
+		return fmt.Errorf("failed to end active policy entitlements by leave type (tx): %w", err)
+	}
+	return nil
+}
+
+func (r *leaveRepository) CreatePolicyLeaveEntitlementTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	entitlement *models.LeaveEntitlement,
+) error {
+	if tx == nil {
+		return errors.New("CreatePolicyLeaveEntitlementTx requires a transaction")
+	}
+	if entitlement.EntitlementID == uuid.Nil {
+		entitlement.EntitlementID = uuid.New()
+	}
+	if entitlement.Source == "" {
+		entitlement.Source = "policy"
+	}
+	if entitlement.CreatedAt.IsZero() {
+		entitlement.CreatedAt = time.Now().UTC()
+	}
+	if entitlement.UpdatedAt == nil {
+		now := time.Now().UTC()
+		entitlement.UpdatedAt = &now
+	}
+
+	accrualMethod, err := r.lookupAccrualMethodTx(
+		ctx, tx, entitlement.PolicyID, entitlement.LeaveTypeID,
+	)
+	if err != nil {
+		return err
+	}
+
+	// ── Same FOR UPDATE / UPDATE / INSERT body as the non-Tx version.
+	//    The only change is that we're already inside the caller's tx,
+	//    so we don't BeginTx / Commit ourselves.
+	checkQuery := `
+		SELECT entitlement_id, total_days
+		FROM leave.leave_entitlement
+		WHERE company_id = $1
+		  AND user_id = $2
+		  AND leave_type_id = $3
+		  AND effective_to IS NULL
+		  AND source = 'policy'
+		LIMIT 1
+		FOR UPDATE
+	`
+	row := tx.QueryRowContext(ctx, checkQuery,
+		entitlement.CompanyID,
+		entitlement.UserID,
+		entitlement.LeaveTypeID,
+	)
+	var existingID uuid.UUID
+	var existingTotal int
+	err = row.Scan(&existingID, &existingTotal)
+	switch {
+	case err == nil:
+		_, err = tx.ExecContext(ctx, `
+			UPDATE leave.leave_entitlement
+			SET total_days = $1,
+				effective_from = $2,
+				policy_id = $3,
+				position_id = $4,
+				work_center_code = $5,
+				updated_at = NOW()
+			WHERE entitlement_id = $6
+		`,
+			entitlement.TotalDays,
+			entitlement.EffectiveFrom,
+			entitlement.PolicyID,
+			entitlement.PositionID,
+			entitlement.WorkCenterCode,
+			existingID,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to update existing policy entitlement (tx): %w", err)
+		}
+		if accrualMethod == "none" && entitlement.TotalDays != existingTotal {
+			delta := entitlement.TotalDays - existingTotal
+			if err = r.writeGrantEntryTx(ctx, tx, existingID, delta, time.Now()); err != nil {
+				return err
+			}
+		}
+	case errors.Is(err, sql.ErrNoRows):
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO leave.leave_entitlement (
+				entitlement_id, company_id, user_id, leave_type_id,
+				total_days, effective_from, effective_to, created_at,
+				policy_id, source, position_id, work_center_code, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10, $11, $12)
+		`,
+			entitlement.EntitlementID,
+			entitlement.CompanyID,
+			entitlement.UserID,
+			entitlement.LeaveTypeID,
+			entitlement.TotalDays,
+			entitlement.EffectiveFrom,
+			entitlement.CreatedAt,
+			entitlement.PolicyID,
+			entitlement.Source,
+			entitlement.PositionID,
+			entitlement.WorkCenterCode,
+			entitlement.UpdatedAt,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to create policy leave entitlement (tx): %w", err)
+		}
+		if accrualMethod == "none" && entitlement.TotalDays > 0 {
+			if err = r.writeGrantEntryTx(ctx, tx,
+				entitlement.EntitlementID,
+				entitlement.TotalDays,
+				entitlement.EffectiveFrom,
+			); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("failed to check existing policy entitlement (tx): %w", err)
+	}
+	return nil
+}
+func (r *leaveRepository) GetUserPositionContextOnDate(
+    ctx context.Context,
+    companyID, userID uuid.UUID,
+    date time.Time,
+) (*uuid.UUID, *string, error) {
+    query := `
+        SELECT eah.position_id, ph.work_center_code
+        FROM hr.employee_assignment_history eah
+        LEFT JOIN hr.position_history ph
+          ON ph.position_id = eah.position_id
+         AND ph.effective_from <= $3::date
+         AND (ph.effective_to IS NULL OR ph.effective_to >= $3::date)
+        WHERE eah.company_id = $1
+          AND eah.user_id = $2
+          AND eah.effective_from <= $3::date
+          AND (eah.effective_to IS NULL OR eah.effective_to >= $3::date)
+        ORDER BY eah.effective_from DESC
+        LIMIT 1
+    `
+    var positionID sql.NullString
+    var workCenterCode sql.NullString
+    err := r.client.QueryRow(ctx, query, companyID, userID, date).Scan(
+        &positionID, &workCenterCode,
+    )
+    if errors.Is(err, sql.ErrNoRows) {
+        return nil, nil, nil
+    }
+    if err != nil {
+        return nil, nil, fmt.Errorf("get user position context on date: %w", err)
+    }
+
+    var pid *uuid.UUID
+    if positionID.Valid && positionID.String != "" {
+        if id, err := uuid.Parse(positionID.String); err == nil {
+            pid = &id
+        }
+    }
+    var wc *string
+    if workCenterCode.Valid {
+        wc = &workCenterCode.String
+    }
+    return pid, wc, nil
 }

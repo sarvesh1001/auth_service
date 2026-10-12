@@ -37,7 +37,9 @@ type ScheduledJobRepository interface {
 	// The actual notice → terminated transition is done by the daily
 	// enforcer (see factory.startDailyExitEnforcer), not by this queue.
 	EnqueueNoticeReminder(ctx context.Context, tx *sql.Tx, companyID, userID uuid.UUID, runAt time.Time, noticeID uuid.UUID, endDate time.Time) error
-
+	CountQueued(ctx context.Context) (int64, error)
+	CountFailed(ctx context.Context, since *time.Time) (int64, error)
+	CountStuck(ctx context.Context, threshold time.Duration) (int64, error)
 	// On-hold — T-3/T-1 reminders + the expiry job that restores the
 	// employee's previous employment_status.
 	EnqueueOnHoldReminder(ctx context.Context, tx *sql.Tx, companyID, userID uuid.UUID, runAt time.Time, onHoldID uuid.UUID, endDate time.Time) error
@@ -531,4 +533,93 @@ func (r *scheduledJobRepository) EnqueueMonthlyAccrual(
 		return fmt.Errorf("enqueue monthly accrual: %w", err)
 	}
 	return nil
+}
+
+// ============================================================================
+// Count* — used by HRLifecycleWorker's periodic snapshot loop to publish
+// the gauges the Prometheus alerts fire on:
+//
+//   hr_lifecycle_queue_depth{status="queued"}            → HRLifecycleQueueDepthHigh
+//   hr_lifecycle_queue_depth{status="processing_stuck"}  → HRLifecycleStuckJobs
+//   hr_lifecycle_queue_depth{status="failed"}            → dead-letter surface
+//
+// The in_flight series is maintained by the pool's OnJobClaimed/OnJobFinished
+// hooks and is NOT counted here.
+// ============================================================================
+
+// CountQueued returns the number of rows currently waiting to run.
+//
+// Matches the WHERE clause the worker's FetchNextRunnableJob uses (minus
+// the FOR UPDATE), so the gauge reflects exactly what the pool would
+// claim on the next tick.
+func (r *scheduledJobRepository) CountQueued(ctx context.Context) (int64, error) {
+	var n int64
+	err := r.client.QueryRow(ctx, `
+		SELECT count(*)
+		  FROM hr.scheduled_job
+		 WHERE status = 'queued'
+	`).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count queued scheduled jobs: %w", err)
+	}
+	return n, nil
+}
+
+// CountFailed returns the number of terminally failed jobs. Pass since=nil
+// for the lifetime total; pass a timestamp to scope to recent failures
+// (e.g. "how many jobs failed in the last hour").
+//
+// This is the dead-letter surface — non-zero means something needs human
+// attention and won't self-heal.
+func (r *scheduledJobRepository) CountFailed(
+	ctx context.Context, since *time.Time,
+) (int64, error) {
+	var n int64
+	var err error
+
+	if since != nil {
+		err = r.client.QueryRow(ctx, `
+			SELECT count(*)
+			  FROM hr.scheduled_job
+			 WHERE status = 'failed'
+			   AND created_at >= $1
+		`, *since).Scan(&n)
+	} else {
+		err = r.client.QueryRow(ctx, `
+			SELECT count(*)
+			  FROM hr.scheduled_job
+			 WHERE status = 'failed'
+		`).Scan(&n)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("count failed scheduled jobs: %w", err)
+	}
+	return n, nil
+}
+
+// CountStuck returns the number of jobs that claimed themselves as
+// 'processing' but haven't been released within `threshold`. A non-zero
+// value that persists for more than a couple of minutes means a worker
+// crashed mid-job (or a job is running far longer than expected) and the
+// stale-lock sweeper hasn't caught up yet.
+//
+// The threshold should be a few multiples of the worker's
+// StaleSweepInterval so transient slow jobs don't trigger the alert.
+func (r *scheduledJobRepository) CountStuck(
+	ctx context.Context, threshold time.Duration,
+) (int64, error) {
+	var n int64
+	seconds := int64(threshold.Seconds())
+
+	err := r.client.QueryRow(ctx, `
+		SELECT count(*)
+		  FROM hr.scheduled_job
+		 WHERE status = 'processing'
+		   AND locked_at IS NOT NULL
+		   AND locked_at < NOW() - ($1 * INTERVAL '1 second')
+	`, seconds).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count stuck scheduled jobs: %w", err)
+	}
+	return n, nil
 }

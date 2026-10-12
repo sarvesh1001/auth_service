@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -11,79 +12,114 @@ import (
 	"auth-service/internal/hr/leave/models"
 	leaverepo "auth-service/internal/hr/leave/repository"
 	leavesvc "auth-service/internal/hr/leave/service"
+	"auth-service/internal/infrastructure/workerpool"
 )
 
+// ResolverWorker wraps workerpool.Pool for the leave entitlement resolver
+// queue. Same concurrency model as the schedule worker: N workers, one job
+// at a time each, single sweeper for stale locks.
 type ResolverWorker struct {
-	repo           leaverepo.ResolverJobRepository
-	resolver       leavesvc.LeavePolicyResolutionService
-	logger         *zap.Logger
-	workerID       string
-	interval       time.Duration
-	batch          int
-	staleThreshold time.Duration
+	repo   leaverepo.ResolverJobRepository
+	svc    leavesvc.LeavePolicyResolutionService
+	logger *zap.Logger
+	pool   *workerpool.Pool[models.ResolverJob]
 }
 
 func NewResolverWorker(
 	repo leaverepo.ResolverJobRepository,
-	resolver leavesvc.LeavePolicyResolutionService,
+	svc leavesvc.LeavePolicyResolutionService,
 	logger *zap.Logger,
-	interval time.Duration,
+	idleInterval time.Duration,
 ) *ResolverWorker {
-	if interval <= 0 {
-		interval = 5 * time.Second
+	w := &ResolverWorker{
+		repo:   repo,
+		svc:    svc,
+		logger: logger.Named("leave_resolver_worker"),
 	}
-	return &ResolverWorker{
-		repo:           repo,
-		resolver:       resolver,
-		logger:         logger.Named("leave_resolver_worker"),
-		workerID:       "leave-resolver-1",
-		interval:       interval,
-		batch:          50,
-		staleThreshold: 5 * time.Minute,
-	}
+
+	w.pool = workerpool.New(workerpool.Config[models.ResolverJob]{
+		Workers:            5,
+		IdleInterval:       idleInterval,
+		StaleSweepInterval: 5 * time.Minute,
+		StaleThreshold:     5 * time.Minute,
+		WorkerIDPrefix:     "leave-resolver",
+		Claim:              repo.FetchNextRunnableJob,
+		Run:                w.runJob,
+		ReleaseStale:       repo.ReleaseStaleLocks,
+		OnJobClaimed: func(job *models.ResolverJob) {
+			QueueDepth.WithLabelValues("in_flight").Inc()
+		},
+		OnJobFinished: func(job *models.ResolverJob, err error, d time.Duration) {
+			QueueDepth.WithLabelValues("in_flight").Dec()
+			JobDuration.WithLabelValues(job.JobType).Observe(d.Seconds())
+			if err != nil {
+				JobsFailed.WithLabelValues(job.JobType).Inc()
+			} else {
+				JobsCompleted.WithLabelValues(job.JobType).Inc()
+			}
+		},
+		OnStaleSweep: func(released int64) {
+			if released > 0 {
+				StaleLocksReleased.Add(float64(released))
+			}
+		},
+		Logger: logger,
+	})
+	return w
 }
 
+// Start launches the pool and the periodic snapshot loop.
 func (w *ResolverWorker) Start(ctx context.Context) {
-	w.logger.Info("resolver worker started",
-		zap.Duration("interval", w.interval),
-		zap.String("worker_id", w.workerID),
-	)
+	go w.startSnapshotLoop(ctx)
+	w.pool.Start(ctx)
+}
 
-	ticker := time.NewTicker(w.interval)
-	defer ticker.Stop()
+// startSnapshotLoop publishes queue depth gauges every 60 seconds so the
+// Prometheus alerts (LeaveResolverQueueDepthHigh, LeaveResolverFailures)
+// have data.
+func (w *ResolverWorker) startSnapshotLoop(ctx context.Context) {
+	log := w.logger.Named("snapshot")
 
+	tick := func() {
+		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+
+		if n, err := w.repo.CountQueued(cctx); err == nil {
+			QueueDepth.WithLabelValues("queued").Set(float64(n))
+		} else {
+			log.Warn("count queued failed", zap.Error(err))
+		}
+
+		if n, err := w.repo.CountStuck(cctx, 30*time.Minute); err == nil {
+			QueueDepth.WithLabelValues("processing_stuck").Set(float64(n))
+		} else {
+			log.Warn("count stuck failed", zap.Error(err))
+		}
+
+		if n, err := w.repo.CountFailed(cctx, nil); err == nil {
+			QueueDepth.WithLabelValues("failed").Set(float64(n))
+		} else {
+			log.Warn("count failed failed", zap.Error(err))
+		}
+	}
+
+	tick()
+	t := time.NewTicker(60 * time.Second)
+	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			w.logger.Info("resolver worker stopping")
 			return
-		case <-ticker.C:
-			w.tick(ctx)
+		case <-t.C:
+			tick()
 		}
 	}
 }
 
-func (w *ResolverWorker) tick(ctx context.Context) {
-	if released, err := w.repo.ReleaseStaleLocks(ctx, w.staleThreshold); err != nil {
-		w.logger.Warn("release stale locks failed", zap.Error(err))
-	} else if released > 0 {
-		w.logger.Warn("released stale resolver locks", zap.Int64("count", released))
-	}
-
-	for i := 0; i < w.batch; i++ {
-		job, err := w.repo.FetchNextRunnableJob(ctx, w.workerID)
-		if err != nil {
-			w.logger.Error("fetch next job failed", zap.Error(err))
-			return
-		}
-		if job == nil {
-			return
-		}
-		w.runJob(ctx, job)
-	}
-}
-
-func (w *ResolverWorker) runJob(ctx context.Context, job *models.ResolverJob) {
+// runJob dispatches on job_type. Returns error so the pool can record the
+// outcome in metrics; the status flip (MarkCompleted/MarkFailed) still
+// happens here.
+func (w *ResolverWorker) runJob(ctx context.Context, job *models.ResolverJob) error {
 	log := w.logger.With(
 		zap.String("job_id", job.JobID.String()),
 		zap.String("job_type", job.JobType),
@@ -105,15 +141,12 @@ func (w *ResolverWorker) runJob(ctx context.Context, job *models.ResolverJob) {
 		err = errors.New("unknown job_type: " + job.JobType)
 	}
 
-	// ── "No matching policy" is not a failure. The user simply has no
-	//    policy coverage. Complete the job cleanly so we don't burn
-	//    retries, and log it at Info so ops can spot the config gap.
 	if errors.Is(err, leavesvc.ErrNoMatchingPolicy) {
 		log.Info("resolver job skipped — no matching policy for user")
 		if mErr := w.repo.MarkCompleted(ctx, job.JobID); mErr != nil {
 			log.Error("mark completed failed", zap.Error(mErr))
 		}
-		return
+		return nil
 	}
 
 	if err != nil {
@@ -121,28 +154,26 @@ func (w *ResolverWorker) runJob(ctx context.Context, job *models.ResolverJob) {
 		if mErr := w.repo.MarkFailed(ctx, job.JobID, err.Error()); mErr != nil {
 			log.Error("mark failed also failed", zap.Error(mErr))
 		}
-		return
+		return err
 	}
 
 	if mErr := w.repo.MarkCompleted(ctx, job.JobID); mErr != nil {
 		log.Error("mark completed failed", zap.Error(mErr))
-		return
+		return mErr
 	}
 	log.Info("resolver job completed")
+	return nil
 }
+
+// ---------- per-type handlers (unchanged) ----------
 
 func (w *ResolverWorker) resolveUser(ctx context.Context, job *models.ResolverJob) error {
 	if job.UserID == nil {
 		return errors.New("resolve_user job missing user_id")
 	}
 	reason := derefString(job.Reason, "system")
-
-	// Scope the idempotency key by job_id so multiple resolver jobs for the
-	// same user on the same day each run. Cross-job dedup is handled at the
-	// resolver_job table level (uq_leave_resolver_job_pending_user), not here.
 	jobCtx := context.WithValue(ctx, "resolver_job_id", job.JobID.String())
-
-	return w.resolver.ResolveUserLeaveEntitlements(
+	return w.svc.ResolveUserLeaveEntitlements(
 		jobCtx, job.CompanyID, *job.UserID,
 		time.Now().UTC(), reason, "system", uuid.Nil,
 		map[string]interface{}{"source": "resolver_worker", "job_id": job.JobID.String()},
@@ -150,7 +181,7 @@ func (w *ResolverWorker) resolveUser(ctx context.Context, job *models.ResolverJo
 }
 
 func (w *ResolverWorker) resolveCompany(ctx context.Context, job *models.ResolverJob) error {
-	userIDs, err := w.resolver.ListActiveEmployeeUserIDs(ctx, job.CompanyID)
+	userIDs, err := w.svc.ListActiveEmployeeUserIDs(ctx, job.CompanyID)
 	if err != nil {
 		return err
 	}
@@ -158,10 +189,6 @@ func (w *ResolverWorker) resolveCompany(ctx context.Context, job *models.Resolve
 		return nil
 	}
 	reason := derefString(job.Reason, "policy change")
-
-	// Same idea: give every user-resolve inside this fan-out a job-scoped
-	// idempotency key so re-enqueueing the same company job on the same day
-	// doesn't silently no-op.
 	jobCtx := context.WithValue(ctx, "resolver_job_id", job.JobID.String())
 
 	const chunk = 100
@@ -170,7 +197,7 @@ func (w *ResolverWorker) resolveCompany(ctx context.Context, job *models.Resolve
 		if end > len(userIDs) {
 			end = len(userIDs)
 		}
-		if _, err := w.resolver.ResolveBatchLeaveEntitlements(
+		if _, err := w.svc.ResolveBatchLeaveEntitlements(
 			jobCtx, job.CompanyID, userIDs[i:end],
 			time.Now().UTC(), reason, "system", uuid.Nil,
 			map[string]interface{}{"source": "resolver_worker", "job_id": job.JobID.String()},
@@ -185,7 +212,7 @@ func (w *ResolverWorker) resolvePosition(ctx context.Context, job *models.Resolv
 	if job.PositionID == nil {
 		return errors.New("resolve_position job missing position_id")
 	}
-	userIDs, err := w.resolver.ListActiveEmployeeUserIDsByPosition(ctx, job.CompanyID, *job.PositionID)
+	userIDs, err := w.svc.ListActiveEmployeeUserIDsByPosition(ctx, job.CompanyID, *job.PositionID)
 	if err != nil {
 		return err
 	}
@@ -194,20 +221,32 @@ func (w *ResolverWorker) resolvePosition(ctx context.Context, job *models.Resolv
 	}
 
 	jobCtx := context.WithValue(ctx, "resolver_job_id", job.JobID.String())
-
-	_, err = w.resolver.ResolveBatchLeaveEntitlements(
-		jobCtx, job.CompanyID, userIDs,
-		time.Now().UTC(), "position work_center change", "system", uuid.Nil,
-		map[string]interface{}{"source": "resolver_worker", "job_id": job.JobID.String()},
-	)
-	return err
+	const chunk = 100
+	for i := 0; i < len(userIDs); i += chunk {
+		end := i + chunk
+		if end > len(userIDs) {
+			end = len(userIDs)
+		}
+		if _, err := w.svc.ResolveBatchLeaveEntitlements(
+			jobCtx, job.CompanyID, userIDs[i:end],
+			time.Now().UTC(), "position work_center change", "system", uuid.Nil,
+			map[string]interface{}{
+				"source": "resolver_worker",
+				"job_id": job.JobID.String(),
+				"chunk":  fmt.Sprintf("%d-%d", i, end),
+			},
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (w *ResolverWorker) endEntitlements(ctx context.Context, job *models.ResolverJob) error {
 	if job.UserID == nil {
 		return errors.New("end_entitlements job missing user_id")
 	}
-	return w.resolver.EndActivePolicyEntitlements(ctx, job.CompanyID, *job.UserID, time.Now().UTC())
+	return w.svc.EndActivePolicyEntitlements(ctx, job.CompanyID, *job.UserID, time.Now().UTC())
 }
 
 func derefString(s *string, fallback string) string {

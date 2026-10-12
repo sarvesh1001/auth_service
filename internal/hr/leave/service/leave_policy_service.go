@@ -59,8 +59,6 @@ func (s *leavePolicyService) CreateLeaveType(
 		return cached, nil
 	}
 
-	// GetLeaveTypeByCode returns ErrLeaveTypeNotFound when the code does
-	// not exist yet — that's the SUCCESS path for a duplicate check.
 	existing, err := s.repo.GetLeaveTypeByCode(ctx, companyID, req.Code)
 	if err != nil && !errors.Is(err, hrErrors.ErrLeaveTypeNotFound) {
 		return nil, fmt.Errorf("failed to check leave type: %w", err)
@@ -192,9 +190,14 @@ func (s *leavePolicyService) AssignEntitlementToUser(
 		return nil, fmt.Errorf("total days must be > 0")
 	}
 
-	positionID, workCenterCode, err := s.repo.GetUserPositionContext(ctx, req.CompanyID, req.UserID)
+	// Position lookup MUST succeed — an entitlement created with a NULL
+	// position_id is invisible to any query that scopes by position.
+	// Previously the error was silently ignored, leaving orphaned rows.
+	positionID, workCenterCode, err := s.repo.GetUserPositionContextOnDate(
+		ctx, req.CompanyID, req.UserID, req.EffectiveFrom,
+	)
 	if err != nil {
-		// log but continue
+		return nil, fmt.Errorf("resolve user position: %w", err)
 	}
 	entitlement := &models.LeaveEntitlement{
 		EntitlementID:  uuid.New(),

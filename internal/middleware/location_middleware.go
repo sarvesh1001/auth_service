@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -39,29 +40,55 @@ const (
 // /api/v1/companies/{companyID} prefix in front of the route.
 var readOnlyPOSTSuffixes = []string{
 	"/hr/employees/details",
-	"/hr/employees",        // 👈 ADD THIS
+	"/hr/employees",
 
 	// add more here as batch-read endpoints are introduced
 }
 
-// allScopeWritePOSTSuffixes lists URL path suffixes for POST endpoints that
-// are permitted to run under the company-wide ("ALL") scope even though they
-// mutate state.
+// allScopeWriteRoots lists RESOURCE ROOTS whose write endpoints
+// (POST/PUT/PATCH/DELETE) may run under the company-wide ("ALL") scope.
 //
-// These endpoints perform their OWN per-target location validation in the
-// service layer, so the middleware does not need to block them. The caller's
-// ALL scope grants them the authority to target any location in the company.
+// A request path is allowed if, after stripping a trailing resource id
+// (a UUID segment), the path ends with one of these roots. This means:
 //
-// AddMember is the canonical example: the request body carries the target
-// employee's location(s), and the service validates each against the
-// caller's allowed set — which, under ALL scope, is the entire company.
+//	POST   /attendance/scheduling/calendars           → allowed
+//	PUT    /attendance/scheduling/calendars/{uuid}    → allowed
+//	DELETE /attendance/scheduling/calendars/{uuid}    → allowed
+//	POST   /attendance/scheduling/holidays/process    → allowed
+//	PUT    /attendance/scheduling/calendars/{uuid}/x  → REJECTED (nested path)
 //
-// RULE OF THUMB: only add an entry here if the endpoint's service layer
-// re-validates every location it writes to. Never add a blanket "any write"
-// allowance — each entry is a deliberate security decision.
-var allScopeWritePOSTSuffixes = []string{
+// RULE OF THUMB — only add an entry here when BOTH conditions hold:
+//
+//	(a) the endpoint legitimately supports a company-wide target
+//	    (i.e. "no specific location"), AND
+//	(b) the endpoint's handler re-validates every location it writes to
+//	    against the caller's scope via locationctx / assertCanTouchLocation.
+//
+// Adding an entry here is a deliberate security decision. Never add a
+// blanket "any write" allowance. If in doubt, leave it out and require the
+// caller to send a concrete X-Location-ID.
+var allScopeWriteRoots = []string{
+	// RBAC: the request body carries every target employee's location(s);
+	// the service validates each against the caller's allowed set, which
+	// under ALL scope is the whole company.
 	"/rbac/members",
-	// add more here as per-target-validating write endpoints are introduced
+
+	// Scheduling — creates and updates that support company-wide targets.
+	//
+	// The handler decides the effective location via resolveTargetLocation()
+	// for creates, and assertCanTouchLocation() for updates / deletes.
+	// ScopeAll callers may pass nil (company-wide) on create; on update the
+	// row's own location_id is checked, and ScopeAll passes trivially.
+	"/attendance/scheduling/calendars",
+	"/attendance/scheduling/templates",
+
+	// Adding a holiday targets an existing calendar. The handler loads the
+	// calendar and verifies the caller can touch its scope before writing.
+	"/attendance/scheduling/holidays",
+
+	// Processing a holiday for a date cancels instances across the whole
+	// company — inherently a company-wide operation.
+	"/attendance/scheduling/holidays/process",
 }
 
 // isReadOnlyPost reports whether r is a POST that should be treated as a read
@@ -79,19 +106,67 @@ func isReadOnlyPost(r *http.Request) bool {
 	return false
 }
 
-// isAllScopeWritePost reports whether r is a POST that is explicitly allowed
-// to run under the company-wide ("ALL") scope, despite mutating state.
-func isAllScopeWritePost(r *http.Request) bool {
-	if r.Method != http.MethodPost {
+// isAllScopeWriteRequest reports whether r is a mutating request (POST, PUT,
+// PATCH, DELETE) that is explicitly allowed to run under the company-wide
+// ("ALL") scope, despite mutating state.
+//
+// Path matching:
+//  1. If the path ends in /{uuid}, that segment is stripped before matching.
+//     This lets a single root like "/attendance/scheduling/calendars" match
+//     both POST /calendars and PUT /calendars/{uuid}.
+//  2. Action segments that don't look like UUIDs (e.g. "process") are NOT
+//     stripped, so "/attendance/scheduling/holidays/process" matches as-is.
+func isAllScopeWriteRequest(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		// proceed
+	default:
 		return false
 	}
+
 	p := r.URL.Path
-	for _, suffix := range allScopeWritePOSTSuffixes {
-		if strings.HasSuffix(p, suffix) {
+
+	// Strip a trailing /{uuid} if present. Idempotent for action paths —
+	// "process" is not a UUID so nothing is stripped for those.
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		tail := p[i+1:]
+		if looksLikeUUID(tail) {
+			p = p[:i]
+		}
+	}
+
+	for _, root := range allScopeWriteRoots {
+		if strings.HasSuffix(p, root) {
 			return true
 		}
 	}
 	return false
+}
+
+// looksLikeUUID does a cheap structural check: 36 chars, hyphens at
+// positions 8/13/18/23, hex digits elsewhere. We do NOT require a valid
+// UUID parse — we only need to distinguish "this is a resource id" from
+// "this is an action segment like 'process'".
+func looksLikeUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, c := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			isHex := (c >= '0' && c <= '9') ||
+				(c >= 'a' && c <= 'f') ||
+				(c >= 'A' && c <= 'F')
+			if !isHex {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // LocationValidationMiddleware normalizes X-Location-ID into a well-defined
@@ -101,24 +176,37 @@ func isAllScopeWritePost(r *http.Request) bool {
 //   - Non-admin requests MUST send X-Location-ID.
 //   - Value is either a location UUID, or the literal "ALL".
 //   - "ALL" requires location_scope == ALL.
-//   - "ALL" is rejected for writes, UNLESS the endpoint's path suffix
-//     appears in allScopeWritePOSTSuffixes — in which case the endpoint is
-//     trusted to re-validate every target location itself.
+//   - "ALL" is rejected for writes, UNLESS the endpoint's path matches
+//     allScopeWriteRoots — in which case the endpoint is trusted to
+//     re-validate every target location itself.
 //   - On success, the request context gains:
-//     location_mode          → "LOCATION" | "ALL"
-//     validated_location_id  → uuid.UUID (uuid.Nil when mode == "ALL")
-//     location_access_level  → "VIEW" | "MANAGE"
+//     locationctx.CtxMode         → ScopeAll | ScopeLocation
+//     locationctx.CtxLocationID   → uuid.UUID (uuid.Nil when Mode == ScopeAll)
+//     locationctx.CtxAccessLevel  → VIEW | MANAGE
 //
-// The strings written into the context are the same ones read by
-// locationctx.FromContext. Do not modify them here — modify
-// locationctx.CtxMode / CtxLocationID / CtxAccessLevel.
-func LocationValidationMiddleware(locationService *service.LocationService) func(http.Handler) http.Handler {
+// The middleware never guesses the effective location for a write. It only
+// answers: "is the caller permitted to enter this location context for this
+// request?" The handler is responsible for deciding which location it will
+// write to, and for rejecting a body that contradicts the context.
+func LocationValidationMiddleware(
+	locationService *service.LocationService,
+) func(http.Handler) http.Handler {
+	if locationService == nil {
+		// Fail at wire time so the misconfiguration is caught during boot,
+		// not on the first request that reaches this middleware.
+		panic("middleware.LocationValidationMiddleware: locationService is nil")
+	}
+
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx := r.Context()
 
 			// ---------------------------------------------------------------
 			// 1. Admin bypass — checked before the header requirement.
+			//
+			// Admin sessions are cross-tenant and don't carry a location.
+			// The rest of the pipeline is responsible for scoping what an
+			// admin may do.
 			// ---------------------------------------------------------------
 			if sessionType, _ := ctx.Value("session_type").(string); sessionType == "admin" {
 				next.ServeHTTP(w, r.WithContext(ctx))
@@ -167,6 +255,13 @@ func LocationValidationMiddleware(locationService *service.LocationService) func
 				util.JSONError(w, http.StatusUnauthorized, "user or company not in context")
 				return
 			}
+			if scope == "" {
+				// No scope on the principal means we cannot reason about
+				// location access at all. Fail closed rather than defaulting
+				// to a permissive mode.
+				util.JSONError(w, http.StatusForbidden, "location scope missing for user")
+				return
+			}
 
 			// ---------------------------------------------------------------
 			// 4. Classify the HTTP method. GET/HEAD/OPTIONS are reads.
@@ -192,7 +287,7 @@ func LocationValidationMiddleware(locationService *service.LocationService) func
 				// allow-listed as a per-target-validating write. The
 				// endpoint's service layer is responsible for validating
 				// every location it writes to against the caller's scope.
-				if isWrite && !isAllScopeWritePost(r) {
+				if isWrite && !isAllScopeWriteRequest(r) {
 					util.JSONError(w, http.StatusBadRequest,
 						"company-wide context cannot be used for write operations")
 					return
@@ -214,7 +309,8 @@ func LocationValidationMiddleware(locationService *service.LocationService) func
 				return
 			}
 
-			allowed, accessLevel, err := locationService.IsLocationAllowed(
+			allowed, accessLevel, err := safeIsLocationAllowed(
+				locationService,
 				ctx, companyID, userID, requestedLoc, scope, primaryID,
 			)
 			if err != nil {
@@ -236,6 +332,28 @@ func LocationValidationMiddleware(locationService *service.LocationService) func
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+// safeIsLocationAllowed wraps LocationService.IsLocationAllowed in a recover
+// so a panic in the resolver chain (bad Redis state, malformed SQL row, etc.)
+// produces a clean 500 instead of crashing the HTTP server goroutine.
+func safeIsLocationAllowed(
+	locationService *service.LocationService,
+	ctx context.Context,
+	companyID, userID, locationID uuid.UUID,
+	scope string,
+	primaryID uuid.UUID,
+) (allowed bool, accessLevel string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			allowed = false
+			accessLevel = ""
+			err = fmt.Errorf("panic in IsLocationAllowed: %v", r)
+		}
+	}()
+	return locationService.IsLocationAllowed(
+		ctx, companyID, userID, locationID, scope, primaryID,
+	)
 }
 
 // stringFromCtx is a small helper to safely pull a string out of context.

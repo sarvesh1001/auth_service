@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"auth-service/internal/attendance/models" // for UserScheduleWarning
 	"auth-service/internal/client"
 	"auth-service/internal/hr/models/employee"
 	"auth-service/internal/hr/repository"
@@ -43,6 +45,16 @@ const (
 	ReminderProbationExtended  = "probation_extended"
 	ReminderOnHoldStarted      = "on_hold_started"
 	ReminderOnHoldEnded        = "on_hold_ended"
+
+	// Schedule generation warnings — produced by the scheduler worker
+	// when some employees could not be scheduled (missing work center,
+	// missing shift mapping, etc).
+	ReminderScheduleGenerationWarning = "schedule_generation_warning"
+
+	// Leave accrual failure — produced by the HR lifecycle worker when a
+	// company's monthly accrual job exhausts retries. Critical severity:
+	// employees may have incorrect balances until it's retried.
+	ReminderLeaveAccrualFailure = "leave_accrual_failure"
 )
 
 const (
@@ -73,10 +85,20 @@ type RecipientInfo struct {
 // This is enforced at the DB query level in HRRecipientResolverImpl, so
 // reminders never land in the inbox of HR users who cannot act on them.
 type RecipientResolver interface {
+	// ResolveRecipients returns HR users whose scope covers the subject.
 	ResolveRecipients(
 		ctx context.Context,
 		companyID uuid.UUID,
 		subjectUserID uuid.UUID,
+	) ([]RecipientInfo, error)
+
+	// ResolveAllCompanyHR returns every HR user in the company with
+	// hr.employee.update, regardless of location scope. Used for
+	// company-wide notifications where there is no single subject
+	// (schedule generation warnings, holiday declarations, etc).
+	ResolveAllCompanyHR(
+		ctx context.Context,
+		companyID uuid.UUID,
 	) ([]RecipientInfo, error)
 }
 
@@ -85,10 +107,10 @@ type RecipientResolver interface {
 // ============================================================================
 
 type ActionPayload struct {
-	Screen            string `json:"screen"`                // "probation" | "on_hold" | "notice" | "employee"
+	Screen            string `json:"screen"`                // "probation" | "on_hold" | "notice" | "employee" | "schedule_generation_job" | "leave_accrual_job"
 	EmployeeID        string `json:"employee_id,omitempty"` // user_id
 	EmployeeProfileID string `json:"employee_profile_id,omitempty"`
-	EntityID          string `json:"entity_id,omitempty"` // probation_id / notice_id / on_hold_id
+	EntityID          string `json:"entity_id,omitempty"` // probation_id / notice_id / on_hold_id / job_id
 	EndDate           string `json:"end_date,omitempty"`  // "2006-01-02"
 	ExtraNote         string `json:"extra_note,omitempty"`
 }
@@ -396,10 +418,6 @@ func (s *ReminderService) Counts(
 
 // ============================================================================
 // Mutations — scoped to the calling HR user only (no location filter)
-//
-// Rationale: the caller already owns the reminder_id. Adding a location
-// check would break the case where HR marks a reminder read and then
-// switches location before the request lands.
 // ============================================================================
 
 func (s *ReminderService) MarkRead(ctx context.Context, recipientID, reminderID uuid.UUID) error {
@@ -418,6 +436,249 @@ func (s *ReminderService) Dismiss(ctx context.Context, recipientID, reminderID u
 		return fmt.Errorf("reminder_id is required")
 	}
 	return s.repo.Dismiss(ctx, recipientID, reminderID)
+}
+
+// ============================================================================
+// Schedule generation warnings
+// ============================================================================
+
+// NotifyScheduleWarnings creates an in-app reminder for every HR user with
+// hr.employee.update in the company. Warnings are grouped by reason so HR
+// sees one reminder per distinct problem, not one per user.
+//
+// Non-fatal: a failure here must never fail the schedule generation job.
+// The job is already persisted; this notification is a best-effort side
+// effect.
+//
+// Uses ResolveAllCompanyHR (not ResolveRecipients) because the notification
+// is company-wide — there is no single subject whose location can be used
+// to narrow the recipient set.
+func (s *ReminderService) NotifyScheduleWarnings(
+	ctx context.Context,
+	companyID, jobID uuid.UUID,
+	warnings []models.UserScheduleWarning,
+) error {
+	if len(warnings) == 0 {
+		return nil
+	}
+
+	// Group by reason so each reminder is a single actionable sentence.
+	byReason := make(map[string][]models.UserScheduleWarning)
+	for _, w := range warnings {
+		byReason[w.Reason] = append(byReason[w.Reason], w)
+	}
+
+	recipients, err := s.resolver.ResolveAllCompanyHR(ctx, companyID)
+	if err != nil {
+		return fmt.Errorf("resolve company HR: %w", err)
+	}
+	if len(recipients) == 0 {
+		s.logger.Warn("no HR recipients for schedule warnings",
+			zap.String("company_id", companyID.String()),
+			zap.String("job_id", jobID.String()),
+		)
+		return nil
+	}
+
+	actionPayload := ActionPayload{
+		Screen:   "schedule_generation_job",
+		EntityID: jobID.String(),
+	}
+	actionJSON := mustJSON(actionPayload)
+
+	for reason, group := range byReason {
+		title := fmt.Sprintf("%d employee(s) need attention: %s",
+			len(group), humanReason(reason))
+		body := renderWarningBody(group)
+
+		// One batch insert per (reason, recipients) group.
+		rows := make([]*employee.Reminder, 0, len(recipients))
+		for _, r := range recipients {
+			bodyCopy := body
+			rows = append(rows, &employee.Reminder{
+				ReminderID:    uuid.New(),
+				CompanyID:     companyID,
+				RecipientID:   r.UserID,
+				RecipientType: r.UserType,
+
+				ReminderType: ReminderScheduleGenerationWarning,
+				Severity:     SeverityWarning,
+				Title:        title,
+				Body:         &bodyCopy,
+
+				ActionType:    ptrString("navigate"),
+				ActionPayload: actionJSON,
+
+				// Dedupe: same job + reason + recipient → one row.
+				DedupeKey: fmt.Sprintf(
+					"schedule_warning:%s:%s:%s",
+					jobID.String(), reason, r.UserID.String(),
+				),
+				Status:    "unread",
+				CreatedAt: time.Now().UTC(),
+			})
+		}
+
+		if _, err := s.repo.CreateBatch(ctx, rows); err != nil {
+			return fmt.Errorf("create reminders for reason %s: %w", reason, err)
+		}
+	}
+
+	s.logger.Info("schedule warnings notifications dispatched",
+		zap.String("company_id", companyID.String()),
+		zap.String("job_id", jobID.String()),
+		zap.Int("warnings", len(warnings)),
+		zap.Int("recipients", len(recipients)),
+		zap.Int("distinct_reasons", len(byReason)),
+	)
+	return nil
+}
+
+// ============================================================================
+// Leave accrual failure
+// ============================================================================
+
+// NotifyAccrualFailure creates a CRITICAL-severity reminder for every HR
+// user in the company when a monthly accrual job exhausts its retries.
+//
+// This is the same pattern as NotifyScheduleWarnings but with different
+// semantics:
+//   - severity is critical, not warning (employees may have wrong balances)
+//   - dedupe is per (job_id, recipient) — one reminder per failed job, ever
+//   - recipients are ALL company HR, no location scoping (accrual is a
+//     company-wide concern)
+//
+// The worker calls this only when the job has truly failed (attempts
+// exhausted). Transient failures that will retry do NOT fire this.
+func (s *ReminderService) NotifyAccrualFailure(
+	ctx context.Context,
+	companyID, jobID uuid.UUID,
+	accrualDate time.Time,
+	errMsg string,
+) error {
+	recipients, err := s.resolver.ResolveAllCompanyHR(ctx, companyID)
+	if err != nil {
+		return fmt.Errorf("resolve company HR: %w", err)
+	}
+	if len(recipients) == 0 {
+		s.logger.Warn("no HR recipients for accrual failure",
+			zap.String("company_id", companyID.String()),
+			zap.String("job_id", jobID.String()),
+		)
+		return nil
+	}
+
+	title := fmt.Sprintf("Monthly accrual failed for %s", accrualDate.Format("Jan 2006"))
+	body := fmt.Sprintf(
+		"Leave accrual for %s could not be processed. "+
+			"Employees may have incorrect balances until this is retried.\n\n"+
+			"Error: %s",
+		accrualDate.Format("Jan 2006"), errMsg,
+	)
+
+	actionPayload := ActionPayload{
+		Screen:   "leave_accrual_job",
+		EntityID: jobID.String(),
+	}
+	actionJSON := mustJSON(actionPayload)
+
+	rows := make([]*employee.Reminder, 0, len(recipients))
+	for _, r := range recipients {
+		bodyCopy := body
+		rows = append(rows, &employee.Reminder{
+			ReminderID:    uuid.New(),
+			CompanyID:     companyID,
+			RecipientID:   r.UserID,
+			RecipientType: r.UserType,
+
+			ReminderType: ReminderLeaveAccrualFailure,
+			Severity:     SeverityCritical,
+			Title:        title,
+			Body:         &bodyCopy,
+
+			ActionType:    ptrString("navigate"),
+			ActionPayload: actionJSON,
+
+			// Dedupe: one reminder per (job, recipient) — a retry of the
+			// same job doesn't duplicate, but a fresh accrual failure
+			// next month produces a new reminder.
+			DedupeKey: fmt.Sprintf(
+				"accrual_failure:%s:%s",
+				jobID.String(), r.UserID.String(),
+			),
+			Status:    "unread",
+			CreatedAt: time.Now().UTC(),
+		})
+	}
+
+	if _, err := s.repo.CreateBatch(ctx, rows); err != nil {
+		return fmt.Errorf("create accrual failure reminders: %w", err)
+	}
+
+	s.logger.Info("accrual failure notifications dispatched",
+		zap.String("company_id", companyID.String()),
+		zap.String("job_id", jobID.String()),
+		zap.Time("accrual_date", accrualDate),
+		zap.Int("recipients", len(recipients)),
+	)
+	return nil
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+// humanReason maps a warning code to a short human string.
+func humanReason(reason string) string {
+	switch reason {
+	case "no_work_center":
+		return "no work center assigned"
+	case "no_shift_mapping":
+		return "no active shift mapping"
+	case "template_not_found":
+		return "shift template missing"
+	case "resolve_failed":
+		return "resolution failed"
+	case "missing_shift_id":
+		return "resolved day has no shift"
+	case "subject_not_found":
+		return "employee not found"
+	case "inactive":
+		return "employee inactive"
+	default:
+		return reason
+	}
+}
+
+// renderWarningBody builds the reminder body. Caps at 5 lines so the feed
+// stays readable; the full list is available via the job detail endpoint.
+func renderWarningBody(group []models.UserScheduleWarning) string {
+	const maxLines = 5
+	var b strings.Builder
+	for i, w := range group {
+		if i >= maxLines {
+			fmt.Fprintf(&b, "…and %d more", len(group)-maxLines)
+			break
+		}
+		fmt.Fprintf(&b, "• %s", w.UserID.String())
+		if w.Date != nil {
+			fmt.Fprintf(&b, " (%s)", w.Date.Format("2006-01-02"))
+		}
+		if w.Detail != "" {
+			fmt.Fprintf(&b, " — %s", w.Detail)
+		}
+		if i < len(group)-1 && i < maxLines-1 {
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+func ptrString(s string) *string { return &s }
+
+func mustJSON(v interface{}) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return b
 }
 
 // ============================================================================
@@ -463,10 +724,6 @@ func (r *HRRecipientResolverImpl) ResolveRecipients(
 	//   - PRIMARY  → eligible only if subject's location == HR's primary
 	//   - SELECTED → eligible only if HR has an employee_location_access
 	//                grant for the subject's location
-	//
-	// Employees with no primary_location_id (rare but possible) only get
-	// ALL-scope recipients, since PRIMARY/SELECTED both need a location to
-	// compare against.
 	rows, err := r.pg.Query(ctx, `
 		WITH subject AS (
 			SELECT primary_location_id
@@ -518,8 +775,6 @@ func (r *HRRecipientResolverImpl) ResolveRecipients(
 
 	// Fallback: if nobody matched (subject has no location AND no HR user
 	// is ALL-scope), route to the company owner so reminders never vanish.
-	// The owner almost always has ALL-scope in practice; this is a
-	// belt-and-braces path for tenant misconfigurations.
 	if len(out) == 0 {
 		var owner uuid.UUID
 		if err := r.pg.QueryRow(ctx, `
@@ -529,5 +784,40 @@ func (r *HRRecipientResolverImpl) ResolveRecipients(
 		}
 	}
 
+	return out, nil
+}
+
+// ResolveAllCompanyHR returns every active HR user in the company with
+// hr.employee.update, regardless of location scope. Used for company-wide
+// notifications where there is no single subject to scope against.
+func (r *HRRecipientResolverImpl) ResolveAllCompanyHR(
+	ctx context.Context,
+	companyID uuid.UUID,
+) ([]RecipientInfo, error) {
+	rows, err := r.pg.Query(ctx, `
+		SELECT DISTINCT hr.user_id
+		  FROM company_employees hr
+		  JOIN role_permissions rp ON rp.role_id = hr.role_id
+		  JOIN permissions      p  ON p.permission_id = rp.permission_id
+		 WHERE hr.company_id = $1
+		   AND hr.is_active  = true
+		   AND p.permission_name = 'hr.employee.update'
+	`, companyID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve all HR: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]RecipientInfo, 0, 8)
+	for rows.Next() {
+		var uid uuid.UUID
+		if err := rows.Scan(&uid); err != nil {
+			return nil, err
+		}
+		out = append(out, RecipientInfo{UserID: uid, UserType: "hr"})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return out, nil
 }

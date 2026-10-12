@@ -2,7 +2,7 @@ package factory
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"time"
 
 	biometricRepoPkg "auth-service/internal/attendance/biometric/repository"
@@ -45,7 +45,19 @@ import (
 	"go.uber.org/zap"
 )
 
+// errScheduleAdapterNoLeaveRepo is returned by the schedule subject resolver
+// adapter when its leave-repository dependency is missing. Without the
+// leave repo we cannot enumerate active employees, so any call that needs
+// the fan-out list fails explicitly rather than silently returning an
+// empty slice (which would look like "no employees exist" downstream).
+var errScheduleAdapterNoLeaveRepo = errors.New("schedule subject resolver adapter: leave repository not wired")
+
 // AttendanceFactory centralizes creation and wiring of all attendance components.
+//
+// Schedule generation has been removed: schedules are derived on read from
+// the rule chain (WC → shift → template → calendar → override). There is no
+// worker, no queue, no schedule_instances table. The only per-day, per-user
+// data we still write is schedule_overrides — the manual override log.
 type AttendanceFactory struct {
 	// external dependencies
 	postgresClient    *client.PostgresClient
@@ -106,7 +118,7 @@ type AttendanceFactory struct {
 	// usage integration service
 	usageIntegrationService *usage_integration.UsageIntegrationService
 
-	// ── NEW: canonical timezone resolver (position → location → work center → company)
+	// canonical timezone resolver (position → location → work center → company)
 	tzProvider resolver.TimezoneProvider
 
 	// resolvers
@@ -222,6 +234,16 @@ func (f *AttendanceFactory) SetCustomerResolverDependencies(
 func (f *AttendanceFactory) SetUsageIntegrationService(svc *usage_integration.UsageIntegrationService) {
 	f.usageIntegrationService = svc
 	f.logger.Info("Usage integration service set")
+}
+
+// SetScheduleNotifier is retained as a no-op for backward compatibility.
+//
+// Schedule generation has been removed, so there are no per-user warnings
+// to dispatch. The method accepts any argument so the outer factory can
+// keep calling it without knowing that the notifier is gone. Remove the
+// call from the outer factory when convenient.
+func (f *AttendanceFactory) SetScheduleNotifier(_ interface{}) {
+	f.logger.Debug("SetScheduleNotifier called (no-op: schedule generation removed)")
 }
 
 // ---------- Repositories ----------
@@ -442,15 +464,6 @@ func (f *AttendanceFactory) TimezoneProvider() resolver.TimezoneProvider {
 }
 
 // ---------- Subject Location Resolver ----------
-//
-// The subject location resolver answers "which employment location does this
-// subject belong to?" It is used on the WRITE path to stamp attendance
-// events and daily summaries with the subject's location, and to enforce
-// row-level scope on writes.
-//
-//   - employee → company_employees.employment_location_id
-//   - student  → academics.students.location_id
-//   - customer → (nil, nil) — customers are company-scoped
 func (f *AttendanceFactory) LocationResolver() resolver.SubjectLocationResolver {
 	if f.locationResolver == nil {
 		employeeLocResolver := resolver.NewEmployeeLocationResolver(f.HREmployeeRepository())
@@ -475,10 +488,8 @@ func (f *AttendanceFactory) SetStudentResolver(studentResolver resolver.SubjectR
 // SubjectResolver builds the composite resolver.
 func (f *AttendanceFactory) SubjectResolver() resolver.SubjectResolver {
 	if f.subjectResolver == nil {
-		// ── NEW: single tz provider instance used by all resolvers.
 		tzProvider := f.TimezoneProvider()
 
-		// Employee resolver
 		hrEmployeeRepo := f.HREmployeeRepository()
 		employeeProvider := resolver.NewEmployeeDataProvider(
 			hrEmployeeRepo,
@@ -502,18 +513,17 @@ func (f *AttendanceFactory) SubjectResolver() resolver.SubjectResolver {
 			f.PolicyRepository(),
 			employeeProvider,
 			leaveProvider,
-			tzProvider, // ── NEW
+			tzProvider,
 			f.logger,
 		)
 
-		// Student resolver (built internally)
 		studentResolver := resolver.NewStudentResolver(
 			f.StudentDataProvider(),
 			f.EnrollmentDataProvider(),
 			f.TimetableDataProvider(),
 			f.SessionDataProvider(),
 			f.WorkCenterRepository(),
-			tzProvider, // ── NEW
+			tzProvider,
 			f.logger,
 		)
 
@@ -527,21 +537,20 @@ func (f *AttendanceFactory) SubjectResolver() resolver.SubjectResolver {
 			f.logger.Info("Using externally provided student resolver")
 		}
 
-		// Customer resolver
 		if f.customerRepo != nil && f.subscriptionRepo != nil && f.trialRepo != nil {
 			customerResolver := resolver.NewCustomerResolverWithSubscription(
 				f.postgresClient.DB,
 				f.customerRepo,
 				f.subscriptionRepo,
 				f.trialRepo,
-				tzProvider, // ── NEW
+				tzProvider,
 				f.logger,
 			)
 			resolvers["customer"] = customerResolver
 			f.logger.Info("Customer resolver with subscription checks enabled")
 		} else {
 			customerResolver := resolver.NewCustomerResolver(
-				tzProvider, // ── NEW
+				tzProvider,
 				f.logger,
 			)
 			resolvers["customer"] = customerResolver
@@ -554,9 +563,20 @@ func (f *AttendanceFactory) SubjectResolver() resolver.SubjectResolver {
 }
 
 // scheduleSubjectResolverAdapter adapts SubjectResolver to ScheduleSubjectResolver.
+//
+// It also serves as the bridge to the leave repository for the two "fan-out"
+// queries the resolver interface exposes:
+//
+//	GetActiveSubjectsByCompany → ListActiveEmployeeUserIDs
+//	GetUsersByPosition         → ListActiveEmployeeUserIDsByPosition
+//
+// Those two methods used to be stubs returning empty slices. They now
+// delegate to the leave repository, which owns the correct SQL for "active
+// employee" and already handles the company scoping.
 type scheduleSubjectResolverAdapter struct {
 	subjectResolver resolver.SubjectResolver
-	tzProvider      resolver.TimezoneProvider // ── NEW: fallback for CompanyTimezone
+	tzProvider      resolver.TimezoneProvider
+	leaveRepo       leaverepo.LeaveRepository
 	logger          *zap.Logger
 }
 
@@ -566,12 +586,9 @@ func (a *scheduleSubjectResolverAdapter) ResolveSubject(ctx context.Context, com
 		return nil, err
 	}
 	if resolved == nil {
-		return nil, fmt.Errorf("resolve returned nil")
+		return nil, err
 	}
 
-	// ── Resolve company default tz as a hint. If this fails, leave it
-	//    empty — the caller's ScheduleSubjectInfo.CompanyTimezone being
-	//    empty signals "go ask TimezoneProvider yourself".
 	companyTz := ""
 	if a.tzProvider != nil {
 		if tz, err := a.tzProvider.ResolveTimezone(ctx, companyID, nil, nil, nil); err == nil {
@@ -591,14 +608,9 @@ func (a *scheduleSubjectResolverAdapter) ResolveSubject(ctx context.Context, com
 		DepartmentID:       resolved.DepartmentID,
 		WorkCenterCode:     resolved.WorkCenterCode,
 		WorkCenterName:     "",
-		// ── CHANGED: WorkCenterTimezone gets the resolved tz from the
-		//    subject resolver (which already walked the chain). This is
-		//    what scheduling uses to compute shift windows.
 		WorkCenterTimezone: resolved.Timezone,
-		// ── NEW: CompanyTimezone is the ultimate fallback. Populated so
-		//    callers can fall back if WorkCenterTimezone is empty.
-		CompanyTimezone: companyTz,
-		CompanyID:       companyID,
+		CompanyTimezone:    companyTz,
+		CompanyID:          companyID,
 	}
 	return info, nil
 }
@@ -625,12 +637,30 @@ func (a *scheduleSubjectResolverAdapter) ResolveOverride(ctx context.Context, co
 	}, nil
 }
 
-func (a *scheduleSubjectResolverAdapter) GetUsersByPosition(ctx context.Context, positionID uuid.UUID) ([]uuid.UUID, error) {
-	return []uuid.UUID{}, nil
+// GetUsersByPosition — delegates to the leave repo, which owns the SQL for
+// "active employees currently in a position". Company-scoped because
+// position IDs are only unique per tenant.
+func (a *scheduleSubjectResolverAdapter) GetUsersByPosition(
+	ctx context.Context,
+	companyID, positionID uuid.UUID,
+) ([]uuid.UUID, error) {
+	if a.leaveRepo == nil {
+		return nil, errScheduleAdapterNoLeaveRepo
+	}
+	return a.leaveRepo.ListActiveEmployeeUserIDsByPosition(ctx, companyID, positionID)
 }
 
-func (a *scheduleSubjectResolverAdapter) GetActiveSubjectsByCompany(ctx context.Context, companyID uuid.UUID, filters map[string]interface{}) ([]uuid.UUID, error) {
-	return []uuid.UUID{}, nil
+// GetActiveSubjectsByCompany — delegates to the leave repo's
+// ListActiveEmployeeUserIDs.
+func (a *scheduleSubjectResolverAdapter) GetActiveSubjectsByCompany(
+	ctx context.Context,
+	companyID uuid.UUID,
+	filters map[string]interface{},
+) ([]uuid.UUID, error) {
+	if a.leaveRepo == nil {
+		return nil, errScheduleAdapterNoLeaveRepo
+	}
+	return a.leaveRepo.ListActiveEmployeeUserIDs(ctx, companyID)
 }
 
 func (f *AttendanceFactory) ScheduleSubjectResolver() resolver.ScheduleSubjectResolver {
@@ -638,7 +668,8 @@ func (f *AttendanceFactory) ScheduleSubjectResolver() resolver.ScheduleSubjectRe
 		subjectResolver := f.SubjectResolver()
 		f.scheduleSubjectResolver = &scheduleSubjectResolverAdapter{
 			subjectResolver: subjectResolver,
-			tzProvider:      f.TimezoneProvider(), // ── NEW
+			tzProvider:      f.TimezoneProvider(),
+			leaveRepo:       leaverepo.NewLeaveRepository(f.postgresClient),
 			logger:          f.logger,
 		}
 	}
@@ -659,9 +690,6 @@ func (f *AttendanceFactory) OMService() ingest.OMService {
 	}
 	return f.omService
 }
-
-// IngestService — includes the subject location resolver so events are
-// stamped with the subject's location and out-of-scope writes are rejected.
 
 func (f *AttendanceFactory) AdminService() admin.AdminService {
 	if f.adminService == nil {
@@ -694,9 +722,6 @@ func (f *AttendanceFactory) QueryService() query.QueryService {
 	return f.queryService
 }
 
-// ResolutionService — includes the subject location resolver so daily
-// summaries are stamped with the subject's location.
-// ── IngestService
 func (f *AttendanceFactory) IngestService() ingest.IngestService {
 	if f.ingestService == nil {
 		f.ingestService = ingest.NewIngestService(
@@ -712,13 +737,12 @@ func (f *AttendanceFactory) IngestService() ingest.IngestService {
 			f.SessionSummaryRepository(),
 			f.usageIntegrationService,
 			f.LocationResolver(),
-			f.TimezoneProvider(), // ── NEW
+			f.TimezoneProvider(),
 		)
 	}
 	return f.ingestService
 }
 
-// ── CorrectionService
 func (f *AttendanceFactory) CorrectionService() admin.CorrectionService {
 	if f.correctionService == nil {
 		f.correctionService = admin.NewCorrectionService(
@@ -730,13 +754,12 @@ func (f *AttendanceFactory) CorrectionService() admin.CorrectionService {
 			f.ResolutionService(),
 			f.logger,
 			f.auditService,
-			f.TimezoneProvider(), // ── NEW
+			f.TimezoneProvider(),
 		)
 	}
 	return f.correctionService
 }
 
-// ── ResolutionService
 func (f *AttendanceFactory) ResolutionService() resolution.ResolutionService {
 	if f.resolutionService == nil {
 		f.resolutionService = resolution.NewResolutionService(
@@ -750,14 +773,11 @@ func (f *AttendanceFactory) ResolutionService() resolution.ResolutionService {
 			f.ExemptionRepository(),
 			f.logger,
 			f.auditService,
-			f.TimezoneProvider(), // ── NEW
+			f.TimezoneProvider(),
 		)
 	}
 	return f.resolutionService
 }
-
-// CorrectionService — includes the subject location resolver so corrections
-// are stamped and out-of-scope corrections are rejected.
 
 func (f *AttendanceFactory) EnrollmentService() enrollment.EnrollmentService {
 	if f.enrollmentService == nil {
@@ -853,6 +873,7 @@ func (f *AttendanceFactory) SourceResolver() source.SourceResolver {
 	return f.sourceResolver
 }
 
+// SchedulingService — no job repo, no generation. Reads + overrides only.
 func (f *AttendanceFactory) SchedulingService() scheduling.SchedulingService {
 	if f.schedulingService == nil {
 		f.schedulingService = scheduling.NewSchedulingService(
@@ -865,11 +886,15 @@ func (f *AttendanceFactory) SchedulingService() scheduling.SchedulingService {
 	return f.schedulingService
 }
 
+// SchedulingQueryService — the query side now takes the scheduling service
+// so PreviewSchedule can reuse ResolveUserDay (single derivation path).
 func (f *AttendanceFactory) SchedulingQueryService() scheduling.SchedulingQueryService {
 	if f.schedulingQueryService == nil {
 		f.schedulingQueryService = scheduling.NewSchedulingQueryService(
 			f.ScheduleRepository(),
 			f.ScheduleSubjectResolver(),
+			f.TimezoneProvider(),
+			f.SchedulingService(),
 			f.logger,
 		)
 	}
@@ -930,7 +955,6 @@ func (f *AttendanceFactory) BiometricSyncService() biometricSvc.BiometricSyncSer
 	return f.biometricSyncSvc
 }
 
-// ExemptionService builds the exemption service.
 func (f *AttendanceFactory) ExemptionService() exemption.ExemptionService {
 	if f.exemptionService == nil {
 		f.exemptionService = exemption.NewExemptionService(
@@ -1094,6 +1118,7 @@ func (f *AttendanceFactory) WorkCenterHandler() *handler.WorkCenterHandler {
 	return f.workCenterHandler
 }
 
+// SchedulingHandler — no longer takes the generation job repository.
 func (f *AttendanceFactory) SchedulingHandler() *handler.SchedulingHandler {
 	if f.schedulingHandler == nil {
 		f.schedulingHandler = handler.NewSchedulingHandler(
@@ -1158,24 +1183,32 @@ func (f *AttendanceFactory) DeviceAuthMiddleware() *middleware.DeviceAuthMiddlew
 }
 
 // ---------- Lifecycle ----------
+
+// StartBackgroundServices brings up the attendance background consumers.
+//
+// The schedule-generation worker pool that used to start here has been
+// removed. Schedules are derived on read, so there is nothing to generate
+// in the background. The remaining consumer is the attendance-resolution
+// consumer, which is Kafka-gated.
 func (f *AttendanceFactory) StartBackgroundServices(ctx context.Context) {
 	if f.kafkaProducer != nil {
 		if consumer := f.ResolutionConsumer(); consumer != nil {
-			ctx, cancel := context.WithCancel(ctx)
+			consumerCtx, cancel := context.WithCancel(ctx)
 			f.resolutionCancel = cancel
 			go func() {
-				if err := consumer.Start(ctx); err != nil && err != context.Canceled {
+				if err := consumer.Start(consumerCtx); err != nil && err != context.Canceled {
 					f.logger.Error("Attendance resolution consumer stopped with error", zap.Error(err))
 				}
 			}()
 			f.logger.Info("Attendance resolution consumer started")
 		}
 	} else {
-		f.logger.Warn("Kafka producer not available; background services disabled")
+		f.logger.Warn("Kafka producer not available; Kafka-backed background services disabled")
 	}
 }
 
-// StopBackgroundServices cancels all background goroutines.
+// StopBackgroundServices cancels the resolution consumer. There is no
+// schedule-generation worker to stop anymore.
 func (f *AttendanceFactory) StopBackgroundServices() {
 	if f.resolutionCancel != nil {
 		f.resolutionCancel()

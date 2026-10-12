@@ -15,6 +15,14 @@ type CompanyEmployee struct {
 	IsActive   bool       `json:"is_active"`
 	ReportsTo  *uuid.UUID `json:"reports_to,omitempty"`
 	PositionID *uuid.UUID `json:"position_id,omitempty"`
-	CreatedAt  time.Time  `json:"created_at"`
-	UpdatedAt  time.Time  `json:"updated_at"`
+
+	// PrimaryLocationID is the employee's HR-assigned home location
+	// (company_employees.primary_location_id). Used by the calendar
+	// resolution chain as the second step when no work center is set.
+	//
+	// Nil when the employee has no primary location assigned.
+	PrimaryLocationID *uuid.UUID `json:"primary_location_id,omitempty"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }

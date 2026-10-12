@@ -35,7 +35,6 @@ func RegisterAttendanceRoutes(
 	bitmaskPermissionMiddleware func(permission string) func(http.Handler) http.Handler,
 	deviceAuthMiddleware func(http.Handler) http.Handler,
 	companyAccessMiddleware func(http.Handler) http.Handler,
-	// 🆕 new — mirrors the protected group's middleware chain
 	subscriptionEnforcementMiddleware func(http.Handler) http.Handler,
 	locationValidationMiddleware func(http.Handler) http.Handler,
 	idempotencyMiddleware func(http.Handler) http.Handler,
@@ -48,9 +47,9 @@ func RegisterAttendanceRoutes(
 	r.Route("/companies/{companyID}/attendance", func(r chi.Router) {
 		r.Use(jwtAuthMiddleware)
 		r.Use(sessionValidationMiddleware)
-		r.Use(subscriptionEnforcementMiddleware) // 🆕
-		r.Use(locationValidationMiddleware)      // 🆕
-		r.Use(idempotencyMiddleware)             // 🆕
+		r.Use(subscriptionEnforcementMiddleware)
+		r.Use(locationValidationMiddleware)
+		r.Use(idempotencyMiddleware)
 
 		// ----- Self punches -----
 		r.With(
@@ -141,39 +140,17 @@ func RegisterAttendanceRoutes(
 			r.Post("/sources", sourceAdminHandler.CreateSource)
 			r.Put("/sources/{sourceType}", sourceAdminHandler.UpdateSourceStatus)
 
-			// ============================================================
-			// 🆕 BIOMETRIC ADMIN
-			//
-			// These are the SAME handlers used by devices under
-			// /attendance-device/biometric/*. They only reject
-			// non-trusted DEVICE sessions:
-			//
-			//     if getSessionTypeFromContext(ctx) == "device" &&
-			//        !isTrustedDevice(ctx) {
-			//         return 403 "device not trusted"
-			//     }
-			//
-			// For an admin session that branch is skipped, and both
-			// getCompanyIDFromContext and getUserIDFromContext work
-			// off the admin JWT. RotateEmbeddingModel additionally
-			// hard-rejects device sessions — it's admin-only by design.
-			// ============================================================
-
-			// ---- Writes ----
+			// ---- Biometric admin ----
 			r.Post("/biometric/enroll", biometricEnrollmentHandler.EnrollFace)
 			r.Post("/biometric/re-enroll", biometricEnrollmentHandler.ReEnrollFace)
 			r.Post("/biometric/deactivate", biometricEnrollmentHandler.DeactivateFace)
 			r.Post("/biometric/activate", biometricEnrollmentHandler.ActivateFace)
 			r.Post("/biometric/rotate", biometricEnrollmentHandler.RotateEmbeddingModel)
-
-			// ---- Reads ----
 			r.Get("/biometric/embeddings", biometricEnrollmentHandler.ListActiveFaceEmbeddings)
 			r.Get(
 				"/biometric/embedding/{subjectType}/{subjectID}",
 				biometricEnrollmentHandler.GetFaceEmbedding,
 			)
-
-			// ---- Force device resync ----
 			r.Post(
 				"/biometric/force-resync/{deviceID}",
 				biometricSyncHandler.ForceDeviceResync,
@@ -234,74 +211,93 @@ func RegisterAttendanceRoutes(
 			})
 		})
 
-		// ----- Scheduling -----
+		// ============================================================
+		// SCHEDULING
+		//
+		// Schedules are derived on read from the rule chain:
+		//   user WC (date-scoped) → WC shift mapping → template rules
+		//     → location calendar → per-day override
+		//
+		// There is no materialization, no schedule_instances table, and
+		// no generation endpoint. The only per-day write is /overrides.
+		//
+		//   Reads  → hr.attendance.view       (any HR user)
+		//   Writes → attendance.configure     (HR-admin)
+		//
+		// Mounted with r.Route (not r.Group) so the /scheduling prefix
+		// is part of the path.
+		// ============================================================
 		r.Route("/scheduling", func(r chi.Router) {
-			r.Use(bitmaskPermissionMiddleware("operations.shift.view"))
 			r.Use(companyAccessMiddleware)
 
-			r.Get("/health", schedulingHandler.HealthCheck)
+			// ---------- READ: hr.attendance.view ----------
+			r.With(bitmaskPermissionMiddleware("hr.attendance.view")).Group(func(r chi.Router) {
+				r.Get("/health", schedulingHandler.HealthCheck)
 
-			r.Get("/calendars", schedulingHandler.ListWorkCalendars)
-			r.Post("/calendars", schedulingHandler.CreateWorkCalendar)
-			r.Get("/calendars/{calendarID}", schedulingHandler.GetWorkCalendar)
-			r.Put("/calendars/{calendarID}", schedulingHandler.UpdateWorkCalendar)
-			r.Delete("/calendars/{calendarID}", schedulingHandler.DeleteWorkCalendar)
-			r.Get("/calendars/{calendarID}/availability", schedulingHandler.GetCalendarAvailability)
+				// Work calendars
+				r.Get("/calendars", schedulingHandler.ListWorkCalendars)
+				r.Get("/calendars/{calendarID}", schedulingHandler.GetWorkCalendar)
+				r.Get("/calendars/{calendarID}/availability", schedulingHandler.GetCalendarAvailability)
 
-			r.Post("/holidays", schedulingHandler.AddHolidayToCalendar)
-			r.Post("/holidays/process", schedulingHandler.ProcessHolidayForDate)
+				// Shift templates
+				r.Get("/templates", schedulingHandler.ListScheduleTemplates)
+				r.Get("/templates/{templateID}", schedulingHandler.GetScheduleTemplate)
 
-			r.Get("/templates", schedulingHandler.ListScheduleTemplates)
-			r.Post("/templates", schedulingHandler.CreateScheduleTemplate)
-			r.Get("/templates/{templateID}", schedulingHandler.GetScheduleTemplate)
-			r.Put("/templates/{templateID}", schedulingHandler.UpdateScheduleTemplate)
-			r.Delete("/templates/{templateID}", schedulingHandler.DeleteScheduleTemplate)
+				// Position-based lookups
+				r.Get("/position-based/users/{userID}/position", schedulingHandler.GetUserScheduledPosition)
+				r.Get("/position-based/users/{userID}/current", schedulingHandler.GetUserCurrentAssignment)
+				r.Get("/query/user/{userID}/assignment", schedulingHandler.GetUserCurrentAssignment)
 
-			r.Get("/instances", schedulingHandler.ListScheduleInstances)
-			r.Post("/instances", schedulingHandler.CreateScheduleInstance)
-			r.Get("/instances/{instanceID}", schedulingHandler.GetScheduleInstance)
-			r.Put("/instances/{instanceID}", schedulingHandler.UpdateScheduleInstance)
-			r.Delete("/instances/{instanceID}", schedulingHandler.DeleteScheduleInstance)
+				// Overrides (read)
+				r.Get("/overrides", schedulingHandler.GetScheduleOverrides)
+				r.Get("/overrides/{overrideID}", schedulingHandler.GetScheduleOverrideByID)
 
-			r.Get("/position-based/users/{userID}/position", schedulingHandler.GetUserScheduledPosition)
-			r.Get("/position-based/users/{userID}/current", schedulingHandler.GetUserCurrentAssignment)
-			r.Post("/position-based/instances", schedulingHandler.CreateScheduleInstanceFromPosition)
+				// Work center shifts (read)
+				r.Get("/work-centers/{workCenterCode}/shifts", schedulingHandler.GetWorkCenterShifts)
 
-			r.Post("/generate/user/{userID}", schedulingHandler.GenerateScheduleForUser)
-			r.Post("/generate/company", schedulingHandler.GenerateScheduleForCompany)
+				// Availability
+				r.Get("/availability/check", schedulingHandler.CheckScheduleAvailability)
 
-			r.Post("/overrides", schedulingHandler.CreateScheduleOverride)
-			r.Get("/overrides", schedulingHandler.GetScheduleOverrides)
-			r.Get("/overrides/{overrideID}", schedulingHandler.GetScheduleOverrideByID)
-			r.Put("/overrides/{overrideID}", schedulingHandler.UpdateScheduleOverride)
-			r.Delete("/overrides/{overrideID}", schedulingHandler.DeleteScheduleOverride)
+				// NEW: derived schedule preview. Replaces the old
+				// /instances family. Writes nothing.
+				r.Get("/schedule/{userID}", schedulingHandler.PreviewUserSchedule)
+			})
 
-			r.Get("/work-centers/{workCenterCode}/shifts", schedulingHandler.GetWorkCenterShifts)
-			r.Post("/work-center-shifts", schedulingHandler.CreateWorkCenterShiftMapping)
-			r.Put("/work-center-shifts", schedulingHandler.UpdateWorkCenterShiftMapping)
+			// ---------- WRITE: attendance.configure ----------
+			r.With(bitmaskPermissionMiddleware("attendance.configure")).Group(func(r chi.Router) {
+				// Work calendars
+				r.Post("/calendars", schedulingHandler.CreateWorkCalendar)
+				r.Put("/calendars/{calendarID}", schedulingHandler.UpdateWorkCalendar)
+				r.Delete("/calendars/{calendarID}", schedulingHandler.DeleteWorkCalendar)
 
-			r.Get("/availability/check", schedulingHandler.CheckScheduleAvailability)
-			r.Get("/availability/conflict-check", schedulingHandler.ValidateScheduleConflict)
+				// Holidays
+				r.Post("/holidays", schedulingHandler.AddHolidayToCalendar)
 
-			r.Get("/reports/stats", schedulingHandler.GetScheduleStats)
+				// Shift templates
+				r.Post("/templates", schedulingHandler.CreateScheduleTemplate)
+				r.Put("/templates/{templateID}", schedulingHandler.UpdateScheduleTemplate)
+				r.Delete("/templates/{templateID}", schedulingHandler.DeleteScheduleTemplate)
 
-			r.Get("/query/instances", schedulingHandler.ListScheduleInstances)
-			r.Get("/query/user/{userID}/assignment", schedulingHandler.GetUserCurrentAssignment)
+				// Overrides (write)
+				r.Post("/overrides", schedulingHandler.CreateScheduleOverride)
+				r.Put("/overrides/{overrideID}", schedulingHandler.UpdateScheduleOverride)
+				r.Delete("/overrides/{overrideID}", schedulingHandler.DeleteScheduleOverride)
+
+				// Work center shift mapping (write)
+				r.Post("/work-center-shifts", schedulingHandler.CreateWorkCenterShiftMapping)
+				r.Put("/work-center-shifts", schedulingHandler.UpdateWorkCenterShiftMapping)
+			})
 		})
 	})
 
 	// ============================================================
 	// 2. DEVICE‑AUTHENTICATED ROUTES
-	//    Device routes authenticate via device token; the device is
-	//    already bound to a location, so we intentionally skip the
-	//    LocationValidationMiddleware here (no X-Location-ID header
-	//    is sent by IoT devices). Subscription + idempotency are safe.
 	// ============================================================
 	r.Route("/companies/{companyID}/attendance-device", func(r chi.Router) {
 		r.Use(deviceAuthMiddleware)
-		r.Use(subscriptionEnforcementMiddleware) // 🆕
+		r.Use(subscriptionEnforcementMiddleware)
 		r.Use(companyAccessMiddleware)
-		r.Use(idempotencyMiddleware) // 🆕
+		r.Use(idempotencyMiddleware)
 
 		r.Post("/events/punch", ingestHandler.DevicePunchAttendance)
 
@@ -330,9 +326,9 @@ func RegisterAttendanceRoutes(
 	// ============================================================
 	r.Route("/companies/{companyID}/academics/biometric-device", func(r chi.Router) {
 		r.Use(deviceAuthMiddleware)
-		r.Use(subscriptionEnforcementMiddleware) // 🆕
+		r.Use(subscriptionEnforcementMiddleware)
 		r.Use(companyAccessMiddleware)
-		r.Use(idempotencyMiddleware) // 🆕
+		r.Use(idempotencyMiddleware)
 
 		r.Post("/sync", biometricSyncHandler.SyncEmbeddings)
 		r.Post("/full/{deviceID}", biometricSyncHandler.FullSync)

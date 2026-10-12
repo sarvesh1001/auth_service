@@ -152,15 +152,11 @@ func (s *leaveBalanceService) GetBalanceAsOf(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) (*models.LeaveBalance, error) {
-	positionID, _, err := s.repo.GetUserPositionContext(ctx, companyID, userID)
+	positionID, _, err := s.repo.GetUserPositionContextOnDate(ctx, companyID, userID, asOfDate)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve user position: %w", err)
 	}
 	balance, err := s.repo.CalculateLeaveBalance(ctx, userID, leaveTypeID, asOfDate, positionID)
-	if err != nil {
-		return nil, err
-	}
-
 	// Audit read
 	ip, _ := ctx.Value("ip_address").(string)
 	auditMeta := mergeMeta(metadata, map[string]interface{}{

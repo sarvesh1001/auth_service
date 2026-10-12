@@ -1,0 +1,219 @@
+groups:
+  # ==========================================================================
+  # Schedule generation
+  # ==========================================================================
+  # Emitted by the worker at internal/attendance/service/scheduling.
+  # Job table: attendance.schedule_generation_job
+  # Alerting on: failures, queue depth, stuck jobs, latency.
+  - name: schedule_generation
+    rules:
+      - alert: ScheduleGenFailures
+        expr: increase(schedule_gen_jobs_failed_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Schedule generation jobs are failing"
+          description: >-
+            {{ $value }} schedule generation jobs failed in the last 15 minutes.
+            Check /admin/schedule-generation/jobs/failed/count and the admin
+            detail endpoint for the underlying error.
+
+      - alert: ScheduleGenQueueDepthHigh
+        expr: schedule_gen_queue_depth{status="queued"} > 500
+        for: 15m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Schedule generation queue is growing"
+          description: >-
+            {{ $value }} jobs are queued and haven't drained in 15 minutes.
+            Either a burst of new requests or the worker pool is stuck.
+            Check schedule_gen_queue_depth{status="in_flight"} — if it's 0
+            while queued is high, the worker pool isn't claiming jobs.
+
+      - alert: ScheduleGenStuckJobs
+        expr: schedule_gen_queue_depth{status="processing_stuck"} > 0
+        for: 10m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Schedule generation jobs are stuck in processing"
+          description: >-
+            {{ $value }} jobs have been in 'processing' status for more than
+            30 minutes. The stale-lock sweeper should have released them;
+            check worker logs for panics or ctx cancellation.
+
+      - alert: ScheduleGenJobSlow
+        expr: >-
+          histogram_quantile(
+            0.95,
+            rate(schedule_gen_job_duration_seconds_bucket[1h])
+          ) > 300
+        for: 10m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Schedule generation p95 latency above 5 minutes"
+          description: >-
+            The 95th-percentile schedule generation job takes over 5 minutes.
+            Likely a very large company or a slow downstream query.
+
+  # ==========================================================================
+  # Leave resolver
+  # ==========================================================================
+  # Emitted by the worker at internal/hr/leave/worker.
+  # Job table: leave.resolver_job
+  - name: leave_resolver
+    rules:
+      - alert: LeaveResolverFailures
+        expr: increase(leave_resolver_jobs_failed_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Leave resolver jobs are failing"
+          description: >-
+            {{ $value }} leave resolver jobs failed in the last 15 minutes.
+            This means employee leave entitlements may be stale for the
+            affected users.
+
+      - alert: LeaveResolverQueueDepthHigh
+        expr: leave_resolver_queue_depth{status="queued"} > 1000
+        for: 15m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Leave resolver queue is growing"
+          description: >-
+            {{ $value }} jobs are queued and haven't drained in 15 minutes.
+            Usually caused by a policy change fanning out to thousands of
+            users, or a stuck worker pool.
+
+      - alert: LeaveResolverStuckJobs
+        expr: leave_resolver_queue_depth{status="processing_stuck"} > 0
+        for: 10m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Leave resolver jobs are stuck in processing"
+          description: >-
+            {{ $value }} jobs have been processing for more than 30 minutes
+            and haven't been reclaimed by the stale-lock sweeper.
+
+  # ==========================================================================
+  # HR lifecycle + monthly leave accrual
+  # ==========================================================================
+  # Emitted by the worker at internal/hr/worker.
+  # Job table: hr.scheduled_job
+  #
+  # Carries two workloads:
+  #   - Lifecycle (probation, notice, on-hold) — small, high priority
+  #   - Monthly leave accrual — heavy, low priority, once per company/month
+  #
+  # The accrual-specific alert fires critical because a missed accrual
+  # leaves employee balances wrong until someone intervenes.
+  - name: hr_lifecycle
+    rules:
+      - alert: HRLifecycleFailures
+        expr: >-
+          increase(hr_lifecycle_jobs_failed_total{
+            job_type!="leave.accrual.monthly"
+          }[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          team: hr
+        annotations:
+          summary: "HR lifecycle jobs are failing"
+          description: >-
+            {{ $value }} probation / notice / on-hold jobs failed in the
+            last 15 minutes. Employees may not be getting their lifecycle
+            reminders.
+
+      - alert: HRLifecycleQueueDepthHigh
+        expr: hr_lifecycle_queue_depth{status="queued"} > 1000
+        for: 30m
+        labels:
+          severity: warning
+          team: hr
+        annotations:
+          summary: "HR lifecycle queue is growing"
+          description: >-
+            {{ $value }} jobs are queued and haven't drained in 30 minutes.
+            Check whether the pool is saturated by a slow accrual job.
+
+      - alert: HRLifecycleStuck
+        expr: hr_lifecycle_queue_depth{status="processing_stuck"} > 0
+        for: 10m
+        labels:
+          severity: warning
+          team: hr
+        annotations:
+          summary: "HR lifecycle jobs are stuck"
+          description: >-
+            {{ $value }} jobs are stuck in processing. The stale-lock
+            sweeper should reclaim them within 5 minutes.
+
+      # -----------------------------------------------------------------
+      # Accrual-specific — CRITICAL severity.
+      #
+      # Fires the moment any monthly accrual job lands in terminal
+      # failure. `for: 0m` means one failed job pages immediately;
+      # accrual failures are rare and each one leaves balances wrong
+      # for every employee at that company.
+      #
+      # If this becomes noisy, raise the threshold or the `for` window,
+      # but do NOT remove it — the customer-visible reminder
+      # (NotifyAccrualFailure) also fires, and the two signals together
+      # are what lets ops correlate an alert with a specific company.
+      # -----------------------------------------------------------------
+      - alert: LeaveAccrualFailures
+        expr: >-
+          increase(hr_lifecycle_jobs_failed_total{
+            job_type="leave.accrual.monthly"
+          }[1h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          team: hr
+        annotations:
+          summary: "A company's monthly leave accrual failed"
+          description: >-
+            One or more monthly accrual jobs exhausted their retries in
+            the last hour. HR at the affected company has received an
+            in-app reminder (type: leave_accrual_failure). Check the
+            job detail endpoint for the underlying error, fix the root
+            cause, and re-trigger the accrual for the affected company.
+
+      # -----------------------------------------------------------------
+      # Accrual job slow — this is the leading indicator that a
+      # company-wide accrual is likely to fail on the next retry.
+      # -----------------------------------------------------------------
+      - alert: LeaveAccrualJobSlow
+        expr: >-
+          histogram_quantile(
+            0.95,
+            rate(hr_lifecycle_job_duration_seconds_bucket{
+              job_type="leave.accrual.monthly"
+            }[1h])
+          ) > 600
+        for: 15m
+        labels:
+          severity: warning
+          team: hr
+        annotations:
+          summary: "Monthly leave accrual is slow (p95 > 10 min)"
+          description: >-
+            The 95th-percentile accrual job takes over 10 minutes. Large
+            companies with tens of thousands of entitlements will hit
+            this. The pool's stale threshold (30 min) is the danger zone;
+            if this alert fires you'll want to raise the stale threshold
+            before long-running jobs start getting reclaimed mid-flight.

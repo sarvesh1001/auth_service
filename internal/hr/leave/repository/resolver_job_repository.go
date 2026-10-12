@@ -21,11 +21,13 @@ type ResolverJobRepository interface {
 	// Enqueue* accept a *sql.Tx so the job is committed atomically with the
 	// business change. Pass the caller's tx; do NOT pass nil.
 	EnqueueUserResolution(ctx context.Context, tx *sql.Tx, companyID, userID uuid.UUID, reason string) error
-	EnqueueUserResolutions(ctx context.Context, tx *sql.Tx, companyID uuid.UUID, userIDs []uuid.UUID, reason string) error   // ← NEW
+	EnqueueUserResolutions(ctx context.Context, tx *sql.Tx, companyID uuid.UUID, userIDs []uuid.UUID, reason string) error // ← NEW
 	EnqueueCompanyResolution(ctx context.Context, tx *sql.Tx, companyID uuid.UUID, reason string) error
 	EnqueuePositionResolution(ctx context.Context, tx *sql.Tx, companyID, positionID uuid.UUID, reason string) error
 	EnqueueEndEntitlements(ctx context.Context, tx *sql.Tx, companyID, userID uuid.UUID, reason string) error
-
+	CountQueued(ctx context.Context) (int64, error)
+	CountFailed(ctx context.Context, since *time.Time) (int64, error)
+	CountStuck(ctx context.Context, threshold time.Duration) (int64, error)
 	FetchNextRunnableJob(ctx context.Context, workerID string) (*models.ResolverJob, error)
 	MarkCompleted(ctx context.Context, jobID uuid.UUID) error
 	MarkFailed(ctx context.Context, jobID uuid.UUID, errMsg string) error
@@ -77,8 +79,6 @@ func (r *resolverJobRepository) EnqueueUserResolution(
 // inference clause to name a non-partial unique constraint, and matching a
 // partial index in a bulk INSERT...SELECT needs the exact predicate
 // repeated — easier and more portable to express intent with NOT EXISTS.
-
-
 
 // EnqueueUserResolutions inserts one resolve_user job per user, inside the
 // caller's transaction. Duplicates (a user already having a pending or
@@ -326,4 +326,41 @@ func (r *resolverJobRepository) ReleaseStaleLocks(
 		return 0, fmt.Errorf("release stale resolver locks: %w", err)
 	}
 	return res.RowsAffected()
+}
+func (r *resolverJobRepository) CountQueued(ctx context.Context) (int64, error) {
+	var n int64
+	err := r.client.QueryRow(ctx, `
+        SELECT count(*) FROM leave.resolver_job WHERE status = 'queued'
+    `).Scan(&n)
+	return n, err
+}
+
+func (r *resolverJobRepository) CountFailed(
+	ctx context.Context, since *time.Time,
+) (int64, error) {
+	var n int64
+	var err error
+	if since != nil {
+		err = r.client.QueryRow(ctx, `
+            SELECT count(*) FROM leave.resolver_job
+            WHERE status = 'failed' AND created_at >= $1
+        `, *since).Scan(&n)
+	} else {
+		err = r.client.QueryRow(ctx, `
+            SELECT count(*) FROM leave.resolver_job WHERE status = 'failed'
+        `).Scan(&n)
+	}
+	return n, err
+}
+
+func (r *resolverJobRepository) CountStuck(
+	ctx context.Context, threshold time.Duration,
+) (int64, error) {
+	var n int64
+	err := r.client.QueryRow(ctx, `
+        SELECT count(*) FROM leave.resolver_job
+        WHERE status = 'processing'
+          AND locked_at < now() - ($1 * interval '1 second')
+    `, int64(threshold.Seconds())).Scan(&n)
+	return n, err
 }

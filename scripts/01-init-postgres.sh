@@ -2376,7 +2376,55 @@ CREATE INDEX IF NOT EXISTS idx_positions_location     ON positions (company_id, 
 CREATE INDEX IF NOT EXISTS idx_positions_open         ON positions (is_open) WHERE is_open = true;
 CREATE INDEX IF NOT EXISTS idx_positions_work_center  ON positions (company_id, work_center_code)
     WHERE work_center_code IS NOT NULL;
+-- ============================================================================
+-- SAP-style effective dating — history tables for the attendance resolver
+-- ============================================================================
 
+CREATE TABLE IF NOT EXISTS hr.employee_assignment_history (
+    history_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id          UUID NOT NULL,
+    user_id             UUID NOT NULL,
+    position_id         UUID,
+    primary_location_id UUID,
+    effective_from      DATE NOT NULL,
+    effective_to        DATE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_eah_company
+        FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
+    CONSTRAINT fk_eah_user
+        FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+    CONSTRAINT no_overlap_employee_assignment EXCLUDE USING gist (
+        company_id WITH =,
+        user_id WITH =,
+        daterange(effective_from, COALESCE(effective_to, 'infinity'), '[)') WITH &&
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_eah_lookup
+    ON hr.employee_assignment_history (company_id, user_id, effective_from DESC);
+CREATE INDEX IF NOT EXISTS idx_eah_open
+    ON hr.employee_assignment_history (company_id, user_id)
+    WHERE effective_to IS NULL;
+
+CREATE TABLE IF NOT EXISTS hr.position_history (
+    history_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    position_id      UUID NOT NULL,
+    work_center_code VARCHAR(100),
+    location_id      UUID,
+    effective_from   DATE NOT NULL,
+    effective_to     DATE,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT no_overlap_position_history EXCLUDE USING gist (
+        position_id WITH =,
+        daterange(effective_from, COALESCE(effective_to, 'infinity'), '[)') WITH &&
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_ph_lookup
+    ON hr.position_history (position_id, effective_from DESC);
+CREATE INDEX IF NOT EXISTS idx_ph_open
+    ON hr.position_history (position_id)
+    WHERE effective_to IS NULL;
 -- ============================================================
 -- EMPLOYEE ROLE HISTORY
 -- ============================================================
@@ -3618,7 +3666,61 @@ CREATE TRIGGER trg_sync_department_on_position
 CREATE TRIGGER trg_sync_role_history
     AFTER INSERT OR UPDATE OF role_id ON company_employees FOR EACH ROW
     EXECUTE FUNCTION sync_employee_role_history();
+CREATE OR REPLACE FUNCTION sync_employee_assignment_history()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'UPDATE'
+       AND OLD.position_id         IS NOT DISTINCT FROM NEW.position_id
+       AND OLD.primary_location_id IS NOT DISTINCT FROM NEW.primary_location_id THEN
+        RETURN NEW;
+    END IF;
 
+    UPDATE hr.employee_assignment_history
+       SET effective_to = CURRENT_DATE - 1,
+           updated_at   = NOW()
+     WHERE company_id = NEW.company_id
+       AND user_id    = NEW.user_id
+       AND effective_to IS NULL;
+
+    INSERT INTO hr.employee_assignment_history
+        (company_id, user_id, position_id, primary_location_id, effective_from)
+    VALUES
+        (NEW.company_id, NEW.user_id, NEW.position_id, NEW.primary_location_id, CURRENT_DATE);
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION sync_position_history()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'UPDATE'
+       AND OLD.work_center_code IS NOT DISTINCT FROM NEW.work_center_code
+       AND OLD.location_id      IS NOT DISTINCT FROM NEW.location_id THEN
+        RETURN NEW;
+    END IF;
+
+    UPDATE hr.position_history
+       SET effective_to = CURRENT_DATE - 1,
+           updated_at   = NOW()
+     WHERE position_id = NEW.position_id
+       AND effective_to IS NULL;
+
+    INSERT INTO hr.position_history
+        (position_id, work_center_code, location_id, effective_from)
+    VALUES
+        (NEW.position_id, NEW.work_center_code, NEW.location_id, CURRENT_DATE);
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER trg_sync_employee_assignment_history
+    AFTER INSERT OR UPDATE OF position_id, primary_location_id ON company_employees
+    FOR EACH ROW EXECUTE FUNCTION sync_employee_assignment_history();
+
+CREATE TRIGGER trg_sync_position_history
+    AFTER INSERT OR UPDATE OF work_center_code, location_id ON positions
+    FOR EACH ROW EXECUTE FUNCTION sync_position_history();
 CREATE TRIGGER trg_prevent_exit_for_inactive_employee
     BEFORE INSERT ON employee_exit FOR EACH ROW
     EXECUTE FUNCTION prevent_exit_for_inactive_employee();
@@ -4592,13 +4694,10 @@ CREATE TABLE IF NOT EXISTS leave.resolver_job (
     position_id    UUID,
     job_type       VARCHAR(40) NOT NULL
         CHECK (job_type IN (
-            'probation_reminder',
-            'probation_end_reached',
-            'notice_reminder',
-            'notice_expiry',
-            'on_hold_reminder',
-            'on_hold_expiry',
-            'leave.accrual.monthly'
+            'resolve_user',
+            'resolve_company',
+            'resolve_position',
+            'end_entitlements'
         )),
     status         VARCHAR(20) NOT NULL DEFAULT 'queued'
         CHECK (status IN ('queued','processing','completed','failed','cancelled')),
@@ -4758,7 +4857,9 @@ CREATE TABLE hr.scheduled_job (
             'notice_reminder',
             'notice_expiry',
             'on_hold_reminder',
-            'on_hold_expiry'
+            'on_hold_expiry',
+            'leave.accrual.monthly'      -- 👈 ADD
+
         )),
     status         VARCHAR(20) NOT NULL DEFAULT 'queued'
         CHECK (status IN ('queued','processing','completed','failed','cancelled')),
@@ -5017,5 +5118,42 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_scheduled_job_monthly_accrual
     WHERE user_id IS NULL
       AND job_type = 'leave.accrual.monthly'
       AND status IN ('queued', 'processing');
+ -- Snapshot-loop indexes (worker pool)
+CREATE INDEX IF NOT EXISTS idx_hr_scheduled_job_failed
+    ON hr.scheduled_job (created_at DESC)
+    WHERE status = 'failed';
+
+CREATE INDEX IF NOT EXISTS idx_hr_scheduled_job_queued
+    ON hr.scheduled_job (created_at DESC)
+    WHERE status = 'queued';
+CREATE INDEX IF NOT EXISTS idx_leave_resolver_job_failed
+    ON leave.resolver_job (created_at DESC)
+    WHERE status = 'failed';         
+
+BEGIN;
+
+ALTER TABLE leave.leave_policy_rule
+    ADD COLUMN effective_from DATE NOT NULL DEFAULT '2000-01-01',
+    ADD COLUMN effective_to   DATE;
+
+ALTER TABLE leave.leave_policy_rule
+    DROP CONSTRAINT IF EXISTS leave_policy_rule_pkey;
+
+ALTER TABLE leave.leave_policy_rule
+    ADD PRIMARY KEY (policy_rule_id, effective_from);
+
+ALTER TABLE leave.leave_policy_rule
+    ADD CONSTRAINT no_overlap_policy_rules EXCLUDE USING gist (
+        policy_id WITH =,
+        leave_type_id WITH =,
+        daterange(effective_from, COALESCE(effective_to, 'infinity'), '[)') WITH &&
+    );
+
+-- Backfill: current rows get effective_from = created_at's date
+UPDATE leave.leave_policy_rule
+SET effective_from = COALESCE(created_at::date, DATE '2000-01-01')
+WHERE effective_from = DATE '2000-01-01';
+
+COMMIT;    
 EOSQL
 echo "✅ Main schema initialized successfully!"

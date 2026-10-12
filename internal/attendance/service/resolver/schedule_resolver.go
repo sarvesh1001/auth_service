@@ -13,6 +13,7 @@ type ScheduleSubjectInfo struct {
 	IsActive           bool
 	PositionID         *uuid.UUID
 	PositionTitle      string
+	PositionLocationID *uuid.UUID // ← NEW
 	IsSchedulable      bool
 	AttendanceRequired bool
 	OvertimeAllowed    bool
@@ -20,23 +21,11 @@ type ScheduleSubjectInfo struct {
 	DepartmentName     string
 	WorkCenterCode     *string
 	WorkCenterName     string
-
-	// ── NEW: timezone inputs for the resolution chain ──────────────────
-	//
-	// WorkCenterTimezone is the tz declared on the work center record.
-	// CompanyTimezone is the ultimate fallback.
-	//
-	// The resolver populates these so callers (scheduling, ingest) can
-	// compute the effective tz without an extra DB round-trip.
-	//
-	// If either is empty, the caller MUST still call TimezoneProvider.
-	// These are hints, not guarantees.
 	WorkCenterTimezone string
 	CompanyTimezone    string
-
-	CompanyID uuid.UUID
+	PrimaryLocationID  *uuid.UUID
+	CompanyID          uuid.UUID
 }
-
 type ScheduleOverrideInfo struct {
 	IsOverride     bool
 	OverrideType   string
@@ -50,6 +39,10 @@ type ScheduleOverrideInfo struct {
 type ScheduleSubjectResolver interface {
 	ResolveSubject(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) (*ScheduleSubjectInfo, error)
 	ResolveOverride(ctx context.Context, companyID, subjectID uuid.UUID, subjectType string, date time.Time) (*ScheduleOverrideInfo, error)
-	GetUsersByPosition(ctx context.Context, positionID uuid.UUID) ([]uuid.UUID, error)
+
+	// GetUsersByPosition — company-scoped. Position IDs are only unique
+	// within a company, so the caller must supply the tenant.
+	GetUsersByPosition(ctx context.Context, companyID, positionID uuid.UUID) ([]uuid.UUID, error)
+
 	GetActiveSubjectsByCompany(ctx context.Context, companyID uuid.UUID, filters map[string]interface{}) ([]uuid.UUID, error)
 }

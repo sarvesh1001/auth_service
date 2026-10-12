@@ -39,6 +39,8 @@ func (r *ruleRepository) GetCompanyRules(ctx context.Context, companyID uuid.UUI
 		       timezone, created_at
 		FROM attendance.company_attendance_rules
 		WHERE company_id = $1
+		ORDER BY effective_from DESC
+		LIMIT 1
 	`
 	row := r.client.QueryRow(ctx, query, companyID)
 
@@ -66,25 +68,12 @@ func (r *ruleRepository) GetCompanyRules(ctx context.Context, companyID uuid.UUI
 }
 
 func (r *ruleRepository) UpsertCompanyRules(ctx context.Context, tx *sql.Tx, rules *models.CompanyAttendanceRules) error {
-	// ── NEW: validate IANA name.
 	if err := util.ValidateTimezone(rules.Timezone); err != nil {
 		return fmt.Errorf("company rules timezone: %w", err)
 	}
-
 	if rules.CreatedAt.IsZero() {
 		rules.CreatedAt = time.Now().UTC()
 	}
-
-	query := `
-		INSERT INTO attendance.company_attendance_rules (
-			company_id, allowed_source_types, allow_multiple_checkins,
-			timezone, created_at
-		) VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (company_id) DO UPDATE SET
-			allowed_source_types = EXCLUDED.allowed_source_types,
-			allow_multiple_checkins = EXCLUDED.allow_multiple_checkins,
-			timezone = EXCLUDED.timezone
-	`
 
 	exec := func(q string, args ...interface{}) (sql.Result, error) {
 		if tx != nil {
@@ -93,19 +82,51 @@ func (r *ruleRepository) UpsertCompanyRules(ctx context.Context, tx *sql.Tx, rul
 		return r.client.Exec(ctx, q, args...)
 	}
 
-	_, err := exec(query,
+	// Case 1: current version opened today — update in place.
+	res, err := exec(`
+		UPDATE attendance.company_attendance_rules
+		SET allowed_source_types = $1,
+		    allow_multiple_checkins = $2,
+		    timezone = $3
+		WHERE company_id = $4
+		  AND effective_to IS NULL
+		  AND effective_from = CURRENT_DATE
+	`,
+		pq.Array(rules.AllowedSourceTypes),
+		rules.AllowMultipleCheckins,
+		rules.Timezone,
+		rules.CompanyID,
+	)
+	if err != nil {
+		return fmt.Errorf("update same-day company rules: %w", err)
+	}
+	affected, _ := res.RowsAffected()
+	if affected > 0 {
+		return nil
+	}
+
+	// Case 2: close current, insert new version.
+	if _, err := exec(`
+		UPDATE attendance.company_attendance_rules
+		SET effective_to = CURRENT_DATE - 1
+		WHERE company_id = $1 AND effective_to IS NULL
+	`, rules.CompanyID); err != nil {
+		return fmt.Errorf("close old company rules: %w", err)
+	}
+
+	if _, err := exec(`
+		INSERT INTO attendance.company_attendance_rules (
+			company_id, allowed_source_types, allow_multiple_checkins,
+			timezone, created_at, effective_from
+		) VALUES ($1, $2, $3, $4, $5, CURRENT_DATE)
+	`,
 		rules.CompanyID,
 		pq.Array(rules.AllowedSourceTypes),
 		rules.AllowMultipleCheckins,
 		rules.Timezone,
 		rules.CreatedAt,
-	)
-	if err != nil {
-		r.logger.Error("failed to upsert company attendance rules",
-			util.String("company_id", rules.CompanyID.String()),
-			util.String("timezone", rules.Timezone),
-			util.ErrorField(err))
-		return fmt.Errorf("upsert company rules: %w", err)
+	); err != nil {
+		return fmt.Errorf("insert new company rules version: %w", err)
 	}
 	return nil
 }
@@ -281,4 +302,39 @@ func (r *ruleRepository) HealthCheck(ctx context.Context) error {
 		return fmt.Errorf("health check: %w", err)
 	}
 	return nil
+}
+func (r *ruleRepository) GetCompanyRulesOnDate(
+	ctx context.Context,
+	companyID uuid.UUID,
+	date time.Time,
+) (*models.CompanyAttendanceRules, error) {
+	query := `
+		SELECT company_id, allowed_source_types, allow_multiple_checkins,
+		       timezone, created_at
+		FROM attendance.company_attendance_rules
+		WHERE company_id = $1
+		  AND effective_from <= $2::date
+		  AND (effective_to IS NULL OR effective_to >= $2::date)
+		ORDER BY effective_from DESC
+		LIMIT 1
+	`
+	row := r.client.QueryRow(ctx, query, companyID, date)
+
+	var rules models.CompanyAttendanceRules
+	var allowedSources []string
+	err := row.Scan(
+		&rules.CompanyID,
+		pq.Array(&allowedSources),
+		&rules.AllowMultipleCheckins,
+		&rules.Timezone,
+		&rules.CreatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get company rules on date: %w", err)
+	}
+	rules.AllowedSourceTypes = allowedSources
+	return &rules, nil
 }

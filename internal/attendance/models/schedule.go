@@ -11,13 +11,30 @@ import (
 // LocationID is an optional scope. When NULL, the template is company-wide.
 // When set, the template is specific to a location — useful when different
 // sites run different shift times.
+// ScheduleTemplate defines a reusable shift pattern.
+//
+// Scope is one of:
+//
+//	company-wide     → PositionID = nil, LocationID = nil
+//	location-scoped  → PositionID = nil, LocationID = <uuid>
+//	position-scoped  → PositionID = <uuid>, LocationID = nil
+//
+// The DB check constraint chk_template_scope enforces that at most one of
+// the two is set. Resolver precedence in ResolveUserDay:
+//
+//  1. position template
+//  2. WC → work_center_shifts → template
+//  3. position.location_id template
+//  4. primary_location_id template
+//  5. company-wide template
 type ScheduleTemplate struct {
 	ScheduleTemplateID uuid.UUID `json:"schedule_template_id" db:"schedule_template_id"`
 	CompanyID          uuid.UUID `json:"company_id" db:"company_id"`
 	CalendarID         uuid.UUID `json:"calendar_id" db:"calendar_id"`
 
-	// Optional scope. nil = company-wide template.
+	// Optional scope. At most one of LocationID / PositionID is set.
 	LocationID *uuid.UUID `json:"location_id,omitempty" db:"location_id"`
+	PositionID *uuid.UUID `json:"position_id,omitempty" db:"position_id"`
 
 	TemplateType string        `json:"template_type" db:"template_type"`
 	Name         string        `json:"name" db:"name"`
@@ -25,7 +42,6 @@ type ScheduleTemplate struct {
 	IsActive     bool          `json:"is_active" db:"is_active"`
 	CreatedAt    time.Time     `json:"created_at" db:"created_at"`
 }
-
 type TemplateRules struct {
 	StartTime    *string       `json:"start_time,omitempty"`
 	EndTime      *string       `json:"end_time,omitempty"`

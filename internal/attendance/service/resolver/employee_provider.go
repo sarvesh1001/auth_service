@@ -29,111 +29,126 @@ func NewEmployeeDataProvider(
 	}
 }
 
-func (p *employeeDataProvider) GetEmployee(ctx context.Context, companyID, userID uuid.UUID) (active bool, positionID *uuid.UUID, workCenterCode *string, err error) {
+// GetEmployee returns the employee's resolved facts for a specific date.
+//
+// The date parameter is mandatory. Every "where was this person" fact comes
+// from a date-scoped history table:
+//
+//   - hr.employee_assignment_history  → position_id, primary_location_id
+//   - hr.position_history             → work_center_code, position location
+//
+// If history has no row for the date, we fall back to the current
+// company_employees / positions row. That covers pre-migration data only;
+// after the backfill every date has a history row.
+func (p *employeeDataProvider) GetEmployee(
+	ctx context.Context,
+	companyID, userID uuid.UUID,
+	date time.Time,
+) (
+	active bool,
+	positionID *uuid.UUID,
+	workCenterCode *string,
+	positionLocationID *uuid.UUID,
+	primaryLocationID *uuid.UUID,
+	err error,
+) {
 	p.logger.Info("GetEmployee called",
 		zap.String("company_id", companyID.String()),
 		zap.String("user_id", userID.String()),
+		zap.String("date", date.Format("2006-01-02")),
 	)
 
-	// 1. Get company employee record
+	// 1. Active check — reads the current membership row. A person who has
+	//    left the company should not resolve, regardless of history.
 	ce, err := p.employeeRepo.GetCompanyEmployeeByUserID(ctx, userID)
 	if err != nil {
 		p.logger.Error("GetCompanyEmployeeByUserID failed", zap.Error(err))
-		return false, nil, nil, err
+		return false, nil, nil, nil, nil, err
 	}
-	if ce == nil {
-		p.logger.Warn("CompanyEmployee not found", zap.String("user_id", userID.String()))
-		return false, nil, nil, nil
-	}
-	if !ce.IsActive {
-		p.logger.Warn("Employee is inactive", zap.String("user_id", userID.String()))
-		return false, nil, nil, nil
+	if ce == nil || !ce.IsActive {
+		p.logger.Warn("Employee not found or inactive",
+			zap.String("user_id", userID.String()))
+		return false, nil, nil, nil, nil, nil
 	}
 	active = true
-	p.logger.Info("CompanyEmployee found",
-		zap.String("employee_id", ce.EmployeeID),
-		zap.String("position_id", func() string {
-			if ce.PositionID != nil {
-				return ce.PositionID.String()
-			}
-			return "<nil>"
-		}()),
-	)
 
-	// 2. Get position if available
-	if ce.PositionID != nil {
-		positionID = ce.PositionID
-		p.logger.Info("Fetching position", zap.String("position_id", positionID.String()))
-		pos, err := p.employeeRepo.GetPositionByID(ctx, *positionID)
-		if err != nil {
-			p.logger.Error("GetPositionByID failed", zap.Error(err), zap.String("position_id", positionID.String()))
-			// Continue without work center
-		} else if pos != nil {
-			workCenterCode = pos.WorkCenterCode
-			p.logger.Info("Position fetched successfully",
-				zap.String("position_id", positionID.String()),
-				zap.String("work_center", func() string {
-					if workCenterCode != nil {
-						return *workCenterCode
-					}
-					return "<nil>"
-				}()),
-			)
-		} else {
-			p.logger.Warn("Position not found (nil)", zap.String("position_id", positionID.String()))
-		}
+	// 2. Date-scoped assignment (position + primary location).
+	assignment, aErr := p.scheduleRepo.GetEmployeeAssignmentOnDate(
+		ctx, companyID, userID, date)
+	if aErr != nil {
+		p.logger.Warn("GetEmployeeAssignmentOnDate failed",
+			zap.String("user_id", userID.String()),
+			zap.String("date", date.Format("2006-01-02")),
+			zap.Error(aErr))
+	}
+	if assignment != nil {
+		positionID = assignment.PositionID
+		primaryLocationID = assignment.PrimaryLocationID
 	} else {
-		p.logger.Warn("Employee has no position_id", zap.String("user_id", userID.String()))
+		// Pre-migration fallback: no history row yet. Use current state
+		// and log it. This branch should disappear after backfill.
+		p.logger.Warn("no employee_assignment_history row for date; using current row",
+			zap.String("user_id", userID.String()),
+			zap.String("date", date.Format("2006-01-02")))
+		if ce.PositionID != nil && *ce.PositionID != uuid.Nil {
+			positionID = ce.PositionID
+		}
+		if ce.PrimaryLocationID != nil && *ce.PrimaryLocationID != uuid.Nil {
+			primaryLocationID = ce.PrimaryLocationID
+		}
 	}
 
-	// 3. Fallback to work center assignment
-	if workCenterCode == nil {
-		assigned, err := p.scheduleRepo.GetUserWorkCenterAssignment(ctx, userID, time.Now())
-		if err == nil && assigned != nil {
-			workCenterCode = &assigned.WorkCenterCode
-			p.logger.Info("Work center from assignment", zap.String("work_center", *workCenterCode))
+	// 3. Position's work_center_code and location_id as of `date`.
+	if positionID != nil && *positionID != uuid.Nil {
+		posHist, pErr := p.scheduleRepo.GetPositionOnDate(ctx, *positionID, date)
+		if pErr != nil {
+			p.logger.Warn("GetPositionOnDate failed",
+				zap.String("position_id", positionID.String()),
+				zap.String("date", date.Format("2006-01-02")),
+				zap.Error(pErr))
+		}
+		if posHist != nil {
+			workCenterCode = posHist.WorkCenterCode
+			positionLocationID = posHist.LocationID
 		} else {
-			if err != nil {
-				p.logger.Warn("GetUserWorkCenterAssignment error", zap.Error(err))
-			} else {
-				p.logger.Warn("No work center assignment found")
+			// Pre-migration fallback: read the current positions row.
+			p.logger.Warn("no position_history row for date; using current row",
+				zap.String("position_id", positionID.String()),
+				zap.String("date", date.Format("2006-01-02")))
+			pos, posErr := p.employeeRepo.GetPositionByID(ctx, *positionID)
+			if posErr != nil {
+				p.logger.Error("GetPositionByID failed", zap.Error(posErr))
+			} else if pos != nil {
+				workCenterCode = pos.WorkCenterCode
+				positionLocationID = pos.LocationID
 			}
 		}
+	} else {
+		p.logger.Warn("employee has no position on date",
+			zap.String("user_id", userID.String()),
+			zap.String("date", date.Format("2006-01-02")))
 	}
 
 	p.logger.Info("GetEmployee result",
 		zap.Bool("active", active),
-		zap.String("position_id", func() string {
-			if positionID != nil {
-				return positionID.String()
-			}
-			return "<nil>"
-		}()),
-		zap.String("work_center_code", func() string {
-			if workCenterCode != nil {
-				return *workCenterCode
-			}
-			return "<nil>"
-		}()),
+		zap.String("position_id", uuidPtrString(positionID)),
+		zap.String("work_center_code", strPtrString(workCenterCode)),
+		zap.String("position_location_id", uuidPtrString(positionLocationID)),
+		zap.String("primary_location_id", uuidPtrString(primaryLocationID)),
 	)
-
-	return active, positionID, workCenterCode, nil
+	return active, positionID, workCenterCode, positionLocationID, primaryLocationID, nil
 }
 
-func (p *employeeDataProvider) GetWorkCenterAssignment(ctx context.Context, userID uuid.UUID, date time.Time) (workCenterCode *string, err error) {
-	p.logger.Debug("GetWorkCenterAssignment called",
-		zap.String("user_id", userID.String()),
-		zap.String("date", date.Format("2006-01-02")),
-	)
-	assignment, err := p.scheduleRepo.GetUserWorkCenterAssignment(ctx, userID, date)
-	if err != nil {
-		p.logger.Error("GetUserWorkCenterAssignment failed", zap.Error(err))
-		return nil, err
+func uuidPtrString(id *uuid.UUID) string {
+	if id == nil {
+		return "<nil>"
 	}
-	if assignment != nil {
-		p.logger.Info("Work center assignment found", zap.String("work_center", assignment.WorkCenterCode))
-		return &assignment.WorkCenterCode, nil
+	return id.String()
+}
+
+func strPtrString(s *string) string {
+	if s == nil {
+		return "<nil>"
 	}
-	p.logger.Warn("No work center assignment found for user", zap.String("user_id", userID.String()))
-	return nil, nil
+	return *s
 }

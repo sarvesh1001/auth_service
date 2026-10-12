@@ -3,13 +3,12 @@ set -e
 
 echo "🧬 Initializing biometric schema..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'EOSQL'
+
 CREATE SCHEMA IF NOT EXISTS attendance;
 CREATE SCHEMA IF NOT EXISTS biometric;
 
 -- ============================================================
 -- TIMEZONE HELPERS
--- Cheap DB-level IANA format guard. Not a substitute for Go's
--- time.LoadLocation, but catches obvious junk at the boundary.
 -- ============================================================
 CREATE OR REPLACE FUNCTION timezone_is_valid(tz TEXT)
 RETURNS BOOLEAN AS $$
@@ -48,11 +47,11 @@ CREATE TABLE IF NOT EXISTS attendance.geofences (
         UNIQUE (company_id, location_code)
 );
 
-CREATE INDEX idx_geofences_company ON attendance.geofences (company_id);
-CREATE INDEX idx_geofences_active ON attendance.geofences (is_active) WHERE is_active = true;
-CREATE INDEX idx_geofences_code ON attendance.geofences (company_id, location_code) WHERE location_code IS NOT NULL;
-CREATE INDEX idx_geofences_zone ON attendance.geofences (company_id, zone) WHERE zone IS NOT NULL;
-CREATE INDEX idx_geofences_company_emploc ON attendance.geofences (company_id, employment_location_id) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_geofences_company ON attendance.geofences (company_id);
+CREATE INDEX IF NOT EXISTS idx_geofences_active ON attendance.geofences (is_active) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_geofences_code ON attendance.geofences (company_id, location_code) WHERE location_code IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_geofences_zone ON attendance.geofences (company_id, zone) WHERE zone IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_geofences_company_emploc ON attendance.geofences (company_id, employment_location_id) WHERE is_active = true;
 
 -- ============================================================
 -- ATTENDANCE SOURCE / EVENT TYPES
@@ -109,7 +108,7 @@ CREATE TABLE IF NOT EXISTS attendance.attendance_devices (
         FOREIGN KEY (geofence_id) REFERENCES attendance.geofences(geofence_id) ON DELETE RESTRICT
 );
 
-CREATE INDEX idx_devices_company_geofence
+CREATE INDEX IF NOT EXISTS idx_devices_company_geofence
     ON attendance.attendance_devices (company_id, geofence_id)
     WHERE geofence_id IS NOT NULL AND is_active = true;
 
@@ -205,8 +204,8 @@ CREATE TABLE IF NOT EXISTS attendance.device_enrollments (
     UNIQUE (company_id, device_id, source_type, device_user_code)
 );
 
-CREATE INDEX idx_device_enrollments_subject ON attendance.device_enrollments(company_id, subject_type, subject_id) WHERE is_active = true;
-CREATE INDEX idx_device_enrollments_device_code ON attendance.device_enrollments(company_id, device_id, device_user_code) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_device_enrollments_subject ON attendance.device_enrollments(company_id, subject_type, subject_id) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_device_enrollments_device_code ON attendance.device_enrollments(company_id, device_id, device_user_code) WHERE is_active = true;
 
 CREATE TABLE IF NOT EXISTS attendance.attendance_sources (
     source_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -224,15 +223,6 @@ CREATE TABLE IF NOT EXISTS attendance.attendance_sources (
 
 -- ============================================================
 -- ATTENDANCE EVENTS
---
--- TIMEZONE-CORRECT SHAPE:
---   event_time             → absolute UTC instant (TZ-agnostic)
---   event_tz               → IANA name, resolved at write time
---   event_offset_minutes   → DST-aware offset snapshot for audit
---   event_date_local       → business date (YYYY-MM-DD) in event_tz, indexed
---
--- The old UTC-generated event_date is REMOVED. Bucketing is now
--- done by the writer, not the DB. See Go timeutil package.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS attendance.attendance_events (
     attendance_event_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -249,12 +239,9 @@ CREATE TABLE IF NOT EXISTS attendance.attendance_events (
     geofence_id            UUID,
     ip_address             VARCHAR(64),
 
-    -- ── NEW: 3 tz columns replace the UTC-generated event_date
     event_tz               VARCHAR(50) NOT NULL,
     event_offset_minutes   SMALLINT NOT NULL,
     event_date_local       DATE NOT NULL,
-
-    -- ── Optional: ISO-3166 alpha-2 country code for tax-residency queries
     event_country          CHAR(2),
 
     metadata               JSONB,
@@ -271,8 +258,6 @@ CREATE TABLE IF NOT EXISTS attendance.attendance_events (
         FOREIGN KEY (employment_location_id) REFERENCES locations(location_id) ON DELETE RESTRICT,
     CONSTRAINT fk_att_events_geofence
         FOREIGN KEY (geofence_id) REFERENCES attendance.geofences(geofence_id) ON DELETE RESTRICT,
-
-    -- ── NEW: format + range guards
     CONSTRAINT chk_att_events_tz_format CHECK (
         event_tz = 'UTC' OR event_tz ~ '^[A-Za-z_]+/[A-Za-z_]+$'
     ),
@@ -281,42 +266,27 @@ CREATE TABLE IF NOT EXISTS attendance.attendance_events (
     )
 );
 
-CREATE INDEX idx_att_events_subject_time ON attendance.attendance_events (company_id, subject_type, subject_id, event_time DESC);
-
--- ── NEW: indexes keyed by LOCAL date (used for "today's punches" queries)
-CREATE INDEX idx_att_events_company_date_local
-    ON attendance.attendance_events (company_id, event_date_local DESC);
-
-CREATE INDEX idx_att_events_subject_date_local
-    ON attendance.attendance_events
-        (company_id, subject_type, subject_id, event_date_local DESC);
-
-CREATE INDEX idx_att_events_tz
-    ON attendance.attendance_events (event_tz);
-
-CREATE INDEX idx_att_events_country
+CREATE INDEX IF NOT EXISTS idx_att_events_subject_time ON attendance.attendance_events (company_id, subject_type, subject_id, event_time DESC);
+CREATE INDEX IF NOT EXISTS idx_att_events_company_date_local ON attendance.attendance_events (company_id, event_date_local DESC);
+CREATE INDEX IF NOT EXISTS idx_att_events_subject_date_local ON attendance.attendance_events (company_id, subject_type, subject_id, event_date_local DESC);
+CREATE INDEX IF NOT EXISTS idx_att_events_tz ON attendance.attendance_events (event_tz);
+CREATE INDEX IF NOT EXISTS idx_att_events_country
     ON attendance.attendance_events
         (company_id, subject_type, subject_id, event_country, event_date_local)
     WHERE event_country IS NOT NULL;
-
--- ── Indexes on event_time (UTC) remain correct — leave unchanged
-CREATE INDEX idx_attendance_events_company ON attendance.attendance_events (company_id);
-CREATE INDEX idx_attendance_events_type ON attendance.attendance_events (event_type);
-CREATE INDEX idx_attendance_events_source ON attendance.attendance_events (source_type, source_id);
-CREATE INDEX idx_attendance_events_user_type_time ON attendance.attendance_events (company_id, subject_type, subject_id, event_type, event_time DESC) WHERE source_type != 'correction';
-CREATE INDEX idx_attendance_events_device_time ON attendance.attendance_events (company_id, subject_type, subject_id, device_id, event_type, event_time DESC) WHERE device_id IS NOT NULL AND source_type != 'correction';
-CREATE INDEX idx_att_events_company_emploc_time ON attendance.attendance_events (company_id, employment_location_id, event_time DESC) WHERE employment_location_id IS NOT NULL;
-CREATE INDEX idx_att_events_company_geofence_time ON attendance.attendance_events (company_id, geofence_id, event_time DESC) WHERE geofence_id IS NOT NULL;
-
--- ── REMOVED (were keyed on the broken UTC-generated event_date):
---    idx_att_events_company_event_date
---    idx_attendance_events_event_date
+CREATE INDEX IF NOT EXISTS idx_attendance_events_company ON attendance.attendance_events (company_id);
+CREATE INDEX IF NOT EXISTS idx_attendance_events_type ON attendance.attendance_events (event_type);
+CREATE INDEX IF NOT EXISTS idx_attendance_events_source ON attendance.attendance_events (source_type, source_id);
+CREATE INDEX IF NOT EXISTS idx_attendance_events_user_type_time ON attendance.attendance_events (company_id, subject_type, subject_id, event_type, event_time DESC) WHERE source_type != 'correction';
+CREATE INDEX IF NOT EXISTS idx_attendance_events_device_time ON attendance.attendance_events (company_id, subject_type, subject_id, device_id, event_type, event_time DESC) WHERE device_id IS NOT NULL AND source_type != 'correction';
+CREATE INDEX IF NOT EXISTS idx_att_events_company_emploc_time ON attendance.attendance_events (company_id, employment_location_id, event_time DESC) WHERE employment_location_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_att_events_company_geofence_time ON attendance.attendance_events (company_id, geofence_id, event_time DESC) WHERE geofence_id IS NOT NULL;
 
 -- ============================================================
--- POLICIES
+-- POLICIES  (versioned — SAP-style effective dating)
 -- ============================================================
 CREATE TABLE IF NOT EXISTS attendance.attendance_policies (
-    policy_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    policy_id        UUID NOT NULL DEFAULT gen_random_uuid(),
     company_id       UUID NOT NULL,
     work_center_code TEXT,
     position_id      UUID,
@@ -325,18 +295,27 @@ CREATE TABLE IF NOT EXISTS attendance.attendance_policies (
     policy_type      VARCHAR(30) NOT NULL,
     rules            JSONB NOT NULL,
     is_active        BOOLEAN NOT NULL DEFAULT true,
+    effective_from   DATE NOT NULL DEFAULT '2000-01-01',
+    effective_to     DATE,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (company_id, policy_code),
+    PRIMARY KEY (policy_id, effective_from),
+    CONSTRAINT no_overlap_policies EXCLUDE USING gist (
+        company_id WITH =,
+        policy_code WITH =,
+        daterange(effective_from, COALESCE(effective_to, 'infinity'), '[)') WITH &&
+    ),
     CONSTRAINT fk_attendance_policies_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
     CONSTRAINT fk_attendance_policies_position FOREIGN KEY (position_id) REFERENCES positions(position_id),
     CONSTRAINT fk_attendance_policies_location FOREIGN KEY (location_id) REFERENCES locations(location_id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_attendance_policies_company ON attendance.attendance_policies (company_id);
-CREATE INDEX idx_attendance_policies_position ON attendance.attendance_policies (position_id) WHERE position_id IS NOT NULL;
-CREATE INDEX idx_attendance_policies_location ON attendance.attendance_policies (company_id, location_id) WHERE location_id IS NOT NULL;
-CREATE INDEX idx_attendance_policies_active ON attendance.attendance_policies (is_active) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_attendance_policies_company ON attendance.attendance_policies (company_id);
+CREATE INDEX IF NOT EXISTS idx_attendance_policies_position ON attendance.attendance_policies (position_id) WHERE position_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_attendance_policies_location ON attendance.attendance_policies (company_id, location_id) WHERE location_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_attendance_policies_active ON attendance.attendance_policies (is_active) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_attendance_policies_lookup
+    ON attendance.attendance_policies (company_id, policy_code, effective_from DESC);
 
 CREATE TABLE IF NOT EXISTS attendance.user_attendance_policies (
     policy_id      UUID NOT NULL,
@@ -348,23 +327,20 @@ CREATE TABLE IF NOT EXISTS attendance.user_attendance_policies (
     subject_type   VARCHAR(20),
     subject_id     UUID,
     PRIMARY KEY (policy_id, effective_from, subject_type, subject_id),
-    CONSTRAINT fk_uap_policy FOREIGN KEY (policy_id) REFERENCES attendance.attendance_policies(policy_id),
     CONSTRAINT fk_uap_user FOREIGN KEY (user_id) REFERENCES users(user_id),
     CONSTRAINT chk_user_or_subject CHECK (
         (user_id IS NOT NULL) OR (subject_type IS NOT NULL AND subject_id IS NOT NULL)
     )
 );
 
-CREATE INDEX idx_user_attendance_policies_user ON attendance.user_attendance_policies (user_id);
-CREATE INDEX idx_user_attendance_policies_policy ON attendance.user_attendance_policies (policy_id);
-CREATE INDEX idx_user_attendance_policies_dates ON attendance.user_attendance_policies (effective_from, effective_to);
-CREATE INDEX idx_attendance_policies_effective ON attendance.user_attendance_policies (user_id, effective_from, effective_to);
-CREATE INDEX idx_uap_subject ON attendance.user_attendance_policies (subject_type, subject_id, effective_from, effective_to);
+CREATE INDEX IF NOT EXISTS idx_user_attendance_policies_user ON attendance.user_attendance_policies (user_id);
+CREATE INDEX IF NOT EXISTS idx_user_attendance_policies_policy ON attendance.user_attendance_policies (policy_id);
+CREATE INDEX IF NOT EXISTS idx_user_attendance_policies_dates ON attendance.user_attendance_policies (effective_from, effective_to);
+CREATE INDEX IF NOT EXISTS idx_attendance_policies_effective ON attendance.user_attendance_policies (user_id, effective_from, effective_to);
+CREATE INDEX IF NOT EXISTS idx_uap_subject ON attendance.user_attendance_policies (subject_type, subject_id, effective_from, effective_to);
 
 -- ============================================================
 -- DAILY SUMMARY
--- Adds timezone + offset_minutes so every summary row records
--- which tz its attendance_date was computed in.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS attendance.attendance_daily_summary (
     attendance_summary_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -379,7 +355,6 @@ CREATE TABLE IF NOT EXISTS attendance.attendance_daily_summary (
     late_minutes           INTEGER,
     expected_minutes       INTEGER,
 
-    -- ── NEW: tz snapshot
     timezone               VARCHAR(50) NOT NULL,
     offset_minutes         SMALLINT NOT NULL,
 
@@ -392,7 +367,6 @@ CREATE TABLE IF NOT EXISTS attendance.attendance_daily_summary (
     UNIQUE (company_id, subject_type, subject_id, attendance_date),
     CONSTRAINT fk_att_summary_employment_location
         FOREIGN KEY (employment_location_id) REFERENCES locations(location_id) ON DELETE RESTRICT,
-    -- ── NEW: guards
     CONSTRAINT chk_att_summary_tz_format CHECK (
         timezone = 'UTC' OR timezone ~ '^[A-Za-z_]+/[A-Za-z_]+$'
     ),
@@ -401,15 +375,17 @@ CREATE TABLE IF NOT EXISTS attendance.attendance_daily_summary (
     )
 );
 
-CREATE INDEX idx_att_summary_subject_date ON attendance.attendance_daily_summary (company_id, subject_type, subject_id, attendance_date DESC);
-CREATE INDEX idx_attendance_daily_summary_company ON attendance.attendance_daily_summary (company_id);
-CREATE INDEX idx_attendance_daily_summary_status ON attendance.attendance_daily_summary (status);
-CREATE INDEX idx_attendance_daily_summary_date_status ON attendance.attendance_daily_summary (attendance_date, status);
-CREATE INDEX idx_att_summary_company_emploc_date ON attendance.attendance_daily_summary (company_id, employment_location_id, attendance_date DESC) WHERE is_finalized = true;
+CREATE INDEX IF NOT EXISTS idx_att_summary_subject_date ON attendance.attendance_daily_summary (company_id, subject_type, subject_id, attendance_date DESC);
+CREATE INDEX IF NOT EXISTS idx_attendance_daily_summary_company ON attendance.attendance_daily_summary (company_id);
+CREATE INDEX IF NOT EXISTS idx_attendance_daily_summary_status ON attendance.attendance_daily_summary (status);
+CREATE INDEX IF NOT EXISTS idx_attendance_daily_summary_date_status ON attendance.attendance_daily_summary (attendance_date, status);
+CREATE INDEX IF NOT EXISTS idx_att_summary_company_emploc_date ON attendance.attendance_daily_summary (company_id, employment_location_id, attendance_date DESC) WHERE is_finalized = true;
+CREATE INDEX IF NOT EXISTS idx_summary_finalize_pending
+    ON attendance.attendance_daily_summary (attendance_date)
+    WHERE is_finalized = false;
 
 -- ============================================================
 -- SESSION SUMMARY
--- Adds timezone so session bucketing can be audited.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS attendance.attendance_session_summary (
     summary_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -427,7 +403,6 @@ CREATE TABLE IF NOT EXISTS attendance.attendance_session_summary (
     is_auto                BOOLEAN NOT NULL DEFAULT false,
     remarks                TEXT,
 
-    -- ── NEW: tz snapshot
     timezone               VARCHAR(50) NOT NULL,
 
     metadata               JSONB,
@@ -437,23 +412,19 @@ CREATE TABLE IF NOT EXISTS attendance.attendance_session_summary (
     CONSTRAINT fk_att_session_summary_employment_location
         FOREIGN KEY (employment_location_id) REFERENCES locations(location_id) ON DELETE RESTRICT,
     UNIQUE (company_id, subject_type, subject_id, session_id),
-    -- ── NEW: guard
     CONSTRAINT chk_att_session_tz_format CHECK (
         timezone = 'UTC' OR timezone ~ '^[A-Za-z_]+/[A-Za-z_]+$'
     )
 );
 
-CREATE INDEX idx_att_session_summary_subject ON attendance.attendance_session_summary (company_id, subject_type, subject_id);
-CREATE INDEX idx_att_session_summary_session ON attendance.attendance_session_summary (session_id);
-CREATE INDEX idx_att_session_summary_date ON attendance.attendance_session_summary (session_date);
-CREATE INDEX idx_att_session_summary_status ON attendance.attendance_session_summary (status);
-CREATE INDEX idx_att_session_summary_company_emploc ON attendance.attendance_session_summary (company_id, employment_location_id);
+CREATE INDEX IF NOT EXISTS idx_att_session_summary_subject ON attendance.attendance_session_summary (company_id, subject_type, subject_id);
+CREATE INDEX IF NOT EXISTS idx_att_session_summary_session ON attendance.attendance_session_summary (session_id);
+CREATE INDEX IF NOT EXISTS idx_att_session_summary_date ON attendance.attendance_session_summary (session_date);
+CREATE INDEX IF NOT EXISTS idx_att_session_summary_status ON attendance.attendance_session_summary (status);
+CREATE INDEX IF NOT EXISTS idx_att_session_summary_company_emploc ON attendance.attendance_session_summary (company_id, employment_location_id);
 
 -- ============================================================
--- WORK CENTERS / CALENDARS / SCHEDULES
--- Removed silent UTC defaults — tz is mandatory, validated by
--- the writer (Go timeutil.ValidateTimezone) and by the check
--- constraints below.
+-- WORK CENTERS
 -- ============================================================
 CREATE TABLE IF NOT EXISTS attendance.work_centers (
     work_center_code VARCHAR(100) NOT NULL,
@@ -461,53 +432,58 @@ CREATE TABLE IF NOT EXISTS attendance.work_centers (
     location_id      UUID,
     name             VARCHAR(255) NOT NULL,
     description      TEXT,
-
-    -- ── CHANGED: no DEFAULT 'UTC'
-    timezone         VARCHAR(50) NOT NULL,
-
+    timezone         VARCHAR(50),
     is_active        BOOLEAN NOT NULL DEFAULT true,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT fk_work_centers_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
     CONSTRAINT fk_work_centers_location FOREIGN KEY (location_id) REFERENCES locations(location_id) ON DELETE SET NULL,
     PRIMARY KEY (company_id, work_center_code),
-    -- ── NEW: guard
     CONSTRAINT chk_work_centers_tz_format CHECK (
-        timezone = 'UTC' OR timezone ~ '^[A-Za-z_]+/[A-Za-z_]+$'
+        timezone IS NULL
+        OR timezone = 'UTC'
+        OR timezone ~ '^[A-Za-z_]+/[A-Za-z_]+$'
     )
 );
 
-CREATE INDEX idx_work_centers_company ON attendance.work_centers (company_id, is_active);
-CREATE INDEX idx_work_centers_company_location ON attendance.work_centers (company_id, location_id) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_work_centers_company ON attendance.work_centers (company_id, is_active);
+CREATE INDEX IF NOT EXISTS idx_work_centers_company_location ON attendance.work_centers (company_id, location_id) WHERE is_active = true;
 
+-- ============================================================
+-- WORK CALENDARS
+-- ============================================================
 CREATE TABLE IF NOT EXISTS attendance.work_calendars (
     calendar_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id   UUID NOT NULL,
     location_id  UUID,
     year         INTEGER NOT NULL,
     name         VARCHAR(100) NOT NULL,
-
-    -- ── CHANGED: no DEFAULT 'UTC'
-    timezone     VARCHAR(50) NOT NULL,
-
     working_days INTEGER[] NOT NULL,
     holidays     JSONB,
     is_active    BOOLEAN DEFAULT true,
     created_at   TIMESTAMPTZ DEFAULT NOW(),
     CONSTRAINT fk_calendar_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
-    CONSTRAINT fk_work_calendars_location FOREIGN KEY (location_id) REFERENCES locations(location_id) ON DELETE CASCADE,
-    CONSTRAINT uq_work_calendar_company_year UNIQUE (company_id, year),
-    -- ── NEW: guard
-    CONSTRAINT chk_work_calendars_tz_format CHECK (
-        timezone = 'UTC' OR timezone ~ '^[A-Za-z_]+/[A-Za-z_]+$'
-    )
+    CONSTRAINT fk_work_calendars_location FOREIGN KEY (location_id) REFERENCES locations(location_id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_work_calendars_company ON attendance.work_calendars (company_id);
-CREATE INDEX idx_work_calendars_active ON attendance.work_calendars (is_active) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_work_calendars_company ON attendance.work_calendars (company_id);
+CREATE INDEX IF NOT EXISTS idx_work_calendars_active ON attendance.work_calendars (is_active) WHERE is_active = true;
 
+CREATE UNIQUE INDEX IF NOT EXISTS uq_work_calendar_company_wide_year
+    ON attendance.work_calendars (company_id, year)
+    WHERE location_id IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_work_calendar_location_year
+    ON attendance.work_calendars (company_id, location_id, year)
+    WHERE location_id IS NOT NULL;
+
+-- ============================================================
+-- SCHEDULE TEMPLATES / INSTANCES
+-- ============================================================
+
+-- Versioned: rules change over time; must preserve historical windows.
 CREATE TABLE IF NOT EXISTS attendance.schedule_templates (
-    schedule_template_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    schedule_template_id UUID NOT NULL DEFAULT gen_random_uuid(),
     company_id           UUID NOT NULL,
     calendar_id          UUID NOT NULL,
     location_id          UUID,
@@ -515,16 +491,25 @@ CREATE TABLE IF NOT EXISTS attendance.schedule_templates (
     name                 VARCHAR(100) NOT NULL,
     rules                JSONB NOT NULL,
     is_active            BOOLEAN DEFAULT true,
+    effective_from       DATE NOT NULL DEFAULT '2000-01-01',
+    effective_to         DATE,
     created_at           TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (schedule_template_id, effective_from),
+    CONSTRAINT no_overlap_templates EXCLUDE USING gist (
+        schedule_template_id WITH =,
+        daterange(effective_from, COALESCE(effective_to, 'infinity'), '[)') WITH &&
+    ),
     CONSTRAINT chk_template_type CHECK (template_type IN ('office', 'shift', 'class')),
     CONSTRAINT fk_schedule_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
     CONSTRAINT fk_schedule_calendar FOREIGN KEY (calendar_id) REFERENCES attendance.work_calendars(calendar_id),
     CONSTRAINT fk_schedule_templates_location FOREIGN KEY (location_id) REFERENCES locations(location_id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_schedule_templates_company ON attendance.schedule_templates (company_id);
-CREATE INDEX idx_schedule_templates_calendar ON attendance.schedule_templates (calendar_id);
-CREATE INDEX idx_schedule_templates_active ON attendance.schedule_templates (is_active) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_schedule_templates_company ON attendance.schedule_templates (company_id);
+CREATE INDEX IF NOT EXISTS idx_schedule_templates_calendar ON attendance.schedule_templates (calendar_id);
+CREATE INDEX IF NOT EXISTS idx_schedule_templates_active ON attendance.schedule_templates (is_active) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_schedule_templates_lookup
+    ON attendance.schedule_templates (schedule_template_id, effective_from DESC);
 
 CREATE TABLE IF NOT EXISTS attendance.user_schedule_assignments (
     user_id              UUID NOT NULL,
@@ -538,13 +523,12 @@ CREATE TABLE IF NOT EXISTS attendance.user_schedule_assignments (
         user_id WITH =,
         daterange(effective_from, COALESCE(effective_to, 'infinity'), '[]') WITH &&
     ),
-    CONSTRAINT fk_usa_user FOREIGN KEY (user_id) REFERENCES users(user_id),
-    CONSTRAINT fk_usa_template FOREIGN KEY (schedule_template_id) REFERENCES attendance.schedule_templates(schedule_template_id)
+    CONSTRAINT fk_usa_user FOREIGN KEY (user_id) REFERENCES users(user_id)
 );
 
-CREATE INDEX idx_user_schedule_assignments_user ON attendance.user_schedule_assignments (user_id);
-CREATE INDEX idx_user_schedule_assignments_template ON attendance.user_schedule_assignments (schedule_template_id);
-CREATE INDEX idx_user_schedule_assignments_dates ON attendance.user_schedule_assignments (effective_from, effective_to);
+CREATE INDEX IF NOT EXISTS idx_user_schedule_assignments_user ON attendance.user_schedule_assignments (user_id);
+CREATE INDEX IF NOT EXISTS idx_user_schedule_assignments_template ON attendance.user_schedule_assignments (schedule_template_id);
+CREATE INDEX IF NOT EXISTS idx_user_schedule_assignments_dates ON attendance.user_schedule_assignments (effective_from, effective_to);
 
 CREATE TABLE IF NOT EXISTS attendance.schedule_instances (
     schedule_instance_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -555,10 +539,7 @@ CREATE TABLE IF NOT EXISTS attendance.schedule_instances (
     schedule_template_id UUID NOT NULL,
     expected_start       TIMESTAMPTZ,
     expected_end         TIMESTAMPTZ,
-
-    -- ── CHANGED: no DEFAULT 'UTC'
     timezone             VARCHAR(50) NOT NULL,
-
     metadata             JSONB,
     generated_at         TIMESTAMPTZ DEFAULT NOW(),
     status               VARCHAR(20) NOT NULL DEFAULT 'active',
@@ -569,20 +550,18 @@ CREATE TABLE IF NOT EXISTS attendance.schedule_instances (
     raw_event_payload    JSONB,
     CONSTRAINT fk_si_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
     CONSTRAINT fk_si_user FOREIGN KEY (user_id) REFERENCES users(user_id),
-    CONSTRAINT fk_si_template FOREIGN KEY (schedule_template_id) REFERENCES attendance.schedule_templates(schedule_template_id),
     CONSTRAINT fk_schedule_instances_work_center FOREIGN KEY (company_id, work_center_code)
         REFERENCES attendance.work_centers(company_id, work_center_code),
     CONSTRAINT fk_schedule_instances_location FOREIGN KEY (location_id) REFERENCES locations(location_id) ON DELETE RESTRICT,
-    -- ── NEW: guard
     CONSTRAINT chk_schedule_instances_tz_format CHECK (
         timezone = 'UTC' OR timezone ~ '^[A-Za-z_]+/[A-Za-z_]+$'
     )
 );
 
-CREATE INDEX idx_schedule_instances_user_date ON attendance.schedule_instances (user_id, schedule_date);
-CREATE INDEX idx_schedule_instances_company ON attendance.schedule_instances (company_id);
-CREATE INDEX idx_schedule_instances_template ON attendance.schedule_instances (schedule_template_id);
-CREATE INDEX idx_schedule_instances_status ON attendance.schedule_instances (status) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_schedule_instances_user_date ON attendance.schedule_instances (user_id, schedule_date);
+CREATE INDEX IF NOT EXISTS idx_schedule_instances_company ON attendance.schedule_instances (company_id);
+CREATE INDEX IF NOT EXISTS idx_schedule_instances_template ON attendance.schedule_instances (schedule_template_id);
+CREATE INDEX IF NOT EXISTS idx_schedule_instances_status ON attendance.schedule_instances (status) WHERE status = 'active';
 
 CREATE TABLE IF NOT EXISTS attendance.work_center_shifts (
     mapping_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -595,7 +574,6 @@ CREATE TABLE IF NOT EXISTS attendance.work_center_shifts (
     created_at       TIMESTAMPTZ DEFAULT NOW(),
     updated_at       TIMESTAMPTZ DEFAULT NOW(),
     CONSTRAINT fk_work_center_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
-    CONSTRAINT fk_work_center_shift FOREIGN KEY (shift_id) REFERENCES attendance.schedule_templates(schedule_template_id) ON DELETE CASCADE,
     CONSTRAINT fk_wcs_work_center FOREIGN KEY (company_id, work_center_code) REFERENCES attendance.work_centers(company_id, work_center_code),
     CONSTRAINT no_overlap_work_center_shifts EXCLUDE USING gist (
         company_id WITH =,
@@ -604,17 +582,11 @@ CREATE TABLE IF NOT EXISTS attendance.work_center_shifts (
     )
 );
 
-CREATE INDEX idx_work_center_shifts_code ON attendance.work_center_shifts (work_center_code);
-CREATE INDEX idx_work_center_shifts_company ON attendance.work_center_shifts (company_id);
-CREATE INDEX idx_work_center_shifts_active ON attendance.work_center_shifts (is_active) WHERE is_active = true;
-CREATE INDEX idx_work_center_shifts_dates ON attendance.work_center_shifts (effective_from, effective_to);
+CREATE INDEX IF NOT EXISTS idx_work_center_shifts_code ON attendance.work_center_shifts (work_center_code);
+CREATE INDEX IF NOT EXISTS idx_work_center_shifts_company ON attendance.work_center_shifts (company_id);
+CREATE INDEX IF NOT EXISTS idx_work_center_shifts_active ON attendance.work_center_shifts (is_active) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_work_center_shifts_dates ON attendance.work_center_shifts (effective_from, effective_to);
 
--- ============================================================
--- USER WORK CENTER ASSIGNMENTS
---   Half-open range '[)' — a closed range [today, today)
---   is EMPTY, so a new assignment starting today does NOT
---   overlap the previous one that was closed at 'today'.
--- ============================================================
 CREATE TABLE IF NOT EXISTS attendance.user_work_center_assignments (
     assignment_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id       UUID NOT NULL,
@@ -636,27 +608,126 @@ CREATE TABLE IF NOT EXISTS attendance.user_work_center_assignments (
     )
 );
 
-CREATE INDEX idx_user_work_center_user ON attendance.user_work_center_assignments (user_id, is_active, effective_from DESC);
-CREATE INDEX idx_user_work_center_company ON attendance.user_work_center_assignments (company_id, work_center_code, is_active);
+CREATE INDEX IF NOT EXISTS idx_user_work_center_user ON attendance.user_work_center_assignments (user_id, is_active, effective_from DESC);
+CREATE INDEX IF NOT EXISTS idx_user_work_center_company ON attendance.user_work_center_assignments (company_id, work_center_code, is_active);
+
+-- ============================================================
+-- SCHEDULE GENERATION JOB
+-- ============================================================
+CREATE TABLE IF NOT EXISTS attendance.schedule_generation_job (
+    job_id         UUID PRIMARY KEY,
+    company_id     UUID NOT NULL,
+    user_id        UUID,
+    position_id    UUID,
+    location_id    UUID,
+    job_type       TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'queued',
+    attempts       INT  NOT NULL DEFAULT 0,
+    max_attempts   INT  NOT NULL DEFAULT 3,
+    priority       INT  NOT NULL DEFAULT 5,
+    reason         TEXT,
+    payload        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_message  TEXT,
+
+    warnings       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    failures       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    result_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    next_run_at    TIMESTAMPTZ,
+    started_at     TIMESTAMPTZ,
+    completed_at   TIMESTAMPTZ,
+    locked_by      TEXT,
+    locked_at      TIMESTAMPTZ,
+
+    CONSTRAINT schedule_generation_job_status_check
+        CHECK (status IN (
+            'queued', 'processing', 'completed',
+            'completed_with_warnings', 'failed'
+        ))
+);
+
+ALTER TABLE attendance.schedule_generation_job
+    ADD COLUMN IF NOT EXISTS warnings       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS failures       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS result_summary JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+DO $$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN
+        SELECT c.conname
+        FROM pg_constraint c
+        JOIN pg_class t     ON c.conrelid = t.oid
+        JOIN pg_namespace n ON t.relnamespace = n.oid
+        WHERE n.nspname = 'attendance'
+          AND t.relname = 'schedule_generation_job'
+          AND c.contype = 'c'
+          AND pg_get_constraintdef(c.oid) LIKE '%status%'
+    LOOP
+        EXECUTE format(
+            'ALTER TABLE attendance.schedule_generation_job DROP CONSTRAINT %I',
+            r.conname
+        );
+    END LOOP;
+END $$;
+
+ALTER TABLE attendance.schedule_generation_job
+    ADD CONSTRAINT schedule_generation_job_status_check
+    CHECK (status IN (
+        'queued', 'processing', 'completed',
+        'completed_with_warnings', 'failed'
+    ));
+
+CREATE INDEX IF NOT EXISTS idx_sched_gen_job_runnable
+    ON attendance.schedule_generation_job (priority, created_at)
+    WHERE status = 'queued';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_sched_gen_job_pending_user
+    ON attendance.schedule_generation_job (company_id, user_id, job_type)
+    WHERE status IN ('queued','processing') AND user_id IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_sched_gen_job_pending_company
+    ON attendance.schedule_generation_job (company_id, job_type)
+    WHERE status IN ('queued','processing')
+      AND user_id IS NULL
+      AND position_id IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_sched_gen_job_locked
+    ON attendance.schedule_generation_job (locked_at)
+    WHERE status = 'processing';
+
+CREATE INDEX IF NOT EXISTS idx_sched_gen_job_needs_attention
+    ON attendance.schedule_generation_job (completed_at DESC)
+    WHERE status IN ('failed', 'completed_with_warnings');
 
 -- ============================================================
 -- RULES / PROFILES / ENTITLEMENTS / OFF
 -- ============================================================
+
+-- Versioned: timezone and source-type rules change over time.
 CREATE TABLE IF NOT EXISTS attendance.company_attendance_rules (
-    company_id              UUID PRIMARY KEY,
+    company_id              UUID NOT NULL,
     allowed_source_types    VARCHAR(30)[] NOT NULL,
     allow_multiple_checkins BOOLEAN NOT NULL DEFAULT false,
-
-    -- ── CHANGED: no DEFAULT 'UTC'
     timezone                VARCHAR(50) NOT NULL,
-
+    effective_from          DATE NOT NULL DEFAULT '2000-01-01',
+    effective_to            DATE,
     created_at              TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (company_id, effective_from),
+    CONSTRAINT no_overlap_company_rules EXCLUDE USING gist (
+        company_id WITH =,
+        daterange(effective_from, COALESCE(effective_to, 'infinity'), '[)') WITH &&
+    ),
     CONSTRAINT fk_company_attendance_rules_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
-    -- ── NEW: guard
     CONSTRAINT chk_company_rules_tz_format CHECK (
         timezone = 'UTC' OR timezone ~ '^[A-Za-z_]+/[A-Za-z_]+$'
     )
 );
+
+CREATE INDEX IF NOT EXISTS idx_company_rules_lookup
+    ON attendance.company_attendance_rules (company_id, effective_from DESC);
 
 CREATE TABLE IF NOT EXISTS attendance.department_attendance_rules (
     rule_id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -711,25 +782,36 @@ CREATE TABLE IF NOT EXISTS attendance.off_requests (
     CONSTRAINT fk_or_user FOREIGN KEY (user_id) REFERENCES users(user_id)
 );
 
-CREATE INDEX idx_user_off_entitlements_user ON attendance.user_off_entitlements (user_id, company_id);
-CREATE INDEX idx_off_requests_user ON attendance.off_requests (user_id, company_id);
+CREATE INDEX IF NOT EXISTS idx_user_off_entitlements_user ON attendance.user_off_entitlements (user_id, company_id);
+CREATE INDEX IF NOT EXISTS idx_off_requests_user ON attendance.off_requests (user_id, company_id);
 
+-- Extended: custom_hours type carries an explicit start/end window.
 CREATE TABLE IF NOT EXISTS attendance.schedule_overrides (
-    override_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id    UUID NOT NULL,
-    user_id       UUID NOT NULL,
-    override_date DATE NOT NULL,
-    override_type VARCHAR(20) NOT NULL,
-    reason        TEXT,
-    created_by    UUID,
-    created_at    TIMESTAMPTZ DEFAULT NOW(),
+    override_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id      UUID NOT NULL,
+    user_id         UUID NOT NULL,
+    override_date   DATE NOT NULL,
+    override_type   VARCHAR(20) NOT NULL,
+    expected_start  TIMESTAMPTZ,
+    expected_end    TIMESTAMPTZ,
+    reason          TEXT,
+    created_by      UUID,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE (user_id, override_date),
     CONSTRAINT fk_so_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
     CONSTRAINT fk_so_user FOREIGN KEY (user_id) REFERENCES users(user_id),
-    CONSTRAINT chk_override_type CHECK (override_type IN ('off','force_work','holiday_override'))
+    CONSTRAINT chk_override_type CHECK (
+        override_type IN ('off','force_work','holiday_override','custom_hours')
+    ),
+    CONSTRAINT chk_custom_hours CHECK (
+        override_type <> 'custom_hours'
+        OR (expected_start IS NOT NULL
+            AND expected_end IS NOT NULL
+            AND expected_end > expected_start)
+    )
 );
 
-CREATE INDEX idx_schedule_overrides_user_date ON attendance.schedule_overrides (user_id, override_date);
+CREATE INDEX IF NOT EXISTS idx_schedule_overrides_user_date ON attendance.schedule_overrides (user_id, override_date);
 
 CREATE TABLE IF NOT EXISTS attendance.attendance_exemptions (
     exemption_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -747,8 +829,8 @@ CREATE TABLE IF NOT EXISTS attendance.attendance_exemptions (
     CONSTRAINT fk_exempt_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_att_exempt_subject ON attendance.attendance_exemptions (company_id, subject_type, subject_id);
-CREATE INDEX idx_att_exempt_dates ON attendance.attendance_exemptions (from_date, to_date);
+CREATE INDEX IF NOT EXISTS idx_att_exempt_subject ON attendance.attendance_exemptions (company_id, subject_type, subject_id);
+CREATE INDEX IF NOT EXISTS idx_att_exempt_dates ON attendance.attendance_exemptions (from_date, to_date);
 COMMENT ON TABLE attendance.attendance_exemptions IS 'Exemptions for any subject type (students, employees, etc.) for specific date ranges.';
 
 -- ============================================================
@@ -773,8 +855,8 @@ CREATE TABLE IF NOT EXISTS attendance.attendance_batch_outbox (
     error_message TEXT
 );
 
-CREATE INDEX idx_attendance_outbox_unprocessed ON attendance.attendance_events_outbox (created_at) WHERE processed_at IS NULL;
-CREATE INDEX idx_attendance_batch_outbox_unprocessed ON attendance.attendance_batch_outbox (created_at) WHERE processed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_attendance_outbox_unprocessed ON attendance.attendance_events_outbox (created_at) WHERE processed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_attendance_batch_outbox_unprocessed ON attendance.attendance_batch_outbox (created_at) WHERE processed_at IS NULL;
 
 -- ============================================================
 -- BIOMETRIC
@@ -819,14 +901,14 @@ CREATE TABLE IF NOT EXISTS biometric.unified_embedding_audit_log (
     metadata      JSONB
 );
 
-CREATE INDEX idx_face_embeddings_active ON biometric.unified_face_embeddings(company_id, is_active) WHERE is_active = true;
-CREATE INDEX idx_face_embeddings_company ON biometric.unified_face_embeddings(company_id);
-CREATE INDEX idx_face_embeddings_sync_lookup ON biometric.unified_face_embeddings(company_id, model_version, updated_at);
-CREATE INDEX idx_face_embeddings_updated ON biometric.unified_face_embeddings(company_id, model_version, updated_at);
-CREATE INDEX idx_device_embedding_sync_company ON biometric.device_embedding_sync(company_id);
+CREATE INDEX IF NOT EXISTS idx_face_embeddings_active ON biometric.unified_face_embeddings(company_id, is_active) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_face_embeddings_company ON biometric.unified_face_embeddings(company_id);
+CREATE INDEX IF NOT EXISTS idx_face_embeddings_sync_lookup ON biometric.unified_face_embeddings(company_id, model_version, updated_at);
+CREATE INDEX IF NOT EXISTS idx_face_embeddings_updated ON biometric.unified_face_embeddings(company_id, model_version, updated_at);
+CREATE INDEX IF NOT EXISTS idx_device_embedding_sync_company ON biometric.device_embedding_sync(company_id);
 
 -- ============================================================
--- ACADEMICS (student attendance)
+-- ACADEMICS
 -- ============================================================
 CREATE TABLE IF NOT EXISTS academics.student_attendance (
     attendance_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -920,24 +1002,24 @@ CREATE TABLE IF NOT EXISTS academics.attendance_session (
     UNIQUE(session_id)
 );
 
-CREATE INDEX idx_attendance_enrollment ON academics.student_attendance(enrollment_id);
-CREATE INDEX idx_attendance_date ON academics.student_attendance(attendance_date);
-CREATE INDEX idx_attendance_status ON academics.student_attendance(status);
-CREATE INDEX idx_att_summary_student ON academics.student_attendance_summary(student_id);
-CREATE INDEX idx_att_summary_year ON academics.student_attendance_summary(academic_year_id);
-CREATE INDEX idx_att_summary_term ON academics.student_attendance_summary(term_id);
-CREATE INDEX idx_att_exempt_student ON academics.student_attendance_exemptions(student_id);
-CREATE INDEX idx_att_exempt_dates ON academics.student_attendance_exemptions(from_date, to_date);
-CREATE INDEX idx_academic_session_section_date ON academics.academic_session(section_id, session_date);
-CREATE INDEX idx_academic_session_teacher_date ON academics.academic_session(teacher_id, session_date);
-CREATE INDEX idx_academic_session_subject ON academics.academic_session(subject_id);
-CREATE INDEX idx_academic_session_status ON academics.academic_session(status) WHERE status = 'ongoing';
-CREATE INDEX idx_ssa_session ON academics.student_session_attendance(session_id);
-CREATE INDEX idx_ssa_enrollment ON academics.student_session_attendance(enrollment_id);
-CREATE INDEX idx_ssa_session_enrollment ON academics.student_session_attendance(session_id, enrollment_id);
-CREATE INDEX idx_ssa_source_type ON academics.student_session_attendance(source_type);
-CREATE INDEX idx_ssa_marked_at ON academics.student_session_attendance(marked_at DESC);
-CREATE INDEX idx_attendance_session_session_id ON academics.attendance_session(session_id);
+CREATE INDEX IF NOT EXISTS idx_attendance_enrollment ON academics.student_attendance(enrollment_id);
+CREATE INDEX IF NOT EXISTS idx_attendance_date ON academics.student_attendance(attendance_date);
+CREATE INDEX IF NOT EXISTS idx_attendance_status ON academics.student_attendance(status);
+CREATE INDEX IF NOT EXISTS idx_att_summary_student ON academics.student_attendance_summary(student_id);
+CREATE INDEX IF NOT EXISTS idx_att_summary_year ON academics.student_attendance_summary(academic_year_id);
+CREATE INDEX IF NOT EXISTS idx_att_summary_term ON academics.student_attendance_summary(term_id);
+CREATE INDEX IF NOT EXISTS idx_att_exempt_student ON academics.student_attendance_exemptions(student_id);
+CREATE INDEX IF NOT EXISTS idx_att_exempt_dates ON academics.student_attendance_exemptions(from_date, to_date);
+CREATE INDEX IF NOT EXISTS idx_academic_session_section_date ON academics.academic_session(section_id, session_date);
+CREATE INDEX IF NOT EXISTS idx_academic_session_teacher_date ON academics.academic_session(teacher_id, session_date);
+CREATE INDEX IF NOT EXISTS idx_academic_session_subject ON academics.academic_session(subject_id);
+CREATE INDEX IF NOT EXISTS idx_academic_session_status ON academics.academic_session(status) WHERE status = 'ongoing';
+CREATE INDEX IF NOT EXISTS idx_ssa_session ON academics.student_session_attendance(session_id);
+CREATE INDEX IF NOT EXISTS idx_ssa_enrollment ON academics.student_session_attendance(enrollment_id);
+CREATE INDEX IF NOT EXISTS idx_ssa_session_enrollment ON academics.student_session_attendance(session_id, enrollment_id);
+CREATE INDEX IF NOT EXISTS idx_ssa_source_type ON academics.student_session_attendance(source_type);
+CREATE INDEX IF NOT EXISTS idx_ssa_marked_at ON academics.student_session_attendance(marked_at DESC);
+CREATE INDEX IF NOT EXISTS idx_attendance_session_session_id ON academics.attendance_session(session_id);
 
 -- ============================================================
 -- ANALYTICS
@@ -1086,13 +1168,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- ============================================================
--- prevent_past_schedule_update — CHANGED
---
--- Was: compared schedule_date against server CURRENT_DATE.
--- Now: resolves the shift's tz via instance > work_center > company
---      and compares against today in that tz.
--- ============================================================
 CREATE OR REPLACE FUNCTION prevent_past_schedule_update()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -1169,15 +1244,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- ============================================================
--- sync_work_center_assignment — CHANGED
---
--- Was: used server CURRENT_DATE for "today".
--- Now: uses company.default_timezone to compute "today" locally,
---      so an employee assigned near IST midnight gets the right
---      effective_from date.
--- Also retains the same-day short-circuit from before.
--- ============================================================
 CREATE OR REPLACE FUNCTION sync_work_center_assignment()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -1187,7 +1253,6 @@ DECLARE
     v_tz             TEXT;
     v_today_local    DATE;
 BEGIN
-    -- Resolve company tz
     SELECT COALESCE(NULLIF(default_timezone, ''), 'UTC')
     INTO v_tz
     FROM companies
@@ -1199,7 +1264,6 @@ BEGIN
 
     v_today_local := (NOW() AT TIME ZONE v_tz)::date;
 
-    -- Guard: only fire when position_id actually changed.
     IF TG_OP = 'UPDATE'
        AND OLD.position_id IS NOT DISTINCT FROM NEW.position_id THEN
         RETURN NEW;
@@ -1217,7 +1281,6 @@ BEGIN
         WHERE position_id = NEW.position_id;
     END IF;
 
-    -- Same-day re-assignment short-circuit
     IF v_wc_code IS NOT NULL THEN
         SELECT assignment_id INTO v_existing_id
         FROM attendance.user_work_center_assignments
@@ -1238,7 +1301,6 @@ BEGIN
         END IF;
     END IF;
 
-    -- Close whatever row is currently open
     UPDATE attendance.user_work_center_assignments
     SET effective_to = v_effective_from,
         is_active    = false,
@@ -1252,7 +1314,6 @@ BEGIN
         RETURN NEW;
     END IF;
 
-    -- Open the new assignment
     INSERT INTO attendance.user_work_center_assignments (
         assignment_id, company_id, user_id, work_center_code,
         effective_from, effective_to, is_active, created_at, updated_at
@@ -1268,28 +1329,34 @@ $$ LANGUAGE plpgsql;
 -- ============================================================
 -- TRIGGERS
 -- ============================================================
+DROP TRIGGER IF EXISTS trg_prevent_past_schedule_update ON attendance.schedule_instances;
 CREATE TRIGGER trg_prevent_past_schedule_update
     BEFORE UPDATE OR DELETE ON attendance.schedule_instances
     FOR EACH ROW EXECUTE FUNCTION prevent_past_schedule_update();
 
+DROP TRIGGER IF EXISTS trg_enforce_schedule_cancel ON attendance.schedule_instances;
 CREATE TRIGGER trg_enforce_schedule_cancel
     BEFORE UPDATE ON attendance.schedule_instances
     FOR EACH ROW EXECUTE FUNCTION enforce_schedule_cancellation();
 
+DROP TRIGGER IF EXISTS trg_revoke_device_on_employee_exit ON employee_exit;
 CREATE TRIGGER trg_revoke_device_on_employee_exit
     AFTER UPDATE OF exit_state ON employee_exit
     FOR EACH ROW WHEN (NEW.exit_state = 'effective')
     EXECUTE FUNCTION revoke_enrollment_on_exit();
 
+DROP TRIGGER IF EXISTS trg_revoke_biometric_on_exit ON employee_exit;
 CREATE TRIGGER trg_revoke_biometric_on_exit
     AFTER UPDATE OF exit_state ON employee_exit
     FOR EACH ROW WHEN (NEW.exit_state = 'effective')
     EXECUTE FUNCTION biometric.revoke_biometric_on_exit();
 
+DROP TRIGGER IF EXISTS trg_prevent_attendance_update_if_locked ON attendance.attendance_daily_summary;
 CREATE TRIGGER trg_prevent_attendance_update_if_locked
     BEFORE UPDATE OR DELETE ON attendance.attendance_daily_summary
     FOR EACH ROW EXECUTE FUNCTION prevent_attendance_update_if_locked();
 
+DROP TRIGGER IF EXISTS trg_sync_work_center_assignment ON company_employees;
 CREATE TRIGGER trg_sync_work_center_assignment
     AFTER INSERT OR UPDATE OF position_id ON company_employees
     FOR EACH ROW EXECUTE FUNCTION sync_work_center_assignment();
@@ -1357,6 +1424,7 @@ ON CONFLICT DO NOTHING;
 -- ============================================================
 -- POST-CREATE: FKs that need attendance.work_centers to exist
 -- ============================================================
+ALTER TABLE positions DROP CONSTRAINT IF EXISTS fk_positions_work_center;
 ALTER TABLE positions ADD CONSTRAINT fk_positions_work_center
     FOREIGN KEY (company_id, work_center_code)
     REFERENCES attendance.work_centers(company_id, work_center_code);
@@ -1365,9 +1433,11 @@ ALTER TABLE payroll.payroll_run DROP CONSTRAINT IF EXISTS payroll_run_status_che
 ALTER TABLE payroll.payroll_run ADD CONSTRAINT payroll_run_status_check
 CHECK (status IN ('draft','processing','executing','calculated','approved','paid','failed','partially_processed','cancelled'));
 
+ALTER TABLE payroll.payroll_component DROP CONSTRAINT IF EXISTS uq_payroll_component_company_code;
 ALTER TABLE payroll.payroll_component
 ADD CONSTRAINT uq_payroll_component_company_code UNIQUE (company_id, component_code);
 
+ALTER TABLE payroll.payroll_item DROP CONSTRAINT IF EXISTS payroll_item_run_user_unique;
 ALTER TABLE payroll.payroll_item
 ADD CONSTRAINT payroll_item_run_user_unique UNIQUE (payroll_run_id, user_id);
 
@@ -1416,6 +1486,7 @@ CREATE TRIGGER trg_enforce_position_location
     FOR EACH ROW
     EXECUTE FUNCTION enforce_position_location_matches_work_center();
 
+ALTER TABLE company_employees DROP CONSTRAINT IF EXISTS fk_employees_position;
 ALTER TABLE company_employees
     ADD CONSTRAINT fk_employees_position
     FOREIGN KEY (position_id)
@@ -1430,14 +1501,12 @@ DO $$
 DECLARE
     v_cnt INTEGER;
 BEGIN
-    -- No company missing a default timezone
     SELECT COUNT(*) INTO v_cnt FROM companies
     WHERE default_timezone IS NULL OR default_timezone = '';
     IF v_cnt > 0 THEN
         RAISE EXCEPTION 'Init check failed: % companies have no default_timezone', v_cnt;
     END IF;
 
-    -- Every tz column in our schema passes the format guard
     SELECT COUNT(*) INTO v_cnt FROM companies
     WHERE NOT timezone_is_valid(default_timezone);
     IF v_cnt > 0 THEN
@@ -1451,14 +1520,58 @@ BEGIN
     END IF;
 
     SELECT COUNT(*) INTO v_cnt FROM attendance.work_centers
-    WHERE NOT timezone_is_valid(timezone);
+    WHERE timezone IS NOT NULL AND NOT timezone_is_valid(timezone);
     IF v_cnt > 0 THEN
         RAISE EXCEPTION 'Init check failed: % work centers have invalid timezone', v_cnt;
     END IF;
 
+    SELECT COUNT(*) INTO v_cnt
+    FROM information_schema.columns
+    WHERE table_schema = 'attendance'
+      AND table_name   = 'work_calendars'
+      AND column_name  = 'timezone';
+    IF v_cnt > 0 THEN
+        RAISE EXCEPTION 'Init check failed: work_calendars.timezone still exists';
+    END IF;
+
     RAISE NOTICE '✅ All timezone init checks passed';
 END $$;
+BEGIN;
 
+-- Convert TIMESTAMPTZ → TIME (wall-clock only)
+ALTER TABLE attendance.schedule_overrides
+    ALTER COLUMN expected_start TYPE TIME
+    USING (expected_start AT TIME ZONE 'UTC')::time,
+    ALTER COLUMN expected_end   TYPE TIME
+    USING (expected_end   AT TIME ZONE 'UTC')::time;
+
+COMMIT;
+
+ALTER TABLE attendance.schedule_overrides
+    DROP CONSTRAINT IF EXISTS chk_custom_hours;
+
+ALTER TABLE attendance.schedule_overrides
+    ADD CONSTRAINT chk_custom_hours CHECK (
+        override_type <> 'custom_hours'
+        OR (expected_start IS NOT NULL
+            AND expected_end IS NOT NULL
+            AND expected_end > expected_start)
+    );
+ALTER TABLE attendance.schedule_templates
+  ADD COLUMN position_id uuid REFERENCES positions(position_id) ON DELETE CASCADE;
+
+-- Fast lookup for the resolver.
+CREATE INDEX idx_st_position_date
+  ON attendance.schedule_templates (company_id, position_id, effective_from DESC)
+  WHERE position_id IS NOT NULL;
+
+-- A template is scoped to at most one of (position, location).
+-- Company-wide = both NULL. Position-scoped = position NOT NULL, location NULL.
+-- Location-scoped = location NOT NULL, position NULL.
+ALTER TABLE attendance.schedule_templates
+  ADD CONSTRAINT chk_template_scope
+  CHECK (NOT (position_id IS NOT NULL AND location_id IS NOT NULL));    
 EOSQL
+
 
 echo "✅ Biometric schema initialized successfully!"

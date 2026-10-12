@@ -252,17 +252,12 @@ import (
 	"auth-service/internal/infrastructure/idempotency"
 )
 
-// ErrNoMatchingPolicy is returned by ResolveUserLeaveEntitlements when the
-// resolver found zero applicable policy rules for a user. It is not a hard
-// failure — it means the user has no policy coverage — but the batch caller
-// must distinguish it from "resolved successfully" so counts are honest.
 var ErrNoMatchingPolicy = errors.New("no matching policy rules for user")
 
 type LeavePolicyResolutionService interface {
 	ResolveUserLeaveEntitlements(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, asOf time.Time, reason string, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
 	ResolveBatchLeaveEntitlements(ctx context.Context, companyID uuid.UUID, userIDs []uuid.UUID, asOf time.Time, reason string, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*LeavePolicyResolutionResult, error)
 
-	// ── Enqueue API (used by HTTP handlers, fan-out only) ────────────────
 	EnqueueUserResolutionJobs(ctx context.Context, companyID uuid.UUID, userIDs []uuid.UUID, reason string) error
 	EnqueueCompanyResolution(ctx context.Context, companyID uuid.UUID, reason string) error
 
@@ -316,13 +311,9 @@ func NewLeavePolicyResolutionService(
 }
 
 // ============================================================
-// Enqueue API — used by HTTP handlers, never does the work inline
+// Enqueue API
 // ============================================================
 
-// EnqueueUserResolutionJobs enqueues one resolve_user job per user.
-// Duplicates (a user already having a pending/processing resolve_user job)
-// are silently skipped by the repository's NOT EXISTS check, so this is
-// safe to call repeatedly.
 func (s *leavePolicyResolutionService) EnqueueUserResolutionJobs(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -346,8 +337,6 @@ func (s *leavePolicyResolutionService) EnqueueUserResolutionJobs(
 	})
 }
 
-// EnqueueCompanyResolution enqueues a single resolve_company job. The
-// worker will fan out internally in chunks of 100.
 func (s *leavePolicyResolutionService) EnqueueCompanyResolution(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -367,7 +356,7 @@ func (s *leavePolicyResolutionService) EnqueueCompanyResolution(
 }
 
 // ============================================================
-// Synchronous resolver — kept for the worker and single-user calls
+// Synchronous resolver
 // ============================================================
 
 func (s *leavePolicyResolutionService) ResolveUserLeaveEntitlements(
@@ -418,17 +407,6 @@ func (s *leavePolicyResolutionService) ResolveUserLeaveEntitlements(
 	}
 	logger.Info("resolve user — policy rules resolved", zap.Int("rule_count", len(rules)))
 
-	for i, r := range rules {
-		logger.Info("resolve user — rule",
-			zap.Int("index", i),
-			zap.String("policy_id", r.PolicyID.String()),
-			zap.String("leave_type_id", r.LeaveTypeID.String()),
-			zap.Int("total_days", r.TotalDays),
-			zap.String("accrual_method", r.AccrualMethod),
-			zap.String("carry_forward_limit", intPtrStr(r.CarryForwardLimit)),
-		)
-	}
-
 	if len(rules) == 0 {
 		logger.Warn("resolve user — no matching policy rules; skipping and storing marker")
 		_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
@@ -440,63 +418,21 @@ func (s *leavePolicyResolutionService) ResolveUserLeaveEntitlements(
 
 	for _, rule := range rules {
 		if processedLeaveTypes[rule.LeaveTypeID] {
-			logger.Info("resolve user — leave type already processed, skipping",
-				zap.String("leave_type_id", rule.LeaveTypeID.String()),
-			)
 			continue
 		}
 
 		existing, err := s.repo.GetActivePolicyEntitlement(ctx, companyID, userID, rule.LeaveTypeID, positionID)
 		if err != nil {
-			logger.Error("resolve user — GetActivePolicyEntitlement failed",
-				zap.String("leave_type_id", rule.LeaveTypeID.String()),
-				zap.Error(err),
-			)
 			return fmt.Errorf("failed to check existing entitlement: %w", err)
-		}
-
-		if existing != nil {
-			logger.Info("resolve user — existing entitlement found",
-				zap.String("leave_type_id", rule.LeaveTypeID.String()),
-				zap.String("existing_policy_id", uuidPtrStr(existing.PolicyID)),
-				zap.String("target_policy_id", rule.PolicyID.String()),
-				zap.Int("existing_total_days", existing.TotalDays),
-				zap.Int("target_total_days", rule.TotalDays),
-			)
-		} else {
-			logger.Info("resolve user — no existing entitlement; will create",
-				zap.String("leave_type_id", rule.LeaveTypeID.String()),
-				zap.String("target_policy_id", rule.PolicyID.String()),
-				zap.Int("target_total_days", rule.TotalDays),
-			)
 		}
 
 		if existing != nil && existing.PolicyID != nil &&
 			*existing.PolicyID == rule.PolicyID &&
 			existing.TotalDays == rule.TotalDays {
-			logger.Info("resolve user — entitlement already correct; skipping",
-				zap.String("leave_type_id", rule.LeaveTypeID.String()),
-				zap.String("policy_id", rule.PolicyID.String()),
-				zap.Int("total_days", rule.TotalDays),
-			)
 			processedLeaveTypes[rule.LeaveTypeID] = true
 			skipped++
 			continue
 		}
-
-		if err := s.repo.EndActivePolicyEntitlementsByLeaveType(
-			ctx, companyID, userID, rule.LeaveTypeID, asOf, positionID,
-		); err != nil {
-			logger.Error("resolve user — EndActivePolicyEntitlementsByLeaveType failed",
-				zap.String("leave_type_id", rule.LeaveTypeID.String()),
-				zap.Error(err),
-			)
-			return fmt.Errorf("failed to end entitlement: %w", err)
-		}
-		logger.Info("resolve user — ended old entitlements for leave type",
-			zap.String("leave_type_id", rule.LeaveTypeID.String()),
-			zap.Time("end_date", asOf),
-		)
 
 		entitlement := &models.LeaveEntitlement{
 			EntitlementID:  uuid.New(),
@@ -511,13 +447,31 @@ func (s *leavePolicyResolutionService) ResolveUserLeaveEntitlements(
 			PositionID:     positionID,
 			WorkCenterCode: workCenterCode,
 		}
-		if err := s.repo.CreatePolicyLeaveEntitlement(ctx, entitlement); err != nil {
-			logger.Error("resolve user — CreatePolicyLeaveEntitlement failed",
+
+		// ── End old + create new in ONE transaction ────────────────────
+		// Previously these were two separate repo calls: a crash between
+		// them left the user with no active entitlement for this leave type.
+		// Now they commit together or not at all.
+		if s.pgClient == nil {
+			return fmt.Errorf("postgres client not configured")
+		}
+		err = s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
+			if err := s.repo.EndActivePolicyEntitlementsByLeaveTypeTx(
+				ctx, tx, companyID, userID, rule.LeaveTypeID, asOf, positionID,
+			); err != nil {
+				return fmt.Errorf("end entitlement: %w", err)
+			}
+			if err := s.repo.CreatePolicyLeaveEntitlementTx(ctx, tx, entitlement); err != nil {
+				return fmt.Errorf("create entitlement: %w", err)
+			}
+			return nil
+		})
+		if err != nil {
+			logger.Error("resolve user — entitlement swap failed",
 				zap.String("leave_type_id", rule.LeaveTypeID.String()),
-				zap.String("policy_id", rule.PolicyID.String()),
 				zap.Error(err),
 			)
-			return fmt.Errorf("failed to create entitlement: %w", err)
+			return err
 		}
 
 		logger.Info("resolve user — entitlement written",
@@ -582,6 +536,9 @@ func (s *leavePolicyResolutionService) ResolveBatchLeaveEntitlements(
 	batchKey := resolveBatchIdempotencyKey(ctx)
 	logger.Debug("resolve batch — idempotency key", zap.String("batch_key", batchKey))
 
+	// Batch-level cache hit only when the previous run fully succeeded.
+	// Failed batches are NOT cached (see below), so retries always re-run
+	// the failed users. Per-user idempotency handles the succeeded ones.
 	var cached *LeavePolicyResolutionResult
 	if err := s.idempotencyStore.Get(ctx, nil, batchKey, &cached); err == nil && cached != nil {
 		logger.Info("resolve batch — short-circuited by idempotency",
@@ -618,6 +575,21 @@ func (s *leavePolicyResolutionService) ResolveBatchLeaveEntitlements(
 		zap.Int("failed", len(result.FailedUsers)),
 	)
 
+	// ── CRITICAL: if any user failed, return an error so the worker retries.
+	//    Do NOT cache — a cached failed result would poison every subsequent
+	//    attempt with the same batch key (derived from resolver_job_id).
+	if len(result.FailedUsers) > 0 {
+		firstErr := "unknown"
+		if len(result.Errors) > 0 {
+			firstErr = result.Errors[0]
+		}
+		return result, fmt.Errorf(
+			"batch resolution: %d/%d users failed; first error: %s",
+			len(result.FailedUsers), result.TotalUsers, firstErr,
+		)
+	}
+
+	// Success — safe to cache.
 	ip, _ := ctx.Value("ip_address").(string)
 	afterJSON, _ := json.Marshal(result)
 	auditMeta := mergeMeta(metadata, map[string]interface{}{
@@ -653,10 +625,6 @@ func (s *leavePolicyResolutionService) GetUserEffectivePolicies(ctx context.Cont
 	return s.repo.ResolveUserPolicyRules(ctx, companyID, userID, asOf)
 }
 
-// ============================================================
-// Resolver worker support
-// ============================================================
-
 func (s *leavePolicyResolutionService) EndActivePolicyEntitlements(
 	ctx context.Context, companyID, userID uuid.UUID, effectiveTo time.Time,
 ) error {
@@ -683,21 +651,6 @@ func (s *leavePolicyResolutionService) ListActiveEmployeeUserIDsByPosition(
 // Idempotency key helpers
 // ============================================================
 
-// resolveUserIdempotencyKey builds a per-user, per-operation key.
-//
-// Priority order:
-//
-//  1. resolver_job_id  → one key per resolver job, unique across jobs.
-//     Multiple jobs for the same user on the same day
-//     each get their own key and both run.
-//
-//  2. idempotency_key  → one key per HTTP request. Retries of the same
-//     request are idempotent; distinct clicks are not.
-//
-//  3. fallback         → day-scoped, last-resort safety net. Only fires
-//     when a caller supplies NEITHER a job id NOR a
-//     request key — a wiring bug we want to collapse
-//     rather than multiply.
 func resolveUserIdempotencyKey(ctx context.Context, userID uuid.UUID, asOf time.Time) string {
 	if jobID, _ := ctx.Value("resolver_job_id").(string); jobID != "" {
 		return fmt.Sprintf("resolve_user_job-%s-user-%s", jobID, userID.String())
@@ -708,16 +661,22 @@ func resolveUserIdempotencyKey(ctx context.Context, userID uuid.UUID, asOf time.
 	return fmt.Sprintf("resolve_user-%s-%s", userID.String(), asOf.Format("2006-01-02"))
 }
 
+// resolveBatchIdempotencyKey — same key for the same job_id so retries
+// short-circuit on the previously successful batch. Falls back to a random
+// UUID only when neither a request key nor a job id is available, which
+// should never happen in practice.
 func resolveBatchIdempotencyKey(ctx context.Context) string {
 	if reqKey, _ := ctx.Value("idempotency_key").(string); reqKey != "" {
 		return fmt.Sprintf("%s-batch", reqKey)
+	}
+	if jobID, _ := ctx.Value("resolver_job_id").(string); jobID != "" {
+		return fmt.Sprintf("resolve_batch_job-%s", jobID)
 	}
 	return fmt.Sprintf("resolve_batch-%s", uuid.New().String())
 }
 
 // ============================================================
-// Logging helpers — small pointer→string adapters so zap fields
-// don't panic on nil pointers and read cleanly in the log output.
+// Logging helpers
 // ============================================================
 
 func uuidPtrStr(id *uuid.UUID) string {
@@ -1004,8 +963,6 @@ func (s *leavePolicyService) CreateLeaveType(
 		return cached, nil
 	}
 
-	// GetLeaveTypeByCode returns ErrLeaveTypeNotFound when the code does
-	// not exist yet — that's the SUCCESS path for a duplicate check.
 	existing, err := s.repo.GetLeaveTypeByCode(ctx, companyID, req.Code)
 	if err != nil && !errors.Is(err, hrErrors.ErrLeaveTypeNotFound) {
 		return nil, fmt.Errorf("failed to check leave type: %w", err)
@@ -1137,10 +1094,14 @@ func (s *leavePolicyService) AssignEntitlementToUser(
 		return nil, fmt.Errorf("total days must be > 0")
 	}
 
+	// Position lookup MUST succeed — an entitlement created with a NULL
+	// position_id is invisible to any query that scopes by position.
+	// Previously the error was silently ignored, leaving orphaned rows.
 	positionID, workCenterCode, err := s.repo.GetUserPositionContext(ctx, req.CompanyID, req.UserID)
 	if err != nil {
-		// log but continue
+		return nil, fmt.Errorf("resolve user position: %w", err)
 	}
+
 	entitlement := &models.LeaveEntitlement{
 		EntitlementID:  uuid.New(),
 		CompanyID:      req.CompanyID,
@@ -1259,12 +1220,14 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 
+	"auth-service/internal/client"
 	"auth-service/internal/hr/leave/models"
 	"auth-service/internal/hr/leave/repository"
 	hrRepo "auth-service/internal/hr/repository"
@@ -1279,7 +1242,6 @@ type LeaveRequestService interface {
 	RejectLeave(ctx context.Context, requestID uuid.UUID, rejectedBy uuid.UUID, reason string, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.LeaveRequest, error)
 	CancelLeave(ctx context.Context, requestID uuid.UUID, cancelledBy uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.LeaveRequest, error)
 
-	// GetPendingRequests — location filter applies when locationID != nil.
 	GetPendingRequests(
 		ctx context.Context,
 		companyID uuid.UUID,
@@ -1292,18 +1254,20 @@ type LeaveRequestService interface {
 
 type leaveRequestService struct {
 	repo             repository.LeaveRepository
-	employeeRepo     hrRepo.EmployeeRepository // 👈 new — for location lookup
+	employeeRepo     hrRepo.EmployeeRepository
 	balanceService   LeaveBalanceService
 	idempotencyStore idempotency.Store
 	auditService     *audit.AuditService
+	pgClient         *client.PostgresClient // 👈 NEW — for atomic request + ledger
 }
 
 func NewLeaveRequestService(
 	repo repository.LeaveRepository,
-	employeeRepo hrRepo.EmployeeRepository, // 👈 new
+	employeeRepo hrRepo.EmployeeRepository,
 	balanceService LeaveBalanceService,
 	idempotencyStore idempotency.Store,
 	auditService *audit.AuditService,
+	pgClient *client.PostgresClient, // 👈 NEW
 ) LeaveRequestService {
 	return &leaveRequestService{
 		repo:             repo,
@@ -1311,6 +1275,7 @@ func NewLeaveRequestService(
 		balanceService:   balanceService,
 		idempotencyStore: idempotencyStore,
 		auditService:     auditService,
+		pgClient:         pgClient,
 	}
 }
 
@@ -1338,6 +1303,9 @@ func (s *leaveRequestService) ensureEmployeeInScope(
 	if empLoc == nil {
 		return ErrEmployeeHasNoLocation
 	}
+	if locCtx.LocationID == nil {
+		return fmt.Errorf("location scope requires a location id")
+	}
 	if *empLoc != *locCtx.LocationID {
 		return ErrEmployeeOutsideScope
 	}
@@ -1360,9 +1328,29 @@ func (s *leaveRequestService) RequestLeave(
 		return cached, nil
 	}
 
-	// 👇 Row-level authorization — target employee must be in scope.
+	// Row-level authorization — target employee must be in scope.
 	if err := s.ensureEmployeeInScope(ctx, req.CompanyID, req.UserID); err != nil {
 		return nil, err
+	}
+
+	// ── Structural validation of the date range + total_days ────────────
+	startUTC := req.StartDate.UTC().Truncate(24 * time.Hour)
+	endUTC := req.EndDate.UTC().Truncate(24 * time.Hour)
+
+	if endUTC.Before(startUTC) {
+		return nil, fmt.Errorf("end_date must be on or after start_date")
+	}
+	if req.TotalDays <= 0 {
+		return nil, fmt.Errorf("total_days must be a positive integer")
+	}
+	span := int(endUTC.Sub(startUTC).Hours()/24) + 1
+	if req.TotalDays > span {
+		return nil, fmt.Errorf(
+			"total_days (%d) cannot exceed the inclusive calendar span (%d) between %s and %s",
+			req.TotalDays, span,
+			req.StartDate.Format("2006-01-02"),
+			req.EndDate.Format("2006-01-02"),
+		)
 	}
 
 	valid, message, err := s.repo.ValidateLeaveRequest(ctx, req, nil)
@@ -1380,6 +1368,11 @@ func (s *leaveRequestService) RequestLeave(
 		return nil, fmt.Errorf("leave type not found")
 	}
 
+	// ── Build the request. Always insert as 'pending'; the auto-approval
+	//    path transitions it in the same transaction via ProcessLeaveRequestTx,
+	//    which is where the ledger consumption entry is written.
+	//    Inserting as 'approved' directly would skip the ledger entry — the
+	//    exact bug this transaction fixes.
 	request := &models.LeaveRequest{
 		LeaveRequestID: uuid.New(),
 		CompanyID:      req.CompanyID,
@@ -1392,21 +1385,39 @@ func (s *leaveRequestService) RequestLeave(
 		RequestedBy:    req.RequestedBy,
 		RequestedAt:    time.Now().UTC(),
 	}
-	if !leaveType.RequiresApproval {
-		request.Status = "approved"
-		request.ApprovedBy = &req.RequestedBy
-		now := time.Now().UTC()
-		request.ApprovedAt = &now
-	}
 
-	if err := s.repo.CreateLeaveRequest(ctx, request); err != nil {
+	// ── Atomic insert + optional auto-approval ─────────────────────────
+	if s.pgClient == nil {
+		return nil, fmt.Errorf("postgres client not configured")
+	}
+	err = s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
+		if err := s.repo.CreateLeaveRequestTx(ctx, tx, request); err != nil {
+			return fmt.Errorf("create leave request: %w", err)
+		}
+		if !leaveType.RequiresApproval {
+			if err := s.repo.ProcessLeaveRequestTx(
+				ctx, tx, request.LeaveRequestID, true, req.RequestedBy,
+			); err != nil {
+				return fmt.Errorf("auto-approve leave request: %w", err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 
-	if request.Status == "approved" {
-		if err := s.processApproval(ctx, request, *request.ApprovedBy); err != nil {
-			// Non-fatal — the request is created; the approval ledger entry
-			// can be reconciled later. Log via audit metadata below.
+	// ── Reflect the actual DB state on the local variable (audit + response) ──
+	if !leaveType.RequiresApproval {
+		updated, rerr := s.repo.GetLeaveRequestByID(ctx, request.LeaveRequestID)
+		if rerr == nil && updated != nil {
+			request = updated
+		} else {
+			// Fall back to the values ProcessLeaveRequestTx would have set.
+			request.Status = "approved"
+			request.ApprovedBy = &req.RequestedBy
+			now := time.Now().UTC()
+			request.ApprovedAt = &now
 		}
 	}
 
@@ -1456,7 +1467,6 @@ func (s *leaveRequestService) ApproveLeave(
 		return nil, fmt.Errorf("leave request is not pending")
 	}
 
-	// 👇 Row-level authorization — target employee must be in scope.
 	if err := s.ensureEmployeeInScope(ctx, request.CompanyID, request.UserID); err != nil {
 		return nil, err
 	}
@@ -1518,7 +1528,6 @@ func (s *leaveRequestService) RejectLeave(
 		return nil, fmt.Errorf("request not found")
 	}
 
-	// 👇 Row-level authorization — target employee must be in scope.
 	if err := s.ensureEmployeeInScope(ctx, request.CompanyID, request.UserID); err != nil {
 		return nil, err
 	}
@@ -1577,7 +1586,6 @@ func (s *leaveRequestService) CancelLeave(
 		return nil, fmt.Errorf("request not found")
 	}
 
-	// 👇 Row-level authorization — target employee must be in scope.
 	if err := s.ensureEmployeeInScope(ctx, request.CompanyID, request.UserID); err != nil {
 		return nil, err
 	}
@@ -1606,7 +1614,6 @@ func (s *leaveRequestService) CancelLeave(
 	return updated, nil
 }
 
-// GetPendingRequests — location filter applies when locationID != nil.
 func (s *leaveRequestService) GetPendingRequests(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1638,7 +1645,6 @@ func (s *leaveRequestService) UpdateLeaveRequest(
 		return err
 	}
 
-	// 👇 Row-level authorization — target employee must be in scope.
 	if err := s.ensureEmployeeInScope(ctx, request.CompanyID, request.UserID); err != nil {
 		return err
 	}
@@ -1664,6 +1670,9 @@ func (s *leaveRequestService) UpdateLeaveRequest(
 	return nil
 }
 
+// processApproval — used by the manual ApproveLeave path. The auto-approval
+// path in RequestLeave no longer goes through here; it calls
+// ProcessLeaveRequestTx inside the same transaction as the insert.
 func (s *leaveRequestService) processApproval(ctx context.Context, request *models.LeaveRequest, approvedBy uuid.UUID) error {
 	return s.repo.ProcessLeaveRequest(ctx, request.LeaveRequestID, true, approvedBy)
 }
@@ -1683,11 +1692,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 
 	"auth-service/internal/client"
 	"auth-service/internal/hr/leave/models"
@@ -1713,7 +1722,6 @@ type leavePolicyConfigService struct {
 	idempotencyStore idempotency.Store
 	auditService     *audit.AuditService
 
-	// 👇 ADD
 	pgClient     *client.PostgresClient
 	resolverJobs repository.ResolverJobRepository
 }
@@ -1722,8 +1730,8 @@ func NewLeavePolicyConfigService(
 	repo repository.LeaveRepository,
 	idempotencyStore idempotency.Store,
 	auditService *audit.AuditService,
-	pgClient *client.PostgresClient, // 👈 ADD
-	resolverJobs repository.ResolverJobRepository, // 👈 ADD
+	pgClient *client.PostgresClient,
+	resolverJobs repository.ResolverJobRepository,
 ) LeavePolicyConfigService {
 	return &leavePolicyConfigService{
 		repo:             repo,
@@ -1734,30 +1742,36 @@ func NewLeavePolicyConfigService(
 	}
 }
 
-// enqueueCompanyResolution is the best-effort emit used by every policy
-// mutation. The policy write has already committed by the time we get here,
-// so a failed enqueue MUST NOT surface as an HTTP error — log and move on.
-// The next policy edit will re-enqueue.
-func (s *leavePolicyConfigService) enqueueCompanyResolution(
+// withResolutionEnqueue runs a policy mutation inside a transaction, then
+// enqueues the company-wide resolution job in the SAME transaction. If either
+// the write or the enqueue fails, both roll back — a policy change cannot be
+// persisted without a corresponding resolver job.
+//
+// Rationale: the previous "write first, enqueue best-effort" pattern left the
+// system in a state where a policy was live but every employee's entitlement
+// still reflected the old rules, silently. The next policy edit would catch
+// up, but that could be days away.
+func (s *leavePolicyConfigService) withResolutionEnqueue(
 	ctx context.Context,
 	companyID uuid.UUID,
 	reason string,
-) {
-	if s.pgClient == nil || s.resolverJobs == nil {
-		return
+	fn func(tx *sql.Tx) error,
+) error {
+	if s.pgClient == nil {
+		return errors.New("postgres client not configured")
+	}
+	if s.resolverJobs == nil {
+		return errors.New("resolver job repository not configured")
 	}
 	if companyID == uuid.Nil {
-		return
+		return errors.New("company_id is required for policy change")
 	}
-	if err := s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
+	return s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
+		if err := fn(tx); err != nil {
+			return err
+		}
 		return s.resolverJobs.EnqueueCompanyResolution(ctx, tx, companyID, reason)
-	}); err != nil {
-		zap.L().Warn("enqueue company resolution failed",
-			zap.String("company_id", companyID.String()),
-			zap.String("reason", reason),
-			zap.Error(err),
-		)
-	}
+	})
 }
 
 // ---------- POLICY ----------
@@ -1778,6 +1792,7 @@ func (s *leavePolicyConfigService) CreatePolicy(
 		return cached, nil
 	}
 
+	// ── Validation ──────────────────────────────────────────────────
 	if policy.CompanyID == uuid.Nil {
 		return nil, fmt.Errorf("company_id is required")
 	}
@@ -1810,10 +1825,16 @@ func (s *leavePolicyConfigService) CreatePolicy(
 	policy.IsActive = true
 	policy.CreatedAt = time.Now().UTC()
 
-	if err := s.repo.CreateLeavePolicy(ctx, policy); err != nil {
-		return nil, err
+	// ── Write + enqueue atomically ─────────────────────────────────
+	if err := s.withResolutionEnqueue(ctx, policy.CompanyID, "policy change",
+		func(tx *sql.Tx) error {
+			return s.repo.CreateLeavePolicyTx(ctx, tx, policy)
+		},
+	); err != nil {
+		return nil, fmt.Errorf("create policy: %w", err)
 	}
 
+	// ── Audit + idempotency (after commit, best-effort) ────────────
 	afterJSON, _ := json.Marshal(policy)
 	ip, _ := ctx.Value("ip_address").(string)
 	auditMeta := mergeMeta(metadata, map[string]interface{}{
@@ -1836,9 +1857,6 @@ func (s *leavePolicyConfigService) CreatePolicy(
 		afterJSON,
 		auditMeta,
 	)
-
-	// 👇 Policy changed → re-resolve every active employee in the company.
-	s.enqueueCompanyResolution(ctx, policy.CompanyID, "policy change")
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, policy)
 
@@ -1867,10 +1885,16 @@ func (s *leavePolicyConfigService) DeactivatePolicy(
 	}
 	beforeJSON, _ := json.Marshal(policy)
 
-	if err := s.repo.DeactivateLeavePolicy(ctx, policyID); err != nil {
-		return err
+	// ── Write + enqueue atomically ─────────────────────────────────
+	if err := s.withResolutionEnqueue(ctx, policy.CompanyID, "policy change",
+		func(tx *sql.Tx) error {
+			return s.repo.DeactivateLeavePolicyTx(ctx, tx, policyID)
+		},
+	); err != nil {
+		return fmt.Errorf("deactivate policy: %w", err)
 	}
 
+	// ── Audit + idempotency ────────────────────────────────────────
 	ip, _ := ctx.Value("ip_address").(string)
 	auditMeta := mergeMeta(metadata, map[string]interface{}{
 		"policy_id": policyID.String(),
@@ -1890,9 +1914,6 @@ func (s *leavePolicyConfigService) DeactivatePolicy(
 		[]byte("{}"),
 		auditMeta,
 	)
-
-	// 👇 Policy changed → re-resolve every active employee in the company.
-	s.enqueueCompanyResolution(ctx, policy.CompanyID, "policy change")
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 
@@ -1930,6 +1951,7 @@ func (s *leavePolicyConfigService) UpdatePolicy(
 	}
 	beforeJSON, _ := json.Marshal(policy)
 
+	// ── Validation ────────────────────────────────────────────────
 	if update.AppliesToType != nil {
 		switch *update.AppliesToType {
 		case "company":
@@ -1951,10 +1973,16 @@ func (s *leavePolicyConfigService) UpdatePolicy(
 		return fmt.Errorf("priority must be > 0")
 	}
 
-	if err := s.repo.UpdateLeavePolicy(ctx, policyID, update); err != nil {
-		return err
+	// ── Write + enqueue atomically ─────────────────────────────────
+	if err := s.withResolutionEnqueue(ctx, policy.CompanyID, "policy change",
+		func(tx *sql.Tx) error {
+			return s.repo.UpdateLeavePolicyTx(ctx, tx, policyID, update)
+		},
+	); err != nil {
+		return fmt.Errorf("update policy: %w", err)
 	}
 
+	// ── Audit + idempotency ────────────────────────────────────────
 	ip, _ := ctx.Value("ip_address").(string)
 	auditMeta := mergeMeta(metadata, map[string]interface{}{
 		"policy_id": policyID.String(),
@@ -1974,9 +2002,6 @@ func (s *leavePolicyConfigService) UpdatePolicy(
 		nil,
 		auditMeta,
 	)
-
-	// 👇 Policy changed → re-resolve every active employee in the company.
-	s.enqueueCompanyResolution(ctx, policy.CompanyID, "policy change")
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 
@@ -2001,6 +2026,7 @@ func (s *leavePolicyConfigService) AddPolicyRule(
 		return cached, nil
 	}
 
+	// ── Validation ────────────────────────────────────────────────
 	if rule.PolicyID == uuid.Nil {
 		return nil, fmt.Errorf("policy_id required")
 	}
@@ -2010,13 +2036,28 @@ func (s *leavePolicyConfigService) AddPolicyRule(
 	if rule.TotalDays <= 0 {
 		return nil, fmt.Errorf("total_days must be > 0")
 	}
+
+	// Look up the parent policy up-front so we have companyID for both the
+	// transaction closure and the audit metadata. If the policy is missing,
+	// fail before we attempt the insert.
+	policy, err := s.repo.GetLeavePolicyByID(ctx, rule.PolicyID)
+	if err != nil {
+		return nil, fmt.Errorf("parent policy not found: %w", err)
+	}
+
 	rule.PolicyRuleID = uuid.New()
 	rule.CreatedAt = time.Now().UTC()
 
-	if err := s.repo.AddPolicyRule(ctx, rule); err != nil {
-		return nil, err
+	// ── Write + enqueue atomically ─────────────────────────────────
+	if err := s.withResolutionEnqueue(ctx, policy.CompanyID, "policy change",
+		func(tx *sql.Tx) error {
+			return s.repo.AddPolicyRuleTx(ctx, tx, rule)
+		},
+	); err != nil {
+		return nil, fmt.Errorf("add policy rule: %w", err)
 	}
 
+	// ── Audit + idempotency ────────────────────────────────────────
 	afterJSON, _ := json.Marshal(rule)
 	ip, _ := ctx.Value("ip_address").(string)
 	auditMeta := mergeMeta(metadata, map[string]interface{}{
@@ -2025,16 +2066,10 @@ func (s *leavePolicyConfigService) AddPolicyRule(
 		"leave_type_id":  rule.LeaveTypeID.String(),
 		"ip":             ip,
 	})
-	// Get companyID from policy
-	policy, _ := s.repo.GetLeavePolicyByID(ctx, rule.PolicyID)
-	var companyID *uuid.UUID
-	if policy != nil {
-		companyID = &policy.CompanyID
-	}
 	_ = s.auditService.LogAction(
 		ctx,
 		nil,
-		companyID,
+		&policy.CompanyID,
 		"leave",
 		"policy_rule.add",
 		"leave_policy_rule",
@@ -2045,11 +2080,6 @@ func (s *leavePolicyConfigService) AddPolicyRule(
 		afterJSON,
 		auditMeta,
 	)
-
-	// 👇 Policy changed → re-resolve every active employee in the company.
-	if policy != nil {
-		s.enqueueCompanyResolution(ctx, policy.CompanyID, "policy change")
-	}
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, rule)
 
@@ -2072,19 +2102,40 @@ func (s *leavePolicyConfigService) RemovePolicyRule(
 		return nil
 	}
 
-	if err := s.repo.DeletePolicyRule(ctx, policyRuleID); err != nil {
-		return err
+	// ── Resolve the parent policy so we know which company to re-resolve.
+	//    Previously this relied on metadata["company_id"], which is a bug:
+	//    if the handler forgot to supply it, no resolver job was enqueued
+	//    and no error was raised. Now we look it up explicitly.
+	policyRule, err := s.repo.GetPolicyRuleByID(ctx, policyRuleID)
+	if err != nil {
+		return fmt.Errorf("policy rule not found: %w", err)
+	}
+	policy, err := s.repo.GetLeavePolicyByID(ctx, policyRule.PolicyID)
+	if err != nil {
+		return fmt.Errorf("parent policy not found: %w", err)
 	}
 
+	// ── Write + enqueue atomically ─────────────────────────────────
+	if err := s.withResolutionEnqueue(ctx, policy.CompanyID, "policy change",
+		func(tx *sql.Tx) error {
+			return s.repo.DeletePolicyRuleTx(ctx, tx, policyRuleID)
+		},
+	); err != nil {
+		return fmt.Errorf("remove policy rule: %w", err)
+	}
+
+	// ── Audit + idempotency ────────────────────────────────────────
 	ip, _ := ctx.Value("ip_address").(string)
 	auditMeta := mergeMeta(metadata, map[string]interface{}{
 		"policy_rule_id": policyRuleID.String(),
+		"policy_id":      policy.PolicyID.String(),
+		"company_id":     policy.CompanyID.String(),
 		"ip":             ip,
 	})
 	_ = s.auditService.LogAction(
 		ctx,
 		nil,
-		nil,
+		&policy.CompanyID,
 		"leave",
 		"policy_rule.remove",
 		"leave_policy_rule",
@@ -2095,15 +2146,6 @@ func (s *leavePolicyConfigService) RemovePolicyRule(
 		[]byte("{}"),
 		auditMeta,
 	)
-
-	// 👇 Policy changed → re-resolve every active employee in the company.
-	// company_id comes via metadata (the handler supplies it) because this
-	// method does not otherwise load the rule's parent policy.
-	if companyIDStr, ok := metadata["company_id"].(string); ok && companyIDStr != "" {
-		if companyID, perr := uuid.Parse(companyIDStr); perr == nil {
-			s.enqueueCompanyResolution(ctx, companyID, "policy change")
-		}
-	}
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 
@@ -2132,6 +2174,7 @@ func (s *leavePolicyConfigService) UpdatePolicyRule(
 		return nil
 	}
 
+	// ── Validation ────────────────────────────────────────────────
 	if update.TotalDays != nil && *update.TotalDays <= 0 {
 		return fmt.Errorf("total_days must be > 0")
 	}
@@ -2145,10 +2188,16 @@ func (s *leavePolicyConfigService) UpdatePolicyRule(
 		}
 	}
 
-	if err := s.repo.UpdatePolicyRule(ctx, companyID, policyRuleID, update); err != nil {
-		return err
+	// ── Write + enqueue atomically ─────────────────────────────────
+	if err := s.withResolutionEnqueue(ctx, companyID, "policy change",
+		func(tx *sql.Tx) error {
+			return s.repo.UpdatePolicyRuleTx(ctx, tx, companyID, policyRuleID, update)
+		},
+	); err != nil {
+		return fmt.Errorf("update policy rule: %w", err)
 	}
 
+	// ── Audit + idempotency ────────────────────────────────────────
 	ip, _ := ctx.Value("ip_address").(string)
 	auditMeta := mergeMeta(metadata, map[string]interface{}{
 		"policy_rule_id": policyRuleID.String(),
@@ -2169,9 +2218,6 @@ func (s *leavePolicyConfigService) UpdatePolicyRule(
 		nil,
 		auditMeta,
 	)
-
-	// 👇 Policy changed → re-resolve every active employee in the company.
-	s.enqueueCompanyResolution(ctx, companyID, "policy change")
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 
@@ -2201,22 +2247,23 @@ import (
 )
 
 type LeaveQueryService interface {
-	// Balance — P3 validates the target user
 	GetLeaveBalance(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, asOfDate time.Time, actorType string, actorID uuid.UUID, metadata map[string]interface{}) ([]*models.LeaveBalance, error)
 	GetLeaveBalanceByType(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, leaveTypeID uuid.UUID, asOfDate time.Time, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.LeaveBalance, error)
-
-	// Internal scheduling resolver — no request ctx, no P3
+	GetCompanyLedger(
+		ctx context.Context,
+		companyID uuid.UUID,
+		locationID *uuid.UUID,
+		filter models.LeaveLedgerFilter,
+	) ([]*models.LeaveLedgerEntry, int64, error)
 	IsUserOnLeave(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, date time.Time) (bool, *models.LeaveRequest, error)
 	GetApprovedLeaveForDate(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, date time.Time) (*models.LeaveRequest, error)
 
-	// History — P3 validates the target user (signature now takes companyID)
 	GetUserLeaveHistory(ctx context.Context, companyID, userID uuid.UUID, startDate, endDate time.Time) ([]*models.LeaveRequest, error)
 	GetLeaveTransactionHistory(ctx context.Context, companyID, userID uuid.UUID, startDate, endDate time.Time) ([]*models.LeaveTransaction, error)
 
 	GetLeaveTypeByID(ctx context.Context, companyID uuid.UUID, leaveTypeID uuid.UUID) (*models.LeaveType, error)
 	GetLeaveForecast(ctx context.Context, userID uuid.UUID, months int) ([]*models.LeaveBalance, error)
 
-	// GetLeaveUtilizationReport — location filter applies when locationID != nil.
 	GetLeaveUtilizationReport(
 		ctx context.Context,
 		companyID uuid.UUID,
@@ -2229,13 +2276,13 @@ type LeaveQueryService interface {
 
 type leaveQueryService struct {
 	repo         repository.LeaveRepository
-	employeeRepo hrRepo.EmployeeRepository // 👈 new — for P3
+	employeeRepo hrRepo.EmployeeRepository
 	auditService *audit.AuditService
 }
 
 func NewLeaveQueryService(
 	repo repository.LeaveRepository,
-	employeeRepo hrRepo.EmployeeRepository, // 👈 new
+	employeeRepo hrRepo.EmployeeRepository,
 	auditService *audit.AuditService,
 ) LeaveQueryService {
 	return &leaveQueryService{
@@ -2245,12 +2292,6 @@ func NewLeaveQueryService(
 	}
 }
 
-// ensureEmployeeInScope verifies that the target employee is within the
-// request's current location scope.
-//
-//   - ScopeAll      → pass
-//   - ScopeLocation → target must be at that location
-//   - missing ctx   → error (route not wrapped → wiring bug)
 func (s *leaveQueryService) ensureEmployeeInScope(
 	ctx context.Context,
 	companyID, userID uuid.UUID,
@@ -2269,6 +2310,9 @@ func (s *leaveQueryService) ensureEmployeeInScope(
 	if empLoc == nil {
 		return ErrEmployeeHasNoLocation
 	}
+	if locCtx.LocationID == nil {
+		return fmt.Errorf("location scope requires a location id")
+	}
 	if *empLoc != *locCtx.LocationID {
 		return ErrEmployeeOutsideScope
 	}
@@ -2276,7 +2320,7 @@ func (s *leaveQueryService) ensureEmployeeInScope(
 }
 
 // ============================================================================
-// BALANCE (P3 validates target)
+// BALANCE
 // ============================================================================
 
 func (s *leaveQueryService) GetLeaveBalance(
@@ -2288,7 +2332,6 @@ func (s *leaveQueryService) GetLeaveBalance(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) ([]*models.LeaveBalance, error) {
-	// 👇 P3 — row-level authorization
 	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
 		return nil, err
 	}
@@ -2326,7 +2369,6 @@ func (s *leaveQueryService) GetLeaveBalanceByType(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) (*models.LeaveBalance, error) {
-	// 👇 P3 — row-level authorization
 	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
 		return nil, err
 	}
@@ -2356,7 +2398,7 @@ func (s *leaveQueryService) GetLeaveBalanceByType(
 }
 
 // ============================================================================
-// INTERNAL (no P3 — called by scheduler resolver without request ctx)
+// INTERNAL
 // ============================================================================
 
 func (s *leaveQueryService) IsUserOnLeave(
@@ -2401,7 +2443,7 @@ func (s *leaveQueryService) GetApprovedLeaveForDate(
 }
 
 // ============================================================================
-// HISTORY (P3 validates target; signature changed to accept companyID)
+// HISTORY
 // ============================================================================
 
 func (s *leaveQueryService) GetUserLeaveHistory(
@@ -2409,7 +2451,6 @@ func (s *leaveQueryService) GetUserLeaveHistory(
 	companyID, userID uuid.UUID,
 	startDate, endDate time.Time,
 ) ([]*models.LeaveRequest, error) {
-	// 👇 P3 — row-level authorization
 	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
 		return nil, err
 	}
@@ -2421,7 +2462,6 @@ func (s *leaveQueryService) GetLeaveTransactionHistory(
 	companyID, userID uuid.UUID,
 	startDate, endDate time.Time,
 ) ([]*models.LeaveTransaction, error) {
-	// 👇 P3 — row-level authorization
 	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
 		return nil, err
 	}
@@ -2441,6 +2481,12 @@ func (s *leaveQueryService) GetLeaveTypeByID(
 	if err != nil {
 		return nil, err
 	}
+	// Defensive nil check — repo convention is to return
+	// ErrLeaveTypeNotFound, but a future change could return (nil, nil),
+	// and downstream callers dereference lt unconditionally.
+	if lt == nil {
+		return nil, fmt.Errorf("leave type not found")
+	}
 	if lt.CompanyID != companyID {
 		return nil, fmt.Errorf("leave type does not belong to company")
 	}
@@ -2455,7 +2501,6 @@ func (s *leaveQueryService) GetLeaveForecast(
 	return s.repo.GetLeaveForecast(ctx, userID, months)
 }
 
-// GetLeaveUtilizationReport — location filter applied when locationID != nil.
 func (s *leaveQueryService) GetLeaveUtilizationReport(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -2478,6 +2523,28 @@ func (s *leaveQueryService) CheckLeaveAvailability(
 		return false, 0, fmt.Errorf("failed to resolve user position: %w", err)
 	}
 	return s.repo.CheckLeaveAvailability(ctx, userID, leaveTypeID, days, startDate, positionID)
+}
+
+func (s *leaveQueryService) GetCompanyLedger(
+	ctx context.Context,
+	companyID uuid.UUID,
+	locationID *uuid.UUID,
+	filter models.LeaveLedgerFilter,
+) ([]*models.LeaveLedgerEntry, int64, error) {
+	filter.CompanyID = companyID
+	filter.LocationID = locationID
+
+	if filter.Page < 1 {
+		filter.Page = 1
+	}
+	if filter.PageSize < 1 {
+		filter.PageSize = 50
+	}
+	if filter.PageSize > 500 {
+		filter.PageSize = 500
+	}
+
+	return s.repo.GetCompanyLedger(ctx, filter)
 }
 
 

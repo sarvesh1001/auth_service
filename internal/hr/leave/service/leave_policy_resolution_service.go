@@ -18,17 +18,12 @@ import (
 	"auth-service/internal/infrastructure/idempotency"
 )
 
-// ErrNoMatchingPolicy is returned by ResolveUserLeaveEntitlements when the
-// resolver found zero applicable policy rules for a user. It is not a hard
-// failure — it means the user has no policy coverage — but the batch caller
-// must distinguish it from "resolved successfully" so counts are honest.
 var ErrNoMatchingPolicy = errors.New("no matching policy rules for user")
 
 type LeavePolicyResolutionService interface {
 	ResolveUserLeaveEntitlements(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, asOf time.Time, reason string, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
 	ResolveBatchLeaveEntitlements(ctx context.Context, companyID uuid.UUID, userIDs []uuid.UUID, asOf time.Time, reason string, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*LeavePolicyResolutionResult, error)
 
-	// ── Enqueue API (used by HTTP handlers, fan-out only) ────────────────
 	EnqueueUserResolutionJobs(ctx context.Context, companyID uuid.UUID, userIDs []uuid.UUID, reason string) error
 	EnqueueCompanyResolution(ctx context.Context, companyID uuid.UUID, reason string) error
 
@@ -82,13 +77,9 @@ func NewLeavePolicyResolutionService(
 }
 
 // ============================================================
-// Enqueue API — used by HTTP handlers, never does the work inline
+// Enqueue API
 // ============================================================
 
-// EnqueueUserResolutionJobs enqueues one resolve_user job per user.
-// Duplicates (a user already having a pending/processing resolve_user job)
-// are silently skipped by the repository's NOT EXISTS check, so this is
-// safe to call repeatedly.
 func (s *leavePolicyResolutionService) EnqueueUserResolutionJobs(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -112,8 +103,6 @@ func (s *leavePolicyResolutionService) EnqueueUserResolutionJobs(
 	})
 }
 
-// EnqueueCompanyResolution enqueues a single resolve_company job. The
-// worker will fan out internally in chunks of 100.
 func (s *leavePolicyResolutionService) EnqueueCompanyResolution(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -133,7 +122,7 @@ func (s *leavePolicyResolutionService) EnqueueCompanyResolution(
 }
 
 // ============================================================
-// Synchronous resolver — kept for the worker and single-user calls
+// Synchronous resolver
 // ============================================================
 
 func (s *leavePolicyResolutionService) ResolveUserLeaveEntitlements(
@@ -167,7 +156,7 @@ func (s *leavePolicyResolutionService) ResolveUserLeaveEntitlements(
 		return nil
 	}
 
-	positionID, workCenterCode, err := s.repo.GetUserPositionContext(ctx, companyID, userID)
+	positionID, workCenterCode, err := s.repo.GetUserPositionContextOnDate(ctx, companyID, userID, asOf)
 	if err != nil {
 		logger.Error("resolve user — GetUserPositionContext failed", zap.Error(err))
 		return fmt.Errorf("failed to get user position context: %w", err)
@@ -184,17 +173,6 @@ func (s *leavePolicyResolutionService) ResolveUserLeaveEntitlements(
 	}
 	logger.Info("resolve user — policy rules resolved", zap.Int("rule_count", len(rules)))
 
-	for i, r := range rules {
-		logger.Info("resolve user — rule",
-			zap.Int("index", i),
-			zap.String("policy_id", r.PolicyID.String()),
-			zap.String("leave_type_id", r.LeaveTypeID.String()),
-			zap.Int("total_days", r.TotalDays),
-			zap.String("accrual_method", r.AccrualMethod),
-			zap.String("carry_forward_limit", intPtrStr(r.CarryForwardLimit)),
-		)
-	}
-
 	if len(rules) == 0 {
 		logger.Warn("resolve user — no matching policy rules; skipping and storing marker")
 		_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
@@ -206,63 +184,21 @@ func (s *leavePolicyResolutionService) ResolveUserLeaveEntitlements(
 
 	for _, rule := range rules {
 		if processedLeaveTypes[rule.LeaveTypeID] {
-			logger.Info("resolve user — leave type already processed, skipping",
-				zap.String("leave_type_id", rule.LeaveTypeID.String()),
-			)
 			continue
 		}
 
 		existing, err := s.repo.GetActivePolicyEntitlement(ctx, companyID, userID, rule.LeaveTypeID, positionID)
 		if err != nil {
-			logger.Error("resolve user — GetActivePolicyEntitlement failed",
-				zap.String("leave_type_id", rule.LeaveTypeID.String()),
-				zap.Error(err),
-			)
 			return fmt.Errorf("failed to check existing entitlement: %w", err)
-		}
-
-		if existing != nil {
-			logger.Info("resolve user — existing entitlement found",
-				zap.String("leave_type_id", rule.LeaveTypeID.String()),
-				zap.String("existing_policy_id", uuidPtrStr(existing.PolicyID)),
-				zap.String("target_policy_id", rule.PolicyID.String()),
-				zap.Int("existing_total_days", existing.TotalDays),
-				zap.Int("target_total_days", rule.TotalDays),
-			)
-		} else {
-			logger.Info("resolve user — no existing entitlement; will create",
-				zap.String("leave_type_id", rule.LeaveTypeID.String()),
-				zap.String("target_policy_id", rule.PolicyID.String()),
-				zap.Int("target_total_days", rule.TotalDays),
-			)
 		}
 
 		if existing != nil && existing.PolicyID != nil &&
 			*existing.PolicyID == rule.PolicyID &&
 			existing.TotalDays == rule.TotalDays {
-			logger.Info("resolve user — entitlement already correct; skipping",
-				zap.String("leave_type_id", rule.LeaveTypeID.String()),
-				zap.String("policy_id", rule.PolicyID.String()),
-				zap.Int("total_days", rule.TotalDays),
-			)
 			processedLeaveTypes[rule.LeaveTypeID] = true
 			skipped++
 			continue
 		}
-
-		if err := s.repo.EndActivePolicyEntitlementsByLeaveType(
-			ctx, companyID, userID, rule.LeaveTypeID, asOf, positionID,
-		); err != nil {
-			logger.Error("resolve user — EndActivePolicyEntitlementsByLeaveType failed",
-				zap.String("leave_type_id", rule.LeaveTypeID.String()),
-				zap.Error(err),
-			)
-			return fmt.Errorf("failed to end entitlement: %w", err)
-		}
-		logger.Info("resolve user — ended old entitlements for leave type",
-			zap.String("leave_type_id", rule.LeaveTypeID.String()),
-			zap.Time("end_date", asOf),
-		)
 
 		entitlement := &models.LeaveEntitlement{
 			EntitlementID:  uuid.New(),
@@ -277,13 +213,31 @@ func (s *leavePolicyResolutionService) ResolveUserLeaveEntitlements(
 			PositionID:     positionID,
 			WorkCenterCode: workCenterCode,
 		}
-		if err := s.repo.CreatePolicyLeaveEntitlement(ctx, entitlement); err != nil {
-			logger.Error("resolve user — CreatePolicyLeaveEntitlement failed",
+
+		// ── End old + create new in ONE transaction ────────────────────
+		// Previously these were two separate repo calls: a crash between
+		// them left the user with no active entitlement for this leave type.
+		// Now they commit together or not at all.
+		if s.pgClient == nil {
+			return fmt.Errorf("postgres client not configured")
+		}
+		err = s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
+			if err := s.repo.EndActivePolicyEntitlementsByLeaveTypeTx(
+				ctx, tx, companyID, userID, rule.LeaveTypeID, asOf, positionID,
+			); err != nil {
+				return fmt.Errorf("end entitlement: %w", err)
+			}
+			if err := s.repo.CreatePolicyLeaveEntitlementTx(ctx, tx, entitlement); err != nil {
+				return fmt.Errorf("create entitlement: %w", err)
+			}
+			return nil
+		})
+		if err != nil {
+			logger.Error("resolve user — entitlement swap failed",
 				zap.String("leave_type_id", rule.LeaveTypeID.String()),
-				zap.String("policy_id", rule.PolicyID.String()),
 				zap.Error(err),
 			)
-			return fmt.Errorf("failed to create entitlement: %w", err)
+			return err
 		}
 
 		logger.Info("resolve user — entitlement written",
@@ -348,6 +302,9 @@ func (s *leavePolicyResolutionService) ResolveBatchLeaveEntitlements(
 	batchKey := resolveBatchIdempotencyKey(ctx)
 	logger.Debug("resolve batch — idempotency key", zap.String("batch_key", batchKey))
 
+	// Batch-level cache hit only when the previous run fully succeeded.
+	// Failed batches are NOT cached (see below), so retries always re-run
+	// the failed users. Per-user idempotency handles the succeeded ones.
 	var cached *LeavePolicyResolutionResult
 	if err := s.idempotencyStore.Get(ctx, nil, batchKey, &cached); err == nil && cached != nil {
 		logger.Info("resolve batch — short-circuited by idempotency",
@@ -384,6 +341,21 @@ func (s *leavePolicyResolutionService) ResolveBatchLeaveEntitlements(
 		zap.Int("failed", len(result.FailedUsers)),
 	)
 
+	// ── CRITICAL: if any user failed, return an error so the worker retries.
+	//    Do NOT cache — a cached failed result would poison every subsequent
+	//    attempt with the same batch key (derived from resolver_job_id).
+	if len(result.FailedUsers) > 0 {
+		firstErr := "unknown"
+		if len(result.Errors) > 0 {
+			firstErr = result.Errors[0]
+		}
+		return result, fmt.Errorf(
+			"batch resolution: %d/%d users failed; first error: %s",
+			len(result.FailedUsers), result.TotalUsers, firstErr,
+		)
+	}
+
+	// Success — safe to cache.
 	ip, _ := ctx.Value("ip_address").(string)
 	afterJSON, _ := json.Marshal(result)
 	auditMeta := mergeMeta(metadata, map[string]interface{}{
@@ -419,20 +391,15 @@ func (s *leavePolicyResolutionService) GetUserEffectivePolicies(ctx context.Cont
 	return s.repo.ResolveUserPolicyRules(ctx, companyID, userID, asOf)
 }
 
-// ============================================================
-// Resolver worker support
-// ============================================================
-
 func (s *leavePolicyResolutionService) EndActivePolicyEntitlements(
 	ctx context.Context, companyID, userID uuid.UUID, effectiveTo time.Time,
 ) error {
-	positionID, _, err := s.repo.GetUserPositionContext(ctx, companyID, userID)
+	positionID, _, err := s.repo.GetUserPositionContextOnDate(ctx, companyID, userID, effectiveTo)
 	if err != nil {
 		return fmt.Errorf("get user position context: %w", err)
 	}
 	return s.repo.EndActivePolicyEntitlements(ctx, companyID, userID, effectiveTo, positionID)
 }
-
 func (s *leavePolicyResolutionService) ListActiveEmployeeUserIDs(
 	ctx context.Context, companyID uuid.UUID,
 ) ([]uuid.UUID, error) {
@@ -449,21 +416,6 @@ func (s *leavePolicyResolutionService) ListActiveEmployeeUserIDsByPosition(
 // Idempotency key helpers
 // ============================================================
 
-// resolveUserIdempotencyKey builds a per-user, per-operation key.
-//
-// Priority order:
-//
-//  1. resolver_job_id  → one key per resolver job, unique across jobs.
-//     Multiple jobs for the same user on the same day
-//     each get their own key and both run.
-//
-//  2. idempotency_key  → one key per HTTP request. Retries of the same
-//     request are idempotent; distinct clicks are not.
-//
-//  3. fallback         → day-scoped, last-resort safety net. Only fires
-//     when a caller supplies NEITHER a job id NOR a
-//     request key — a wiring bug we want to collapse
-//     rather than multiply.
 func resolveUserIdempotencyKey(ctx context.Context, userID uuid.UUID, asOf time.Time) string {
 	if jobID, _ := ctx.Value("resolver_job_id").(string); jobID != "" {
 		return fmt.Sprintf("resolve_user_job-%s-user-%s", jobID, userID.String())
@@ -474,16 +426,22 @@ func resolveUserIdempotencyKey(ctx context.Context, userID uuid.UUID, asOf time.
 	return fmt.Sprintf("resolve_user-%s-%s", userID.String(), asOf.Format("2006-01-02"))
 }
 
+// resolveBatchIdempotencyKey — same key for the same job_id so retries
+// short-circuit on the previously successful batch. Falls back to a random
+// UUID only when neither a request key nor a job id is available, which
+// should never happen in practice.
 func resolveBatchIdempotencyKey(ctx context.Context) string {
 	if reqKey, _ := ctx.Value("idempotency_key").(string); reqKey != "" {
 		return fmt.Sprintf("%s-batch", reqKey)
+	}
+	if jobID, _ := ctx.Value("resolver_job_id").(string); jobID != "" {
+		return fmt.Sprintf("resolve_batch_job-%s", jobID)
 	}
 	return fmt.Sprintf("resolve_batch-%s", uuid.New().String())
 }
 
 // ============================================================
-// Logging helpers — small pointer→string adapters so zap fields
-// don't panic on nil pointers and read cleanly in the log output.
+// Logging helpers
 // ============================================================
 
 func uuidPtrStr(id *uuid.UUID) string {

@@ -44,11 +44,8 @@ type StudentResolver struct {
 	timetableRepo  TimetableDataProvider
 	sessionRepo    SessionDataProvider
 	workCenterRepo repository.WorkCenterRepository
-
-	// ── NEW
-	tzProvider TimezoneProvider
-
-	logger *zap.Logger
+	tzProvider     TimezoneProvider
+	logger         *zap.Logger
 }
 
 func NewStudentResolver(
@@ -87,9 +84,6 @@ func (r *StudentResolver) Resolve(
 		return &ResolvedSubject{IsActive: active}, err
 	}
 
-	// ── NEW: resolve school tz via chain (students don't have positions,
-	//    so we walk from company default; if a section has a location,
-	//    future work should pass it in).
 	tz, tzErr := r.tzProvider.ResolveTimezone(ctx, companyID, nil, nil, nil)
 	if tzErr != nil || tz == "" {
 		r.logger.Warn("student tz resolution failed, defaulting to UTC",
@@ -124,7 +118,6 @@ func (r *StudentResolver) Resolve(
 
 	var earliestStart, latestEnd *time.Time
 	for _, e := range entries {
-		// ── CHANGED: build times in the school's tz, not UTC.
 		start := time.Date(date.Year(), date.Month(), date.Day(),
 			e.StartTime.Hour(), e.StartTime.Minute(), e.StartTime.Second(), 0, loc)
 		end := time.Date(date.Year(), date.Month(), date.Day(),
@@ -139,22 +132,13 @@ func (r *StudentResolver) Resolve(
 		}
 	}
 
-	var sessionID *uuid.UUID
-	if len(entries) > 0 {
-		sess, _, _, err := r.sessionRepo.GetAcademicSession(ctx, entries[0].EntryID, date)
-		if err == nil && sess != nil {
-			sessionID = sess
-		}
-	}
-
 	return &ResolvedSubject{
-		IsActive:           true,
-		Timezone:           tz,
-		ScheduleStatus:     "working",
-		ExpectedStart:      earliestStart,
-		ExpectedEnd:        latestEnd,
-		ScheduleInstanceID: sessionID,
-		IsOnLeave:          false,
-		IsLeavePaid:        false,
+		IsActive:       true,
+		Timezone:       tz,
+		ScheduleStatus: "working",
+		ExpectedStart:  earliestStart,
+		ExpectedEnd:    latestEnd,
+		IsOnLeave:      false,
+		IsLeavePaid:    false,
 	}, nil
 }

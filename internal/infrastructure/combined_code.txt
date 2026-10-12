@@ -32,42 +32,70 @@ func NewProcessor(
 
 // Start polling loop
 func (p *Processor) Start(ctx context.Context) {
+	logger := p.logger.With(zap.String("component", "outbox_processor"))
+	logger.Info("Outbox processor started, polling every 2 seconds")
+
+	if p.producer == nil {
+		logger.Error("❌ Kafka producer is nil – outbox processor will not function")
+		return
+	}
+
+	var lastProcessed time.Time
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			p.processBatch(ctx)
+			p.processBatch(ctx, &lastProcessed)
 		case <-ctx.Done():
+			logger.Info("Outbox processor stopped (context cancelled)")
 			return
 		}
 	}
 }
 
-func (p *Processor) processBatch(ctx context.Context) {
-	events, err := p.repo.FetchPending(ctx, p.batchSize)
-	if err != nil {
-		p.logger.Error("failed to fetch outbox events", zap.Error(err))
+func (p *Processor) processBatch(ctx context.Context, lastProcessed *time.Time) {
+	logger := p.logger.With(zap.String("component", "outbox_processor"))
+
+	if p.producer == nil {
+		logger.Error("Producer is nil, cannot process events")
 		return
 	}
 
-	for _, e := range events {
+	events, err := p.repo.FetchPending(ctx, p.batchSize)
+	if err != nil {
+		logger.Error("Failed to fetch outbox events", zap.Error(err))
+		return
+	}
 
-		// 🔥 USE topic from DB (NO routing logic)
-		topic := e.Topic
+	// No events: do nothing and don't log.
+	if len(events) == 0 {
+		return
+	}
 
-		// Prepare headers
+	*lastProcessed = time.Now()
+
+	logger.Info("Processing outbox events batch", zap.Int("count", len(events)))
+
+	for i, e := range events {
+		eventLogger := logger.With(
+			zap.String("event_id", e.EventID),
+			zap.String("event_type", e.EventType),
+			zap.String("topic", e.Topic),
+			zap.Int("retry_count", e.RetryCount),
+			zap.Int("batch_index", i),
+			zap.String("aggregate_id", e.AggregateID),
+		)
+
 		headers := make(map[string]string)
 		if e.Headers != nil {
 			for k, v := range e.Headers {
 				headers[k] = v
 			}
 		}
-
 		headers["event_id"] = e.EventID
 		headers["event_type"] = e.EventType
-
 		if e.AggregateType != "" {
 			headers["aggregate_type"] = e.AggregateType
 		}
@@ -75,27 +103,28 @@ func (p *Processor) processBatch(ctx context.Context) {
 			headers["aggregate_id"] = e.AggregateID
 		}
 
-		err := p.producer.ProduceMessage(
-			ctx,
-			topic,
-			[]byte(e.AggregateID), // partition key
-			e.Payload,
-			headers,
-		)
+		if e.Topic == "" {
+			eventLogger.Error("Event has empty topic, cannot publish")
+			if e.RetryCount >= 3 {
+				_ = p.repo.MarkFailed(ctx, e.EventID, e.RetryCount+1)
+			}
+			continue
+		}
 
+		err := p.producer.ProduceMessage(ctx, e.Topic, []byte(e.AggregateID), e.Payload, headers)
 		if err != nil {
-			p.logger.Error("failed to publish event",
-				zap.String("event_id", e.EventID),
-				zap.String("topic", topic),
-				zap.String("event_type", e.EventType),
-				zap.Error(err),
-			)
-
+			eventLogger.Error("Failed to publish event", zap.Error(err))
 			_ = p.repo.MarkFailed(ctx, e.EventID, e.RetryCount+1)
 			continue
 		}
 
-		_ = p.repo.MarkProcessed(ctx, e.EventID)
+		if err := p.repo.MarkProcessed(ctx, e.EventID); err != nil {
+			eventLogger.Error("Failed to mark event as processed", zap.Error(err))
+			// leave pending – retry later
+			continue
+		}
+
+		eventLogger.Info("Event published and marked processed")
 	}
 }
 
@@ -131,7 +160,7 @@ func (r *PostgresRepository) Store(ctx context.Context, tx *sql.Tx, event *Event
 		return errors.New("event_type cannot be empty")
 	}
 	if event.Topic == "" {
-		return errors.New("topic cannot be empty") // 🔥 NEW
+		return errors.New("topic cannot be empty")
 	}
 	if len(event.Payload) == 0 {
 		return errors.New("payload cannot be empty")
@@ -149,13 +178,19 @@ func (r *PostgresRepository) Store(ctx context.Context, tx *sql.Tx, event *Event
 		}
 	}
 
+	// ✅ Convert empty AggregateID to NULL for UUID column
+	var aggregateID interface{} = event.AggregateID
+	if aggregateID == "" {
+		aggregateID = nil
+	}
+
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO outbox.events (
 			event_id,
 			aggregate_type,
 			aggregate_id,
 			event_type,
-			topic,              -- 🔥 NEW
+			topic,
 			payload,
 			headers,
 			status,
@@ -166,9 +201,9 @@ func (r *PostgresRepository) Store(ctx context.Context, tx *sql.Tx, event *Event
 	`,
 		event.EventID,
 		event.AggregateType,
-		event.AggregateID,
+		aggregateID, // nil if empty
 		event.EventType,
-		event.Topic, // 🔥 NEW
+		event.Topic,
 		event.Payload,
 		headers,
 	)
@@ -177,7 +212,7 @@ func (r *PostgresRepository) Store(ctx context.Context, tx *sql.Tx, event *Event
 }
 
 // ============================================================
-// Fetch pending events
+// Fetch pending events with row-level locking
 // ============================================================
 func (r *PostgresRepository) FetchPending(ctx context.Context, limit int) ([]*Event, error) {
 	rows, err := r.db.QueryContext(ctx, `
@@ -186,7 +221,7 @@ func (r *PostgresRepository) FetchPending(ctx context.Context, limit int) ([]*Ev
 			aggregate_type,
 			aggregate_id,
 			event_type,
-			topic,              -- 🔥 NEW
+			topic,
 			payload,
 			headers,
 			retry_count,
@@ -195,6 +230,7 @@ func (r *PostgresRepository) FetchPending(ctx context.Context, limit int) ([]*Ev
 		WHERE status = 'pending'
 		ORDER BY created_at
 		LIMIT $1
+		FOR UPDATE SKIP LOCKED
 	`, limit)
 	if err != nil {
 		return nil, err
@@ -206,19 +242,27 @@ func (r *PostgresRepository) FetchPending(ctx context.Context, limit int) ([]*Ev
 	for rows.Next() {
 		var e Event
 		var headers []byte
+		var aggregateID sql.NullString // ✅ handle NULL
 
 		if err := rows.Scan(
 			&e.EventID,
 			&e.AggregateType,
-			&e.AggregateID,
+			&aggregateID, // scan into NullString
 			&e.EventType,
-			&e.Topic, // 🔥 NEW
+			&e.Topic,
 			&e.Payload,
 			&headers,
 			&e.RetryCount,
 			&e.CreatedAt,
 		); err != nil {
 			return nil, err
+		}
+
+		// Convert NullString to string (empty if NULL)
+		if aggregateID.Valid {
+			e.AggregateID = aggregateID.String
+		} else {
+			e.AggregateID = ""
 		}
 
 		// Unmarshal headers
@@ -263,8 +307,6 @@ func (r *PostgresRepository) MarkFailed(ctx context.Context, eventID string, ret
 	}
 
 	status := "pending"
-
-	// optional: move to failed after max retries
 	if retryCount >= 5 {
 		status = "failed"
 	}
@@ -346,31 +388,43 @@ func NewHybridStore(db *PostgresStore, cache *RedisCache) *HybridStore {
 	}
 }
 
-// ✅ Get now accepts tx and passes it to dbStore
+// Get tries Redis first; if tx is nil and cache miss, return sql.ErrNoRows.
 func (h *HybridStore) Get(ctx context.Context, tx *sql.Tx, key string, target interface{}) error {
-	// 1. Try Redis
+	// 1. Always try Redis
 	found, err := h.cache.Get(ctx, key, target)
 	if err == nil && found {
 		return nil
 	}
-	// 2. Fallback to DB with transaction
+	// 2. If no transaction, don't fallback to DB – just treat as miss
+	if tx == nil {
+		return sql.ErrNoRows
+	}
+	// 3. Fallback to DB with transaction
 	if err := h.dbStore.Get(ctx, tx, key, target); err != nil {
 		return err
 	}
-	// 3. Backfill Redis (non‑blocking)
+	// 4. Backfill Redis (non‑blocking)
 	go h.cache.Set(context.Background(), key, target)
 	return nil
 }
 
 func (h *HybridStore) Exists(ctx context.Context, tx *sql.Tx, key string) (bool, error) {
+	// Could check cache first, but we keep DB-only for simplicity.
 	return h.dbStore.Exists(ctx, tx, key)
 }
 
+// Store writes to Redis always; writes to DB only if tx != nil.
 func (h *HybridStore) Store(ctx context.Context, tx *sql.Tx, key string, response interface{}) error {
-	if err := h.dbStore.Store(ctx, tx, key, response); err != nil {
+	// Always store in Redis (synchronous or async – choose based on need)
+	if err := h.cache.Set(ctx, key, response); err != nil {
+		// Log error and continue? For idempotency, cache is critical, so return error.
 		return err
 	}
-	go h.cache.Set(context.Background(), key, response)
+	if tx != nil {
+		if err := h.dbStore.Store(ctx, tx, key, response); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -1143,264 +1197,6 @@ package audit
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"time"
-
-	"github.com/jmoiron/sqlx"
-	"github.com/lib/pq"
-	"go.uber.org/zap"
-
-	"auth-service/internal/client"
-	"auth-service/internal/util"
-)
-
-type AuditOutboxService struct {
-	postgresClient *client.PostgresClient
-	kafkaProducer  *client.KafkaProducer
-	logger         *zap.Logger
-	batchSize      int
-	pollInterval   time.Duration
-	stopChan       chan struct{}
-	isRunning      bool
-	topicName      string
-}
-
-func NewAuditOutboxService(
-	postgresClient *client.PostgresClient,
-	kafkaProducer *client.KafkaProducer,
-	batchSize int,
-	pollInterval time.Duration,
-	topicName string,
-) *AuditOutboxService {
-	logger := util.Get()
-	return &AuditOutboxService{
-		postgresClient: postgresClient,
-		kafkaProducer:  kafkaProducer,
-		logger:         logger,
-		batchSize:      batchSize,
-		pollInterval:   pollInterval,
-		stopChan:       make(chan struct{}),
-		isRunning:      false,
-		topicName:      topicName,
-	}
-}
-
-func (s *AuditOutboxService) Start(ctx context.Context) error {
-	s.logger.Info("Starting audit outbox service",
-		zap.String("topic", s.topicName),
-		zap.Int("batch_size", s.batchSize),
-		zap.Duration("poll_interval", s.pollInterval),
-	)
-
-	s.isRunning = true
-	ticker := time.NewTicker(s.pollInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			s.logger.Info("Audit outbox service stopped via context")
-			s.isRunning = false
-			return nil
-		case <-s.stopChan:
-			s.logger.Info("Audit outbox service stopped")
-			s.isRunning = false
-			return nil
-		case <-ticker.C:
-			if err := s.processOutboxBatch(ctx); err != nil {
-				s.logger.Error("Failed to process outbox batch", zap.Error(err))
-			}
-		}
-	}
-}
-
-func (s *AuditOutboxService) processOutboxBatch(ctx context.Context) error {
-	db := s.postgresClient.DB
-	if db == nil {
-		return fmt.Errorf("postgres client not initialized")
-	}
-
-	sqlxDB := sqlx.NewDb(db, "postgres")
-	tx, err := sqlxDB.BeginTxx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	var lastProcessedID *string
-	err = tx.GetContext(ctx, &lastProcessedID, `
-		SELECT last_processed_id::text
-		FROM audit.outbox_debounce
-		ORDER BY last_processed_at DESC
-		LIMIT 1
-	`)
-	if err != nil {
-		s.logger.Warn("No debounce record found, starting from beginning")
-	}
-
-	query := `
-		SELECT outbox_id, audit_id, operation, payload, created_at
-		FROM audit.audit_logs_outbox
-		WHERE processed_at IS NULL
-		AND ($1::uuid IS NULL OR outbox_id > $1::uuid)
-		ORDER BY outbox_id ASC
-		LIMIT $2
-		FOR UPDATE SKIP LOCKED
-	`
-	rows, err := tx.QueryxContext(ctx, query, lastProcessedID, s.batchSize)
-	if err != nil {
-		return fmt.Errorf("failed to query outbox: %w", err)
-	}
-	defer rows.Close()
-
-	var processedIDs []string
-	var lastID string
-	for rows.Next() {
-		var outboxID, auditID string
-		var operation string
-		var payloadBytes []byte
-		var createdAt time.Time
-
-		if err := rows.Scan(&outboxID, &auditID, &operation, &payloadBytes, &createdAt); err != nil {
-			s.logger.Error("Failed to scan outbox row", zap.Error(err))
-			continue
-		}
-
-		auditEvent := AuditLogEvent{
-			EventID:     outboxID,
-			AuditID:     auditID,
-			Timestamp:   createdAt,
-			EventType:   "audit",
-			CompanyID:   nil,
-			Module:      "",
-			Action:      "",
-			EntityType:  "",
-			EntityID:    nil,
-			ActorType:   "",
-			ActorID:     nil,
-			BeforeState: nil,
-			AfterState:  nil,
-			Metadata:    nil,
-		}
-
-		var payload map[string]interface{}
-		if err := json.Unmarshal(payloadBytes, &payload); err == nil {
-			if companyID, ok := payload["company_id"].(string); ok && companyID != "" {
-				auditEvent.CompanyID = &companyID
-			}
-			if module, ok := payload["module"].(string); ok {
-				auditEvent.Module = module
-			}
-			if action, ok := payload["action"].(string); ok {
-				auditEvent.Action = action
-			}
-			if entityType, ok := payload["entity_type"].(string); ok {
-				auditEvent.EntityType = entityType
-			}
-			if entityID, ok := payload["entity_id"].(string); ok && entityID != "" {
-				auditEvent.EntityID = &entityID
-			}
-			if actorType, ok := payload["actor_type"].(string); ok {
-				auditEvent.ActorType = actorType
-			}
-			if actorID, ok := payload["actor_id"].(string); ok && actorID != "" {
-				auditEvent.ActorID = &actorID
-			}
-			auditEvent.BeforeState = payload["before_state"]
-			auditEvent.AfterState = payload["after_state"]
-			auditEvent.Metadata = payload["metadata"]
-		}
-
-		messageBytes, err := json.Marshal(auditEvent)
-		if err != nil {
-			s.logger.Error("Failed to marshal audit event", zap.Error(err))
-			continue
-		}
-
-		if err := s.kafkaProducer.ProduceMessage(ctx, s.topicName, []byte(auditEvent.EventID), messageBytes, nil); err != nil {
-			s.logger.Error("Failed to produce audit event to Kafka",
-				zap.String("outbox_id", outboxID),
-				zap.Error(err),
-			)
-			continue
-		}
-
-		processedIDs = append(processedIDs, outboxID)
-		lastID = outboxID
-	}
-
-	if len(processedIDs) == 0 {
-		return nil
-	}
-
-	// FIX: Use pq.Array for PostgreSQL array conversion
-	updateQuery := `
-		UPDATE audit.audit_logs_outbox
-		SET processed_at = NOW()
-		WHERE outbox_id = ANY($1::uuid[])
-	`
-	_, err = tx.ExecContext(ctx, updateQuery, pq.Array(processedIDs))
-	if err != nil {
-		return fmt.Errorf("failed to mark records as processed: %w", err)
-	}
-
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO audit.outbox_debounce (last_processed_id, last_processed_at, batch_size)
-		VALUES ($1, NOW(), $2)
-	`, lastID, len(processedIDs))
-	if err != nil {
-		return fmt.Errorf("failed to update debounce table: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	s.logger.Info("Processed audit outbox batch",
-		zap.Int("count", len(processedIDs)),
-		zap.String("last_id", lastID),
-	)
-	return nil
-}
-
-func (s *AuditOutboxService) Stop() {
-	if s.isRunning {
-		close(s.stopChan)
-		s.isRunning = false
-		s.logger.Info("Audit outbox service stopping...")
-	}
-}
-
-func (s *AuditOutboxService) HealthCheck(ctx context.Context) error {
-	if err := s.postgresClient.HealthCheck(ctx); err != nil {
-		return fmt.Errorf("postgres health check failed: %w", err)
-	}
-
-	if s.kafkaProducer == nil {
-		return fmt.Errorf("kafka producer not initialized")
-	}
-
-	db := s.postgresClient.DB
-	sqlxDB := sqlx.NewDb(db, "postgres")
-	var count int
-	err := sqlxDB.GetContext(ctx, &count, `
-		SELECT COUNT(*)
-		FROM audit.audit_logs_outbox
-		WHERE processed_at IS NULL
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to check unprocessed records: %w", err)
-	}
-
-	s.logger.Debug("Audit outbox health check", zap.Int("pending_records", count))
-	return nil
-}
-
-package audit
-
-import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -1409,22 +1205,33 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
-	"auth-service/internal/util"
+	"auth-service/internal/client"
+	"auth-service/internal/infrastructure/outbox"
 )
 
+// AuditService now uses outbox.Repository to reliably publish events.
+// It holds a PostgresClient to create transactions if none is provided.
 type AuditService struct {
-	repo   AuditRepository
-	logger *zap.Logger
+	outboxRepo outbox.Repository
+	pgClient   *client.PostgresClient
+	logger     *zap.Logger
 }
 
-func NewAuditService(repo AuditRepository, logger *zap.Logger) *AuditService {
+// NewAuditService creates a new audit service with outbox repository and PostgreSQL client.
+func NewAuditService(
+	outboxRepo outbox.Repository,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+) *AuditService {
 	return &AuditService{
-		repo:   repo,
-		logger: logger,
+		outboxRepo: outboxRepo,
+		pgClient:   pgClient,
+		logger:     logger.Named("audit_service"),
 	}
 }
 
-// ✅ LogAction now accepts a transaction pointer
+// LogAction stores an outbox event for the audit log.
+// If tx is nil, it creates its own transaction.
 func (s *AuditService) LogAction(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -1443,11 +1250,12 @@ func (s *AuditService) LogAction(
 		return fmt.Errorf("missing required audit fields")
 	}
 
+	// Build the audit log struct (will be serialised as payload)
 	var metadataBytes []byte
 	if metadata != nil {
 		jsonBytes, err := json.Marshal(metadata)
 		if err != nil {
-			s.logger.Warn("Failed to marshal metadata", util.ErrorField(err))
+			s.logger.Warn("failed to marshal metadata", zap.Error(err))
 		} else {
 			metadataBytes = jsonBytes
 		}
@@ -1468,15 +1276,66 @@ func (s *AuditService) LogAction(
 		CreatedAt:   time.Now().UTC(),
 	}
 
-	// ✅ Use transaction‑aware repository method
-	if tx == nil {
-		// Fallback to non‑transactional (e.g., for background jobs)
-		return s.repo.CreateAuditLog(ctx, auditLog)
+	// Marshal entire audit log as JSON payload
+	payload, err := json.Marshal(auditLog)
+	if err != nil {
+		return fmt.Errorf("failed to marshal audit log: %w", err)
 	}
-	return s.repo.CreateAuditLogWithTx(ctx, tx, auditLog)
+
+	getUUIDString := func(id *uuid.UUID) string {
+		if id == nil {
+			return ""
+		}
+		return id.String()
+	}
+
+	// Build outbox event
+	event := &outbox.Event{
+		EventID:       auditLog.AuditID.String(),
+		AggregateType: entityType,
+		AggregateID:   getUUIDString(entityID),
+		EventType:     fmt.Sprintf("%s.%s", module, action),
+		Topic:         "audit-logs",
+		Payload:       payload,
+		Headers: map[string]string{
+			"audit_id":   auditLog.AuditID.String(),
+			"company_id": getUUIDString(companyID),
+			"module":     module,
+			"action":     action,
+			"event_type": fmt.Sprintf("%s.%s", module, action),
+		},
+	}
+
+	// If no transaction is provided, create one.
+	if tx == nil {
+		tx, err = s.pgClient.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("failed to begin transaction for outbox: %w", err)
+		}
+		defer tx.Rollback() // ignored if commit succeeds
+
+		if err := s.outboxRepo.Store(ctx, tx, event); err != nil {
+			return fmt.Errorf("failed to store outbox event: %w", err)
+		}
+		return tx.Commit()
+	}
+
+	// Use the provided transaction.
+	if err := s.outboxRepo.Store(ctx, tx, event); err != nil {
+		return fmt.Errorf("failed to store outbox event: %w", err)
+	}
+
+	s.logger.Debug("Audit event stored in outbox",
+		zap.String("audit_id", auditLog.AuditID.String()),
+		zap.String("module", module),
+		zap.String("action", action),
+	)
+
+	return nil
 }
 
-// Helper methods also updated to accept tx
+// Helper methods remain unchanged – they call LogAction.
+
 func (s *AuditService) LogDeviceEnrollment(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -1532,6 +1391,192 @@ func (s *AuditService) LogDeviceEnrollmentRevocation(
 		nil,
 		metadata,
 	)
+}
+
+package audit
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/segmentio/kafka-go"
+	"go.uber.org/zap"
+
+	"auth-service/internal/client"
+)
+
+// AuditClickHouseConsumer consumes audit events from Kafka and writes to ClickHouse.
+type AuditClickHouseConsumer struct {
+	consumer   *client.KafkaConsumer
+	chRepo     AuditRepository
+	logger     *zap.Logger
+	topic      string
+	maxRetries int
+	producer   *kafka.Writer
+}
+
+// NewAuditClickHouseConsumer creates a new consumer for audit events.
+func NewAuditClickHouseConsumer(
+	consumer *client.KafkaConsumer,
+	chRepo AuditRepository,
+	logger *zap.Logger,
+	brokers []string,
+) *AuditClickHouseConsumer {
+	return &AuditClickHouseConsumer{
+		consumer:   consumer,
+		chRepo:     chRepo,
+		logger:     logger.Named("audit_clickhouse_consumer"),
+		topic:      "audit-logs",
+		maxRetries: 3,
+		producer: &kafka.Writer{
+			Addr:         kafka.TCP(brokers...),
+			Balancer:     &kafka.LeastBytes{},
+			RequiredAcks: kafka.RequireOne,
+			Async:        false,
+		},
+	}
+}
+
+// Start consumes messages from Kafka indefinitely.
+func (c *AuditClickHouseConsumer) Start(ctx context.Context) {
+	c.logger.Info("starting audit clickhouse consumer", zap.String("topic", c.topic))
+	for {
+		msg, err := c.consumer.ConsumeMessage(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			c.logger.Error("failed to consume message", zap.Error(err))
+			continue
+		}
+
+		eventID := c.extractHeader(msg, "audit_id")
+		logger := c.logger.With(
+			zap.String("audit_id", eventID),
+			zap.Int64("offset", msg.Offset),
+			zap.String("topic", msg.Topic),
+		)
+
+		if eventID == "" {
+			logger.Warn("missing audit_id header, skipping")
+			_ = c.consumer.CommitMessage(ctx, msg)
+			continue
+		}
+
+		logger.Debug("processing audit event", zap.Int("payload_size", len(msg.Value)))
+
+		// Unmarshal payload into AuditLog
+		var auditLog AuditLog
+		if err := json.Unmarshal(msg.Value, &auditLog); err != nil {
+			logger.Error("failed to unmarshal audit log", zap.Error(err))
+			// Send to DLQ after max retries
+			if err := c.sendToDLQ(ctx, msg, err); err != nil {
+				logger.Error("failed to send to DLQ", zap.Error(err))
+			}
+			_ = c.consumer.CommitMessage(ctx, msg)
+			continue
+		}
+
+		// Write to ClickHouse
+		if err := c.chRepo.CreateAuditLog(ctx, &auditLog); err != nil {
+			logger.Error("failed to write to ClickHouse", zap.Error(err))
+			retryCount := c.extractRetry(msg)
+			if retryCount < c.maxRetries {
+				logger.Info("publishing retry", zap.Int("next_retry", retryCount+1))
+				if pubErr := c.publishRetry(ctx, msg, retryCount+1); pubErr != nil {
+					logger.Error("failed to publish retry", zap.Error(pubErr))
+				}
+			} else {
+				logger.Error("max retries exceeded, sending to DLQ")
+				if dlqErr := c.sendToDLQ(ctx, msg, err); dlqErr != nil {
+					logger.Error("failed to send to DLQ", zap.Error(dlqErr))
+				}
+			}
+			_ = c.consumer.CommitMessage(ctx, msg)
+			continue
+		}
+
+		logger.Info("audit event written to ClickHouse")
+		if err := c.consumer.CommitMessage(ctx, msg); err != nil {
+			logger.Error("failed to commit Kafka message", zap.Error(err))
+		}
+	}
+}
+
+// extractHeader returns the value of a specific header key.
+func (c *AuditClickHouseConsumer) extractHeader(msg *kafka.Message, key string) string {
+	for _, h := range msg.Headers {
+		if h.Key == key {
+			return string(h.Value)
+		}
+	}
+	return ""
+}
+
+// extractRetry reads retry_count from headers.
+func (c *AuditClickHouseConsumer) extractRetry(msg *kafka.Message) int {
+	val := c.extractHeader(msg, "retry_count")
+	var count int
+	fmt.Sscanf(val, "%d", &count)
+	return count
+}
+
+// publishRetry sends the message back to the same topic with an incremented retry count.
+func (c *AuditClickHouseConsumer) publishRetry(ctx context.Context, original *kafka.Message, newRetry int) error {
+	headers := make([]kafka.Header, 0, len(original.Headers)+1)
+	found := false
+	for _, h := range original.Headers {
+		if h.Key == "retry_count" {
+			headers = append(headers, kafka.Header{
+				Key:   "retry_count",
+				Value: []byte(fmt.Sprintf("%d", newRetry)),
+			})
+			found = true
+		} else {
+			headers = append(headers, h)
+		}
+	}
+	if !found {
+		headers = append(headers, kafka.Header{
+			Key:   "retry_count",
+			Value: []byte(fmt.Sprintf("%d", newRetry)),
+		})
+	}
+	retryMsg := kafka.Message{
+		Topic:   original.Topic,
+		Key:     original.Key,
+		Value:   original.Value,
+		Headers: headers,
+		Time:    time.Now(),
+	}
+	return c.producer.WriteMessages(ctx, retryMsg)
+}
+
+// sendToDLQ forwards the failed message to the dead‑letter queue.
+func (c *AuditClickHouseConsumer) sendToDLQ(ctx context.Context, original *kafka.Message, processErr error) error {
+	dlqTopic := original.Topic + ".dlq"
+	headers := append(original.Headers,
+		kafka.Header{Key: "error", Value: []byte(processErr.Error())},
+		kafka.Header{Key: "failed_at", Value: []byte(time.Now().Format(time.RFC3339))},
+	)
+	dlqMsg := kafka.Message{
+		Topic:   dlqTopic,
+		Key:     original.Key,
+		Value:   original.Value,
+		Headers: headers,
+		Time:    time.Now(),
+	}
+	return c.producer.WriteMessages(ctx, dlqMsg)
+}
+
+// Close shuts down the consumer and its internal producer.
+func (c *AuditClickHouseConsumer) Close() error {
+	if err := c.consumer.Close(); err != nil {
+		c.logger.Error("failed to close consumer", zap.Error(err))
+	}
+	return c.producer.Close()
 }
 
 package audit
@@ -1893,6 +1938,166 @@ func (r *AuditRepositoryImpl) getStmt(name string) (*sql.Stmt, bool) {
 	defer r.stmtMutex.RUnlock()
 	stmt, exists := r.stmtCache[name]
 	return stmt, exists
+}
+
+// File: internal/infrastructure/audit/es_consumer.go
+package audit
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"github.com/segmentio/kafka-go"
+	"go.uber.org/zap"
+
+	"auth-service/internal/client"
+)
+
+// AuditESConsumer consumes audit events from Kafka and indexes them to Elasticsearch.
+type AuditESConsumer struct {
+	consumer    *client.KafkaConsumer
+	esClient    *client.ESClient
+	logger      *zap.Logger
+	topic       string
+	maxRetries  int
+	environment string
+}
+
+// NewAuditESConsumer creates a new consumer for audit events to Elasticsearch.
+func NewAuditESConsumer(
+	consumer *client.KafkaConsumer,
+	esClient *client.ESClient,
+	logger *zap.Logger,
+	environment string,
+) *AuditESConsumer {
+	return &AuditESConsumer{
+		consumer:    consumer,
+		esClient:    esClient,
+		logger:      logger.Named("audit_es_consumer"),
+		topic:       "audit-logs",
+		maxRetries:  3,
+		environment: environment,
+	}
+}
+
+// Start consumes messages from Kafka and indexes them to Elasticsearch.
+func (c *AuditESConsumer) Start(ctx context.Context) {
+	c.logger.Info("starting audit ES consumer", zap.String("topic", c.topic))
+	for {
+		msg, err := c.consumer.ConsumeMessage(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			c.logger.Error("failed to consume message", zap.Error(err))
+			continue
+		}
+
+		// Extract audit_id from headers
+		auditIDHeader := c.extractHeader(msg, "audit_id")
+		logger := c.logger.With(
+			zap.String("audit_id_header", auditIDHeader),
+			zap.Int64("offset", msg.Offset),
+			zap.String("topic", msg.Topic),
+		)
+
+		if auditIDHeader == "" {
+			logger.Warn("missing audit_id header, skipping")
+			_ = c.consumer.CommitMessage(ctx, msg)
+			continue
+		}
+
+		logger.Debug("processing audit event for ES", zap.Int("payload_size", len(msg.Value)))
+
+		// ✅ FIXED: Unmarshal into AuditLog (not AuditLogEvent)
+		var auditLog AuditLog
+		if err := json.Unmarshal(msg.Value, &auditLog); err != nil {
+			logger.Error("failed to unmarshal audit log", zap.Error(err))
+			_ = c.consumer.CommitMessage(ctx, msg)
+			continue
+		}
+
+		// Index to Elasticsearch
+		if err := c.indexAuditLog(ctx, &auditLog); err != nil {
+			logger.Error("failed to index audit log to ES", zap.Error(err))
+			_ = c.consumer.CommitMessage(ctx, msg)
+			continue
+		}
+
+		logger.Info("audit event indexed to Elasticsearch",
+			zap.String("audit_id", auditLog.AuditID.String()),
+			zap.String("module", auditLog.Module),
+			zap.String("action", auditLog.Action),
+		)
+		if err := c.consumer.CommitMessage(ctx, msg); err != nil {
+			logger.Error("failed to commit Kafka message", zap.Error(err))
+		}
+	}
+}
+
+// indexAuditLog prepares the document and indexes it to Elasticsearch.
+func (c *AuditESConsumer) indexAuditLog(ctx context.Context, log *AuditLog) error {
+	docID := log.AuditID.String()
+	if docID == "" {
+		return fmt.Errorf("missing audit_id")
+	}
+
+	// Index by creation date
+	index := fmt.Sprintf("audit-%s", log.CreatedAt.Format("2006.01.02"))
+
+	// Build the document
+	doc := map[string]interface{}{
+		"audit_id":     log.AuditID,
+		"company_id":   log.CompanyID,
+		"module":       log.Module,
+		"action":       log.Action,
+		"entity_type":  log.EntityType,
+		"entity_id":    log.EntityID,
+		"actor_type":   log.ActorType,
+		"actor_id":     log.ActorID,
+		"created_at":   log.CreatedAt,
+		"environment":  c.environment,
+		"service_name": "auth-service",
+	}
+
+	// Add optional JSON fields if present
+	if len(log.BeforeState) > 0 {
+		var before interface{}
+		if err := json.Unmarshal(log.BeforeState, &before); err == nil {
+			doc["before_state"] = before
+		}
+	}
+	if len(log.AfterState) > 0 {
+		var after interface{}
+		if err := json.Unmarshal(log.AfterState, &after); err == nil {
+			doc["after_state"] = after
+		}
+	}
+	if len(log.Metadata) > 0 {
+		var meta interface{}
+		if err := json.Unmarshal(log.Metadata, &meta); err == nil {
+			doc["metadata"] = meta
+		}
+	}
+
+	_, err := c.esClient.IndexDocument(index, docID, doc)
+	return err
+}
+
+// extractHeader returns the value of a specific header key.
+func (c *AuditESConsumer) extractHeader(msg *kafka.Message, key string) string {
+	for _, h := range msg.Headers {
+		if h.Key == key {
+			return string(h.Value)
+		}
+	}
+	return ""
+}
+
+// Close shuts down the consumer.
+func (c *AuditESConsumer) Close() error {
+	return c.consumer.Close()
 }
 
 package audit
@@ -2391,6 +2596,272 @@ type AuditLogEvent struct {
 	Version     string      `json:"version"`
 	Message     string      `json:"message"`
 	ServiceName string      `json:"service_name"`
+}
+
+package audit
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"strings"
+
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"auth-service/internal/client"
+)
+
+// AuditRepositoryClickHouse implements AuditRepository using ClickHouse.
+// It uses the ReplacingMergeTree engine to deduplicate on audit_id.
+type AuditRepositoryClickHouse struct {
+	chClient *client.ClickHouseClient
+	logger   *zap.Logger
+}
+
+// NewAuditRepositoryClickHouse creates a new ClickHouse-backed audit repository.
+func NewAuditRepositoryClickHouse(chClient *client.ClickHouseClient, logger *zap.Logger) AuditRepository {
+	return &AuditRepositoryClickHouse{
+		chClient: chClient,
+		logger:   logger.Named("audit_repo_clickhouse"),
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Helper: convert *uuid.UUID to interface{} that ClickHouse can handle.
+// Returns nil for nil pointer, otherwise the dereferenced uuid.UUID.
+// This prevents a panic when the driver calls Value() on a nil pointer.
+// ----------------------------------------------------------------------------
+func nullableUUID(id *uuid.UUID) interface{} {
+	if id == nil {
+		return nil
+	}
+	return *id
+}
+
+// ----------------------------------------------------------------------------
+// Write operations (append-only)
+// ----------------------------------------------------------------------------
+
+func (r *AuditRepositoryClickHouse) CreateAuditLog(ctx context.Context, log *AuditLog) error {
+	return r.insert(ctx, log)
+}
+
+// CreateAuditLogWithTx ignores the tx parameter (ClickHouse has no transactions).
+func (r *AuditRepositoryClickHouse) CreateAuditLogWithTx(ctx context.Context, _ *sql.Tx, log *AuditLog) error {
+	return r.insert(ctx, log)
+}
+
+func (r *AuditRepositoryClickHouse) CreateAuditLogBatch(ctx context.Context, logs []*AuditLog) error {
+	if len(logs) == 0 {
+		return nil
+	}
+	batch, err := r.chClient.Conn().PrepareBatch(ctx, `
+		INSERT INTO auth_analytics.audit_events (
+			audit_id, company_id, module, action, entity_type, entity_id,
+			actor_type, actor_id, before_state, after_state, metadata, created_at
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare batch: %w", err)
+	}
+
+	for _, log := range logs {
+		err := batch.Append(
+			log.AuditID,
+			nullableUUID(log.CompanyID), // fixed
+			log.Module,
+			log.Action,
+			log.EntityType,
+			nullableUUID(log.EntityID), // fixed
+			log.ActorType,
+			nullableUUID(log.ActorID), // fixed
+			string(log.BeforeState),
+			string(log.AfterState),
+			string(log.Metadata),
+			log.CreatedAt,
+		)
+		if err != nil {
+			return fmt.Errorf("append to batch: %w", err)
+		}
+	}
+	return batch.Send()
+}
+
+// insert performs a single-row insert.
+func (r *AuditRepositoryClickHouse) insert(ctx context.Context, log *AuditLog) error {
+	query := `
+		INSERT INTO auth_analytics.audit_events (
+			audit_id, company_id, module, action, entity_type, entity_id,
+			actor_type, actor_id, before_state, after_state, metadata, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	return r.chClient.Exec(ctx, query,
+		log.AuditID,
+		nullableUUID(log.CompanyID),
+		log.Module,
+		log.Action,
+		log.EntityType,
+		nullableUUID(log.EntityID),
+		log.ActorType,
+		nullableUUID(log.ActorID),
+		string(log.BeforeState),
+		string(log.AfterState),
+		string(log.Metadata),
+		log.CreatedAt,
+	)
+}
+
+// ----------------------------------------------------------------------------
+// Read operations
+// ----------------------------------------------------------------------------
+
+func (r *AuditRepositoryClickHouse) GetAuditLogByID(ctx context.Context, auditID uuid.UUID) (*AuditLog, error) {
+	query := `
+		SELECT audit_id, company_id, module, action, entity_type, entity_id,
+		       actor_type, actor_id, before_state, after_state, metadata, created_at
+		FROM auth_analytics.audit_events
+		WHERE audit_id = ?
+	`
+	rows, err := r.chClient.QueryRows(ctx, query, auditID)
+	if err != nil {
+		return nil, fmt.Errorf("query: %w", err)
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		return r.scanRow(rows)
+	}
+	return nil, fmt.Errorf("audit log not found: %s", auditID)
+}
+
+func (r *AuditRepositoryClickHouse) ListAuditLogs(
+	ctx context.Context,
+	filter AuditLogFilter,
+) ([]*AuditLog, int, error) {
+	// Build WHERE clause
+	conditions := []string{}
+	args := []interface{}{}
+
+	addCondition := func(field string, value interface{}, isPtr bool) {
+		if !isPtr || value != nil {
+			conditions = append(conditions, fmt.Sprintf("%s = ?", field))
+			args = append(args, value)
+		}
+	}
+
+	addCondition("company_id", filter.CompanyID, true)
+	addCondition("module", filter.Module, true)
+	addCondition("action", filter.Action, true)
+	addCondition("entity_type", filter.EntityType, true)
+	addCondition("entity_id", filter.EntityID, true)
+	addCondition("actor_type", filter.ActorType, true)
+	addCondition("actor_id", filter.ActorID, true)
+
+	if filter.StartDate != nil {
+		conditions = append(conditions, "created_at >= ?")
+		args = append(args, *filter.StartDate)
+	}
+	if filter.EndDate != nil {
+		conditions = append(conditions, "created_at <= ?")
+		args = append(args, *filter.EndDate)
+	}
+
+	whereClause := ""
+	if len(conditions) > 0 {
+		whereClause = "WHERE " + strings.Join(conditions, " AND ")
+	}
+
+	// Count total
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM auth_analytics.audit_events %s", whereClause)
+	var total int
+	rows, err := r.chClient.QueryRows(ctx, countQuery, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("count query: %w", err)
+	}
+	if rows.Next() {
+		if err := rows.Scan(&total); err != nil {
+			return nil, 0, fmt.Errorf("scan count: %w", err)
+		}
+	}
+	rows.Close()
+	if total == 0 {
+		return []*AuditLog{}, 0, nil
+	}
+
+	// Data query with pagination
+	dataQuery := fmt.Sprintf(`
+		SELECT audit_id, company_id, module, action, entity_type, entity_id,
+		       actor_type, actor_id, before_state, after_state, metadata, created_at
+		FROM auth_analytics.audit_events
+		%s
+		ORDER BY created_at DESC
+		LIMIT ? OFFSET ?
+	`, whereClause)
+
+	params := append(args, filter.Limit, filter.Offset)
+	dataRows, err := r.chClient.QueryRows(ctx, dataQuery, params...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("data query: %w", err)
+	}
+	defer dataRows.Close()
+
+	logs := make([]*AuditLog, 0, filter.Limit)
+	for dataRows.Next() {
+		log, err := r.scanRow(dataRows)
+		if err != nil {
+			r.logger.Warn("failed to scan row", zap.Error(err))
+			continue
+		}
+		logs = append(logs, log)
+	}
+	return logs, total, nil
+}
+
+// ----------------------------------------------------------------------------
+// Infrastructure
+// ----------------------------------------------------------------------------
+
+func (r *AuditRepositoryClickHouse) HealthCheck(ctx context.Context) error {
+	return r.chClient.HealthCheck(ctx)
+}
+
+// ----------------------------------------------------------------------------
+// Helper: scan a single row into AuditLog
+// ----------------------------------------------------------------------------
+
+func (r *AuditRepositoryClickHouse) scanRow(rows driver.Rows) (*AuditLog, error) {
+	var log AuditLog
+	var companyID, entityID, actorID *uuid.UUID
+	var beforeState, afterState, metadata string
+
+	err := rows.Scan(
+		&log.AuditID,
+		&companyID,
+		&log.Module,
+		&log.Action,
+		&log.EntityType,
+		&entityID,
+		&log.ActorType,
+		&actorID,
+		&beforeState,
+		&afterState,
+		&metadata,
+		&log.CreatedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("scan: %w", err)
+	}
+
+	log.CompanyID = companyID
+	log.EntityID = entityID
+	log.ActorID = actorID
+	log.BeforeState = []byte(beforeState)
+	log.AfterState = []byte(afterState)
+	log.Metadata = []byte(metadata)
+
+	return &log, nil
 }
 
 package audit

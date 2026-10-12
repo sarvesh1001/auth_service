@@ -15,28 +15,23 @@ import (
 )
 
 type LeaveQueryService interface {
-	// Balance — P3 validates the target user
 	GetLeaveBalance(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, asOfDate time.Time, actorType string, actorID uuid.UUID, metadata map[string]interface{}) ([]*models.LeaveBalance, error)
 	GetLeaveBalanceByType(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, leaveTypeID uuid.UUID, asOfDate time.Time, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.LeaveBalance, error)
-	// In LeaveQueryService interface:
 	GetCompanyLedger(
 		ctx context.Context,
 		companyID uuid.UUID,
 		locationID *uuid.UUID,
 		filter models.LeaveLedgerFilter,
 	) ([]*models.LeaveLedgerEntry, int64, error)
-	// Internal scheduling resolver — no request ctx, no P3
 	IsUserOnLeave(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, date time.Time) (bool, *models.LeaveRequest, error)
 	GetApprovedLeaveForDate(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, date time.Time) (*models.LeaveRequest, error)
 
-	// History — P3 validates the target user (signature now takes companyID)
 	GetUserLeaveHistory(ctx context.Context, companyID, userID uuid.UUID, startDate, endDate time.Time) ([]*models.LeaveRequest, error)
 	GetLeaveTransactionHistory(ctx context.Context, companyID, userID uuid.UUID, startDate, endDate time.Time) ([]*models.LeaveTransaction, error)
 
 	GetLeaveTypeByID(ctx context.Context, companyID uuid.UUID, leaveTypeID uuid.UUID) (*models.LeaveType, error)
 	GetLeaveForecast(ctx context.Context, userID uuid.UUID, months int) ([]*models.LeaveBalance, error)
 
-	// GetLeaveUtilizationReport — location filter applies when locationID != nil.
 	GetLeaveUtilizationReport(
 		ctx context.Context,
 		companyID uuid.UUID,
@@ -49,13 +44,13 @@ type LeaveQueryService interface {
 
 type leaveQueryService struct {
 	repo         repository.LeaveRepository
-	employeeRepo hrRepo.EmployeeRepository // 👈 new — for P3
+	employeeRepo hrRepo.EmployeeRepository
 	auditService *audit.AuditService
 }
 
 func NewLeaveQueryService(
 	repo repository.LeaveRepository,
-	employeeRepo hrRepo.EmployeeRepository, // 👈 new
+	employeeRepo hrRepo.EmployeeRepository,
 	auditService *audit.AuditService,
 ) LeaveQueryService {
 	return &leaveQueryService{
@@ -65,12 +60,6 @@ func NewLeaveQueryService(
 	}
 }
 
-// ensureEmployeeInScope verifies that the target employee is within the
-// request's current location scope.
-//
-//   - ScopeAll      → pass
-//   - ScopeLocation → target must be at that location
-//   - missing ctx   → error (route not wrapped → wiring bug)
 func (s *leaveQueryService) ensureEmployeeInScope(
 	ctx context.Context,
 	companyID, userID uuid.UUID,
@@ -89,6 +78,9 @@ func (s *leaveQueryService) ensureEmployeeInScope(
 	if empLoc == nil {
 		return ErrEmployeeHasNoLocation
 	}
+	if locCtx.LocationID == nil {
+		return fmt.Errorf("location scope requires a location id")
+	}
 	if *empLoc != *locCtx.LocationID {
 		return ErrEmployeeOutsideScope
 	}
@@ -96,7 +88,7 @@ func (s *leaveQueryService) ensureEmployeeInScope(
 }
 
 // ============================================================================
-// BALANCE (P3 validates target)
+// BALANCE
 // ============================================================================
 
 func (s *leaveQueryService) GetLeaveBalance(
@@ -108,12 +100,11 @@ func (s *leaveQueryService) GetLeaveBalance(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) ([]*models.LeaveBalance, error) {
-	// 👇 P3 — row-level authorization
 	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
 		return nil, err
 	}
 
-	positionID, _, err := s.repo.GetUserPositionContext(ctx, companyID, userID)
+	positionID, _, err := s.repo.GetUserPositionContextOnDate(ctx, companyID, userID, asOfDate)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve user position: %w", err)
 	}
@@ -146,12 +137,11 @@ func (s *leaveQueryService) GetLeaveBalanceByType(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) (*models.LeaveBalance, error) {
-	// 👇 P3 — row-level authorization
 	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
 		return nil, err
 	}
 
-	positionID, _, err := s.repo.GetUserPositionContext(ctx, companyID, userID)
+	positionID, _, err := s.repo.GetUserPositionContextOnDate(ctx, companyID, userID, asOfDate)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve user position: %w", err)
 	}
@@ -176,7 +166,7 @@ func (s *leaveQueryService) GetLeaveBalanceByType(
 }
 
 // ============================================================================
-// INTERNAL (no P3 — called by scheduler resolver without request ctx)
+// INTERNAL
 // ============================================================================
 
 func (s *leaveQueryService) IsUserOnLeave(
@@ -221,7 +211,7 @@ func (s *leaveQueryService) GetApprovedLeaveForDate(
 }
 
 // ============================================================================
-// HISTORY (P3 validates target; signature changed to accept companyID)
+// HISTORY
 // ============================================================================
 
 func (s *leaveQueryService) GetUserLeaveHistory(
@@ -229,7 +219,6 @@ func (s *leaveQueryService) GetUserLeaveHistory(
 	companyID, userID uuid.UUID,
 	startDate, endDate time.Time,
 ) ([]*models.LeaveRequest, error) {
-	// 👇 P3 — row-level authorization
 	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
 		return nil, err
 	}
@@ -241,7 +230,6 @@ func (s *leaveQueryService) GetLeaveTransactionHistory(
 	companyID, userID uuid.UUID,
 	startDate, endDate time.Time,
 ) ([]*models.LeaveTransaction, error) {
-	// 👇 P3 — row-level authorization
 	if err := s.ensureEmployeeInScope(ctx, companyID, userID); err != nil {
 		return nil, err
 	}
@@ -261,6 +249,12 @@ func (s *leaveQueryService) GetLeaveTypeByID(
 	if err != nil {
 		return nil, err
 	}
+	// Defensive nil check — repo convention is to return
+	// ErrLeaveTypeNotFound, but a future change could return (nil, nil),
+	// and downstream callers dereference lt unconditionally.
+	if lt == nil {
+		return nil, fmt.Errorf("leave type not found")
+	}
 	if lt.CompanyID != companyID {
 		return nil, fmt.Errorf("leave type does not belong to company")
 	}
@@ -275,7 +269,6 @@ func (s *leaveQueryService) GetLeaveForecast(
 	return s.repo.GetLeaveForecast(ctx, userID, months)
 }
 
-// GetLeaveUtilizationReport — location filter applied when locationID != nil.
 func (s *leaveQueryService) GetLeaveUtilizationReport(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -293,19 +286,19 @@ func (s *leaveQueryService) CheckLeaveAvailability(
 	days int,
 	startDate time.Time,
 ) (bool, float64, error) {
-	positionID, _, err := s.repo.GetUserPositionContext(ctx, companyID, userID)
+	positionID, _, err := s.repo.GetUserPositionContextOnDate(ctx, companyID, userID, startDate)
 	if err != nil {
 		return false, 0, fmt.Errorf("failed to resolve user position: %w", err)
 	}
 	return s.repo.CheckLeaveAvailability(ctx, userID, leaveTypeID, days, startDate, positionID)
 }
+
 func (s *leaveQueryService) GetCompanyLedger(
 	ctx context.Context,
 	companyID uuid.UUID,
 	locationID *uuid.UUID,
 	filter models.LeaveLedgerFilter,
 ) ([]*models.LeaveLedgerEntry, int64, error) {
-	// Force caller scope — never trust the filter's CompanyID/LocationID.
 	filter.CompanyID = companyID
 	filter.LocationID = locationID
 

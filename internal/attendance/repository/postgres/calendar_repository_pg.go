@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -30,17 +31,16 @@ func NewCalendarRepository(pg *client.PostgresClient, logger *zap.Logger) reposi
 	}
 }
 
+// calendarColumns — timezone removed. The operational tz now lives on the
+// location (locations.timezone) or, for company-wide calendars, comes from
+// the company default via TimezoneProvider. A calendar is a date set; it
+// has no tz of its own.
 const calendarColumns = `
-	calendar_id, company_id, location_id, year, name, timezone,
+	calendar_id, company_id, location_id, year, name,
 	working_days, holidays, is_active, created_at
 `
 
 func (r *calendarRepository) Create(ctx context.Context, calendar *models.WorkCalendar) error {
-	// ── NEW: validate IANA name.
-	if err := util.ValidateTimezone(calendar.Timezone); err != nil {
-		return fmt.Errorf("work calendar timezone: %w", err)
-	}
-
 	if calendar.CalendarID == uuid.Nil {
 		calendar.CalendarID = uuid.New()
 	}
@@ -50,10 +50,13 @@ func (r *calendarRepository) Create(ctx context.Context, calendar *models.WorkCa
 
 	query := `
 		INSERT INTO attendance.work_calendars (
-			calendar_id, company_id, location_id, year, name, timezone,
+			calendar_id, company_id, location_id, year, name,
 			working_days, holidays, is_active, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
-	holidaysJSON, err := calendar.Holidays.Value()
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
+
+	// Holidays is a plain map — marshal it explicitly. pq cannot handle a
+	// raw map for a JSONB column on the write path either.
+	holidaysJSON, err := json.Marshal(calendar.Holidays)
 	if err != nil {
 		return fmt.Errorf("marshal holidays: %w", err)
 	}
@@ -64,7 +67,6 @@ func (r *calendarRepository) Create(ctx context.Context, calendar *models.WorkCa
 		calendar.LocationID,
 		calendar.Year,
 		calendar.Name,
-		calendar.Timezone,
 		pq.Array(calendar.WorkingDays),
 		holidaysJSON,
 		calendar.IsActive,
@@ -74,7 +76,6 @@ func (r *calendarRepository) Create(ctx context.Context, calendar *models.WorkCa
 		r.logger.Error("failed to create calendar",
 			util.String("company_id", calendar.CompanyID.String()),
 			util.Int("year", calendar.Year),
-			util.String("timezone", calendar.Timezone),
 			util.ErrorField(err))
 		return fmt.Errorf("create calendar: %w", err)
 	}
@@ -112,24 +113,19 @@ func (r *calendarRepository) GetByCompany(ctx context.Context, companyID uuid.UU
 }
 
 func (r *calendarRepository) Update(ctx context.Context, calendar *models.WorkCalendar) error {
-	// ── NEW: validate IANA name.
-	if err := util.ValidateTimezone(calendar.Timezone); err != nil {
-		return fmt.Errorf("work calendar timezone: %w", err)
-	}
-
 	query := `
 		UPDATE attendance.work_calendars
-		SET location_id = $1, name = $2, timezone = $3,
-			working_days = $4, holidays = $5, is_active = $6
-		WHERE calendar_id = $7`
-	holidaysJSON, err := calendar.Holidays.Value()
+		SET location_id = $1, name = $2,
+			working_days = $3, holidays = $4, is_active = $5
+		WHERE calendar_id = $6`
+
+	holidaysJSON, err := json.Marshal(calendar.Holidays)
 	if err != nil {
 		return fmt.Errorf("marshal holidays: %w", err)
 	}
 	result, err := r.client.Exec(ctx, query,
 		calendar.LocationID,
 		calendar.Name,
-		calendar.Timezone,
 		pq.Array(calendar.WorkingDays),
 		holidaysJSON,
 		calendar.IsActive,
@@ -234,10 +230,12 @@ func (r *calendarRepository) List(ctx context.Context, companyID uuid.UUID, filt
 	return cals, total, nil
 }
 
+// scanCalendar — working_days is decoded as []int64 (pq's Int64Array path)
+// then narrowed. Holidays is a plain map; unmarshal from JSON directly.
 func (r *calendarRepository) scanCalendar(row *sql.Row) (*models.WorkCalendar, error) {
 	var cal models.WorkCalendar
 	var holidaysJSON []byte
-	var workingDays []int
+	var workingDays []int64
 	var locationID sql.NullString
 
 	err := row.Scan(
@@ -246,7 +244,6 @@ func (r *calendarRepository) scanCalendar(row *sql.Row) (*models.WorkCalendar, e
 		&locationID,
 		&cal.Year,
 		&cal.Name,
-		&cal.Timezone,
 		pq.Array(&workingDays),
 		&holidaysJSON,
 		&cal.IsActive,
@@ -258,14 +255,19 @@ func (r *calendarRepository) scanCalendar(row *sql.Row) (*models.WorkCalendar, e
 		}
 		return nil, fmt.Errorf("scan calendar: %w", err)
 	}
-	cal.WorkingDays = workingDays
+
+	cal.WorkingDays = int64SliceToInt(workingDays)
+
 	if locationID.Valid && locationID.String != "" {
 		if id, err := uuid.Parse(locationID.String); err == nil {
 			cal.LocationID = &id
 		}
 	}
-	if err := cal.Holidays.Scan(holidaysJSON); err != nil {
-		return nil, fmt.Errorf("scan holidays: %w", err)
+
+	if len(holidaysJSON) > 0 {
+		if err := json.Unmarshal(holidaysJSON, &cal.Holidays); err != nil {
+			return nil, fmt.Errorf("unmarshal holidays: %w", err)
+		}
 	}
 	return &cal, nil
 }
@@ -275,7 +277,7 @@ func (r *calendarRepository) scanCalendars(rows *sql.Rows) ([]*models.WorkCalend
 	for rows.Next() {
 		var cal models.WorkCalendar
 		var holidaysJSON []byte
-		var workingDays []int
+		var workingDays []int64
 		var locationID sql.NullString
 
 		err := rows.Scan(
@@ -284,7 +286,6 @@ func (r *calendarRepository) scanCalendars(rows *sql.Rows) ([]*models.WorkCalend
 			&locationID,
 			&cal.Year,
 			&cal.Name,
-			&cal.Timezone,
 			pq.Array(&workingDays),
 			&holidaysJSON,
 			&cal.IsActive,
@@ -293,14 +294,19 @@ func (r *calendarRepository) scanCalendars(rows *sql.Rows) ([]*models.WorkCalend
 		if err != nil {
 			return nil, fmt.Errorf("scan calendar: %w", err)
 		}
-		cal.WorkingDays = workingDays
+
+		cal.WorkingDays = int64SliceToInt(workingDays)
+
 		if locationID.Valid && locationID.String != "" {
 			if id, err := uuid.Parse(locationID.String); err == nil {
 				cal.LocationID = &id
 			}
 		}
-		if err := cal.Holidays.Scan(holidaysJSON); err != nil {
-			return nil, fmt.Errorf("scan holidays: %w", err)
+
+		if len(holidaysJSON) > 0 {
+			if err := json.Unmarshal(holidaysJSON, &cal.Holidays); err != nil {
+				return nil, fmt.Errorf("unmarshal holidays: %w", err)
+			}
 		}
 		cals = append(cals, &cal)
 	}

@@ -2,12 +2,14 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 
+	"auth-service/internal/client"
 	"auth-service/internal/hr/leave/models"
 	"auth-service/internal/hr/leave/repository"
 	hrRepo "auth-service/internal/hr/repository"
@@ -22,7 +24,6 @@ type LeaveRequestService interface {
 	RejectLeave(ctx context.Context, requestID uuid.UUID, rejectedBy uuid.UUID, reason string, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.LeaveRequest, error)
 	CancelLeave(ctx context.Context, requestID uuid.UUID, cancelledBy uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*models.LeaveRequest, error)
 
-	// GetPendingRequests — location filter applies when locationID != nil.
 	GetPendingRequests(
 		ctx context.Context,
 		companyID uuid.UUID,
@@ -35,18 +36,20 @@ type LeaveRequestService interface {
 
 type leaveRequestService struct {
 	repo             repository.LeaveRepository
-	employeeRepo     hrRepo.EmployeeRepository // 👈 new — for location lookup
+	employeeRepo     hrRepo.EmployeeRepository
 	balanceService   LeaveBalanceService
 	idempotencyStore idempotency.Store
 	auditService     *audit.AuditService
+	pgClient         *client.PostgresClient // 👈 NEW — for atomic request + ledger
 }
 
 func NewLeaveRequestService(
 	repo repository.LeaveRepository,
-	employeeRepo hrRepo.EmployeeRepository, // 👈 new
+	employeeRepo hrRepo.EmployeeRepository,
 	balanceService LeaveBalanceService,
 	idempotencyStore idempotency.Store,
 	auditService *audit.AuditService,
+	pgClient *client.PostgresClient, // 👈 NEW
 ) LeaveRequestService {
 	return &leaveRequestService{
 		repo:             repo,
@@ -54,6 +57,7 @@ func NewLeaveRequestService(
 		balanceService:   balanceService,
 		idempotencyStore: idempotencyStore,
 		auditService:     auditService,
+		pgClient:         pgClient,
 	}
 }
 
@@ -81,6 +85,9 @@ func (s *leaveRequestService) ensureEmployeeInScope(
 	if empLoc == nil {
 		return ErrEmployeeHasNoLocation
 	}
+	if locCtx.LocationID == nil {
+		return fmt.Errorf("location scope requires a location id")
+	}
 	if *empLoc != *locCtx.LocationID {
 		return ErrEmployeeOutsideScope
 	}
@@ -103,15 +110,12 @@ func (s *leaveRequestService) RequestLeave(
 		return cached, nil
 	}
 
-	// 👇 Row-level authorization — target employee must be in scope.
+	// Row-level authorization — target employee must be in scope.
 	if err := s.ensureEmployeeInScope(ctx, req.CompanyID, req.UserID); err != nil {
 		return nil, err
 	}
 
 	// ── Structural validation of the date range + total_days ────────────
-	// The form already computes total_days, but a direct API caller can
-	// bypass the client. These checks ensure the persisted row is always
-	// internally consistent.
 	startUTC := req.StartDate.UTC().Truncate(24 * time.Hour)
 	endUTC := req.EndDate.UTC().Truncate(24 * time.Hour)
 
@@ -121,8 +125,6 @@ func (s *leaveRequestService) RequestLeave(
 	if req.TotalDays <= 0 {
 		return nil, fmt.Errorf("total_days must be a positive integer")
 	}
-
-	// Inclusive span in days: 2026-10-11 → 2026-10-16 == 6 days.
 	span := int(endUTC.Sub(startUTC).Hours()/24) + 1
 	if req.TotalDays > span {
 		return nil, fmt.Errorf(
@@ -132,7 +134,6 @@ func (s *leaveRequestService) RequestLeave(
 			req.EndDate.Format("2006-01-02"),
 		)
 	}
-	// ────────────────────────────────────────────────────────────────────
 
 	valid, message, err := s.repo.ValidateLeaveRequest(ctx, req, nil)
 	if err != nil {
@@ -149,6 +150,11 @@ func (s *leaveRequestService) RequestLeave(
 		return nil, fmt.Errorf("leave type not found")
 	}
 
+	// ── Build the request. Always insert as 'pending'; the auto-approval
+	//    path transitions it in the same transaction via ProcessLeaveRequestTx,
+	//    which is where the ledger consumption entry is written.
+	//    Inserting as 'approved' directly would skip the ledger entry — the
+	//    exact bug this transaction fixes.
 	request := &models.LeaveRequest{
 		LeaveRequestID: uuid.New(),
 		CompanyID:      req.CompanyID,
@@ -161,21 +167,39 @@ func (s *leaveRequestService) RequestLeave(
 		RequestedBy:    req.RequestedBy,
 		RequestedAt:    time.Now().UTC(),
 	}
-	if !leaveType.RequiresApproval {
-		request.Status = "approved"
-		request.ApprovedBy = &req.RequestedBy
-		now := time.Now().UTC()
-		request.ApprovedAt = &now
-	}
 
-	if err := s.repo.CreateLeaveRequest(ctx, request); err != nil {
+	// ── Atomic insert + optional auto-approval ─────────────────────────
+	if s.pgClient == nil {
+		return nil, fmt.Errorf("postgres client not configured")
+	}
+	err = s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
+		if err := s.repo.CreateLeaveRequestTx(ctx, tx, request); err != nil {
+			return fmt.Errorf("create leave request: %w", err)
+		}
+		if !leaveType.RequiresApproval {
+			if err := s.repo.ProcessLeaveRequestTx(
+				ctx, tx, request.LeaveRequestID, true, req.RequestedBy,
+			); err != nil {
+				return fmt.Errorf("auto-approve leave request: %w", err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 
-	if request.Status == "approved" {
-		if err := s.processApproval(ctx, request, *request.ApprovedBy); err != nil {
-			// Non-fatal — the request is created; the approval ledger entry
-			// can be reconciled later. Log via audit metadata below.
+	// ── Reflect the actual DB state on the local variable (audit + response) ──
+	if !leaveType.RequiresApproval {
+		updated, rerr := s.repo.GetLeaveRequestByID(ctx, request.LeaveRequestID)
+		if rerr == nil && updated != nil {
+			request = updated
+		} else {
+			// Fall back to the values ProcessLeaveRequestTx would have set.
+			request.Status = "approved"
+			request.ApprovedBy = &req.RequestedBy
+			now := time.Now().UTC()
+			request.ApprovedAt = &now
 		}
 	}
 
@@ -196,6 +220,7 @@ func (s *leaveRequestService) RequestLeave(
 
 	return request, nil
 }
+
 func (s *leaveRequestService) ApproveLeave(
 	ctx context.Context,
 	requestID uuid.UUID,
@@ -224,7 +249,6 @@ func (s *leaveRequestService) ApproveLeave(
 		return nil, fmt.Errorf("leave request is not pending")
 	}
 
-	// 👇 Row-level authorization — target employee must be in scope.
 	if err := s.ensureEmployeeInScope(ctx, request.CompanyID, request.UserID); err != nil {
 		return nil, err
 	}
@@ -286,7 +310,6 @@ func (s *leaveRequestService) RejectLeave(
 		return nil, fmt.Errorf("request not found")
 	}
 
-	// 👇 Row-level authorization — target employee must be in scope.
 	if err := s.ensureEmployeeInScope(ctx, request.CompanyID, request.UserID); err != nil {
 		return nil, err
 	}
@@ -345,7 +368,6 @@ func (s *leaveRequestService) CancelLeave(
 		return nil, fmt.Errorf("request not found")
 	}
 
-	// 👇 Row-level authorization — target employee must be in scope.
 	if err := s.ensureEmployeeInScope(ctx, request.CompanyID, request.UserID); err != nil {
 		return nil, err
 	}
@@ -374,7 +396,6 @@ func (s *leaveRequestService) CancelLeave(
 	return updated, nil
 }
 
-// GetPendingRequests — location filter applies when locationID != nil.
 func (s *leaveRequestService) GetPendingRequests(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -406,7 +427,6 @@ func (s *leaveRequestService) UpdateLeaveRequest(
 		return err
 	}
 
-	// 👇 Row-level authorization — target employee must be in scope.
 	if err := s.ensureEmployeeInScope(ctx, request.CompanyID, request.UserID); err != nil {
 		return err
 	}
@@ -432,6 +452,9 @@ func (s *leaveRequestService) UpdateLeaveRequest(
 	return nil
 }
 
+// processApproval — used by the manual ApproveLeave path. The auto-approval
+// path in RequestLeave no longer goes through here; it calls
+// ProcessLeaveRequestTx inside the same transaction as the insert.
 func (s *leaveRequestService) processApproval(ctx context.Context, request *models.LeaveRequest, approvedBy uuid.UUID) error {
 	return s.repo.ProcessLeaveRequest(ctx, request.LeaveRequestID, true, approvedBy)
 }

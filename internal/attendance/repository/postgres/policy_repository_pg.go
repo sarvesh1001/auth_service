@@ -50,11 +50,11 @@ func (r *policyRepository) CreatePolicy(ctx context.Context, tx *sql.Tx, policy 
 	}
 
 	query := `
-		INSERT INTO attendance.attendance_policies (
-			policy_id, company_id, work_center_code, position_id,
-			policy_code, policy_type, rules, is_active,
-			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	INSERT INTO attendance.attendance_policies (
+		policy_id, company_id, work_center_code, position_id,
+		policy_code, policy_type, rules, is_active,
+		created_at, updated_at, effective_from
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 	`
 
 	exec := func(q string, args ...interface{}) (sql.Result, error) {
@@ -75,6 +75,7 @@ func (r *policyRepository) CreatePolicy(ctx context.Context, tx *sql.Tx, policy 
 		policy.IsActive,
 		policy.CreatedAt,
 		policy.UpdatedAt,
+		policy.CreatedAt.UTC().Truncate(24*time.Hour),
 	)
 	if err != nil {
 		r.logger.Error("failed to create attendance policy",
@@ -85,30 +86,37 @@ func (r *policyRepository) CreatePolicy(ctx context.Context, tx *sql.Tx, policy 
 	return nil
 }
 
+// GetPolicyByID returns the latest version of a policy.
+// For the version active on a specific date, use GetPolicyByIDOnDate.
 func (r *policyRepository) GetPolicyByID(ctx context.Context, policyID uuid.UUID) (*models.AttendancePolicy, error) {
 	query := `
-		SELECT policy_id, company_id, work_center_code, position_id,
-		       policy_code, policy_type, rules, is_active,
-		       created_at, updated_at
-		FROM attendance.attendance_policies
-		WHERE policy_id = $1
+	SELECT policy_id, company_id, work_center_code, position_id,
+	       policy_code, policy_type, rules, is_active,
+	       created_at, updated_at
+	FROM attendance.attendance_policies
+	WHERE policy_id = $1
+	ORDER BY effective_from DESC
+	LIMIT 1
 	`
 	row := r.client.QueryRow(ctx, query, policyID)
 	return r.scanPolicy(row)
 }
 
+// GetPoliciesByCompany returns the current version of every distinct policy
+// in the company. Historical versions are collapsed via DISTINCT ON.
 func (r *policyRepository) GetPoliciesByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.AttendancePolicy, error) {
 	query := `
-		SELECT policy_id, company_id, work_center_code, position_id,
-		       policy_code, policy_type, rules, is_active,
-		       created_at, updated_at
-		FROM attendance.attendance_policies
-		WHERE company_id = $1
-	`
+	SELECT DISTINCT ON (policy_id)
+	       policy_id, company_id, work_center_code, position_id,
+	       policy_code, policy_type, rules, is_active,
+	       created_at, updated_at
+	FROM attendance.attendance_policies
+	WHERE company_id = $1
+`
 	if activeOnly {
 		query += " AND is_active = true"
 	}
-	query += " ORDER BY policy_code"
+	query += " ORDER BY policy_id, effective_from DESC"
 
 	rows, err := r.client.Query(ctx, query, companyID)
 	if err != nil {
@@ -140,57 +148,118 @@ func (r *policyRepository) GetPolicyByCode(ctx context.Context, companyID uuid.U
 		       created_at, updated_at
 		FROM attendance.attendance_policies
 		WHERE company_id = $1 AND policy_code = $2
+		ORDER BY effective_from DESC
+		LIMIT 1
 	`
 	row := r.client.QueryRow(ctx, query, companyID, policyCode)
 	return r.scanPolicy(row)
 }
 
+// GetPolicyByIDOnDate returns the version of a policy that was active on
+// the given date. Used by the resolver when the caller already has the
+// policy_id and wants the dated snapshot.
+func (r *policyRepository) GetPolicyByIDOnDate(ctx context.Context, policyID uuid.UUID, date time.Time) (*models.AttendancePolicy, error) {
+	query := `
+		SELECT policy_id, company_id, work_center_code, position_id,
+		       policy_code, policy_type, rules, is_active,
+		       created_at, updated_at
+		FROM attendance.attendance_policies
+		WHERE policy_id = $1
+		  AND effective_from <= $2::date
+		  AND (effective_to IS NULL OR effective_to >= $2::date)
+		ORDER BY effective_from DESC
+		LIMIT 1
+	`
+	row := r.client.QueryRow(ctx, query, policyID, date)
+	return r.scanPolicy(row)
+}
+
+// GetPositionPolicy returns the policy active for the position on CURRENT_DATE.
+// For a historical date, use GetPositionPolicyOnDate.
 func (r *policyRepository) GetPositionPolicy(ctx context.Context, positionID uuid.UUID) (*models.AttendancePolicy, error) {
 	query := `
 		SELECT policy_id, company_id, work_center_code, position_id,
 		       policy_code, policy_type, rules, is_active,
 		       created_at, updated_at
 		FROM attendance.attendance_policies
-		WHERE position_id = $1 AND is_active = true
-		ORDER BY created_at DESC
+		WHERE position_id = $1
+		  AND is_active = true
+		  AND effective_from <= CURRENT_DATE
+		  AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)
+		ORDER BY effective_from DESC
 		LIMIT 1
 	`
 	row := r.client.QueryRow(ctx, query, positionID)
 	return r.scanPolicy(row)
 }
 
+// GetPositionPolicyOnDate is the date-scoped variant. The resolver must use
+// this, not GetPositionPolicy, for historical queries.
+func (r *policyRepository) GetPositionPolicyOnDate(ctx context.Context, positionID uuid.UUID, date time.Time) (*models.AttendancePolicy, error) {
+	query := `
+		SELECT policy_id, company_id, work_center_code, position_id,
+		       policy_code, policy_type, rules, is_active,
+		       created_at, updated_at
+		FROM attendance.attendance_policies
+		WHERE position_id = $1
+		  AND is_active = true
+		  AND effective_from <= $2::date
+		  AND (effective_to IS NULL OR effective_to >= $2::date)
+		ORDER BY effective_from DESC
+		LIMIT 1
+	`
+	row := r.client.QueryRow(ctx, query, positionID, date)
+	return r.scanPolicy(row)
+}
+
+// GetWorkCenterPolicy returns the policy active for the work center on CURRENT_DATE.
+// For a historical date, use GetWorkCenterPolicyOnDate.
 func (r *policyRepository) GetWorkCenterPolicy(ctx context.Context, companyID uuid.UUID, workCenterCode string) (*models.AttendancePolicy, error) {
 	query := `
 		SELECT policy_id, company_id, work_center_code, position_id,
 		       policy_code, policy_type, rules, is_active,
 		       created_at, updated_at
 		FROM attendance.attendance_policies
-		WHERE company_id = $1 AND work_center_code = $2 AND is_active = true
-		ORDER BY created_at DESC
+		WHERE company_id = $1
+		  AND work_center_code = $2
+		  AND is_active = true
+		  AND effective_from <= CURRENT_DATE
+		  AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)
+		ORDER BY effective_from DESC
 		LIMIT 1
 	`
 	row := r.client.QueryRow(ctx, query, companyID, workCenterCode)
 	return r.scanPolicy(row)
 }
 
+// GetWorkCenterPolicyOnDate is the date-scoped variant.
+func (r *policyRepository) GetWorkCenterPolicyOnDate(ctx context.Context, companyID uuid.UUID, workCenterCode string, date time.Time) (*models.AttendancePolicy, error) {
+	query := `
+		SELECT policy_id, company_id, work_center_code, position_id,
+		       policy_code, policy_type, rules, is_active,
+		       created_at, updated_at
+		FROM attendance.attendance_policies
+		WHERE company_id = $1
+		  AND work_center_code = $2
+		  AND is_active = true
+		  AND effective_from <= $3::date
+		  AND (effective_to IS NULL OR effective_to >= $3::date)
+		ORDER BY effective_from DESC
+		LIMIT 1
+	`
+	row := r.client.QueryRow(ctx, query, companyID, workCenterCode, date)
+	return r.scanPolicy(row)
+}
+
+// UpdatePolicy versions in place: close the current row, insert a new one.
+// Same-day edits collapse into the current row so a user fixing a typo
+// doesn't blow up the version history.
 func (r *policyRepository) UpdatePolicy(ctx context.Context, tx *sql.Tx, policy *models.AttendancePolicy) error {
 	policy.UpdatedAt = time.Now().UTC()
 	rulesJSON, err := json.Marshal(policy.Rules)
 	if err != nil {
 		return fmt.Errorf("marshal rules: %w", err)
 	}
-
-	query := `
-		UPDATE attendance.attendance_policies SET
-			work_center_code = $1,
-			position_id = $2,
-			policy_code = $3,
-			policy_type = $4,
-			rules = $5,
-			is_active = $6,
-			updated_at = $7
-		WHERE policy_id = $8
-	`
 
 	exec := func(q string, args ...interface{}) (sql.Result, error) {
 		if tx != nil {
@@ -199,7 +268,20 @@ func (r *policyRepository) UpdatePolicy(ctx context.Context, tx *sql.Tx, policy 
 		return r.client.Exec(ctx, q, args...)
 	}
 
-	result, err := exec(query,
+	// Case 1: the open version was created today. Collapse the edit into it.
+	res, err := exec(`
+		UPDATE attendance.attendance_policies
+		SET work_center_code = $1,
+		    position_id = $2,
+		    policy_code = $3,
+		    policy_type = $4,
+		    rules = $5,
+		    is_active = $6,
+		    updated_at = $7
+		WHERE policy_id = $8
+		  AND effective_to IS NULL
+		  AND effective_from = CURRENT_DATE
+	`,
 		policy.WorkCenterCode,
 		policy.PositionID,
 		policy.PolicyCode,
@@ -210,14 +292,42 @@ func (r *policyRepository) UpdatePolicy(ctx context.Context, tx *sql.Tx, policy 
 		policy.PolicyID,
 	)
 	if err != nil {
-		r.logger.Error("failed to update policy",
-			util.String("policy_id", policy.PolicyID.String()),
-			util.ErrorField(err))
-		return fmt.Errorf("update policy: %w", err)
+		return fmt.Errorf("update same-day policy version: %w", err)
 	}
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		return errors.New("policy not found")
+	affected, _ := res.RowsAffected()
+	if affected > 0 {
+		return nil
+	}
+
+	// Case 2: close the open version, insert a new one starting today.
+	if _, err := exec(`
+		UPDATE attendance.attendance_policies
+		SET effective_to = CURRENT_DATE - 1
+		WHERE policy_id = $1
+		  AND effective_to IS NULL
+	`, policy.PolicyID); err != nil {
+		return fmt.Errorf("close old policy version: %w", err)
+	}
+
+	if _, err := exec(`
+		INSERT INTO attendance.attendance_policies (
+			policy_id, company_id, work_center_code, position_id,
+			policy_code, policy_type, rules, is_active,
+			created_at, updated_at, effective_from
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_DATE)
+	`,
+		policy.PolicyID,
+		policy.CompanyID,
+		policy.WorkCenterCode,
+		policy.PositionID,
+		policy.PolicyCode,
+		policy.PolicyType,
+		rulesJSON,
+		policy.IsActive,
+		policy.CreatedAt,
+		policy.UpdatedAt,
+	); err != nil {
+		return fmt.Errorf("insert new policy version: %w", err)
 	}
 	return nil
 }
@@ -243,7 +353,6 @@ func (r *policyRepository) AssignUserPolicy(ctx context.Context, tx *sql.Tx, ass
 	if assignment.CreatedAt.IsZero() {
 		assignment.CreatedAt = time.Now().UTC()
 	}
-	// If polymorphic fields are empty, default to employee
 	if assignment.SubjectType == "" {
 		assignment.SubjectType = "employee"
 	}
@@ -285,14 +394,15 @@ func (r *policyRepository) AssignUserPolicy(ctx context.Context, tx *sql.Tx, ass
 	return nil
 }
 
-// GetUserActivePolicy (legacy) – tries new polymorphic query first, then legacy query
+// GetUserActivePolicy (legacy) – tries the polymorphic lookup first,
+// then falls back to the legacy user_id query. Both filter the policy
+// version so the caller gets the rules that were true on `at`.
 func (r *policyRepository) GetUserActivePolicy(ctx context.Context, userID uuid.UUID, at time.Time) (*models.AttendancePolicy, error) {
-	// First try the new polymorphic lookup for 'employee'
 	policy, err := r.GetActivePolicyBySubject(ctx, "employee", userID, at)
 	if err == nil && policy != nil {
 		return policy, nil
 	}
-	// Fallback to legacy query (for older records)
+
 	query := `
 		SELECT ap.policy_id, ap.company_id, ap.work_center_code, ap.position_id,
 		       ap.policy_code, ap.policy_type, ap.rules, ap.is_active,
@@ -303,7 +413,9 @@ func (r *policyRepository) GetUserActivePolicy(ctx context.Context, userID uuid.
 		  AND uap.effective_from <= $2
 		  AND (uap.effective_to IS NULL OR uap.effective_to >= $2)
 		  AND ap.is_active = true
-		ORDER BY uap.effective_from DESC
+		  AND ap.effective_from <= $2::date
+		  AND (ap.effective_to IS NULL OR ap.effective_to >= $2::date)
+		ORDER BY uap.effective_from DESC, ap.effective_from DESC
 		LIMIT 1
 	`
 	row := r.client.QueryRow(ctx, query, userID, at)
@@ -323,7 +435,6 @@ func (r *policyRepository) EndUserPolicy(ctx context.Context, userID, policyID u
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		// Fallback: try using subject_type='employee'
 		return r.EndPolicyForSubject(ctx, "employee", userID, policyID, endDate)
 	}
 	return nil
@@ -397,7 +508,6 @@ func (r *policyRepository) AssignPolicyToSubject(ctx context.Context, tx *sql.Tx
 		subjectType = "employee"
 	}
 	now := time.Now().UTC()
-	// For employees, also set user_id for backward compatibility
 	var userID uuid.UUID
 	if subjectType == "employee" {
 		userID = subjectID
@@ -437,7 +547,9 @@ func (r *policyRepository) AssignPolicyToSubject(ctx context.Context, tx *sql.Tx
 	return nil
 }
 
-// GetActivePolicyBySubject retrieves the active policy for a given subject at a given date
+// GetActivePolicyBySubject retrieves the policy version active on `at`,
+// filtering both the assignment window (user_attendance_policies) and the
+// policy version window (attendance_policies).
 func (r *policyRepository) GetActivePolicyBySubject(ctx context.Context, subjectType string, subjectID uuid.UUID, at time.Time) (*models.AttendancePolicy, error) {
 	query := `
 		SELECT ap.policy_id, ap.company_id, ap.work_center_code, ap.position_id,
@@ -450,7 +562,9 @@ func (r *policyRepository) GetActivePolicyBySubject(ctx context.Context, subject
 		  AND uap.effective_from <= $3
 		  AND (uap.effective_to IS NULL OR uap.effective_to >= $3)
 		  AND ap.is_active = true
-		ORDER BY uap.effective_from DESC
+		  AND ap.effective_from <= $3::date
+		  AND (ap.effective_to IS NULL OR ap.effective_to >= $3::date)
+		ORDER BY uap.effective_from DESC, ap.effective_from DESC
 		LIMIT 1
 	`
 	row := r.client.QueryRow(ctx, query, subjectType, subjectID, at)

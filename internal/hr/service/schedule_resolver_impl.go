@@ -8,18 +8,18 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
-	attRepo "auth-service/internal/attendance/repository" // WorkCenterRepository (from attendance)
+	attRepo "auth-service/internal/attendance/repository"
 	"auth-service/internal/attendance/service/resolver"
-	leaveSvc "auth-service/internal/hr/leave/service" // alias to avoid name conflict
-	hrRepo "auth-service/internal/hr/repository"      // EmployeeRepository
+	leaveSvc "auth-service/internal/hr/leave/service"
+	hrRepo "auth-service/internal/hr/repository"
 )
 
 // EmployeeScheduleResolver implements the ScheduleSubjectResolver interface
 // for HR employees. It resolves schedule-related information using HR data.
 type EmployeeScheduleResolver struct {
-	employeeRepo   hrRepo.EmployeeRepository    // HR employee repository
-	workCenterRepo attRepo.WorkCenterRepository // Attendance work center repository
-	leaveQuery     leaveSvc.LeaveQueryService   // Leave query service
+	employeeRepo   hrRepo.EmployeeRepository
+	workCenterRepo attRepo.WorkCenterRepository
+	leaveQuery     leaveSvc.LeaveQueryService
 	logger         *zap.Logger
 }
 
@@ -39,10 +39,6 @@ func NewEmployeeScheduleResolver(
 }
 
 // ResolveSubject returns schedule-related subject info for an employee.
-//
-// Reads from GetPositionViewByID (joined with `jobs` and `locations`)
-// so the schedule engine gets the job's schedulable / attendance /
-// overtime flags along with the seat's work-center.
 func (r *EmployeeScheduleResolver) ResolveSubject(
 	ctx context.Context,
 	companyID, subjectID uuid.UUID,
@@ -53,7 +49,6 @@ func (r *EmployeeScheduleResolver) ResolveSubject(
 		return nil, fmt.Errorf("unsupported subject type: %s", subjectType)
 	}
 
-	// Get company employee record.
 	employee, err := r.employeeRepo.GetCompanyEmployeeByUserID(ctx, subjectID)
 	if err != nil {
 		return nil, err
@@ -69,27 +64,26 @@ func (r *EmployeeScheduleResolver) ResolveSubject(
 		CompanyID:   companyID,
 	}
 
+	if employee.PrimaryLocationID != nil && *employee.PrimaryLocationID != uuid.Nil {
+		info.PrimaryLocationID = employee.PrimaryLocationID
+	}
+
 	if employee.PositionID == nil {
 		return info, nil
 	}
 
-	// Joined view: seat + job definition + joined names.
 	pv, err := r.employeeRepo.GetPositionViewByID(ctx, *employee.PositionID)
 	if err != nil || pv == nil {
-		// A missing position is not fatal — return the employee
-		// without schedule flags; the caller can decide.
 		return info, nil
 	}
 
-	// Job-level fields — these come from the joined `jobs` row.
 	info.PositionID = &pv.PositionID
 	info.PositionTitle = pv.EffectiveTitle()
+	info.PositionLocationID = pv.LocationID // ← NEW: feeds the resolver's tier-2 fallback
 	info.IsSchedulable = pv.IsSchedulable
 	info.AttendanceRequired = pv.AttendanceRequired
 	info.OvertimeAllowed = pv.OvertimeAllowed
 
-	// Work-center resolution — the seat carries the code; the
-	// attendance repo resolves the WC's name and timezone.
 	if pv.WorkCenterCode != nil {
 		info.WorkCenterCode = pv.WorkCenterCode
 		wc, err := r.workCenterRepo.GetByCode(ctx, companyID, *pv.WorkCenterCode)
@@ -127,8 +121,23 @@ func (r *EmployeeScheduleResolver) ResolveOverride(ctx context.Context, companyI
 	return &overrideInfo, nil
 }
 
-// GetUsersByPosition returns subject IDs (user IDs) assigned to a given position.
-func (r *EmployeeScheduleResolver) GetUsersByPosition(ctx context.Context, positionID uuid.UUID) ([]uuid.UUID, error) {
+// GetUsersByPosition returns subject IDs (user IDs) assigned to a given
+// position.
+//
+// The interface now carries companyID for tenant scoping. The underlying
+// employee repo method does not take a companyID today because positions
+// are already tenant-scoped at the schema level (positions.company_id),
+// and this resolver is only ever called with a position that the caller
+// has already validated belongs to companyID. We accept the parameter for
+// interface compatibility and future-proofing, but do not forward it.
+//
+// If you later add companyID to the employee repo method, thread it
+// through here in the same change.
+func (r *EmployeeScheduleResolver) GetUsersByPosition(
+	ctx context.Context,
+	companyID, positionID uuid.UUID,
+) ([]uuid.UUID, error) {
+	_ = companyID // reserved for future use; see doc comment
 	return r.employeeRepo.GetActiveUsersByPosition(ctx, positionID)
 }
 

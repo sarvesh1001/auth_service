@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	academics "auth-service/internal/academics"
 	academichandler "auth-service/internal/academics/handler"
 	"auth-service/internal/accounting"
@@ -178,6 +180,7 @@ func NewRouter(
 			"time":    time.Now().UTC().Format(time.RFC3339),
 		})
 	})
+	router.Handle("/metrics", promhttp.Handler())
 
 	router.Route("/api/v1", func(r chi.Router) {
 		r.Get("/health", adminHandler.HealthCheckHandler)
@@ -1135,14 +1138,6 @@ func NewRouter(
 					r.Route("/hr", func(r chi.Router) {
 						// ----------------------------------------------------------
 						// REMINDERS — the in-app feed (HR inbox).
-						//
-						// Recipient is ALWAYS the caller (from JWT) — no user_id in
-						// the path, so one HR user cannot read another's feed.
-						//
-						// Writes are idempotent (already-read / already-dismissed
-						// rows are silently no-ops) but do NOT need a client
-						// Idempotency-Key; the operations are naturally idempotent
-						// on their primary key.
 						// ----------------------------------------------------------
 						r.Route("/reminders", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view")).
@@ -1210,9 +1205,6 @@ func NewRouter(
 								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view")).
 									Get("/role-history", employeeHandler.GetRoleHistory)
 
-								// ==================================================
-								// EMPLOYEE LIFECYCLE — PROBATION / NOTICE / ON-HOLD
-								// ==================================================
 								r.Route("/probation", func(r chi.Router) {
 									r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update")).
 										Post("/confirm", employeeHandler.ConfirmProbation)
@@ -1248,27 +1240,6 @@ func NewRouter(
 								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.document.upload")).
 									Post("/documents", employeeHandler.UploadEmployeeDocument)
 
-								// --------------------------------------------------
-								// Reactivate — inverse of termination.
-								//
-								// Restores a terminated or resigned employee to
-								// active. Idempotent: already-active returns 200.
-								//
-								// Keyed by user_id (not employee_profile_id) so the
-								// mobile client can call this with the id it already
-								// has on every typeahead row. Service enqueues a
-								// leave-resolver job on success so entitlements are
-								// rebuilt for the new employment window.
-								//
-								// Errors:
-								//   400 — invalid UUID, or status guard blocked the
-								//         reactivation (employee on probation /
-								//         notice / on_hold — those need their own
-								//         lifecycle path first)
-								//   403 — employee outside caller's location scope
-								//   404 — profile not found
-								//   500 — repo/tx failure
-								// --------------------------------------------------
 								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.terminate")).
 									Patch("/reactivate", employeeHandler.ReactivateEmployee)
 							})

@@ -2,6 +2,9 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -10,10 +13,140 @@ import (
 	"go.uber.org/zap"
 
 	attendancemodels "auth-service/internal/attendance/models"
+	"auth-service/internal/locationctx"
 )
 
-// assertPathCompany verifies that the company ID in the URL path matches the
-// caller's company from context. On mismatch it writes 403 and returns false.
+// =============================================================================
+// Location resolution — target location for a write
+// =============================================================================
+//
+// resolveTargetLocation is the single source of truth for "which location_id
+// should this create write to?".
+//
+// Middleware guarantees the following at this point:
+//
+//	ScopeAll      → caller sent "ALL", path is allow-listed for writes
+//	ScopeLocation → caller sent a concrete UUID they have MANAGE on
+//
+// Rules:
+//
+//	ScopeAll      → body wins; nil means "company-wide"
+//	ScopeLocation → body must be nil (falls back to active) or equal to the
+//	                active location; anything else is a 403.
+//
+// This deliberately does NOT re-derive the caller's location set. Middleware
+// already did that. Duplicating the logic here would create two answers.
+//
+// Error vars are exported so handlers and tests can assert on them.
+var (
+	ErrLocationRequired     = errors.New("location_id is required — you do not have company-wide access")
+	ErrLocationOutsideScope = errors.New("location_id is outside your access scope")
+	ErrLocationContext      = errors.New("location context missing from request")
+)
+
+func resolveTargetLocation(
+	ctx context.Context,
+	bodyLocationID *uuid.UUID,
+) (*uuid.UUID, error) {
+	locCtx, err := locationctx.FromContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrLocationContext, err)
+	}
+
+	switch locCtx.Mode {
+	case locationctx.ScopeAll:
+		// Company-wide caller: body decides. nil → company-wide row.
+		return bodyLocationID, nil
+
+	case locationctx.ScopeLocation:
+		if locCtx.LocationID == nil {
+			return nil, ErrLocationRequired
+		}
+		if bodyLocationID != nil && *bodyLocationID != *locCtx.LocationID {
+			return nil, ErrLocationOutsideScope
+		}
+		return locCtx.LocationID, nil
+
+	default:
+		// Unknown mode — fail closed.
+		return nil, ErrLocationContext
+	}
+}
+
+// assertCanTouchLocation is the guard for update/delete/action operations
+// where the target already exists and carries its own LocationID.
+//
+// Rules:
+//
+//	ScopeAll                 → allowed
+//	ScopeLocation, row nil   → denied (company-wide rows are owner-only)
+//	ScopeLocation, row match → allowed
+//	ScopeLocation, row diff  → denied
+func assertCanTouchLocation(
+	ctx context.Context,
+	rowLocationID *uuid.UUID,
+) error {
+	locCtx, err := locationctx.FromContext(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrLocationContext, err)
+	}
+
+	if locCtx.Mode == locationctx.ScopeAll {
+		return nil
+	}
+
+	if locCtx.LocationID == nil {
+		return ErrLocationRequired
+	}
+	if rowLocationID == nil {
+		return ErrLocationOutsideScope
+	}
+	if *rowLocationID != *locCtx.LocationID {
+		return ErrLocationOutsideScope
+	}
+	return nil
+}
+
+// writeLocationResolutionError maps location errors to HTTP responses.
+// Handlers should call this once, in the error branch, instead of repeating
+// the switch.
+func writeLocationResolutionError(
+	w http.ResponseWriter,
+	logger *zap.Logger,
+	err error,
+) {
+	switch {
+	case errors.Is(err, ErrLocationRequired):
+		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, ErrLocationOutsideScope):
+		writeError(w, http.StatusForbidden, err.Error())
+	case errors.Is(err, ErrLocationContext):
+		writeError(w, http.StatusUnauthorized, "location context missing")
+	default:
+		if logger != nil {
+			logger.Error("unexpected location resolution error", zap.Error(err))
+		}
+		writeError(w, http.StatusInternalServerError, "location resolution failed")
+	}
+}
+
+// writeError is a low-level helper used by helper-internal error paths.
+// Handlers with a logger should prefer their own respondWithError so the
+// logger sees the event.
+func writeError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	body, _ := json.Marshal(map[string]interface{}{
+		"success": false,
+		"error":   message,
+	})
+	_, _ = w.Write(body)
+}
+
+// =============================================================================
+// Company scope enforcement
+// =============================================================================
+
 func assertPathCompany(
 	w http.ResponseWriter,
 	ctxCompany uuid.UUID,
@@ -35,12 +168,12 @@ func assertPathCompany(
 	return false
 }
 
-// trustedProxyNets is the set of peer networks from which X-Forwarded-For
-// and X-Real-IP are honored. Populate at startup via SetTrustedProxies.
+// =============================================================================
+// Client IP resolution behind trusted proxies
+// =============================================================================
+
 var trustedProxyNets []*net.IPNet
 
-// SetTrustedProxies configures which peers are allowed to forward client-IP
-// headers. Call once at startup from config. Passing nil disables XFF trust.
 func SetTrustedProxies(nets []*net.IPNet) {
 	trustedProxyNets = nets
 }
@@ -54,15 +187,12 @@ func isTrustedProxy(ip net.IP) bool {
 	return false
 }
 
-// clientIP returns the caller's IP, honoring XFF only when the immediate
-// peer is a configured trusted proxy. Always returns a bare IP (no port).
 func clientIP(r *http.Request) string {
 	peerIP := r.RemoteAddr
 	if host, _, err := net.SplitHostPort(peerIP); err == nil {
 		peerIP = host
 	}
 	peer := net.ParseIP(peerIP)
-
 	if peer != nil && isTrustedProxy(peer) {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 			if idx := strings.IndexByte(xff, ','); idx >= 0 {
@@ -79,9 +209,10 @@ func clientIP(r *http.Request) string {
 	return peerIP
 }
 
-// isTrustedDevice reports whether the current request comes from a trusted
-// device. Reads either the boolean "is_trusted_device" context value or the
-// full DeviceAuthContext.
+// =============================================================================
+// Device trust helper
+// =============================================================================
+
 func isTrustedDevice(ctx context.Context) bool {
 	if v, ok := ctx.Value("is_trusted_device").(bool); ok {
 		return v

@@ -4,11 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 
 	"auth-service/internal/client"
 	"auth-service/internal/hr/leave/models"
@@ -34,7 +34,6 @@ type leavePolicyConfigService struct {
 	idempotencyStore idempotency.Store
 	auditService     *audit.AuditService
 
-	// 👇 ADD
 	pgClient     *client.PostgresClient
 	resolverJobs repository.ResolverJobRepository
 }
@@ -43,8 +42,8 @@ func NewLeavePolicyConfigService(
 	repo repository.LeaveRepository,
 	idempotencyStore idempotency.Store,
 	auditService *audit.AuditService,
-	pgClient *client.PostgresClient, // 👈 ADD
-	resolverJobs repository.ResolverJobRepository, // 👈 ADD
+	pgClient *client.PostgresClient,
+	resolverJobs repository.ResolverJobRepository,
 ) LeavePolicyConfigService {
 	return &leavePolicyConfigService{
 		repo:             repo,
@@ -55,30 +54,36 @@ func NewLeavePolicyConfigService(
 	}
 }
 
-// enqueueCompanyResolution is the best-effort emit used by every policy
-// mutation. The policy write has already committed by the time we get here,
-// so a failed enqueue MUST NOT surface as an HTTP error — log and move on.
-// The next policy edit will re-enqueue.
-func (s *leavePolicyConfigService) enqueueCompanyResolution(
+// withResolutionEnqueue runs a policy mutation inside a transaction, then
+// enqueues the company-wide resolution job in the SAME transaction. If either
+// the write or the enqueue fails, both roll back — a policy change cannot be
+// persisted without a corresponding resolver job.
+//
+// Rationale: the previous "write first, enqueue best-effort" pattern left the
+// system in a state where a policy was live but every employee's entitlement
+// still reflected the old rules, silently. The next policy edit would catch
+// up, but that could be days away.
+func (s *leavePolicyConfigService) withResolutionEnqueue(
 	ctx context.Context,
 	companyID uuid.UUID,
 	reason string,
-) {
-	if s.pgClient == nil || s.resolverJobs == nil {
-		return
+	fn func(tx *sql.Tx) error,
+) error {
+	if s.pgClient == nil {
+		return errors.New("postgres client not configured")
+	}
+	if s.resolverJobs == nil {
+		return errors.New("resolver job repository not configured")
 	}
 	if companyID == uuid.Nil {
-		return
+		return errors.New("company_id is required for policy change")
 	}
-	if err := s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
+	return s.pgClient.WithTx(ctx, func(tx *sql.Tx) error {
+		if err := fn(tx); err != nil {
+			return err
+		}
 		return s.resolverJobs.EnqueueCompanyResolution(ctx, tx, companyID, reason)
-	}); err != nil {
-		zap.L().Warn("enqueue company resolution failed",
-			zap.String("company_id", companyID.String()),
-			zap.String("reason", reason),
-			zap.Error(err),
-		)
-	}
+	})
 }
 
 // ---------- POLICY ----------
@@ -99,6 +104,7 @@ func (s *leavePolicyConfigService) CreatePolicy(
 		return cached, nil
 	}
 
+	// ── Validation ──────────────────────────────────────────────────
 	if policy.CompanyID == uuid.Nil {
 		return nil, fmt.Errorf("company_id is required")
 	}
@@ -131,10 +137,16 @@ func (s *leavePolicyConfigService) CreatePolicy(
 	policy.IsActive = true
 	policy.CreatedAt = time.Now().UTC()
 
-	if err := s.repo.CreateLeavePolicy(ctx, policy); err != nil {
-		return nil, err
+	// ── Write + enqueue atomically ─────────────────────────────────
+	if err := s.withResolutionEnqueue(ctx, policy.CompanyID, "policy change",
+		func(tx *sql.Tx) error {
+			return s.repo.CreateLeavePolicyTx(ctx, tx, policy)
+		},
+	); err != nil {
+		return nil, fmt.Errorf("create policy: %w", err)
 	}
 
+	// ── Audit + idempotency (after commit, best-effort) ────────────
 	afterJSON, _ := json.Marshal(policy)
 	ip, _ := ctx.Value("ip_address").(string)
 	auditMeta := mergeMeta(metadata, map[string]interface{}{
@@ -157,9 +169,6 @@ func (s *leavePolicyConfigService) CreatePolicy(
 		afterJSON,
 		auditMeta,
 	)
-
-	// 👇 Policy changed → re-resolve every active employee in the company.
-	s.enqueueCompanyResolution(ctx, policy.CompanyID, "policy change")
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, policy)
 
@@ -188,10 +197,16 @@ func (s *leavePolicyConfigService) DeactivatePolicy(
 	}
 	beforeJSON, _ := json.Marshal(policy)
 
-	if err := s.repo.DeactivateLeavePolicy(ctx, policyID); err != nil {
-		return err
+	// ── Write + enqueue atomically ─────────────────────────────────
+	if err := s.withResolutionEnqueue(ctx, policy.CompanyID, "policy change",
+		func(tx *sql.Tx) error {
+			return s.repo.DeactivateLeavePolicyTx(ctx, tx, policyID)
+		},
+	); err != nil {
+		return fmt.Errorf("deactivate policy: %w", err)
 	}
 
+	// ── Audit + idempotency ────────────────────────────────────────
 	ip, _ := ctx.Value("ip_address").(string)
 	auditMeta := mergeMeta(metadata, map[string]interface{}{
 		"policy_id": policyID.String(),
@@ -211,9 +226,6 @@ func (s *leavePolicyConfigService) DeactivatePolicy(
 		[]byte("{}"),
 		auditMeta,
 	)
-
-	// 👇 Policy changed → re-resolve every active employee in the company.
-	s.enqueueCompanyResolution(ctx, policy.CompanyID, "policy change")
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 
@@ -251,6 +263,7 @@ func (s *leavePolicyConfigService) UpdatePolicy(
 	}
 	beforeJSON, _ := json.Marshal(policy)
 
+	// ── Validation ────────────────────────────────────────────────
 	if update.AppliesToType != nil {
 		switch *update.AppliesToType {
 		case "company":
@@ -272,10 +285,16 @@ func (s *leavePolicyConfigService) UpdatePolicy(
 		return fmt.Errorf("priority must be > 0")
 	}
 
-	if err := s.repo.UpdateLeavePolicy(ctx, policyID, update); err != nil {
-		return err
+	// ── Write + enqueue atomically ─────────────────────────────────
+	if err := s.withResolutionEnqueue(ctx, policy.CompanyID, "policy change",
+		func(tx *sql.Tx) error {
+			return s.repo.UpdateLeavePolicyTx(ctx, tx, policyID, update)
+		},
+	); err != nil {
+		return fmt.Errorf("update policy: %w", err)
 	}
 
+	// ── Audit + idempotency ────────────────────────────────────────
 	ip, _ := ctx.Value("ip_address").(string)
 	auditMeta := mergeMeta(metadata, map[string]interface{}{
 		"policy_id": policyID.String(),
@@ -295,9 +314,6 @@ func (s *leavePolicyConfigService) UpdatePolicy(
 		nil,
 		auditMeta,
 	)
-
-	// 👇 Policy changed → re-resolve every active employee in the company.
-	s.enqueueCompanyResolution(ctx, policy.CompanyID, "policy change")
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 
@@ -322,6 +338,7 @@ func (s *leavePolicyConfigService) AddPolicyRule(
 		return cached, nil
 	}
 
+	// ── Validation ────────────────────────────────────────────────
 	if rule.PolicyID == uuid.Nil {
 		return nil, fmt.Errorf("policy_id required")
 	}
@@ -331,13 +348,28 @@ func (s *leavePolicyConfigService) AddPolicyRule(
 	if rule.TotalDays <= 0 {
 		return nil, fmt.Errorf("total_days must be > 0")
 	}
+
+	// Look up the parent policy up-front so we have companyID for both the
+	// transaction closure and the audit metadata. If the policy is missing,
+	// fail before we attempt the insert.
+	policy, err := s.repo.GetLeavePolicyByID(ctx, rule.PolicyID)
+	if err != nil {
+		return nil, fmt.Errorf("parent policy not found: %w", err)
+	}
+
 	rule.PolicyRuleID = uuid.New()
 	rule.CreatedAt = time.Now().UTC()
 
-	if err := s.repo.AddPolicyRule(ctx, rule); err != nil {
-		return nil, err
+	// ── Write + enqueue atomically ─────────────────────────────────
+	if err := s.withResolutionEnqueue(ctx, policy.CompanyID, "policy change",
+		func(tx *sql.Tx) error {
+			return s.repo.AddPolicyRuleTx(ctx, tx, rule)
+		},
+	); err != nil {
+		return nil, fmt.Errorf("add policy rule: %w", err)
 	}
 
+	// ── Audit + idempotency ────────────────────────────────────────
 	afterJSON, _ := json.Marshal(rule)
 	ip, _ := ctx.Value("ip_address").(string)
 	auditMeta := mergeMeta(metadata, map[string]interface{}{
@@ -346,16 +378,10 @@ func (s *leavePolicyConfigService) AddPolicyRule(
 		"leave_type_id":  rule.LeaveTypeID.String(),
 		"ip":             ip,
 	})
-	// Get companyID from policy
-	policy, _ := s.repo.GetLeavePolicyByID(ctx, rule.PolicyID)
-	var companyID *uuid.UUID
-	if policy != nil {
-		companyID = &policy.CompanyID
-	}
 	_ = s.auditService.LogAction(
 		ctx,
 		nil,
-		companyID,
+		&policy.CompanyID,
 		"leave",
 		"policy_rule.add",
 		"leave_policy_rule",
@@ -366,11 +392,6 @@ func (s *leavePolicyConfigService) AddPolicyRule(
 		afterJSON,
 		auditMeta,
 	)
-
-	// 👇 Policy changed → re-resolve every active employee in the company.
-	if policy != nil {
-		s.enqueueCompanyResolution(ctx, policy.CompanyID, "policy change")
-	}
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, rule)
 
@@ -393,19 +414,40 @@ func (s *leavePolicyConfigService) RemovePolicyRule(
 		return nil
 	}
 
-	if err := s.repo.DeletePolicyRule(ctx, policyRuleID); err != nil {
-		return err
+	// ── Resolve the parent policy so we know which company to re-resolve.
+	//    Previously this relied on metadata["company_id"], which is a bug:
+	//    if the handler forgot to supply it, no resolver job was enqueued
+	//    and no error was raised. Now we look it up explicitly.
+	policyRule, err := s.repo.GetPolicyRuleByID(ctx, policyRuleID)
+	if err != nil {
+		return fmt.Errorf("policy rule not found: %w", err)
+	}
+	policy, err := s.repo.GetLeavePolicyByID(ctx, policyRule.PolicyID)
+	if err != nil {
+		return fmt.Errorf("parent policy not found: %w", err)
 	}
 
+	// ── Write + enqueue atomically ─────────────────────────────────
+	if err := s.withResolutionEnqueue(ctx, policy.CompanyID, "policy change",
+		func(tx *sql.Tx) error {
+			return s.repo.DeletePolicyRuleTx(ctx, tx, policyRuleID)
+		},
+	); err != nil {
+		return fmt.Errorf("remove policy rule: %w", err)
+	}
+
+	// ── Audit + idempotency ────────────────────────────────────────
 	ip, _ := ctx.Value("ip_address").(string)
 	auditMeta := mergeMeta(metadata, map[string]interface{}{
 		"policy_rule_id": policyRuleID.String(),
+		"policy_id":      policy.PolicyID.String(),
+		"company_id":     policy.CompanyID.String(),
 		"ip":             ip,
 	})
 	_ = s.auditService.LogAction(
 		ctx,
 		nil,
-		nil,
+		&policy.CompanyID,
 		"leave",
 		"policy_rule.remove",
 		"leave_policy_rule",
@@ -416,15 +458,6 @@ func (s *leavePolicyConfigService) RemovePolicyRule(
 		[]byte("{}"),
 		auditMeta,
 	)
-
-	// 👇 Policy changed → re-resolve every active employee in the company.
-	// company_id comes via metadata (the handler supplies it) because this
-	// method does not otherwise load the rule's parent policy.
-	if companyIDStr, ok := metadata["company_id"].(string); ok && companyIDStr != "" {
-		if companyID, perr := uuid.Parse(companyIDStr); perr == nil {
-			s.enqueueCompanyResolution(ctx, companyID, "policy change")
-		}
-	}
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 
@@ -453,6 +486,7 @@ func (s *leavePolicyConfigService) UpdatePolicyRule(
 		return nil
 	}
 
+	// ── Validation ────────────────────────────────────────────────
 	if update.TotalDays != nil && *update.TotalDays <= 0 {
 		return fmt.Errorf("total_days must be > 0")
 	}
@@ -466,10 +500,16 @@ func (s *leavePolicyConfigService) UpdatePolicyRule(
 		}
 	}
 
-	if err := s.repo.UpdatePolicyRule(ctx, companyID, policyRuleID, update); err != nil {
-		return err
+	// ── Write + enqueue atomically ─────────────────────────────────
+	if err := s.withResolutionEnqueue(ctx, companyID, "policy change",
+		func(tx *sql.Tx) error {
+			return s.repo.UpdatePolicyRuleTx(ctx, tx, companyID, policyRuleID, update)
+		},
+	); err != nil {
+		return fmt.Errorf("update policy rule: %w", err)
 	}
 
+	// ── Audit + idempotency ────────────────────────────────────────
 	ip, _ := ctx.Value("ip_address").(string)
 	auditMeta := mergeMeta(metadata, map[string]interface{}{
 		"policy_rule_id": policyRuleID.String(),
@@ -490,9 +530,6 @@ func (s *leavePolicyConfigService) UpdatePolicyRule(
 		nil,
 		auditMeta,
 	)
-
-	// 👇 Policy changed → re-resolve every active employee in the company.
-	s.enqueueCompanyResolution(ctx, companyID, "policy change")
 
 	_ = s.idempotencyStore.Store(ctx, nil, idempKey, true)
 

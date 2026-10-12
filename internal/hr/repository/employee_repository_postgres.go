@@ -12,8 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jackc/pgtype" // for UUIDArray
-
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v4"
 	"go.uber.org/zap"
@@ -1863,19 +1861,22 @@ func (r *EmployeeRepositoryImpl) GetActiveEmployeesByCompany(ctx context.Context
 
 func (r *EmployeeRepositoryImpl) GetCompanyEmployeeByUserID(ctx context.Context, userID uuid.UUID) (*employee.CompanyEmployee, error) {
 	query := `
-			SELECT company_id, user_id, employee_id, role_id, hire_date, is_active,
-				reports_to, position_id, created_at, updated_at
-			FROM company_employees
-			WHERE user_id = $1`
+		SELECT company_id, user_id, employee_id, role_id, hire_date, is_active,
+		       reports_to, position_id, primary_location_id,
+		       created_at, updated_at
+		FROM company_employees
+		WHERE user_id = $1`
 
 	row := r.client.QueryRow(ctx, query, userID)
 	var ce employee.CompanyEmployee
 	var reportsTo *uuid.UUID
 	var positionID *uuid.UUID
+	var primaryLocationID *uuid.UUID
 
 	err := row.Scan(
 		&ce.CompanyID, &ce.UserID, &ce.EmployeeID, &ce.RoleID,
 		&ce.HireDate, &ce.IsActive, &reportsTo, &positionID,
+		&primaryLocationID,
 		&ce.CreatedAt, &ce.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1883,15 +1884,11 @@ func (r *EmployeeRepositoryImpl) GetCompanyEmployeeByUserID(ctx context.Context,
 		}
 		return nil, err
 	}
-	if reportsTo != nil {
-		ce.ReportsTo = reportsTo
-	}
-	if positionID != nil {
-		ce.PositionID = positionID
-	}
+	ce.ReportsTo = reportsTo
+	ce.PositionID = positionID
+	ce.PrimaryLocationID = primaryLocationID
 	return &ce, nil
 }
-
 func (r *EmployeeRepositoryImpl) GetEmploymentLocationID(ctx context.Context, companyID, userID uuid.UUID) (*uuid.UUID, error) {
 	var locID sql.NullString
 	query := `
@@ -1972,23 +1969,6 @@ func (r *EmployeeRepositoryImpl) CreateEmployeeProfileTx(
 // ============================================================================
 // SEARCH + HYDRATE (location-scoped; encryption-agnostic)
 // ============================================================================
-
-func toUUIDArray(ids []uuid.UUID) pgtype.UUIDArray {
-	if len(ids) == 0 {
-		return pgtype.UUIDArray{Status: pgtype.Null}
-	}
-	arr := pgtype.UUIDArray{
-		Elements: make([]pgtype.UUID, len(ids)),
-		Status:   pgtype.Present,
-	}
-	for i, id := range ids {
-		arr.Elements[i] = pgtype.UUID{
-			Bytes:  [16]byte(id),
-			Status: pgtype.Present,
-		}
-	}
-	return arr
-}
 
 func (r *EmployeeRepositoryImpl) SearchEmployeeIDs(
 	ctx context.Context,

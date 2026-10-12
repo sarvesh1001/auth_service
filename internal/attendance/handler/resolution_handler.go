@@ -31,6 +31,11 @@ func NewAttendanceResolutionHandler(
 }
 
 // ---- DTOs ----
+//
+// Dates are strings on the wire so we can accept either "YYYY-MM-DD"
+// (what the mobile app sends) or full RFC3339 timestamps. Go's
+// encoding/json only fills time.Time from RFC3339, so decoding
+// directly into time.Time would reject the plain date form.
 
 type ResolveEventRequest struct {
 	EventID uuid.UUID `json:"event_id"`
@@ -38,9 +43,9 @@ type ResolveEventRequest struct {
 
 type ResolveDayRequest struct {
 	UserID      uuid.UUID `json:"user_id"`
-	Date        time.Time `json:"date"`
+	Date        string    `json:"date"`
 	Recalculate bool      `json:"recalculate,omitempty"`
-	SubjectType string    `json:"subject_type,omitempty"` // added – defaults to "employee"
+	SubjectType string    `json:"subject_type,omitempty"` // defaults to "employee"
 }
 
 type BatchResolveRequest struct {
@@ -49,10 +54,10 @@ type BatchResolveRequest struct {
 
 type BatchResolveByPeriodRequest struct {
 	UserIDs     []uuid.UUID `json:"user_ids"`
-	StartDate   time.Time   `json:"start_date"`
-	EndDate     time.Time   `json:"end_date"`
+	StartDate   string      `json:"start_date"`
+	EndDate     string      `json:"end_date"`
 	Recalculate bool        `json:"recalculate,omitempty"`
-	SubjectType string      `json:"subject_type,omitempty"` // added – defaults to "employee"
+	SubjectType string      `json:"subject_type,omitempty"` // defaults to "employee"
 }
 
 // ---- Handlers ----
@@ -107,22 +112,32 @@ func (h *AttendanceResolutionHandler) ResolveDay(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusBadRequest, "user_id is required")
 		return
 	}
-	if req.Date.IsZero() {
-		req.Date = time.Now()
+
+	// Date defaults to now when the caller omits it.
+	var date time.Time
+	if req.Date == "" {
+		date = time.Now()
+	} else {
+		t, err := parseDateFlexible(req.Date)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest,
+				"date must be YYYY-MM-DD or RFC3339")
+			return
+		}
+		date = t
 	}
 
-	// Default to "employee" if not provided
 	subjectType := req.SubjectType
 	if subjectType == "" {
 		subjectType = "employee"
 	}
 
 	if req.Recalculate {
-		if err := h.resolutionService.RecalculateDay(ctx, companyID, req.UserID, subjectType, req.Date); err != nil {
+		if err := h.resolutionService.RecalculateDay(ctx, companyID, req.UserID, subjectType, date); err != nil {
 			h.logger.Error("Failed to recalculate day",
 				zap.String("user_id", req.UserID.String()),
 				zap.String("subject_type", subjectType),
-				zap.Time("date", req.Date),
+				zap.Time("date", date),
 				zap.Error(err))
 			h.respondWithError(w, http.StatusInternalServerError, "failed to recalculate day")
 			return
@@ -134,11 +149,11 @@ func (h *AttendanceResolutionHandler) ResolveDay(w http.ResponseWriter, r *http.
 		return
 	}
 
-	if err := h.resolutionService.ResolveDay(ctx, companyID, req.UserID, subjectType, req.Date); err != nil {
+	if err := h.resolutionService.ResolveDay(ctx, companyID, req.UserID, subjectType, date); err != nil {
 		h.logger.Error("Failed to resolve day",
 			zap.String("user_id", req.UserID.String()),
 			zap.String("subject_type", subjectType),
-			zap.Time("date", req.Date),
+			zap.Time("date", date),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to resolve day")
 		return
@@ -207,7 +222,6 @@ func (h *AttendanceResolutionHandler) ResolveDayByPath(w http.ResponseWriter, r 
 	}
 	recalculate := r.URL.Query().Get("recalculate") == "true"
 
-	// Read subject_type from query, default to "employee"
 	subjectType := r.URL.Query().Get("subject_type")
 	if subjectType == "" {
 		subjectType = "employee"
@@ -263,11 +277,24 @@ func (h *AttendanceResolutionHandler) BatchResolveByPeriod(w http.ResponseWriter
 		h.respondWithError(w, http.StatusBadRequest, "at least one user_id is required")
 		return
 	}
-	if req.StartDate.IsZero() || req.EndDate.IsZero() {
+	if req.StartDate == "" || req.EndDate == "" {
 		h.respondWithError(w, http.StatusBadRequest, "start_date and end_date are required")
 		return
 	}
-	if req.EndDate.Before(req.StartDate) {
+
+	startDate, err := parseDateFlexible(req.StartDate)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest,
+			"start_date must be YYYY-MM-DD or RFC3339")
+		return
+	}
+	endDate, err := parseDateFlexible(req.EndDate)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest,
+			"end_date must be YYYY-MM-DD or RFC3339")
+		return
+	}
+	if endDate.Before(startDate) {
 		h.respondWithError(w, http.StatusBadRequest, "end_date cannot be before start_date")
 		return
 	}
@@ -277,7 +304,7 @@ func (h *AttendanceResolutionHandler) BatchResolveByPeriod(w http.ResponseWriter
 		subjectType = "employee"
 	}
 
-	if err := h.resolutionService.ResolvePeriod(ctx, companyID, req.UserIDs, subjectType, req.StartDate, req.EndDate, req.Recalculate); err != nil {
+	if err := h.resolutionService.ResolvePeriod(ctx, companyID, req.UserIDs, subjectType, startDate, endDate, req.Recalculate); err != nil {
 		h.logger.Error("Failed to resolve period",
 			zap.Int("user_count", len(req.UserIDs)),
 			zap.String("subject_type", subjectType),

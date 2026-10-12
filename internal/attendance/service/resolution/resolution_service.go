@@ -63,9 +63,7 @@ type resolutionService struct {
 	exemptionRepo    repository.AttendanceExemptionRepository
 	logger           *zap.Logger
 	audit            *auditservice.AuditService
-
-	// ── NEW
-	tzProvider resolver.TimezoneProvider
+	tzProvider       resolver.TimezoneProvider
 }
 
 func NewResolutionService(
@@ -79,7 +77,7 @@ func NewResolutionService(
 	exemptionRepo repository.AttendanceExemptionRepository,
 	logger *zap.Logger,
 	audit *auditservice.AuditService,
-	tzProvider resolver.TimezoneProvider, // ── NEW
+	tzProvider resolver.TimezoneProvider,
 ) ResolutionService {
 	return &resolutionService{
 		eventRepo:        eventRepo,
@@ -114,8 +112,6 @@ func (s *resolutionService) ResolveDay(ctx context.Context, companyID, subjectID
 	return s.resolveSubjectDay(ctx, companyID, subjectID, subjectType, date)
 }
 
-// ResolvePeriod iterates calendar days in the subject's local tz, not UTC.
-// Each subject may have a different tz; we resolve per subject.
 func (s *resolutionService) ResolvePeriod(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -133,7 +129,6 @@ func (s *resolutionService) ResolvePeriod(
 		if loc == nil {
 			loc = time.UTC
 		}
-		// Iterate days in local tz.
 		current := time.Date(startDate.Year(), startDate.Month(), startDate.Day(), 0, 0, 0, 0, loc)
 		last := time.Date(endDate.Year(), endDate.Month(), endDate.Day(), 0, 0, 0, 0, loc)
 		for !current.After(last) {
@@ -158,7 +153,6 @@ func (s *resolutionService) ResolvePeriod(
 	return nil
 }
 
-// BatchResolveEvents dedups by (subject, local-midnight-in-that-tz).
 func (s *resolutionService) BatchResolveEvents(ctx context.Context, eventIDs []uuid.UUID) error {
 	if len(eventIDs) == 0 {
 		return fmt.Errorf("no event IDs provided")
@@ -167,7 +161,7 @@ func (s *resolutionService) BatchResolveEvents(ctx context.Context, eventIDs []u
 		CompanyID    uuid.UUID
 		SubjectType  string
 		SubjectID    uuid.UUID
-		BusinessDate string // YYYY-MM-DD in the subject's tz
+		BusinessDate string
 	}
 	processed := make(map[dayKey]bool)
 	for _, id := range eventIDs {
@@ -219,6 +213,15 @@ func (s *resolutionService) RecalculateDay(ctx context.Context, companyID, subje
 			)
 			return nil
 		}
+		if existing.IsFinalized {
+			s.logger.Info("Attendance frozen, skipping recalculation",
+				zap.String("subject_type", subjectType),
+				zap.String("subject_id", subjectID.String()),
+				zap.Time("date", normalized),
+				zap.String("tz", tz),
+			)
+			return nil
+		}
 		if err := s.summaryRepo.DeleteByID(ctx, existing.AttendanceSummaryID); err != nil {
 			s.logger.Warn("Failed to delete existing summary", zap.String("summary_id", existing.AttendanceSummaryID.String()), zap.Error(err))
 		}
@@ -226,8 +229,6 @@ func (s *resolutionService) RecalculateDay(ctx context.Context, companyID, subje
 	return s.resolveSubjectDay(ctx, companyID, subjectID, subjectType, normalized)
 }
 
-// resolveSubjectTz uses the subject resolver first (it already walked the
-// chain), falling back to the provider.
 func (s *resolutionService) resolveSubjectTz(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -277,7 +278,6 @@ func (s *resolutionService) resolveSubjectDay(ctx context.Context, companyID, su
 		tz = "UTC"
 	}
 
-	// ── CHANGED: businessDate is local midnight of the subject's tz.
 	businessDate := util.CalendarDateInTz(refTime, tz)
 
 	existingSummary, _ := s.summaryRepo.GetBySubjectDate(ctx, companyID, subjectID, subjectType, businessDate)
@@ -291,7 +291,6 @@ func (s *resolutionService) resolveSubjectDay(ctx context.Context, companyID, su
 		return nil
 	}
 
-	// Fetch a wide UTC window that covers the local day + DST slack.
 	fetchStart := businessDate.Add(-6 * time.Hour)
 	fetchEnd := businessDate.Add(30 * time.Hour)
 
@@ -474,7 +473,7 @@ func (s *resolutionService) applyAttendanceRules(
 			TotalCheckOuts: &metrics.CheckOuts,
 			BreakMinutes:   metrics.BreakMinutes,
 			ScheduleStatus: &resolved.ScheduleStatus,
-			ShiftID:        resolved.ScheduleInstanceID,
+			ShiftID:        resolved.ShiftID,
 			Timezone:       &tz,
 			Anomalies:      anomalies,
 			PairedEvents:   convertPairedEvents(dayPairs),
@@ -798,6 +797,12 @@ func (s *resolutionService) determineStatus(
 	return models.StatusAbsent
 }
 
+// resolvePolicy picks the attendance policy that was in force on `date` for
+// the given subject, using the SAP-style chain: subject assignment →
+// position → work center. Falls back to the built-in default policy.
+//
+// All lookups are date-scoped: a backdated correction uses the policy in
+// force on the day being resolved, not today's policy.
 func (s *resolutionService) resolvePolicy(
 	ctx context.Context,
 	companyID, subjectID uuid.UUID,
@@ -811,13 +816,13 @@ func (s *resolutionService) resolvePolicy(
 	}
 	if subjectType == models.SubjectTypeEmployee {
 		if resolved.PositionID != nil {
-			posPolicy, err := s.policyRepo.GetPositionPolicy(ctx, *resolved.PositionID)
+			posPolicy, err := s.policyRepo.GetPositionPolicyOnDate(ctx, *resolved.PositionID, date)
 			if err == nil && posPolicy != nil {
 				return posPolicy, nil
 			}
 		}
 		if resolved.WorkCenterCode != nil {
-			wcPolicy, err := s.policyRepo.GetWorkCenterPolicy(ctx, companyID, *resolved.WorkCenterCode)
+			wcPolicy, err := s.policyRepo.GetWorkCenterPolicyOnDate(ctx, companyID, *resolved.WorkCenterCode, date)
 			if err == nil && wcPolicy != nil {
 				return wcPolicy, nil
 			}
